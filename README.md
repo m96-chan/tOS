@@ -453,7 +453,7 @@ wrapped lines rather than re-wrapping them.
 - [x] pane splitting
 - [x] focus management
 - [x] workspaces
-- [ ] session persistence
+- [x] session persistence — resolved by decision: a restart starts clean with one terminal ([#5](https://github.com/m96-chan/tOS/issues/5)); shells surviving the compositor is a separate feature ([#6](https://github.com/m96-chan/tOS/issues/6))
 - [x] compositor key bindings
 
 ### 0.0.4 — Graphics
