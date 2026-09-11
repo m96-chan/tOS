@@ -427,9 +427,9 @@ person can check.
 
 ## Proposed task issues
 
-These are proposals for the issue tracker, not issues that have been created.
+These are on the issue tracker as #47–#54.
 
-### Lock: refuse the VT switch while the session is locked
+### #47 — Lock: refuse the VT switch while the session is locked
 
 `vt.rs` can now refuse a switch with `VT_RELDISP 0`, and nothing calls it.
 `main.rs:238-262` releases DRM master and agrees to every switch the kernel
@@ -441,7 +441,7 @@ an unlocked one behaves exactly as it does today. The ordering matters —
 must skip both rather than skipping the second. Labels: `enhancement`,
 `area:platform`.
 
-### Installer: a password for the user it creates
+### #48 — Installer: a password for the user it creates
 
 `tos-install` collects a hostname and a username (`plan.rs:40-44`) and writes
 `/etc/passwd` with `x` in the password field, promising a hash in a file it
@@ -455,7 +455,7 @@ existing recorded-backend tests cover the write; what the screen looks like
 when the two entries disagree is the part worth testing by hand. Labels:
 `enhancement`, `area:iso`, `security`.
 
-### SHA-512 crypt in tree, so tOS can check a password
+### #49 — SHA-512 crypt in tree, so tOS can check a password
 
 tOS has no way to verify a password and no library it is willing to take one
 from: the `libc` crate does not declare `crypt(3)`, musl's `crypt` cannot read
@@ -467,7 +467,7 @@ of it as pure functions over bytes, the way the DEFLATE and PNG decoders in
 installer and the lock depend on, and it is testable entirely on its own.
 Labels: `enhancement`, `area:system-ui`, `security`.
 
-### The lock screen: the state machine and the keyboard it owns
+### #50 — The lock screen: the state machine and the keyboard it owns
 
 With a credential to check against, the lock itself is compositor work:
 `Action::Lock` and a row in the binding table at `keys.rs:117-148`, a
@@ -482,7 +482,7 @@ field is the opposite of all three. Refuse to engage, with a message, when
 there is no credential — which is what makes the live ISO behave. Labels:
 `enhancement`, `area:system-ui`.
 
-### Blank the display by disabling the CRTC
+### #51 — Blank the display by disabling the CRTC
 
 Nothing in tOS ever stops putting pixels on the screen, so a laptop left in a
 tOS session burns its panel and its battery, and a locked session would show a
@@ -496,7 +496,7 @@ blanked locked screen different from a switched-away one. This is the display
 half of #16 and the screen half of #45. Labels: `enhancement`,
 `area:platform`.
 
-### Lock and blank on idle
+### #52 — Lock and blank on idle
 
 The compositor has no idea whether anyone is there. It has two deadlines
 already — the blink interval and the animation frame, both folded into
@@ -509,7 +509,7 @@ intervals belong in the configuration of #38; until that exists they are
 constants with a flag. A session with no credential blanks and does not lock.
 Labels: `enhancement`, `area:system-ui`.
 
-### Decide whether the lock takes VT_LOCKSWITCH
+### #53 — Decide whether the lock takes VT_LOCKSWITCH
 
 Refusing each switch with `VT_RELDISP 0` stops Ctrl+Alt+F2 and dies with the
 process, which is the right failure. `VT_LOCKSWITCH` is stronger — it makes
@@ -523,7 +523,7 @@ has the ioctls and the bookkeeping; what it does not have is the answer, and
 the answer is an experiment on the kernels tOS actually boots, not a reading
 of the source. Labels: `experiment`, `area:platform`, `security`.
 
-### The unauthenticated ways past a locked screen
+### #54 — The unauthenticated ways past a locked screen
 
 A screen lock is only as good as the other doors. `Alt+SysRq+r` takes the
 keyboard out of raw mode and undoes tOS's grab, and `Alt+SysRq+k` kills

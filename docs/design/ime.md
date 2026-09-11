@@ -632,9 +632,9 @@ them.
 
 ## Proposed task issues
 
-These are proposals for the issue tracker, not issues that have been created.
+These are on the issue tracker as #55–#64.
 
-### Romaji to kana, as a table and a state machine
+### #55 — Romaji to kana, as a table and a state machine
 
 There is no way to type a Japanese character on a Japanese keyboard in tOS, and
 the first missing piece is the smallest one: `ka` is か, `kya` is きゃ, `kka`
@@ -647,7 +647,7 @@ decoder and the PNG reader are. Cover halfwidth and fullwidth punctuation and
 the katakana table too, since they are the same table read differently. Nothing
 calls it yet. Labels: `enhancement`, `area:input`.
 
-### Read an SKK dictionary and look a reading up in it
+### #56 — Read an SKK dictionary and look a reading up in it
 
 With kana to type, the next thing is somewhere to look them up. SKK's
 dictionary format is a sorted text file — `かんれい /慣例/寒冷/管領/艦齢/` —
@@ -660,7 +660,7 @@ ignoring it for now. The path comes from a seam a test can point at its own
 small file, the way `tos-system` does, so none of this needs a dictionary on
 the machine running the tests. Labels: `enhancement`, `area:input`.
 
-### Ship a Japanese dictionary on the ISO
+### #57 — Ship a Japanese dictionary on the ISO
 
 `iso/mkiso.sh` learned to copy a CJK font out of the build container for #34,
 and the dictionary is the same move for a quarter less space: `SKK-JISYO.L`
@@ -674,7 +674,7 @@ in rather than assuming EUC-JP. Record the new image size in the comment block
 beside the font's numbers, and note that after #20 this copy goes away and the
 rootfs's own `/usr/share/skk` takes over. Labels: `enhancement`, `area:iso`.
 
-### A box that is not an overlay
+### #58 — A box that is not an overlay
 
 `Overlay::draw` builds its own border, clips its own text and pads its own rows
 with `chrome::draw_text`, and it is the only thing in the tree that knows how.
@@ -689,7 +689,7 @@ same thing. Do this after `notification-queue`, `workspace-rename` and
 `keys-cheatsheet` have landed, since all three are changing `overlay.rs`.
 Labels: `enhancement`, `area:system-ui`.
 
-### Draw a preedit at the cursor, and damage what it uncovers
+### #59 — Draw a preedit at the cursor, and damage what it uncovers
 
 A preedit is text the program has not been given and must not be given, so it
 cannot go in the grid; the compositor draws it over the pane's cursor row at
@@ -704,7 +704,7 @@ covered last frame instead — the same trick the graphics code already uses to
 repaint only the rows a moving image covers. Labels: `enhancement`,
 `area:system-ui`.
 
-### The candidate window
+### #60 — The candidate window
 
 Conversion is ambiguous — かんれい is four words — so there has to be somewhere
 to show the choice. It is a list with a cursor, drawn at the cursor rather than
@@ -716,7 +716,7 @@ and typing during a conversion abandons the conversion rather than narrowing
 the list. 変換 walks it, the number keys pick from it, Enter commits, Escape
 goes back to the unconverted kana. Labels: `enhancement`, `area:system-ui`.
 
-### Wire the IME into handle_key, and give it a toggle
+### #61 — Wire the IME into handle_key, and give it a toggle
 
 With a table, a dictionary and somewhere to draw, the IME becomes one arm of
 `Resolution::Passthrough` in `handle_key` (`compositor.rs:340`) and nothing
@@ -732,7 +732,7 @@ binding rather than a JIS key: on a USB JIS keyboard 半角/全角 is HID usage
 0x35, which `hid-input` maps to `KEY_GRAVE`, so it is indistinguishable from a
 backtick. Labels: `enhancement`, `area:input`, `area:system-ui`.
 
-### Find out what 半角/全角 actually sends, and name the keys that are left
+### #62 — Find out what 半角/全角 actually sends, and name the keys that are left
 
 #41 mapped the five scancodes a JIS keyboard adds, and the key a Japanese user
 presses to turn an IME on is not among them. On a USB JIS keyboard that key
@@ -747,7 +747,7 @@ hardware actually emits them. Record what the keyboards in the room really
 send, then give the ones that turn up `ImeKey` variants. Labels: `experiment`,
 `area:input`.
 
-### Okurigana, so an inflected word can be converted
+### #63 — Okurigana, so an inflected word can be converted
 
 Single-segment conversion over the okuri-nasi half of the dictionary converts
 「かんじ」to「漢字」and cannot convert「かきます」to「書きます」, which is most
@@ -759,7 +759,7 @@ which of those tOS does, implement it, and say in the commit which Japanese it
 still cannot write. This is the largest single piece of the IME and the one
 that decides whether it is usable. Labels: `enhancement`, `area:input`.
 
-### Remember which candidate was chosen
+### #64 — Remember which candidate was chosen
 
 A converter that offers 貴社 before 記者 every time, to someone who has picked
 記者 forty times, is a converter people work around rather than use. Reordering
