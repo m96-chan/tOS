@@ -129,7 +129,7 @@ mknod -m 666 "$ROOT/dev/null" c 1 3
 # Display and input, then the storage stack the installer needs: without a
 # disk driver it sees no disks, and without the filesystem modules it cannot
 # mount what it just created.
-MODULES="bochs virtio_gpu simpledrm cirrus vmwgfx \
+MODULES="bochs virtio_gpu simpledrm cirrus vmwgfx vboxvideo \
     evdev atkbd i8042 psmouse virtio_input hid_generic usbhid virtio_pci \
     sd_mod sr_mod cdrom ata_piix ahci libahci virtio_blk virtio_scsi \
     nvme usb_storage uas xhci_pci ehci_pci ohci_pci sdhci_pci mmc_block \
@@ -161,17 +161,20 @@ done
 
 # --- ISO ---------------------------------------------------------------
 cp "/boot/vmlinuz-$KVER" "$ISODIR/boot/vmlinuz"
+# The last console= on the command line is the one userspace gets as
+# /dev/console, so tty0 comes last: a person watching a screen is the common
+# case, and ttyS0 still carries the kernel log for anyone capturing it.
 cat >"$ISODIR/boot/grub/grub.cfg" <<'EOF'
-set timeout=1
+set timeout=10
 set default=0
 
 menuentry "tOS" {
-    linux /boot/vmlinuz console=tty0 console=ttyS0 quiet
+    linux /boot/vmlinuz console=ttyS0 console=tty0 quiet
     initrd /boot/initramfs.gz
 }
 
 menuentry "tOS (verbose)" {
-    linux /boot/vmlinuz console=tty0 console=ttyS0
+    linux /boot/vmlinuz console=ttyS0 console=tty0
     initrd /boot/initramfs.gz
 }
 EOF

@@ -5,6 +5,18 @@
 
 /bin/busybox --install -s /bin
 
+# /init's own stdout is whichever console= came last on the kernel command
+# line, and the machine may have several. Anything a person needs to read
+# goes to all of them: a screen is the usual one, a serial line is what CI
+# and anyone debugging a headless boot captures.
+say() {
+    said=
+    for tty in /dev/tty0 /dev/ttyS0; do
+        [ -c "$tty" ] && echo "$@" >"$tty" 2>/dev/null && said=1
+    done
+    [ -n "$said" ] || echo "$@"
+}
+
 mount -t proc none /proc
 mount -t sysfs none /sys
 mount -t devtmpfs none /dev 2>/dev/null || true
@@ -15,7 +27,7 @@ mount -t tmpfs none /tmp
 
 # The kernel ships these as modules. Load whatever the machine has; missing
 # hardware just means a harmless failure.
-for mod in bochs virtio_gpu simpledrm cirrus \
+for mod in bochs virtio_gpu simpledrm cirrus vmwgfx vboxvideo \
     evdev atkbd i8042 psmouse virtio_input hid_generic usbhid \
     sd_mod sr_mod cdrom ata_piix ahci virtio_blk virtio_scsi \
     nvme usb_storage uas xhci_pci ehci_pci ohci_pci sdhci_pci mmc_block \
@@ -27,6 +39,10 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     [ -e /dev/dri/card0 ] && break
     sleep 0.2
 done
+# Without a card the compositor cannot take the screen, and what it falls back
+# to may not be on the screen at all. Say so rather than leaving a blank one.
+[ -e /dev/dri/card0 ] ||
+    say "tOS: no display driver claimed this machine's graphics"
 
 # The kernel and initramfs live on the medium, not in the initramfs, so the
 # installer needs the medium mounted to copy them onto a disk. Look for the
@@ -43,14 +59,14 @@ for dev in /dev/sr* /dev/sd?? /dev/sd? /dev/vd?? /dev/vd? /dev/nvme*n*p* /dev/nv
     [ -b "$dev" ] || continue
     if mount -o ro "$dev" /run/live/medium 2>/dev/null; then
         if [ -f /run/live/medium/boot/vmlinuz ]; then
-            echo "tOS: live medium is $dev"
+            say "tOS: live medium is $dev"
             break
         fi
         umount /run/live/medium 2>/dev/null
     fi
 done
 if [ ! -f /run/live/medium/boot/vmlinuz ]; then
-    echo "tOS: no live medium found; the installer cannot copy a kernel"
+    say "tOS: no live medium found; the installer cannot copy a kernel"
 fi
 
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin
@@ -62,7 +78,7 @@ export TOS=1
 # of the day reaches each pane the compositor opens.
 export ENV=/etc/profile
 
-echo "tOS: starting compositor"
+say "tOS: starting compositor"
 /sbin/tos
-echo "tOS: compositor exited ($?), dropping to emergency shell"
+say "tOS: compositor exited ($?), dropping to emergency shell"
 exec sh
