@@ -327,29 +327,26 @@ GPU acceleration can be added later without changing the terminal/session model.
 
 ---
 
-## Proposed Implementation Stack
+## Implementation Stack
 
-The current preferred implementation language is **Rust**.
-
-Possible low-level building blocks:
+The implementation language is **Rust**.
 
 ```text
-Display      DRM/KMS
-Input        evdev / libinput
-PTY          Linux PTY
-Fonts        FreeType or Rust font stack
-Shaping      HarfBuzz where required
-Rendering    CPU framebuffer first
+Display      DRM/KMS via direct ioctls
+Input        evdev via direct reads
+PTY          POSIX pseudoterminals
+Fonts        built-in bitmap face, plus TrueType
+Shaping      not yet; per cell glyph placement
+Rendering    CPU framebuffer
              GPU acceleration later
-Audio        PipeWire / ALSA userspace
+Audio        not yet
 Rootfs       Debian
 ```
 
-The exact dependencies are intentionally not frozen yet.
-
-The architecture matters more than any individual library.
-
----
+The dependency surface is deliberately small: `libc` for the kernel
+interfaces, and `fontdue` for TrueType rasterization. DRM/KMS, evdev and the
+virtual terminal are spoken to directly rather than through a wrapper crate,
+so the first milestone has nothing between tOS and the kernel.
 
 ## Browser
 
@@ -415,66 +412,80 @@ That is the first real tOS.
 
 Everything after that grows from the same architecture.
 
+This milestone is implemented. See [Status](#status).
+
 ---
 
 ## Roadmap
 
+Implemented items are ticked. Everything ticked is covered by tests in the
+workspace; see [Status](#status) for what has and has not been run on real
+hardware.
+
 ### 0.0.1 — Direct terminal
 
-- DRM/KMS initialization
-- framebuffer renderer
-- font loading
-- basic terminal grid
-- basic ANSI / VT parser
-- keyboard input
-- PTY
-- shell
+- [x] DRM/KMS initialization
+- [x] framebuffer renderer
+- [x] font loading
+- [x] basic terminal grid
+- [x] basic ANSI / VT parser
+- [x] keyboard input
+- [x] PTY
+- [x] shell
 
 ### 0.0.2 — Usable terminal
 
-- UTF-8
-- true color
-- scrollback
-- resize
-- cursor styles
-- mouse support
-- clipboard
-- font fallback
+- [x] UTF-8
+- [x] true color
+- [x] scrollback
+- [x] resize
+- [x] cursor styles
+- [x] mouse support
+- [x] clipboard
+- [x] font fallback
+
+Line reflow on width changes is still missing: narrowing a pane truncates
+wrapped lines rather than re-wrapping them.
 
 ### 0.0.3 — Native compositor
 
-- multiple PTYs
-- pane splitting
-- focus management
-- workspaces
-- session persistence
-- compositor key bindings
+- [x] multiple PTYs
+- [x] pane splitting
+- [x] focus management
+- [x] workspaces
+- [ ] session persistence
+- [x] compositor key bindings
 
 ### 0.0.4 — Graphics
 
-- Kitty Graphics Protocol
-- image surfaces
-- GPU-backed texture cache
-- image previews
-- video experiments
+- [x] Kitty Graphics Protocol
+- [x] image surfaces
+- [ ] GPU-backed texture cache
+- [ ] image previews
+- [ ] video experiments
+
+Raw RGB and RGBA transmission work, including chunked transfers, placements
+and deletion. PNG payloads and zlib compression are parsed and answered with
+the protocol's error response rather than being silently dropped, so
+applications can fall back instead of hanging.
 
 ### 0.0.5 — System UI
 
-- launcher
-- status interface
-- notifications
-- power controls
-- network controls
-- Bluetooth controls
-- audio controls
+- [x] status interface
+- [x] notifications
+- [ ] launcher
+- [ ] power controls
+- [ ] network controls
+- [ ] Bluetooth controls
+- [ ] audio controls
 
 ### 0.1 — Portable tOS
 
-- generic x86_64 image
-- generic arm64 image
-- Debian rootfs tooling
-- install / boot tooling
-- hardware abstraction cleanup
+- [ ] generic x86_64 image
+- [ ] generic arm64 image
+- [ ] Debian rootfs tooling
+- [ ] install / boot tooling
+- [ ] hardware abstraction cleanup
 
 ### Later — Android devices
 
@@ -490,8 +501,6 @@ Everything after that grows from the same architecture.
 - terminal-native browser
 - graphical web surfaces
 - keyboard / pointer / touch web interaction
-
----
 
 ## Candidate Applications
 
@@ -557,9 +566,80 @@ That is tOS.
 
 ## Status
 
-Very early experimental project.
+Early, but running. The first milestone is implemented: tOS obtains a DRM/KMS
+display, renders a monospace font into a dumb buffer, creates PTYs, starts
+shells, parses ANSI/VT, and routes evdev input, with no X11, no Wayland, no
+Cage and no Kitty process anywhere in the stack.
 
-The first target is direct DRM/KMS output with a PTY-backed shell.
+What has been exercised, and how:
+
+| Area | Verified by |
+| --- | --- |
+| Terminal model, parser, grid, graphics protocol | unit and behavioural tests |
+| Glyph engine, box drawing, TTF rasterization | unit tests, rendered ASCII art |
+| Renderer | pixel-level tests over a real framebuffer |
+| PTYs, signals, window size, controlling terminal | tests that fork real processes |
+| Input encoding, both legacy and Kitty | unit tests, plus a decode round trip |
+| Layout, focus, workspaces, key bindings | unit tests |
+| Whole compositor | tests that run shells in split panes and inspect pixels |
+| DRM/KMS, evdev, VT ownership | compile for x86_64 and arm64 Linux; ioctl numbers and structure layouts are unit-tested against the kernel headers |
+
+The last row is the honest gap: the kernel-facing backends have not yet been
+run on hardware. Everything above them has, through the nested and headless
+backends.
+
+## Repository layout
+
+```text
+tOS/
+└── compositor/
+    ├── tos-term/        terminal model: cells, grid, VT parser, graphics
+    ├── tos-font/        glyph engine: bitmap face, box drawing, TrueType
+    ├── tos-render/      CPU renderer: surfaces, grid painting
+    ├── tos-pty/         pseudoterminals
+    ├── tos-input/       key and mouse model, encoders, evdev
+    ├── tos-session/     pane tree, focus, workspaces, key bindings
+    ├── tos-platform/    display backends: DRM/KMS, nested, headless
+    └── tos-compositor/  the `tos` binary
+```
+
+Only `tos-platform` and `tos-input` contain Linux-specific code. Everything
+else is portable, which is what makes the compositor testable away from the
+target hardware.
+
+## Building and running
+
+```sh
+cargo build --release
+cargo test
+```
+
+On Linux hardware, from a virtual terminal with no display server running:
+
+```sh
+sudo ./target/release/tos
+```
+
+Access to `/dev/dri/card0` and `/dev/input/event*` is required; adding the
+user to the `video` and `input` groups avoids needing root.
+
+To develop on any Unix, run tOS nested inside another terminal. The pixel
+framebuffer is encoded as half block characters, so the whole compositor,
+renderer and font stack are exercised exactly as they would be on hardware:
+
+```sh
+./target/release/tos --backend nested
+```
+
+To render a frame without a display at all:
+
+```sh
+./target/release/tos --screenshot /tmp/tos.ppm --size 1280x720 \
+    -e /bin/sh -c 'ls; sleep 1'
+```
+
+`tos --help` lists the options and the default key bindings. The leader key is
+`ctrl+a`; on hardware the same bindings work directly with `super`.
 
 ## License
 

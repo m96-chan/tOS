@@ -1,0 +1,15 @@
+[package]
+name = "tos-font"
+description = "tOS glyph engine: bitmap fallback font, procedural box drawing, TTF rasterization"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["ttf"]
+ttf = ["dep:fontdue"]
+
+[dependencies]
+fontdue = { version = "0.9", optional = true, default-features = false, features = ["std"] }

@@ -1,0 +1,33 @@
+[package]
+name = "tos-compositor"
+description = "The tOS terminal compositor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "tos_compositor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tos"
+path = "src/main.rs"
+
+[dependencies]
+tos-term = { workspace = true }
+tos-font = { workspace = true }
+tos-render = { workspace = true }
+tos-pty = { workspace = true }
+tos-input = { workspace = true }
+tos-session = { workspace = true }
+tos-platform = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tos-term = { workspace = true }
+tos-pty = { workspace = true }
+tos-render = { workspace = true }
+tos-session = { workspace = true }
+tos-input = { workspace = true }

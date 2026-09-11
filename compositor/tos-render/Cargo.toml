@@ -1,0 +1,12 @@
+[package]
+name = "tos-render"
+description = "tOS CPU renderer: framebuffer surfaces, terminal grid painting"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tos-term = { workspace = true }
+tos-font = { workspace = true }
