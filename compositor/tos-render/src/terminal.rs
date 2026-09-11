@@ -471,7 +471,7 @@ fn draw_graphics(
         // scale is done once and the frames after it are just the blend.
         let key = TextureKey::new(
             placement.image_id,
-            image.version,
+            image.generation(),
             region,
             dest.width,
             dest.height,
