@@ -168,7 +168,7 @@ either way, so this can be decided when the installer screen is written.
 ## VT switching and DRM master
 
 **Decision: the lock refuses the switch with `VT_RELDISP 0`. It does not take
-`VT_LOCKSWITCH`, at least not yet.**
+`VT_LOCKSWITCH`.**
 
 A lock that Ctrl+Alt+F2 walks around is not a lock. There are exactly two
 mechanisms in the kernel for stopping it, `vt.rs` can reach both, and they
@@ -206,33 +206,42 @@ hang. That is why refusal must be a branch on lock state rather than a
 standing policy — an unlocked session answers immediately, a locked one
 refuses immediately, and neither is silent.
 
-### `VT_LOCKSWITCH`, and why not yet
+### `VT_LOCKSWITCH`, and why not
 
 `VT_LOCKSWITCH` (`0x560B`) and `VT_UNLOCKSWITCH` (`0x560C`) set and clear the
 kernel's `vt_dont_switch`, which makes `set_console()` — the function behind
-the Ctrl+Alt+Fn keysym — refuse, and makes `VT_ACTIVATE` fail. It needs
+both the Ctrl+Alt+Fn keysym and `VT_ACTIVATE` — do nothing. It needs
 `CAP_SYS_TTY_CONFIG`, which tOS has. This is what an X server's
-`DontVTSwitch` uses, and it is a strictly stronger statement than refusing a
-switch one at a time.
+`DontVTSwitch` uses, and it reads as a strictly stronger statement than
+refusing a switch one at a time.
 
-It is also a single global kernel flag with no owner. Nothing clears it when
-the process that set it exits. If tOS is killed while locked, that machine can
-never switch virtual terminals again until it reboots.
+It is measured now, in [`vt-lockswitch.md`](vt-lockswitch.md), on Debian
+bookworm's 6.1.187 — the kernel the ISO boots — and on 7.2.4. Three results
+decide it:
 
-`vt.rs` is already careful about this exact class of failure — `Drop` restores
-the terminal because "leaving a VT in graphics mode with the keyboard off would
-make the machine look dead" — but `Drop` is not a guarantee here. The release
-profile sets `panic = "abort"`, so a panic does not unwind and no destructor
-runs, and `SIGKILL` never ran one to begin with. Today that exposure is
-"this VT looks dead". Taking `VT_LOCKSWITCH` widens it to "no VT can be
-reached".
+- **The flag outlives the process that set it.** The setting process was
+  `SIGKILL`ed and reaped, and switching stayed dead. `VT_UNLOCKSWITCH` from
+  any privileged process clears it, and a reboot clears it; nothing else in
+  the kernel touches it.
+- **It buys nothing the refusal does not.** `VT_RELDISP 0` refuses a switch
+  whoever asked for it, so another process's `VT_ACTIVATE` is already refused
+  while tOS is alive and locked. On hardware the keyboard path is gone before
+  either mechanism: `EVIOCGRAB` takes the keyboards away from the kernel's
+  input handler, and `K_OFF` makes the VT keyboard drop the `KT_CONS` keysym
+  that Ctrl+Alt+Fn is.
+- **It costs the only recovery there is.** When the process holding a VT under
+  `VT_PROCESS` dies, the kernel notices on the next switch, resets the
+  terminal out of `KD_GRAPHICS` and lets the switch through. A killed `tos`
+  leaves a dead screen and a dead console keyboard — `Drop` does not run under
+  `panic = "abort"` and never runs on `SIGKILL` — and one `VT_ACTIVATE` from
+  ssh or the serial line brings the machine back. `set_console` tests
+  `vt_dont_switch` first, so taking the flag discards that rescue too.
 
-That trade is probably still worth making, because the window is exactly the
-locked interval and the whole point of a locked interval is that the machine
-should be hard to get into. But it should be made after someone has answered
-the empirical question on real hardware — does the kernel clear
-`vt_dont_switch` when the process that set it dies, on the kernels tOS boots?
-— rather than by reasoning from the source. That is its own task, below.
+So the trade is not a stronger lock for a small risk. It adds no protection
+against anyone who is not already able to kill `tos`, and it removes the way a
+machine is recovered when `tos` dies holding the screen. `vt.rs` keeps the
+pair: `unlock_switching` is the rescue, and `tos` should call it once at
+startup so that a respawn clears the flag however it came to be set.
 
 ### What the lock does not stop
 
@@ -509,19 +518,17 @@ intervals belong in the configuration of #38; until that exists they are
 constants with a flag. A session with no credential blanks and does not lock.
 Labels: `enhancement`, `area:system-ui`.
 
-### #53 — Decide whether the lock takes VT_LOCKSWITCH
+### #53 — Decide whether the lock takes VT_LOCKSWITCH — settled
 
-Refusing each switch with `VT_RELDISP 0` stops Ctrl+Alt+F2 and dies with the
-process, which is the right failure. `VT_LOCKSWITCH` is stronger — it makes
-`set_console()` refuse outright, and it also blocks `VT_ACTIVATE` from any
-other process — but it sets a single global kernel flag with no owner, and the
-release profile builds with `panic = "abort"`, so no destructor runs on a
-panic and none ever runs on `SIGKILL`. If the kernel does not clear
-`vt_dont_switch` when the setting process dies, a crash while locked leaves a
-machine whose virtual terminals cannot be reached until it reboots. `vt.rs`
-has the ioctls and the bookkeeping; what it does not have is the answer, and
-the answer is an experiment on the kernels tOS actually boots, not a reading
-of the source. Labels: `experiment`, `area:platform`, `security`.
+Answered in [`vt-lockswitch.md`](vt-lockswitch.md). The kernel does not clear
+`vt_dont_switch` when the process that set it is killed, on 6.1.187 and on
+7.2.4; `VT_UNLOCKSWITCH` and a reboot are the only things that clear it. The
+lock refuses each switch with `VT_RELDISP 0` and does not take the flag,
+because the flag adds no protection the refusal does not already give and
+removes the `VT_ACTIVATE` that recovers a machine whose `tos` died holding the
+screen. `compositor/tos-platform/examples/vt_lockswitch.rs` is the reproducer;
+it has not been run on bare metal. Labels: `experiment`, `area:platform`,
+`security`.
 
 ### #54 — The unauthenticated ways past a locked screen
 
