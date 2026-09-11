@@ -18,7 +18,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build ISO
-        run: iso/build.sh
+        run: |
+          iso/build.sh
+          # The ISO is built inside a container as root, so dist/ comes back
+          # root-owned; the steps below rename and checksum it as the runner.
+          sudo chown -R "$(id -u):$(id -g)" dist
       - name: Smoke-boot in QEMU
         run: |
           sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86
