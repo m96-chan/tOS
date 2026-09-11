@@ -3,6 +3,8 @@
 //! tOS owns the whole keyboard, so bindings are direct combinations rather
 //! than a prefix key. A leader key is still supported, because a nested
 //! development session cannot rely on the super key reaching the compositor.
+//! The two bindings that grow a session, splitting a pane and opening a
+//! workspace, are also on their familiar ctrl+shift combinations.
 
 use std::collections::HashMap;
 
@@ -102,7 +104,9 @@ impl Keymap {
     ///
     /// Direct bindings use super, which only a compositor that owns the
     /// keyboard can claim. The same set is available after the leader key for
-    /// nested sessions, where super never arrives.
+    /// nested sessions, where super never arrives. Splitting and opening a
+    /// workspace are additionally bound to ctrl+shift+enter and ctrl+shift+t,
+    /// which is where most people expect them.
     pub fn default_bindings() -> Self {
         let mut keymap = Keymap::empty();
         keymap.leader = Some(Binding::new(KeyCode::Char('a'), Modifiers::CTRL));
@@ -164,6 +168,18 @@ impl Keymap {
                 Action::MovePaneToWorkspace(n),
             );
         }
+
+        // The combinations people arrive with from browsers, editors and other
+        // terminal emulators. tOS owns the keyboard, so these can be direct
+        // defaults rather than something the leader has to reach.
+        keymap.bind(
+            Binding::new(KeyCode::Enter, Modifiers::CTRL.union(Modifiers::SHIFT)),
+            Action::Split(Axis::Columns),
+        );
+        keymap.bind(
+            Binding::new(KeyCode::Char('t'), Modifiers::CTRL.union(Modifiers::SHIFT)),
+            Action::NewWorkspace,
+        );
 
         // Scrolling is useful without any prefix at all.
         keymap.bind(
@@ -415,6 +431,45 @@ mod tests {
             )),
             Resolution::Action(Action::MovePaneToWorkspace(3))
         );
+    }
+
+    #[test]
+    fn ctrl_shift_enter_splits_and_ctrl_shift_t_opens_a_workspace() {
+        let mut keymap = Keymap::default_bindings();
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Enter,
+                Modifiers::CTRL.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::Split(Axis::Columns))
+        );
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('t'),
+                Modifiers::CTRL.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::NewWorkspace)
+        );
+    }
+
+    #[test]
+    fn the_ctrl_shift_bindings_need_both_modifiers() {
+        // Plain enter and a lone ctrl+t belong to the program in the pane.
+        let mut keymap = Keymap::default_bindings();
+        for (code, modifiers) in [
+            (KeyCode::Enter, Modifiers::NONE),
+            (KeyCode::Enter, Modifiers::CTRL),
+            (KeyCode::Enter, Modifiers::SHIFT),
+            (KeyCode::Char('t'), Modifiers::NONE),
+            (KeyCode::Char('t'), Modifiers::CTRL),
+            (KeyCode::Char('t'), Modifiers::SHIFT),
+        ] {
+            assert_eq!(
+                keymap.resolve(&press(code, modifiers)),
+                Resolution::Passthrough,
+                "{code:?} with {modifiers:?} should reach the pane"
+            );
+        }
     }
 
     #[test]

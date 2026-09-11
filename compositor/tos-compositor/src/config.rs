@@ -95,6 +95,8 @@ options:
   -V, --version                          show the version
 
 key bindings (leader is ctrl+a; super works without the leader):
+  ctrl+shift+enter  split the focused pane
+  ctrl+shift+t      new workspace
   leader d / s      split into columns / rows
   leader h j k l    move focus
   leader z          zoom the focused pane

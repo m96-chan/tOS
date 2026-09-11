@@ -652,7 +652,10 @@ To render a frame without a display at all:
 ```
 
 `tos --help` lists the options and the default key bindings. The leader key is
-`ctrl+a`; on hardware the same bindings work directly with `super`.
+`ctrl+a`; on hardware the same bindings work directly with `super`. The two
+bindings that grow a session are also where most people expect them:
+`ctrl+shift+enter` splits the focused pane and `ctrl+shift+t` opens a new
+workspace.
 
 ## Installing
 
