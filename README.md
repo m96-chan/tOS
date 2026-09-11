@@ -501,10 +501,22 @@ answered with an error, and frames carry the same raw formats images do.
 - [x] status interface
 - [x] notifications
 - [ ] launcher
-- [ ] power controls
+- [x] power controls
 - [ ] network controls
 - [ ] Bluetooth controls
 - [ ] audio controls
+
+`tos-system`'s `power` module reads `/sys/class/power_supply`: which supplies
+are batteries and which are chargers, charge from `capacity` or worked out
+from `energy_*` or `charge_*` when it is missing, charging state, and time to
+empty or to full where a rate is reported — absent rather than invented where
+it is not, which covers the idle battery whose `power_now` is zero. Two
+batteries are weighted into one reading, and a machine with none says so.
+Powering off and rebooting call `reboot(2)` directly, after `sync(2)`, because
+tOS may be PID 1 with no init to ask; suspend writes `mem` to
+`/sys/power/state`. All three sit behind a trait, so the tests assert what was
+asked for without the machine acting on it. There is no UI on any of this yet,
+and the syscall path itself is only exercised on a real Linux machine.
 
 ### 0.1 — Portable tOS
 
