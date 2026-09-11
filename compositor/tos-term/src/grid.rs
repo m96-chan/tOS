@@ -275,7 +275,8 @@ impl Grid {
         let to_history = keep_history && region.top == 0 && self.max_scrollback > 0;
 
         for i in 0..n {
-            let row = std::mem::replace(&mut self.screen[region.top + i], Row::new(self.cols, attrs));
+            let row =
+                std::mem::replace(&mut self.screen[region.top + i], Row::new(self.cols, attrs));
             if to_history {
                 self.push_history(row);
             }

@@ -20,7 +20,9 @@ pub mod width;
 pub use cell::{Attrs, Cell, Flags, GraphicsRef, Underline};
 pub use color::{Color, Palette, Rgb};
 pub use grid::{Grid, Region, Row};
-pub use modes::{CursorShape, CursorStyle, KeyboardFlags, MouseEncoding, MouseState, MouseTracking, Modes};
+pub use modes::{
+    CursorShape, CursorStyle, KeyboardFlags, Modes, MouseEncoding, MouseState, MouseTracking,
+};
 pub use parser::{Params, Parser, Perform};
 pub use term::{Cursor, Damage, TermEvent, Terminal, TerminalConfig};
 pub use width::{char_width, str_width};

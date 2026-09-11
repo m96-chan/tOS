@@ -366,7 +366,9 @@ impl Image {
 
     /// Gap of a 1-based frame, in milliseconds.
     pub fn frame_gap(&self, frame: u32) -> Option<u32> {
-        self.frames.get(frame.checked_sub(1)? as usize).map(|f| f.gap_ms)
+        self.frames
+            .get(frame.checked_sub(1)? as usize)
+            .map(|f| f.gap_ms)
     }
 
     /// Pixels of a frame by index, following the rule that the current frame's
@@ -952,10 +954,7 @@ impl GraphicsStore {
                 });
                 image.current = 0;
             }
-            let slot = image
-                .frames
-                .get_mut(index)
-                .ok_or("EINVAL:no such frame")?;
+            let slot = image.frames.get_mut(index).ok_or("EINVAL:no such frame")?;
             slot.gap_ms = gap_ms(cmd.frame_gap(), slot.gap_ms);
         }
 
@@ -1183,8 +1182,7 @@ pub fn decode_base64(input: &[u8]) -> Vec<u8> {
 
 /// Encode base64, used when tOS answers queries with payloads.
 pub fn encode_base64(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b = [
@@ -1241,10 +1239,8 @@ mod tests {
     fn stores_rgb_as_rgba() {
         let mut store = GraphicsStore::new(1 << 20);
         let payload = encode_base64(&[1, 2, 3, 4, 5, 6]);
-        let cmd = GraphicsCommand::parse(
-            format!("a=t,f=24,s=2,v=1,i=1;{payload}").as_bytes(),
-        )
-        .unwrap();
+        let cmd =
+            GraphicsCommand::parse(format!("a=t,f=24,s=2,v=1,i=1;{payload}").as_bytes()).unwrap();
         let id = store.store(&cmd, &cmd.payload).unwrap();
         let img = store.image(id).unwrap();
         assert_eq!(img.data, vec![1, 2, 3, 255, 4, 5, 6, 255]);
@@ -1285,7 +1281,10 @@ mod tests {
         let mut store = GraphicsStore::new(1 << 20);
         let pixels: Vec<u8> = (0..2 * 4).map(|i| (i * 3) as u8).collect();
         let file = crate::png::tests::rgba_png(1, 2, &pixels);
-        let cmd = transmit("a=t,f=100,o=z,i=1", &crate::inflate::tests::zlib_stored(&file));
+        let cmd = transmit(
+            "a=t,f=100,o=z,i=1",
+            &crate::inflate::tests::zlib_stored(&file),
+        );
         let id = store.store(&cmd, &cmd.payload).unwrap();
         assert_eq!(store.image(id).unwrap().data, pixels);
     }
@@ -1357,10 +1356,8 @@ mod tests {
         let mut store = GraphicsStore::new(1 << 20);
         let data = vec![0u8; 20 * 32 * 4];
         let payload = encode_base64(&data);
-        let cmd = GraphicsCommand::parse(
-            format!("a=T,f=32,s=20,v=32,i=1;{payload}").as_bytes(),
-        )
-        .unwrap();
+        let cmd =
+            GraphicsCommand::parse(format!("a=T,f=32,s=20,v=32,i=1;{payload}").as_bytes()).unwrap();
         let id = store.store(&cmd, &cmd.payload).unwrap();
         let placement = store.place(&cmd, id, 0, 0, 8, 16).unwrap();
         let p = store.placement(placement).unwrap();
@@ -1387,7 +1384,8 @@ mod tests {
 
     #[test]
     fn animation_keys_reuse_the_placement_keys() {
-        let cmd = GraphicsCommand::parse(b"a=f,i=1,r=3,c=2,x=4,y=5,s=6,v=7,z=90,X=1,Y=255").unwrap();
+        let cmd =
+            GraphicsCommand::parse(b"a=f,i=1,r=3,c=2,x=4,y=5,s=6,v=7,z=90,X=1,Y=255").unwrap();
         assert_eq!(cmd.action, Action::TransmitFrame);
         assert_eq!(cmd.frame_number(), 3);
         assert_eq!(cmd.base_frame(), 2);
@@ -1645,9 +1643,13 @@ mod tests {
         let overwrite = command("a=f,f=32,s=1,v=1,c=1,i=1,z=40,X=1", &[255, 255, 255, 128]);
         store.store_frame(&overwrite, &overwrite.payload).unwrap();
 
-        store.control_animation(&command("a=a,i=1,c=2", &[])).unwrap();
+        store
+            .control_animation(&command("a=a,i=1,c=2", &[]))
+            .unwrap();
         assert_eq!(store.image(1).unwrap().data, vec![128, 128, 128, 255]);
-        store.control_animation(&command("a=a,i=1,c=3", &[])).unwrap();
+        store
+            .control_animation(&command("a=a,i=1,c=3", &[]))
+            .unwrap();
         assert_eq!(store.image(1).unwrap().data, vec![255, 255, 255, 128]);
     }
 
@@ -1689,13 +1691,13 @@ mod tests {
         store.store(&base, &base.payload).unwrap();
 
         for spec in [
-            "a=f,f=32,s=2,v=2,i=9",      // no such image
-            "a=f,f=32,s=2,v=2,x=1,i=1",  // rectangle runs past the edge
-            "a=f,f=32,s=2,v=2,c=7,i=1",  // no such base frame
-            "a=f,f=32,s=2,v=2,r=9,i=1",  // frame past the end
-            "a=f,f=100,s=2,v=2,i=1",     // PNG
-            "a=f,f=32,s=2,v=2,i=1,o=z",  // compressed
-            "a=f,f=32,s=2,v=2,i=1,t=f",  // file backed
+            "a=f,f=32,s=2,v=2,i=9",     // no such image
+            "a=f,f=32,s=2,v=2,x=1,i=1", // rectangle runs past the edge
+            "a=f,f=32,s=2,v=2,c=7,i=1", // no such base frame
+            "a=f,f=32,s=2,v=2,r=9,i=1", // frame past the end
+            "a=f,f=100,s=2,v=2,i=1",    // PNG
+            "a=f,f=32,s=2,v=2,i=1,o=z", // compressed
+            "a=f,f=32,s=2,v=2,i=1,t=f", // file backed
         ] {
             let cmd = command(spec, &[0u8; 16]);
             assert!(store.store_frame(&cmd, &cmd.payload).is_err(), "{spec}");

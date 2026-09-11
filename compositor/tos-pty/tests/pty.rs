@@ -33,11 +33,7 @@ fn read_until(pty: &mut Pty, needle: &str, timeout: Duration) -> String {
 }
 
 fn sh(script: &str) -> PtyConfig {
-    PtyConfig::command(
-        "/bin/sh",
-        vec!["-c".into(), script.into()],
-        winsize(),
-    )
+    PtyConfig::command("/bin/sh", vec!["-c".into(), script.into()], winsize())
 }
 
 #[test]

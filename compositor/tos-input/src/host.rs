@@ -126,10 +126,9 @@ impl HostInput {
                 let final_byte = self.buf[2];
                 self.buf.drain(..3);
                 match ss3_key(final_byte) {
-                    Some(code) => Step::Event(InputEvent::Key(KeyEvent::new(
-                        code,
-                        Modifiers::NONE,
-                    ))),
+                    Some(code) => {
+                        Step::Event(InputEvent::Key(KeyEvent::new(code, Modifiers::NONE)))
+                    }
                     None => Step::Consumed,
                 }
             }
@@ -231,12 +230,8 @@ enum Step {
 /// Decode a non-escape byte sequence, returning the event and bytes used.
 fn decode_plain(buf: &[u8]) -> (Option<InputEvent>, usize) {
     let byte = buf[0];
-    let key = |code: KeyCode, mods: Modifiers| {
-        (
-            Some(InputEvent::Key(KeyEvent::new(code, mods))),
-            1usize,
-        )
-    };
+    let key =
+        |code: KeyCode, mods: Modifiers| (Some(InputEvent::Key(KeyEvent::new(code, mods))), 1usize);
     match byte {
         b'\r' | b'\n' => key(KeyCode::Enter, Modifiers::NONE),
         b'\t' => key(KeyCode::Tab, Modifiers::NONE),
@@ -470,9 +465,7 @@ pub fn modifier_key_event(key: ModifierKey, pressed: bool) -> InputEvent {
     } else {
         KeyState::Release
     };
-    InputEvent::Key(
-        KeyEvent::new(KeyCode::ModifierKey(key), key.modifier()).with_state(state),
-    )
+    InputEvent::Key(KeyEvent::new(KeyCode::ModifierKey(key), key.modifier()).with_state(state))
 }
 
 #[cfg(test)]

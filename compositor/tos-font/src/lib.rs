@@ -3,9 +3,9 @@
 pub mod bitmap;
 pub mod boxdraw;
 pub mod glyph;
+pub mod stack;
 #[cfg(feature = "ttf")]
 pub mod ttf;
-pub mod stack;
 
 pub use bitmap::BitmapFont;
 pub use boxdraw::BoxDrawing;

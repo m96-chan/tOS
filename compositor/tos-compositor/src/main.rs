@@ -32,8 +32,14 @@ extern "C" fn on_terminate(_: libc::c_int) {
 fn install_signal_handlers() {
     unsafe {
         libc::signal(libc::SIGWINCH, on_winch as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, on_terminate as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_terminate as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            on_terminate as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            on_terminate as *const () as libc::sighandler_t,
+        );
         // Writing to a PTY whose child has gone must return an error, not kill
         // the compositor.
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
@@ -346,7 +352,10 @@ mod tests {
 
     #[test]
     fn help_flags_before_dash_e_are_ours() {
-        let args: Vec<String> = ["--help", "-e", "sh"].iter().map(|s| s.to_string()).collect();
+        let args: Vec<String> = ["--help", "-e", "sh"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let at = args.iter().position(|a| a == "-e" || a == "--command");
         let own = &args[..at.unwrap()];
         assert!(own.iter().any(|a| a == "--help"));

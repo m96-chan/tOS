@@ -56,8 +56,7 @@ fn main() -> ExitCode {
         .filter(|a| {
             !matches!(
                 a.as_str(),
-                "--dry-run" | "--plan" | "--motd" | "--list" | "-h" | "--help" | "-V"
-                    | "--version"
+                "--dry-run" | "--plan" | "--motd" | "--list" | "-h" | "--help" | "-V" | "--version"
             )
         })
         .collect();

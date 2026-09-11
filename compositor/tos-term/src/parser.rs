@@ -37,7 +37,10 @@ impl Params {
 
     /// Iterate parameter groups; a group is a parameter plus its subparameters.
     pub fn iter(&self) -> ParamsIter<'_> {
-        ParamsIter { params: self, at: 0 }
+        ParamsIter {
+            params: self,
+            at: 0,
+        }
     }
 
     /// Number of groups.
@@ -306,7 +309,10 @@ impl Parser {
             0x18 | 0x1a => {
                 let was_string = matches!(
                     self.state,
-                    State::OscString | State::ApcString | State::IgnoreString | State::DcsPassthrough
+                    State::OscString
+                        | State::ApcString
+                        | State::IgnoreString
+                        | State::DcsPassthrough
                 );
                 if was_string {
                     self.end_string(performer);
@@ -320,7 +326,10 @@ impl Parser {
             0x1b => {
                 if matches!(
                     self.state,
-                    State::OscString | State::ApcString | State::IgnoreString | State::DcsPassthrough
+                    State::OscString
+                        | State::ApcString
+                        | State::IgnoreString
+                        | State::DcsPassthrough
                 ) {
                     // ESC \ is the string terminator; ESC anything-else also
                     // ends the string and starts a new sequence.

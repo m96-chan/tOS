@@ -154,9 +154,11 @@ mod tests {
         executable(&dir, "runnable");
         fs::write(dir.join("readme"), "not executable").expect("write");
         fs::create_dir(dir.join("subdir")).expect("mkdir");
-        fs::set_permissions(dir.join("subdir"), fs::Permissions::from_mode(0o755))
-            .expect("chmod");
-        assert_eq!(names(&programs_in(std::slice::from_ref(&dir))), ["runnable"]);
+        fs::set_permissions(dir.join("subdir"), fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(
+            names(&programs_in(std::slice::from_ref(&dir))),
+            ["runnable"]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

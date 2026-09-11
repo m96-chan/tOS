@@ -189,11 +189,17 @@ impl PowerState {
             }
         }
 
-        let known: Vec<u64> = live.iter().filter_map(|b| b.percent).map(u64::from).collect();
+        let known: Vec<u64> = live
+            .iter()
+            .filter_map(|b| b.percent)
+            .map(u64::from)
+            .collect();
         if known.is_empty() {
             return None;
         }
-        Some(clamp_percent(known.iter().sum::<u64>() / known.len() as u64))
+        Some(clamp_percent(
+            known.iter().sum::<u64>() / known.len() as u64,
+        ))
     }
 
     /// What the machine as a whole is doing. Charging wins over discharging,
@@ -350,10 +356,12 @@ fn read_battery(sysfs: &Sysfs, name: &str) -> Battery {
         let current = number("current_now").filter(|value| *value > 0)?;
         Some(current.saturating_mul(voltage_uv?) / 1_000_000)
     });
-    let current_ua = number("current_now").filter(|value| *value > 0).or_else(|| {
-        let power = number("power_now").filter(|value| *value > 0)?;
-        Some(power.saturating_mul(1_000_000) / voltage_uv?)
-    });
+    let current_ua = number("current_now")
+        .filter(|value| *value > 0)
+        .or_else(|| {
+            let power = number("power_now").filter(|value| *value > 0)?;
+            Some(power.saturating_mul(1_000_000) / voltage_uv?)
+        });
 
     let rate = match unit {
         Some(CapacityUnit::MicrowattHours) => power_uw,
@@ -914,8 +922,16 @@ mod tests {
         // answer — and it has to be the mean of both, not whichever came
         // first out of the directory listing.
         let tree = Tree::new("mean");
-        tree.supply("BAT0", "Battery", &[("status", "Discharging"), ("capacity", "20")])
-            .supply("BAT1", "Battery", &[("status", "Discharging"), ("capacity", "80")]);
+        tree.supply(
+            "BAT0",
+            "Battery",
+            &[("status", "Discharging"), ("capacity", "20")],
+        )
+        .supply(
+            "BAT1",
+            "Battery",
+            &[("status", "Discharging"), ("capacity", "80")],
+        );
 
         let state = tree.state();
         assert_eq!(state.batteries.len(), 2);

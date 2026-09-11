@@ -22,7 +22,11 @@ fn compositor(command: &[&str]) -> Compositor {
 }
 
 /// Pump the compositor until `predicate` holds or time runs out.
-fn wait_for(compositor: &mut Compositor, timeout: Duration, predicate: impl Fn(&Compositor) -> bool) -> bool {
+fn wait_for(
+    compositor: &mut Compositor,
+    timeout: Duration,
+    predicate: impl Fn(&Compositor) -> bool,
+) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         compositor.pump_panes();
@@ -109,10 +113,15 @@ fn each_pane_runs_its_own_process() {
     let mut c = compositor(&["/bin/sh", "-c", "echo $$; sleep 5"]);
     c.perform(Action::Split(Axis::Rows));
     assert!(wait_for(&mut c, Duration::from_secs(5), |c| {
-        c.session()
-            .all_panes()
-            .iter()
-            .all(|id| !c.pane(*id).unwrap().terminal.grid().to_text().trim().is_empty())
+        c.session().all_panes().iter().all(|id| {
+            !c.pane(*id)
+                .unwrap()
+                .terminal
+                .grid()
+                .to_text()
+                .trim()
+                .is_empty()
+        })
     }));
 
     let pids: Vec<String> = c
@@ -292,7 +301,11 @@ fn a_zoomed_pane_fills_the_workspace() {
 
 #[test]
 fn output_scrolls_into_history_and_can_be_read_back() {
-    let mut c = compositor(&["/bin/sh", "-c", "i=0; while [ $i -lt 200 ]; do echo line$i; i=$((i+1)); done; sleep 5"]);
+    let mut c = compositor(&[
+        "/bin/sh",
+        "-c",
+        "i=0; while [ $i -lt 200 ]; do echo line$i; i=$((i+1)); done; sleep 5",
+    ]);
     let focus = c.session().focus();
     assert!(wait_for(&mut c, Duration::from_secs(5), |c| {
         c.pane(focus).unwrap().terminal.grid().scrollback_len() > 50
@@ -452,11 +465,7 @@ fn a_large_paste_is_not_truncated() {
     // The PTY input buffer is a few kilobytes, so a big paste needs several
     // writes; dropping the remainder used to take the bracketed paste
     // terminator with it.
-    let mut c = compositor(&[
-        "/bin/sh",
-        "-c",
-        "cat > /dev/null; sleep 5",
-    ]);
+    let mut c = compositor(&["/bin/sh", "-c", "cat > /dev/null; sleep 5"]);
     let focus = c.session().focus();
     let payload = vec![b'x'; 200_000];
     c.pane_mut(focus).unwrap().write(&payload);
@@ -520,7 +529,10 @@ fn every_byte_of_a_large_paste_reaches_the_child() {
     });
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let _ = std::fs::remove_file(&path);
-    assert!(arrived, "the child never finished reading; got {size} bytes");
+    assert!(
+        arrived,
+        "the child never finished reading; got {size} bytes"
+    );
     assert_eq!(size, payload.len() as u64, "bytes were lost on the way");
 }
 
@@ -553,7 +565,7 @@ fn a_pane_too_small_to_split_is_left_alone() {
 
 #[test]
 fn a_closed_pane_does_not_wedge_the_mouse() {
-    use tos_input::{InputEvent, MouseAction, MouseButton, Modifiers, PointerEvent};
+    use tos_input::{InputEvent, Modifiers, MouseAction, MouseButton, PointerEvent};
 
     let mut c = compositor(&["/bin/sh", "-c", "sleep 30"]);
     c.perform(Action::Split(Axis::Columns));
@@ -628,7 +640,11 @@ fn a_synchronized_update_is_painted_once_it_ends() {
         let mut surface = framebuffer.surface();
         c.render_frame(&mut surface, true);
     }
-    assert_eq!(framebuffer.pixel(1, 1), 0xcc5757, "the update was never drawn");
+    assert_eq!(
+        framebuffer.pixel(1, 1),
+        0xcc5757,
+        "the update was never drawn"
+    );
 }
 
 #[test]
@@ -745,7 +761,11 @@ fn the_cheat_sheet_is_the_running_keymap() {
     assert!(c.perform(Action::ShowBindings));
 
     let overlay = c.overlay().expect("the sheet should be open");
-    assert!(overlay.title().contains("leader ctrl+a"), "{:?}", overlay.title());
+    assert!(
+        overlay.title().contains("leader ctrl+a"),
+        "{:?}",
+        overlay.title()
+    );
     let expected = tos_session::cheat_sheet(&tos_session::Keymap::default_bindings());
     let shown: Vec<(&str, &str)> = overlay
         .items()
@@ -794,7 +814,10 @@ fn reading_a_row_does_nothing_but_close_the_sheet() {
     let mut c = compositor(&["/bin/sh", "-c", "sleep 5"]);
     let before = c.session().all_panes().len();
     c.perform(Action::ShowBindings);
-    c.handle_input(InputEvent::Key(KeyEvent::new(KeyCode::Enter, Modifiers::NONE)));
+    c.handle_input(InputEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        Modifiers::NONE,
+    )));
     assert!(c.overlay().is_none());
     assert_eq!(c.session().all_panes().len(), before);
 }

@@ -159,9 +159,7 @@ pub const MINIMUM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const SECTOR_BYTES: u64 = 512;
 
 /// Device name prefixes that are never installation targets.
-const EXCLUDED_PREFIXES: &[&str] = &[
-    "loop", "ram", "zram", "sr", "fd", "dm-", "md", "nbd", "zd",
-];
+const EXCLUDED_PREFIXES: &[&str] = &["loop", "ram", "zram", "sr", "fd", "dm-", "md", "nbd", "zd"];
 
 /// List the disks on this machine, in the order they should be offered.
 pub fn enumerate(source: &dyn DiskSource) -> Vec<Disk> {
@@ -269,7 +267,10 @@ fn unescape_mount(text: &str) -> String {
             continue;
         }
         let digits: String = chars.clone().take(3).collect();
-        match u32::from_str_radix(&digits, 8).ok().and_then(char::from_u32) {
+        match u32::from_str_radix(&digits, 8)
+            .ok()
+            .and_then(char::from_u32)
+        {
             Some(decoded) if digits.len() == 3 => {
                 out.push(decoded);
                 for _ in 0..3 {
@@ -413,7 +414,10 @@ pub(crate) mod tests {
         let source = FakeDisks::default()
             .disk("sda", gib(8), "disk")
             .mounted("/dev/sda1", "/mnt/data");
-        assert_eq!(enumerate(&source)[0].refusal(), Some("a partition is mounted"));
+        assert_eq!(
+            enumerate(&source)[0].refusal(),
+            Some("a partition is mounted")
+        );
     }
 
     #[test]

@@ -515,7 +515,11 @@ fn unfilter(filter: u8, current: &mut [u8], previous: &[u8], step: usize) -> Res
         // Average: the mean of left and above, computed without wrapping.
         3 => {
             for i in 0..current.len() {
-                let left = if i >= step { current[i - step] as u16 } else { 0 };
+                let left = if i >= step {
+                    current[i - step] as u16
+                } else {
+                    0
+                };
                 let above = previous[i] as u16;
                 current[i] = current[i].wrapping_add(((left + above) / 2) as u8);
             }
@@ -727,7 +731,10 @@ pub(crate) mod tests {
             decode(&data, rgba + raw - 1).is_err(),
             "a budget smaller than the decode accepted the image"
         );
-        assert!(decode(&data, rgba + raw).is_ok(), "an ample budget was refused");
+        assert!(
+            decode(&data, rgba + raw).is_ok(),
+            "an ample budget was refused"
+        );
     }
 
     #[test]
@@ -751,13 +758,23 @@ pub(crate) mod tests {
     #[test]
     fn an_eight_bit_greyscale_image_becomes_grey_rgba() {
         let image = decode(&png(2, 1, 8, 0, 0, &[], &[0, 0x20, 0x40]), LIMIT).unwrap();
-        assert_eq!(image.rgba, vec![0x20, 0x20, 0x20, 255, 0x40, 0x40, 0x40, 255]);
+        assert_eq!(
+            image.rgba,
+            vec![0x20, 0x20, 0x20, 255, 0x40, 0x40, 0x40, 255]
+        );
     }
 
     #[test]
     fn a_greyscale_alpha_image_keeps_its_alpha() {
-        let image = decode(&png(2, 1, 8, 4, 0, &[], &[0, 0x10, 0x80, 0x20, 0x00]), LIMIT).unwrap();
-        assert_eq!(image.rgba, vec![0x10, 0x10, 0x10, 0x80, 0x20, 0x20, 0x20, 0x00]);
+        let image = decode(
+            &png(2, 1, 8, 4, 0, &[], &[0, 0x10, 0x80, 0x20, 0x00]),
+            LIMIT,
+        )
+        .unwrap();
+        assert_eq!(
+            image.rgba,
+            vec![0x10, 0x10, 0x10, 0x80, 0x20, 0x20, 0x20, 0x00]
+        );
     }
 
     #[test]
@@ -810,8 +827,15 @@ pub(crate) mod tests {
     #[test]
     fn sixteen_bit_samples_are_reduced_to_eight() {
         // 0x1234 and 0xabcd keep their high bytes.
-        let image = decode(&png(2, 1, 16, 0, 0, &[], &[0, 0x12, 0x34, 0xab, 0xcd]), LIMIT).unwrap();
-        assert_eq!(image.rgba, vec![0x12, 0x12, 0x12, 255, 0xab, 0xab, 0xab, 255]);
+        let image = decode(
+            &png(2, 1, 16, 0, 0, &[], &[0, 0x12, 0x34, 0xab, 0xcd]),
+            LIMIT,
+        )
+        .unwrap();
+        assert_eq!(
+            image.rgba,
+            vec![0x12, 0x12, 0x12, 255, 0xab, 0xab, 0xab, 255]
+        );
     }
 
     #[test]
@@ -848,7 +872,11 @@ pub(crate) mod tests {
                 } else {
                     0
                 };
-                let above = if row > 0 { source[(row - 1) * stride + i] } else { 0 };
+                let above = if row > 0 {
+                    source[(row - 1) * stride + i]
+                } else {
+                    0
+                };
                 let corner = if row > 0 && i >= step {
                     source[(row - 1) * stride + i - step]
                 } else {
@@ -1040,7 +1068,10 @@ pub(crate) mod tests {
         bytes.extend_from_slice(&chunk(b"IDAT", first));
         bytes.extend_from_slice(&chunk(b"IDAT", second));
         bytes.extend_from_slice(&chunk(b"IEND", &[]));
-        assert_eq!(decode(&bytes, LIMIT).unwrap().rgba, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            decode(&bytes, LIMIT).unwrap().rgba,
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
     }
 
     #[test]

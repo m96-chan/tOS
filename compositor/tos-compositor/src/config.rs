@@ -209,8 +209,8 @@ pub fn parse_args_over(base: Config, args: &[String]) -> Result<Config, String> 
         match arg {
             "--backend" => {
                 let name = value("--backend")?;
-                config.backend = Backend::parse(&name)
-                    .ok_or_else(|| format!("unknown backend: {name}"))?;
+                config.backend =
+                    Backend::parse(&name).ok_or_else(|| format!("unknown backend: {name}"))?;
                 backend_from_flag = true;
             }
             "--config" => config.source = ConfigSource::File(PathBuf::from(value("--config")?)),
@@ -223,23 +223,16 @@ pub fn parse_args_over(base: Config, args: &[String]) -> Result<Config, String> 
                 .push(PathBuf::from(value("--font-fallback")?)),
             "--font-size" => {
                 let text = value("--font-size")?;
-                config.font_size = Some(
-                    text.parse()
-                        .map_err(|_| format!("not a number: {text}"))?,
-                );
+                config.font_size = Some(text.parse().map_err(|_| format!("not a number: {text}"))?);
             }
             "--bitmap-scale" => {
                 let text = value("--bitmap-scale")?;
-                config.bitmap_scale = Some(
-                    text.parse()
-                        .map_err(|_| format!("not a number: {text}"))?,
-                );
+                config.bitmap_scale =
+                    Some(text.parse().map_err(|_| format!("not a number: {text}"))?);
             }
             "--scrollback" => {
                 let text = value("--scrollback")?;
-                config.scrollback = text
-                    .parse()
-                    .map_err(|_| format!("not a number: {text}"))?;
+                config.scrollback = text.parse().map_err(|_| format!("not a number: {text}"))?;
             }
             "--size" => config.size = parse_size(&value("--size")?)?,
             "--screenshot" => {
@@ -254,8 +247,7 @@ pub fn parse_args_over(base: Config, args: &[String]) -> Result<Config, String> 
             "--preload" => config.preload = Some(value("--preload")?),
             "--warmup" => {
                 let text = value("--warmup")?;
-                config.warmup_frames =
-                    text.parse().map_err(|_| format!("not a number: {text}"))?;
+                config.warmup_frames = text.parse().map_err(|_| format!("not a number: {text}"))?;
             }
             "--no-status-bar" => config.status_bar = false,
             "--allow-clipboard-read" => config.allow_clipboard_read = true,
@@ -387,7 +379,9 @@ mod tests {
     fn the_config_file_can_be_named_or_refused() {
         assert_eq!(parse_args(&[]).unwrap().source, ConfigSource::Search);
         assert_eq!(
-            parse_args(&args(&["--config", "/tmp/tos.conf"])).unwrap().source,
+            parse_args(&args(&["--config", "/tmp/tos.conf"]))
+                .unwrap()
+                .source,
             ConfigSource::File(PathBuf::from("/tmp/tos.conf"))
         );
         assert_eq!(
@@ -426,7 +420,11 @@ mod tests {
         // binding being moved, because no line of it is written down.
         let text = usage();
         for row in describe::cheat_sheet(&Keymap::default_bindings()) {
-            assert!(text.contains(&row.keys), "{:?} missing from --help", row.keys);
+            assert!(
+                text.contains(&row.keys),
+                "{:?} missing from --help",
+                row.keys
+            );
             assert!(text.contains(&row.action), "{:?} missing", row.action);
         }
         assert!(text.contains("key bindings (leader is ctrl+a"));
@@ -447,7 +445,10 @@ mod tests {
         use tos_session::{Action, Binding};
 
         let mut keymap = Keymap::empty();
-        keymap.bind(Binding::new(KeyCode::Function(1), Modifiers::NONE), Action::Quit);
+        keymap.bind(
+            Binding::new(KeyCode::Function(1), Modifiers::NONE),
+            Action::Quit,
+        );
         let text = bindings(&keymap);
         assert!(text.starts_with("key bindings:\n"), "{text:?}");
         assert!(text.contains("f1"));

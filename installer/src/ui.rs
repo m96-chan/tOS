@@ -512,7 +512,10 @@ mod tests {
         // Drawing the same thing again should not repaint any cell.
         screen.text(0, 0, "hello", Style::default());
         let bytes = String::from_utf8(screen.render()).unwrap();
-        assert!(!bytes.contains("hello"), "redrew an unchanged frame: {bytes:?}");
+        assert!(
+            !bytes.contains("hello"),
+            "redrew an unchanged frame: {bytes:?}"
+        );
     }
 
     #[test]

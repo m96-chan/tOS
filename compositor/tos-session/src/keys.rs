@@ -125,26 +125,82 @@ impl Keymap {
         keymap.leader = Some(Binding::new(KeyCode::Char('a'), Modifiers::CTRL));
 
         let bindings: &[(KeyCode, Modifiers, Action)] = &[
-            (KeyCode::Char('d'), Modifiers::NONE, Action::Split(Axis::Columns)),
-            (KeyCode::Char('s'), Modifiers::NONE, Action::Split(Axis::Rows)),
+            (
+                KeyCode::Char('d'),
+                Modifiers::NONE,
+                Action::Split(Axis::Columns),
+            ),
+            (
+                KeyCode::Char('s'),
+                Modifiers::NONE,
+                Action::Split(Axis::Rows),
+            ),
             (KeyCode::Char('x'), Modifiers::NONE, Action::ClosePane),
-            (KeyCode::Left, Modifiers::NONE, Action::Focus(Direction::Left)),
-            (KeyCode::Right, Modifiers::NONE, Action::Focus(Direction::Right)),
+            (
+                KeyCode::Left,
+                Modifiers::NONE,
+                Action::Focus(Direction::Left),
+            ),
+            (
+                KeyCode::Right,
+                Modifiers::NONE,
+                Action::Focus(Direction::Right),
+            ),
             (KeyCode::Up, Modifiers::NONE, Action::Focus(Direction::Up)),
-            (KeyCode::Down, Modifiers::NONE, Action::Focus(Direction::Down)),
-            (KeyCode::Char('h'), Modifiers::NONE, Action::Focus(Direction::Left)),
-            (KeyCode::Char('l'), Modifiers::NONE, Action::Focus(Direction::Right)),
-            (KeyCode::Char('k'), Modifiers::NONE, Action::Focus(Direction::Up)),
-            (KeyCode::Char('j'), Modifiers::NONE, Action::Focus(Direction::Down)),
-            (KeyCode::Left, Modifiers::SHIFT, Action::Resize(Direction::Left, 2)),
-            (KeyCode::Right, Modifiers::SHIFT, Action::Resize(Direction::Right, 2)),
-            (KeyCode::Up, Modifiers::SHIFT, Action::Resize(Direction::Up, 1)),
-            (KeyCode::Down, Modifiers::SHIFT, Action::Resize(Direction::Down, 1)),
+            (
+                KeyCode::Down,
+                Modifiers::NONE,
+                Action::Focus(Direction::Down),
+            ),
+            (
+                KeyCode::Char('h'),
+                Modifiers::NONE,
+                Action::Focus(Direction::Left),
+            ),
+            (
+                KeyCode::Char('l'),
+                Modifiers::NONE,
+                Action::Focus(Direction::Right),
+            ),
+            (
+                KeyCode::Char('k'),
+                Modifiers::NONE,
+                Action::Focus(Direction::Up),
+            ),
+            (
+                KeyCode::Char('j'),
+                Modifiers::NONE,
+                Action::Focus(Direction::Down),
+            ),
+            (
+                KeyCode::Left,
+                Modifiers::SHIFT,
+                Action::Resize(Direction::Left, 2),
+            ),
+            (
+                KeyCode::Right,
+                Modifiers::SHIFT,
+                Action::Resize(Direction::Right, 2),
+            ),
+            (
+                KeyCode::Up,
+                Modifiers::SHIFT,
+                Action::Resize(Direction::Up, 1),
+            ),
+            (
+                KeyCode::Down,
+                Modifiers::SHIFT,
+                Action::Resize(Direction::Down, 1),
+            ),
             (KeyCode::Char('z'), Modifiers::NONE, Action::ToggleZoom),
             (KeyCode::Char('='), Modifiers::NONE, Action::Balance),
             (KeyCode::Char('c'), Modifiers::NONE, Action::NewWorkspace),
             (KeyCode::Char('n'), Modifiers::NONE, Action::NextWorkspace),
-            (KeyCode::Char('p'), Modifiers::NONE, Action::PreviousWorkspace),
+            (
+                KeyCode::Char('p'),
+                Modifiers::NONE,
+                Action::PreviousWorkspace,
+            ),
             // Comma is where tmux renames a window, and nothing else here
             // wants the key.
             (KeyCode::Char(','), Modifiers::NONE, Action::RenameWorkspace),
@@ -158,7 +214,11 @@ impl Keymap {
             // where a launcher lives on every other desktop.
             (KeyCode::Char(' '), Modifiers::NONE, Action::OpenLauncher),
             // m for messages: the notifications that have been and gone.
-            (KeyCode::Char('m'), Modifiers::NONE, Action::ShowNotifications),
+            (
+                KeyCode::Char('m'),
+                Modifiers::NONE,
+                Action::ShowNotifications,
+            ),
             // Shift and the slash key is the question mark, which is where
             // every other program with a leader key keeps its own help.
             (KeyCode::Char('/'), Modifiers::SHIFT, Action::ShowBindings),
@@ -252,10 +312,7 @@ impl Keymap {
         // trigger a binding nor consume a leader that is waiting.
         if matches!(
             event.code,
-            KeyCode::ModifierKey(_)
-                | KeyCode::CapsLock
-                | KeyCode::NumLock
-                | KeyCode::ScrollLock
+            KeyCode::ModifierKey(_) | KeyCode::CapsLock | KeyCode::NumLock | KeyCode::ScrollLock
         ) {
             return Resolution::Passthrough;
         }
@@ -400,8 +457,7 @@ mod tests {
             Resolution::Pending
         );
         for _ in 0..5 {
-            let repeat =
-                press(KeyCode::Char('a'), Modifiers::CTRL).with_state(KeyState::Repeat);
+            let repeat = press(KeyCode::Char('a'), Modifiers::CTRL).with_state(KeyState::Repeat);
             assert_eq!(keymap.resolve(&repeat), Resolution::Pending);
             assert!(keymap.is_pending());
         }

@@ -124,7 +124,11 @@ fn encode_legacy(event: &KeyEvent, ctx: &EncodeContext) -> Vec<u8> {
             }
             out.push(0x1b);
         }
-        KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left | KeyCode::Home
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Right
+        | KeyCode::Left
+        | KeyCode::Home
         | KeyCode::End => {
             let final_byte = cursor_final(event.code);
             if mods.is_empty() {
@@ -449,8 +453,8 @@ fn encode_kitty(event: &KeyEvent, ctx: &EncodeContext) -> Vec<u8> {
     // The Kitty protocol does report caps lock and num lock, unlike the
     // legacy encoding, so the full modifier set is used for the parameter.
     let modifier_param = event.modifiers.xterm_param();
-    let report_event = flags.contains(KeyboardFlags::REPORT_EVENT_TYPES)
-        && event.state != KeyState::Press;
+    let report_event =
+        flags.contains(KeyboardFlags::REPORT_EVENT_TYPES) && event.state != KeyState::Press;
     let mut modifier_field = String::new();
     if modifier_param != 1 || report_event {
         modifier_field = modifier_param.to_string();
@@ -707,12 +711,18 @@ mod tests {
 
     #[test]
     fn keypad_follows_the_application_mode() {
-        assert_eq!(encode(KeyCode::Keypad(Keypad::Digit(5)), Modifiers::NONE), "5");
+        assert_eq!(
+            encode(KeyCode::Keypad(Keypad::Digit(5)), Modifiers::NONE),
+            "5"
+        );
         let ctx = EncodeContext {
             keypad_application: true,
             ..EncodeContext::default()
         };
-        let bytes = encode_key(&key(KeyCode::Keypad(Keypad::Digit(5)), Modifiers::NONE), &ctx);
+        let bytes = encode_key(
+            &key(KeyCode::Keypad(Keypad::Digit(5)), Modifiers::NONE),
+            &ctx,
+        );
         assert_eq!(bytes, b"\x1bOu");
         let enter = encode_key(&key(KeyCode::Keypad(Keypad::Enter), Modifiers::NONE), &ctx);
         assert_eq!(enter, b"\x1bOM");
@@ -871,7 +881,8 @@ mod tests {
     #[test]
     fn sgr_encoding_is_one_based() {
         let state = mouse_state(MouseTracking::Normal, MouseEncoding::Sgr);
-        let bytes = encode_mouse(&mouse(MouseAction::Press, Some(MouseButton::Left)), state).unwrap();
+        let bytes =
+            encode_mouse(&mouse(MouseAction::Press, Some(MouseButton::Left)), state).unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), "\x1b[<0;5;10M");
     }
 
@@ -886,7 +897,8 @@ mod tests {
     #[test]
     fn x10_encoding_offsets_by_32() {
         let state = mouse_state(MouseTracking::Normal, MouseEncoding::X10);
-        let bytes = encode_mouse(&mouse(MouseAction::Press, Some(MouseButton::Left)), state).unwrap();
+        let bytes =
+            encode_mouse(&mouse(MouseAction::Press, Some(MouseButton::Left)), state).unwrap();
         assert_eq!(bytes, vec![0x1b, b'[', b'M', 32, 32 + 5, 32 + 10]);
     }
 
@@ -932,8 +944,11 @@ mod tests {
     #[test]
     fn wheel_buttons_report_in_the_high_range() {
         let state = mouse_state(MouseTracking::Normal, MouseEncoding::Sgr);
-        let bytes =
-            encode_mouse(&mouse(MouseAction::Press, Some(MouseButton::WheelUp)), state).unwrap();
+        let bytes = encode_mouse(
+            &mouse(MouseAction::Press, Some(MouseButton::WheelUp)),
+            state,
+        )
+        .unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), "\x1b[<64;5;10M");
     }
 

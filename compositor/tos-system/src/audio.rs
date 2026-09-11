@@ -1655,8 +1655,11 @@ mod tests {
 
     #[test]
     fn speaker_is_taken_when_neither_master_nor_pcm_is_there() {
-        let card = FakeCard::new("bytcr-rt5640")
-            .volume("Speaker Playback Volume", Range::new(0, 31, 0), &[20, 20]);
+        let card = FakeCard::new("bytcr-rt5640").volume(
+            "Speaker Playback Volume",
+            Range::new(0, 31, 0),
+            &[20, 20],
+        );
         let mixer = Mixer::attach(card).unwrap();
         assert_eq!(mixer.element_name(), "Speaker Playback Volume");
         // No switch on this card, which is the common shape on such hardware.
@@ -1695,11 +1698,8 @@ mod tests {
 
     #[test]
     fn a_volume_that_is_not_on_the_mixer_interface_is_not_the_volume() {
-        let mut card = FakeCard::new("Odd").volume(
-            "Master Playback Volume",
-            Range::new(0, 87, 0),
-            &[40],
-        );
+        let mut card =
+            FakeCard::new("Odd").volume("Master Playback Volume", Range::new(0, 87, 0), &[40]);
         // SNDRV_CTL_ELEM_IFACE_PCM, where the same name means something else.
         card.elements[0].id.iface = 3;
         assert_eq!(
@@ -1824,7 +1824,11 @@ mod tests {
         // A switch-like control has one raw value between silence and full, so
         // five percent of it rounds back to where it started. Stepping in
         // percent alone would leave the volume key doing nothing for ever.
-        for range in [Range::new(0, 1, 0), Range::new(0, 3, 0), Range::new(0, 7, 0)] {
+        for range in [
+            Range::new(0, 1, 0),
+            Range::new(0, 3, 0),
+            Range::new(0, 7, 0),
+        ] {
             let card = FakeCard::new("Coarse").volume("Master Playback Volume", range, &[0]);
             let mixer = Mixer::attach(card).unwrap();
             let before = mixer.volume().unwrap().percent;
@@ -1845,8 +1849,8 @@ mod tests {
     fn a_step_coarser_than_the_key_still_moves_by_one_step() {
         // The driver insists on multiples of 32, which is more than the five
         // percent the key asks for, so the move snaps back to where it was.
-        let card = FakeCard::new("Chunky")
-            .volume("Master Playback Volume", Range::new(0, 100, 32), &[0]);
+        let card =
+            FakeCard::new("Chunky").volume("Master Playback Volume", Range::new(0, 100, 32), &[0]);
         let mixer = Mixer::attach(card).unwrap();
         let after = mixer.volume_up().unwrap().percent;
         assert!(after > 0, "stuck at {after}% with a step of 32");
@@ -1963,11 +1967,8 @@ mod tests {
 
     #[test]
     fn a_volume_range_that_runs_backwards_is_an_error() {
-        let card = FakeCard::new("Broken").volume(
-            "Master Playback Volume",
-            Range::new(100, 0, 0),
-            &[40],
-        );
+        let card =
+            FakeCard::new("Broken").volume("Master Playback Volume", Range::new(100, 0, 0), &[40]);
         assert_eq!(
             Mixer::attach(card).unwrap_err().kind(),
             io::ErrorKind::InvalidData

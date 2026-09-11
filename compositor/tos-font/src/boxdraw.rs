@@ -134,7 +134,10 @@ impl BoxDrawing {
     }
 
     fn draw_box(&self, c: char) -> Canvas {
-        let (w, h) = (self.metrics.cell_width as i64, self.metrics.cell_height as i64);
+        let (w, h) = (
+            self.metrics.cell_width as i64,
+            self.metrics.cell_height as i64,
+        );
         let mut canvas = Canvas::new(self.metrics.cell_width, self.metrics.cell_height);
         let cp = c as u32;
 
@@ -209,7 +212,10 @@ impl BoxDrawing {
 
     /// Quarter circle corners, U+256D..U+2570.
     fn draw_arc(&self, canvas: &mut Canvas, cp: u32) {
-        let (w, h) = (self.metrics.cell_width as i64, self.metrics.cell_height as i64);
+        let (w, h) = (
+            self.metrics.cell_width as i64,
+            self.metrics.cell_height as i64,
+        );
         let t = self.light();
         let cx = (w - t) / 2;
         let cy = (h - t) / 2;
@@ -248,7 +254,10 @@ impl BoxDrawing {
     }
 
     fn draw_block(&self, c: char) -> Canvas {
-        let (w, h) = (self.metrics.cell_width as i64, self.metrics.cell_height as i64);
+        let (w, h) = (
+            self.metrics.cell_width as i64,
+            self.metrics.cell_height as i64,
+        );
         let mut canvas = Canvas::new(self.metrics.cell_width, self.metrics.cell_height);
         let eighth_h = |n: i64| (h * n + 4) / 8;
         let eighth_w = |n: i64| (w * n + 4) / 8;
@@ -273,8 +282,9 @@ impl BoxDrawing {
             0x2595 => canvas.fill(w - eighth_w(1), 0, eighth_w(1), h, 0xff),
             cp @ 0x2596..=0x259f => {
                 // Bits: upper left, upper right, lower left, lower right.
-                const QUADRANTS: [u8; 10] =
-                    [0b0100, 0b1000, 0b0001, 0b1101, 0b1001, 0b0111, 0b1011, 0b0010, 0b0110, 0b1110];
+                const QUADRANTS: [u8; 10] = [
+                    0b0100, 0b1000, 0b0001, 0b1101, 0b1001, 0b0111, 0b1011, 0b0010, 0b0110, 0b1110,
+                ];
                 let mask = QUADRANTS[(cp - 0x2596) as usize];
                 let (hw, hh) = (w / 2, h / 2);
                 if mask & 0b0001 != 0 {
@@ -297,14 +307,24 @@ impl BoxDrawing {
 
     /// Braille patterns: a 2x4 dot matrix in the low eight bits.
     fn draw_braille(&self, c: char) -> Canvas {
-        let (w, h) = (self.metrics.cell_width as i64, self.metrics.cell_height as i64);
+        let (w, h) = (
+            self.metrics.cell_width as i64,
+            self.metrics.cell_height as i64,
+        );
         let mut canvas = Canvas::new(self.metrics.cell_width, self.metrics.cell_height);
         let bits = (c as u32 - 0x2800) as u8;
         let dot = (w / 4).max(1).min((h / 8).max(1));
 
         // Dot order is 1,2,3,7 down the left column then 4,5,6,8 down the right.
         const POSITIONS: [(i64, i64); 8] = [
-            (0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (0, 3), (1, 3),
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (0, 3),
+            (1, 3),
         ];
         for (i, (col, row)) in POSITIONS.iter().enumerate() {
             if bits & (1 << i) == 0 {
@@ -319,7 +339,10 @@ impl BoxDrawing {
 
     /// Powerline separators, U+E0B0..U+E0B3.
     fn draw_powerline(&self, c: char) -> Canvas {
-        let (w, h) = (self.metrics.cell_width as i64, self.metrics.cell_height as i64);
+        let (w, h) = (
+            self.metrics.cell_width as i64,
+            self.metrics.cell_height as i64,
+        );
         let mut canvas = Canvas::new(self.metrics.cell_width, self.metrics.cell_height);
         let t = self.light();
         match c as u32 {
@@ -433,7 +456,10 @@ mod tests {
         let g = render('│');
         let mid = metrics().cell_width / 2;
         for y in 0..g.height {
-            assert!((mid - 1..=mid + 1).any(|x| g.coverage_at(x, y) != 0), "gap at row {y}");
+            assert!(
+                (mid - 1..=mid + 1).any(|x| g.coverage_at(x, y) != 0),
+                "gap at row {y}"
+            );
         }
     }
 

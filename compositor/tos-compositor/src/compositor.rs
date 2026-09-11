@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 use tos_font::{BitmapFont, FontStack, GlyphSource};
 use tos_input::encode::{encode_alternate_scroll, EncodeContext};
 use tos_input::{
-    encode_focus, encode_key, encode_mouse, encode_paste, InputEvent, KeyEvent,
-    MouseAction, MouseButton, MouseEvent,
+    encode_focus, encode_key, encode_mouse, encode_paste, InputEvent, KeyEvent, MouseAction,
+    MouseButton, MouseEvent,
 };
 use tos_platform::Display;
-use tos_render::{render, RenderOptions, Rect as PixelRect, Surface};
+use tos_render::{render, Rect as PixelRect, RenderOptions, Surface};
 use tos_session::{describe, Action, Axis, Keymap, PaneId, Rect, Resolution, Session};
 use tos_term::TermEvent;
 
@@ -108,7 +108,11 @@ pub struct Compositor {
 
 impl Compositor {
     /// Build a compositor for a display of this size.
-    pub fn new(config: Config, size: (u32, u32), physical_mm: Option<(u32, u32)>) -> io::Result<Self> {
+    pub fn new(
+        config: Config,
+        size: (u32, u32),
+        physical_mm: Option<(u32, u32)>,
+    ) -> io::Result<Self> {
         let fonts = build_fonts(&config, size, physical_mm);
         let mut compositor = Compositor {
             session: Session::new(),
@@ -171,7 +175,11 @@ impl Compositor {
         let (cw, ch) = self.cell_size();
         let cols = (self.size.0 / cw).max(1);
         let rows = (self.size.1 / ch).max(1);
-        let status = if self.config.status_bar && rows > 2 { 1 } else { 0 };
+        let status = if self.config.status_bar && rows > 2 {
+            1
+        } else {
+            0
+        };
         Rect::new(0, 0, cols, rows - status)
     }
 
@@ -1659,10 +1667,7 @@ mod tests {
         let typing = KeyEvent::new(KeyCode::Char('x'), tos_input::Modifiers::NONE);
         compositor.handle_input(InputEvent::Key(typing));
         // A binding is consumed by the compositor instead.
-        let split = KeyEvent::new(
-            KeyCode::Char('d'),
-            tos_input::Modifiers::SUPER,
-        );
+        let split = KeyEvent::new(KeyCode::Char('d'), tos_input::Modifiers::SUPER);
         compositor.handle_input(InputEvent::Key(split));
         assert_eq!(compositor.panes.len(), 2);
     }
@@ -1734,7 +1739,11 @@ mod tests {
             KeyCode::Char('d'),
             tos_input::Modifiers::SUPER,
         )));
-        assert_eq!(compositor.panes.len(), 1, "a binding fired under the overlay");
+        assert_eq!(
+            compositor.panes.len(),
+            1,
+            "a binding fired under the overlay"
+        );
         // And the pane below sees nothing of what is typed into the query.
         type_into_overlay(&mut compositor, "vi");
         let focus = compositor.session.focus();
@@ -1824,7 +1833,11 @@ mod tests {
     fn a_bell_says_which_pane_rang() {
         let mut compositor = compositor();
         let focus = compositor.session.focus();
-        compositor.pane_mut(focus).unwrap().terminal.advance(b"\x07");
+        compositor
+            .pane_mut(focus)
+            .unwrap()
+            .terminal
+            .advance(b"\x07");
         compositor.handle_terminal_events(focus);
         assert_eq!(
             compositor.notifications.status_line().as_deref(),
@@ -2048,8 +2061,16 @@ mod tests {
         let mut compositor = compositor();
         compositor.perform(Action::RenameWorkspace);
         type_into_overlay(&mut compositor, "build");
-        press_key(&mut compositor, KeyCode::Char('d'), tos_input::Modifiers::SUPER);
-        assert_eq!(compositor.panes.len(), 1, "a binding fired under the prompt");
+        press_key(
+            &mut compositor,
+            KeyCode::Char('d'),
+            tos_input::Modifiers::SUPER,
+        );
+        assert_eq!(
+            compositor.panes.len(),
+            1,
+            "a binding fired under the prompt"
+        );
         let focus = compositor.session.focus();
         assert_eq!(compositor.pane(focus).unwrap().pending_input(), 0);
     }

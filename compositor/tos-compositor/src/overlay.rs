@@ -180,7 +180,7 @@ impl Overlay {
                     // Nothing matches, so there is nothing to choose. The
                     // overlay stays open rather than closing on an empty list.
                     None => OverlayOutcome::Consumed,
-                }
+                };
             }
             KeyCode::Backspace => {
                 return match self.query.pop() {
@@ -306,21 +306,66 @@ impl Overlay {
         let mut top = format!("┌─ {title} ");
         pad_to(&mut top, box_cols - 1, '─');
         top.push('┐');
-        draw_text(surface, fonts, x0, row_y(0), &top, border, Some(chrome.background), false);
+        draw_text(
+            surface,
+            fonts,
+            x0,
+            row_y(0),
+            &top,
+            border,
+            Some(chrome.background),
+            false,
+        );
 
         // The query line, ending in a block cursor so it is obvious where the
         // keyboard is going.
         let y = row_y(1);
-        let mut x = draw_text(surface, fonts, x0, y, "│ ", border, Some(chrome.background), false);
-        x = draw_text(surface, fonts, x, y, "> ", chrome.accent, Some(chrome.background), true);
+        let mut x = draw_text(
+            surface,
+            fonts,
+            x0,
+            y,
+            "│ ",
+            border,
+            Some(chrome.background),
+            false,
+        );
+        x = draw_text(
+            surface,
+            fonts,
+            x,
+            y,
+            "> ",
+            chrome.accent,
+            Some(chrome.background),
+            true,
+        );
         let shown = clip_end(&self.query, inner.saturating_sub(5));
-        x = draw_text(surface, fonts, x, y, &shown, chrome.foreground, Some(chrome.background), false);
+        x = draw_text(
+            surface,
+            fonts,
+            x,
+            y,
+            &shown,
+            chrome.foreground,
+            Some(chrome.background),
+            false,
+        );
         surface.fill(Rect::new(x, y, cw, ch), chrome.accent);
         x += cw as i32;
         let used = 4 + width_of(&shown);
         let mut tail = " ".repeat(inner.saturating_sub(used.min(inner)));
         tail.push('│');
-        draw_text(surface, fonts, x, y, &tail, border, Some(chrome.background), false);
+        draw_text(
+            surface,
+            fonts,
+            x,
+            y,
+            &tail,
+            border,
+            Some(chrome.background),
+            false,
+        );
 
         // With no list under it there is nothing for a divider to divide, and
         // the loop below has no rows to draw.
@@ -342,9 +387,27 @@ impl Overlay {
 
         for row in 0..list_rows {
             let y = row_y(3 + row);
-            draw_text(surface, fonts, x0, y, "│", border, Some(chrome.background), false);
+            draw_text(
+                surface,
+                fonts,
+                x0,
+                y,
+                "│",
+                border,
+                Some(chrome.background),
+                false,
+            );
             let right = x0 + ((box_cols - 1) as u32 * cw) as i32;
-            draw_text(surface, fonts, right, y, "│", border, Some(chrome.background), false);
+            draw_text(
+                surface,
+                fonts,
+                right,
+                y,
+                "│",
+                border,
+                Some(chrome.background),
+                false,
+            );
             let x = x0 + cw as i32;
             let position = self.scroll + row;
             let Some(&index) = self.matches.get(position) else {
@@ -353,10 +416,28 @@ impl Overlay {
                 if self.matches.is_empty() && row == 0 {
                     let mut text = clip(" (no matches)", inner);
                     pad_to(&mut text, inner, ' ');
-                    draw_text(surface, fonts, x, y, &text, chrome.dim, Some(chrome.background), false);
+                    draw_text(
+                        surface,
+                        fonts,
+                        x,
+                        y,
+                        &text,
+                        chrome.dim,
+                        Some(chrome.background),
+                        false,
+                    );
                 } else {
                     let blank = " ".repeat(inner);
-                    draw_text(surface, fonts, x, y, &blank, chrome.dim, Some(chrome.background), false);
+                    draw_text(
+                        surface,
+                        fonts,
+                        x,
+                        y,
+                        &blank,
+                        chrome.dim,
+                        Some(chrome.background),
+                        false,
+                    );
                 }
                 continue;
             };
@@ -377,7 +458,11 @@ impl Overlay {
             let label_width = width_of(&item.label) + 1;
             if detail_width > 0 && label_width + detail_width + 2 <= inner {
                 let offset = inner - detail_width - 1;
-                let detail_fg = if selected { chrome.accent_text } else { chrome.dim };
+                let detail_fg = if selected {
+                    chrome.accent_text
+                } else {
+                    chrome.dim
+                };
                 draw_text(
                     surface,
                     fonts,
@@ -801,7 +886,12 @@ mod tests {
         }
         {
             let mut surface = fb.surface();
-            overlay.draw(&mut surface, &mut fonts, Rect::new(0, 0, w, h), &Chrome::default());
+            overlay.draw(
+                &mut surface,
+                &mut fonts,
+                Rect::new(0, 0, w, h),
+                &Chrome::default(),
+            );
         }
         assert!(overlay.scroll > 0, "the list should have scrolled");
         assert!(overlay.scroll <= overlay.cursor);
@@ -823,7 +913,10 @@ mod tests {
             let mut surface = fb.surface();
             list.draw(&mut surface, &mut fonts, area, &chrome);
         }
-        assert!(fb.pixels().iter().all(|&px| px == 0), "the list should not fit");
+        assert!(
+            fb.pixels().iter().all(|&px| px == 0),
+            "the list should not fit"
+        );
 
         let mut prompt = Overlay::prompt("rename workspace", "build");
         let mut fb = OwnedFramebuffer::new(w, h);
@@ -846,9 +939,17 @@ mod tests {
         let mut overlay = overlay(&["ls"]);
         {
             let mut surface = fb.surface();
-            overlay.draw(&mut surface, &mut fonts, Rect::new(0, 0, w, h), &Chrome::default());
+            overlay.draw(
+                &mut surface,
+                &mut fonts,
+                Rect::new(0, 0, w, h),
+                &Chrome::default(),
+            );
         }
-        assert!(fb.pixels().iter().all(|&px| px == 0), "nothing should be drawn");
+        assert!(
+            fb.pixels().iter().all(|&px| px == 0),
+            "nothing should be drawn"
+        );
     }
 
     #[test]

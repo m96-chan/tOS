@@ -37,9 +37,7 @@ impl NestedDisplay {
         let input = io::stdin().as_raw_fd();
         let size = terminal_size(output)?;
         if size.cols == 0 || size.rows == 0 {
-            return Err(io::Error::other(
-                "the host terminal reported no size",
-            ));
+            return Err(io::Error::other("the host terminal reported no size"));
         }
         // Deliberately not O_NONBLOCK: stdin, stdout and the parent shell's
         // own descriptors usually share one open file description, and the

@@ -1,9 +1,9 @@
 //! tOS input.
 
 pub mod encode;
-pub mod event;
 #[cfg(target_os = "linux")]
 pub mod evdev;
+pub mod event;
 pub mod host;
 // The layout table is plain data, so it builds and is tested everywhere even
 // though only the evdev backend consumes it.

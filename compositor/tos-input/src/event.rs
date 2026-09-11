@@ -385,7 +385,10 @@ mod tests {
         assert_eq!(Modifiers::SHIFT.union(Modifiers::ALT).xterm_param(), 4);
         assert_eq!(Modifiers::CTRL.xterm_param(), 5);
         assert_eq!(
-            Modifiers::CTRL.union(Modifiers::ALT).union(Modifiers::SHIFT).xterm_param(),
+            Modifiers::CTRL
+                .union(Modifiers::ALT)
+                .union(Modifiers::SHIFT)
+                .xterm_param(),
             8
         );
     }

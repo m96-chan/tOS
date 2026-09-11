@@ -147,7 +147,16 @@ pub fn draw_status_bar(
         } else {
             (chrome.dim, chrome.background)
         };
-        x = draw_text(surface, fonts, x, area.y, &label, fg, Some(bg), item.highlighted);
+        x = draw_text(
+            surface,
+            fonts,
+            x,
+            area.y,
+            &label,
+            fg,
+            Some(bg),
+            item.highlighted,
+        );
     }
 
     if right.is_empty() {
@@ -260,7 +269,16 @@ mod tests {
         let cw = fonts.metrics().cell_width as i32;
         let mut fb = OwnedFramebuffer::new(64, 16);
         let mut surface = fb.surface();
-        let end = draw_text(&mut surface, &mut fonts, 0, 0, "漢", Rgb::WHITE, None, false);
+        let end = draw_text(
+            &mut surface,
+            &mut fonts,
+            0,
+            0,
+            "漢",
+            Rgb::WHITE,
+            None,
+            false,
+        );
         assert_eq!(end, cw * 2);
     }
 

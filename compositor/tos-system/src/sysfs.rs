@@ -77,7 +77,8 @@ mod tests {
 
     impl Fake {
         pub fn new(name: &str) -> Fake {
-            let root = std::env::temp_dir().join(format!("tos-sysfs-{name}-{}", std::process::id()));
+            let root =
+                std::env::temp_dir().join(format!("tos-sysfs-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
             Fake { root }
@@ -114,7 +115,10 @@ mod tests {
     #[test]
     fn a_missing_file_is_absence_rather_than_an_error() {
         let fake = Fake::new("missing");
-        assert_eq!(fake.sysfs().read("/sys/class/power_supply/BAT0/capacity"), None);
+        assert_eq!(
+            fake.sysfs().read("/sys/class/power_supply/BAT0/capacity"),
+            None
+        );
         assert!(!fake.sysfs().exists("/sys/class/net/eth0"));
     }
 
@@ -129,7 +133,8 @@ mod tests {
     #[test]
     fn a_listing_comes_back_in_a_settled_order() {
         let fake = Fake::new("list");
-        fake.file("/sys/class/net/wlan0/x", "").file("/sys/class/net/eth0/x", "");
+        fake.file("/sys/class/net/wlan0/x", "")
+            .file("/sys/class/net/eth0/x", "");
         assert_eq!(fake.sysfs().list("/sys/class/net"), vec!["eth0", "wlan0"]);
     }
 

@@ -197,11 +197,7 @@ impl Session {
     /// Close a pane. Returns the panes that should be torn down: the pane
     /// itself, or nothing when it was the last pane of the last workspace.
     pub fn close_pane(&mut self, pane: PaneId) -> Vec<PaneId> {
-        let Some(index) = self
-            .workspaces
-            .iter()
-            .position(|w| w.layout.contains(pane))
-        else {
+        let Some(index) = self.workspaces.iter().position(|w| w.layout.contains(pane)) else {
             return Vec::new();
         };
 
@@ -265,7 +261,10 @@ impl Session {
     pub fn focus_next(&mut self) -> PaneId {
         let workspace = self.active_mut();
         let panes = workspace.layout.panes();
-        let current = panes.iter().position(|&p| p == workspace.focus).unwrap_or(0);
+        let current = panes
+            .iter()
+            .position(|&p| p == workspace.focus)
+            .unwrap_or(0);
         let next = panes[(current + 1) % panes.len()];
         workspace.set_focus(next);
         next
@@ -273,11 +272,7 @@ impl Session {
 
     pub fn set_focus(&mut self, pane: PaneId) -> bool {
         // Focusing a pane on another workspace switches to that workspace.
-        let Some(index) = self
-            .workspaces
-            .iter()
-            .position(|w| w.layout.contains(pane))
-        else {
+        let Some(index) = self.workspaces.iter().position(|w| w.layout.contains(pane)) else {
             return false;
         };
         self.active = index;
@@ -594,7 +589,11 @@ mod tests {
 
         assert!(session.move_focused_to_workspace(area(), 2));
         assert_eq!(session.workspace_of(moving), Some(WorkspaceId(1)));
-        assert_eq!(session.active_index(), 0, "the source workspace stays active");
+        assert_eq!(
+            session.active_index(),
+            0,
+            "the source workspace stays active"
+        );
         assert!(!session.workspaces()[0].layout.contains(moving));
     }
 

@@ -121,10 +121,8 @@ fn missing_glyph(metrics: FontMetrics) -> Glyph {
     let mut coverage = vec![0u8; (width * height) as usize];
     for y in 0..height {
         for x in 0..width {
-            let edge = x < thickness
-                || y < thickness
-                || x + thickness >= width
-                || y + thickness >= height;
+            let edge =
+                x < thickness || y < thickness || x + thickness >= width || y + thickness >= height;
             if edge {
                 coverage[(y * width + x) as usize] = 0xff;
             }
@@ -194,7 +192,11 @@ mod tests {
     #[test]
     fn space_renders_as_nothing() {
         let mut stack = stack();
-        assert!(stack.glyph(' ', RasterStyle::REGULAR).coverage.iter().all(|&v| v == 0));
+        assert!(stack
+            .glyph(' ', RasterStyle::REGULAR)
+            .coverage
+            .iter()
+            .all(|&v| v == 0));
     }
 
     #[test]

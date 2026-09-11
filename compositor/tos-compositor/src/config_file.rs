@@ -66,7 +66,11 @@ pub fn search_path() -> Vec<PathBuf> {
     let config_home = std::env::var("XDG_CONFIG_HOME").ok();
     let home = std::env::var("HOME").ok();
     let config_dirs = std::env::var("XDG_CONFIG_DIRS").ok();
-    search_path_from(config_home.as_deref(), home.as_deref(), config_dirs.as_deref())
+    search_path_from(
+        config_home.as_deref(),
+        home.as_deref(),
+        config_dirs.as_deref(),
+    )
 }
 
 /// The basedir spec says an empty variable counts as unset, and empty is
@@ -463,7 +467,10 @@ mod tests {
 
     #[test]
     fn a_named_file_is_read_and_the_flags_still_win() {
-        let path = scratch("named", "scrollback = 500\nbackend = headless\nsize = 640x400\n");
+        let path = scratch(
+            "named",
+            "scrollback = 500\nbackend = headless\nsize = 640x400\n",
+        );
         let flags = args(&["--config", path.to_str().unwrap(), "--scrollback", "7"]);
         let startup = startup(&flags).expect("startup");
         assert!(startup.problems.is_empty(), "{:?}", startup.problems);

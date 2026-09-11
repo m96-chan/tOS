@@ -214,12 +214,30 @@ impl CursorStyle {
     /// DECSCUSR parameter to style.
     pub fn from_decscusr(param: u16) -> CursorStyle {
         match param {
-            0 | 1 => CursorStyle { shape: CursorShape::Block, blinking: true },
-            2 => CursorStyle { shape: CursorShape::Block, blinking: false },
-            3 => CursorStyle { shape: CursorShape::Underline, blinking: true },
-            4 => CursorStyle { shape: CursorShape::Underline, blinking: false },
-            5 => CursorStyle { shape: CursorShape::Beam, blinking: true },
-            6 => CursorStyle { shape: CursorShape::Beam, blinking: false },
+            0 | 1 => CursorStyle {
+                shape: CursorShape::Block,
+                blinking: true,
+            },
+            2 => CursorStyle {
+                shape: CursorShape::Block,
+                blinking: false,
+            },
+            3 => CursorStyle {
+                shape: CursorShape::Underline,
+                blinking: true,
+            },
+            4 => CursorStyle {
+                shape: CursorShape::Underline,
+                blinking: false,
+            },
+            5 => CursorStyle {
+                shape: CursorShape::Beam,
+                blinking: true,
+            },
+            6 => CursorStyle {
+                shape: CursorShape::Beam,
+                blinking: false,
+            },
             _ => CursorStyle::default(),
         }
     }

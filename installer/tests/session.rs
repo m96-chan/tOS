@@ -69,11 +69,7 @@ impl Session {
     fn new(machine: &FakeMachine, args: &[&str]) -> Session {
         Session {
             pty: spawn(machine, args),
-            terminal: tos_term::Terminal::new(
-                100,
-                32,
-                tos_term::TerminalConfig::default(),
-            ),
+            terminal: tos_term::Terminal::new(100, 32, tos_term::TerminalConfig::default()),
         }
     }
 
@@ -240,7 +236,11 @@ fn escape_steps_back_through_the_screens() {
     session.reach_confirmation("vda");
 
     session.type_keys(b"\x1b");
-    assert!(session.wait_for("Tab switches fields"), "{}", session.screen());
+    assert!(
+        session.wait_for("Tab switches fields"),
+        "{}",
+        session.screen()
+    );
     session.type_keys(b"\x1b");
     assert!(session.wait_for("GiB"), "{}", session.screen());
 }
@@ -303,9 +303,16 @@ fn the_plan_can_be_printed_without_a_terminal() {
         .output()
         .expect("run tos-install --plan");
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(text.contains("/dev/vda"));
-    assert!(text.contains("sfdisk"), "the real commands should be listed: {text}");
+    assert!(
+        text.contains("sfdisk"),
+        "the real commands should be listed: {text}"
+    );
     assert!(text.contains("mkfs.ext4"));
     assert!(text.contains("grub-install"));
 }
@@ -353,7 +360,10 @@ fn installing_without_root_refuses_rather_than_half_trying() {
     assert!(!output.status.success());
     let text = String::from_utf8_lossy(&output.stderr);
     assert!(text.contains("needs root"), "{text}");
-    assert!(text.contains("--dry-run"), "it should say what to try instead");
+    assert!(
+        text.contains("--dry-run"),
+        "it should say what to try instead"
+    );
 }
 
 extern "C" {

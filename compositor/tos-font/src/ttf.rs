@@ -292,7 +292,11 @@ impl GlyphSource for TtfFont {
             coverage,
         };
 
-        let glyph = if synthesize.bold { glyph.embolden() } else { glyph };
+        let glyph = if synthesize.bold {
+            glyph.embolden()
+        } else {
+            glyph
+        };
         let glyph = if synthesize.italic {
             glyph.slant((px / 8.0).round().max(1.0) as u32)
         } else {
@@ -339,7 +343,9 @@ mod tests {
 
     #[test]
     fn rasterizes_ascii() {
-        let Some(mut font) = system_font() else { return };
+        let Some(mut font) = system_font() else {
+            return;
+        };
         let g = font.rasterize('A', RasterStyle::REGULAR).unwrap();
         assert!(g.width > 0 && g.height > 0);
         assert!(g.coverage.iter().any(|&v| v != 0));
@@ -347,7 +353,9 @@ mod tests {
 
     #[test]
     fn synthetic_bold_is_wider() {
-        let Some(mut font) = system_font() else { return };
+        let Some(mut font) = system_font() else {
+            return;
+        };
         let regular = font.rasterize('l', RasterStyle::REGULAR).unwrap();
         let bold = font.rasterize('l', RasterStyle::new(true, false)).unwrap();
         assert!(bold.width > regular.width);
@@ -370,7 +378,9 @@ mod tests {
 
     #[test]
     fn the_cjk_search_finds_the_same_face_twice() {
-        let Some(path) = TtfFont::find_system_cjk_font() else { return };
+        let Some(path) = TtfFont::find_system_cjk_font() else {
+            return;
+        };
         assert!(path.is_file());
         assert!(TtfFont::from_path(&path, 16.0).unwrap().covers_cjk());
         assert!(

@@ -232,7 +232,13 @@ impl TextureCache {
             }
             self.evict_until_free(bytes);
             self.bytes += bytes;
-            self.entries.insert(key, Entry { texture, used: clock });
+            self.entries.insert(
+                key,
+                Entry {
+                    texture,
+                    used: clock,
+                },
+            );
         }
 
         // Touching the entry on a hit as well as an insert is what makes the

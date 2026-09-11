@@ -11,7 +11,11 @@ fn term(cols: usize, rows: usize) -> Terminal {
 
 fn screen(t: &Terminal) -> Vec<String> {
     // `split` rather than `lines` so trailing blank rows stay in the vector.
-    t.grid().to_text().split('\n').map(|l| l.to_string()).collect()
+    t.grid()
+        .to_text()
+        .split('\n')
+        .map(|l| l.to_string())
+        .collect()
 }
 
 #[test]
@@ -201,7 +205,13 @@ fn sgr_reset_clears_the_pen() {
     let mut t = term(10, 1);
     t.advance(b"\x1b[1;31mA\x1b[0mB");
     assert_eq!(t.grid().cell(1, 0).unwrap().attrs.fg, Color::Default);
-    assert!(!t.grid().cell(1, 0).unwrap().attrs.flags.contains(Flags::BOLD));
+    assert!(!t
+        .grid()
+        .cell(1, 0)
+        .unwrap()
+        .attrs
+        .flags
+        .contains(Flags::BOLD));
 }
 
 #[test]
@@ -436,7 +446,10 @@ fn kitty_graphics_reports_undecodable_payloads() {
     let mut t = term(10, 4);
     t.advance(b"\x1b_Ga=T,f=100,s=1,v=1,i=9;AAAA\x1b\\");
     let out = String::from_utf8(t.take_output()).unwrap();
-    assert!(out.contains("i=9"), "response should identify the image: {out}");
+    assert!(
+        out.contains("i=9"),
+        "response should identify the image: {out}"
+    );
     assert!(out.contains("EINVAL"), "response should be an error: {out}");
     assert!(t.graphics().image(9).is_none());
 }
@@ -550,7 +563,10 @@ fn del_and_c1_bytes_are_discarded() {
     t.advance(b"ab\x7f\x7f\x7f");
     let cell = t.grid().cell(1, 0).unwrap();
     assert_eq!(cell.ch, 'b');
-    assert!(cell.zerowidth.is_none(), "DEL must not become a combining mark");
+    assert!(
+        cell.zerowidth.is_none(),
+        "DEL must not become a combining mark"
+    );
     assert_eq!(t.cursor().x, 2);
 }
 
@@ -678,7 +694,10 @@ fn kitty_graphics_rejects_frames_for_images_that_were_never_sent() {
     let mut t = term(10, 4);
     t.advance(b"\x1b_Ga=f,f=32,s=1,v=1,i=9;AAAAAA==\x1b\\");
     let out = String::from_utf8(t.take_output()).unwrap();
-    assert!(out.contains("i=9"), "response should identify the image: {out}");
+    assert!(
+        out.contains("i=9"),
+        "response should identify the image: {out}"
+    );
     assert!(out.contains("ENOENT"), "response should be an error: {out}");
 }
 
