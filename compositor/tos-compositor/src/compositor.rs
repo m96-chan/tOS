@@ -1108,6 +1108,23 @@ fn build_fonts(config: &Config, size: (u32, u32), physical_mm: Option<(u32, u32)
             FontStack::new(Box::new(scale))
         }
     };
+    let cell = stack.metrics();
+    for path in &config.font_fallback {
+        // A fallback that will not load is worth saying so about: the person
+        // named this file, unlike the ones found by searching.
+        match tos_font::TtfFont::from_path(path, pixel_size) {
+            Ok(font) => stack.push_fallback(Box::new(font.fit_wide_cell(cell))),
+            Err(e) => eprintln!("tos: font fallback {}: {e}", path.display()),
+        }
+    }
+    // Without kanji somewhere in the stack Japanese is a row of hollow boxes,
+    // so a face is looked for even when nothing asked for one. The ISO's own
+    // face is monospace and covers kana, so this usually finds nothing to do.
+    if !stack.covers(tos_font::ttf::FULL_WIDTH_PROBE) {
+        if let Some(font) = tos_font::TtfFont::system_cjk(pixel_size) {
+            stack.push_fallback(Box::new(font.fit_wide_cell(cell)));
+        }
+    }
     // The built-in face is always available as a last resort, so a missing
     // glyph in the main font never leaves a hole.
     stack.push_fallback(Box::new(BitmapFont::for_display(size.0, size.1)));
@@ -1135,6 +1152,68 @@ mod tests {
             ..Config::default()
         };
         Compositor::new(config, (640, 360), None).expect("compositor")
+    }
+
+    /// A font stack built from `config`, at a size the tests can reason about.
+    fn fonts(config: Config) -> FontStack {
+        build_fonts(&config, (640, 360), None)
+    }
+
+    /// Nothing to assert about CJK on a machine with no CJK face.
+    fn a_cjk_face() -> Option<std::path::PathBuf> {
+        tos_font::TtfFont::find_system_cjk_font()
+    }
+
+    #[test]
+    fn kanji_are_found_without_being_configured() {
+        if a_cjk_face().is_none() {
+            return;
+        }
+        let fonts = fonts(Config::default());
+        assert!(fonts.covers('漢'), "Japanese would render as boxes");
+        assert!(fonts.covers('あ') && fonts.covers('ア'));
+    }
+
+    #[test]
+    fn a_configured_fallback_supplies_the_glyphs() {
+        let Some(path) = a_cjk_face() else { return };
+        let fonts = fonts(Config {
+            // A primary with no kanji in it, so only the fallback can answer.
+            font: Some("/nonexistent-so-the-bitmap-font-is-used".into()),
+            bitmap_scale: Some(1),
+            font_fallback: vec![path],
+            ..Config::default()
+        });
+        assert!(fonts.covers('漢'));
+    }
+
+    #[test]
+    fn a_fallback_that_will_not_load_is_skipped() {
+        let fonts = fonts(Config {
+            font_fallback: vec!["/nonexistent.ttf".into()],
+            bitmap_scale: Some(1),
+            ..Config::default()
+        });
+        // ASCII still works, which is the whole point of not giving up here.
+        assert!(fonts.covers('A'));
+    }
+
+    #[test]
+    fn a_wide_glyph_fills_two_cells() {
+        if a_cjk_face().is_none() {
+            return;
+        }
+        let mut fonts = fonts(Config::default());
+        let cell = fonts.metrics();
+        let glyph = fonts.glyph('漢', tos_font::RasterStyle::REGULAR).clone();
+        assert!(
+            glyph.width > cell.cell_width,
+            "a kanji narrower than two cells is the missing box"
+        );
+        assert!(
+            glyph.left + glyph.width as i32 <= (cell.cell_width * 2) as i32,
+            "a kanji wider than two cells would overwrite its neighbour"
+        );
     }
 
     #[test]

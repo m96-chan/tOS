@@ -44,6 +44,14 @@ impl FontStack {
         self.cache.clear();
     }
 
+    /// Whether some source already draws `c`.
+    ///
+    /// Asked before loading a fallback: a CJK face is tens of megabytes and
+    /// there is no sense parsing one when the primary already has kanji.
+    pub fn covers(&self, c: char) -> bool {
+        self.sources.iter().any(|source| source.has_glyph(c))
+    }
+
     pub fn metrics(&self) -> FontMetrics {
         self.metrics
     }
@@ -247,6 +255,29 @@ mod tests {
         let after = stack.glyph('漢', RasterStyle::REGULAR).coverage.clone();
         assert_ne!(before, after, "the stale box must not be cached forever");
         assert_eq!(after, vec![0x5a]);
+    }
+
+    #[test]
+    fn coverage_is_reported_across_every_source() {
+        struct OnlyKanji;
+        impl GlyphSource for OnlyKanji {
+            fn metrics(&self) -> FontMetrics {
+                BitmapFont::new(2).metrics()
+            }
+            fn has_glyph(&self, c: char) -> bool {
+                c == '漢'
+            }
+            fn rasterize(&mut self, _c: char, _style: RasterStyle) -> Option<Glyph> {
+                None
+            }
+        }
+
+        let mut stack = stack();
+        assert!(stack.covers('A'), "the bitmap face has ASCII");
+        assert!(!stack.covers('漢'), "and nothing else");
+        stack.push_fallback(Box::new(OnlyKanji));
+        assert!(stack.covers('漢'));
+        assert!(stack.covers('A'), "a fallback does not hide the primary");
     }
 
     #[test]
