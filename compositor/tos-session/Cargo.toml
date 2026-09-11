@@ -1,0 +1,11 @@
+[package]
+name = "tos-session"
+description = "tOS session model: pane tree, splits, focus, workspaces, keybindings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tos-input = { workspace = true }

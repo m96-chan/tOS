@@ -1,0 +1,13 @@
+[package]
+name = "tos-platform"
+description = "tOS display and session backends: DRM/KMS, nested terminal, headless"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tos-render = { workspace = true }
+tos-term = { workspace = true }
+libc = { workspace = true }
