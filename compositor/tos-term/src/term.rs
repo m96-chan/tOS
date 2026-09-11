@@ -1204,7 +1204,7 @@ impl Perform for Terminal {
             0x07 => self.events.push(TermEvent::Bell),
             0x08 => self.backspace(),
             0x09 => self.tab(1),
-            0x0a | 0x0b | 0x0c => {
+            0x0a..=0x0c => {
                 self.reset_display_offset();
                 self.linefeed();
                 if self.modes.linefeed_newline {

@@ -506,10 +506,11 @@ impl GraphicsStore {
 pub fn decode_base64(input: &[u8]) -> Vec<u8> {
     const INVALID: u8 = 0xff;
     let mut table = [INVALID; 256];
-    let mut i = 0u8;
-    for &c in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" {
-        table[c as usize] = i;
-        i += 1;
+    for (value, &c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        .iter()
+        .enumerate()
+    {
+        table[c as usize] = value as u8;
     }
 
     let mut out = Vec::with_capacity(input.len() / 4 * 3);

@@ -136,7 +136,10 @@ MODULES="bochs virtio_gpu simpledrm cirrus vmwgfx \
     isofs ext4 vfat nls_cp437 nls_iso8859_1 nls_ascii"
 for mod in $MODULES; do
     modprobe -S "$KVER" --show-depends "$mod" 2>/dev/null || true
-done | sed -n 's/^insmod //p' | sort -u | while read -r path; do
+# `--show-depends` prints the module's default parameters after its path, so
+# only the first field is a filename. nvme is the first module in the list
+# that has any, which is why this held up until now.
+done | sed -n 's/^insmod \([^ ]*\).*/\1/p' | sort -u | while read -r path; do
     rel="${path#/lib/modules/$KVER/}"
     mkdir -p "$ROOT/lib/modules/$KVER/$(dirname "$rel")"
     cp "$path" "$ROOT/lib/modules/$KVER/$rel"

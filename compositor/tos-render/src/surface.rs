@@ -248,9 +248,9 @@ impl<'a> Surface<'a> {
 /// Blend `color` over a packed XRGB pixel.
 #[inline]
 fn blend_packed(dest: u32, color: Rgb, alpha: u8) -> u32 {
-    let dr = ((dest >> 16) & 0xff) as u32;
-    let dg = ((dest >> 8) & 0xff) as u32;
-    let db = (dest & 0xff) as u32;
+    let dr = (dest >> 16) & 0xff;
+    let dg = (dest >> 8) & 0xff;
+    let db = dest & 0xff;
     let a = alpha as u32;
     let inv = 255 - a;
     let r = (color.r as u32 * a + dr * inv) / 255;

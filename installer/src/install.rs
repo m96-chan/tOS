@@ -349,22 +349,20 @@ impl<'a> Installer<'a> {
     /// Written directly rather than through `grub-mkconfig`, which needs a
     /// Debian userspace the live image does not have yet.
     fn grub_config(&self) -> String {
-        format!(
-            "set timeout=2\n\
+        "set timeout=2\n\
              set default=0\n\
              \n\
-             menuentry \"tOS\" {{\n\
+             menuentry \"tOS\" {\n\
              \tsearch --no-floppy --label --set=root tos-root\n\
              \tlinux /boot/vmlinuz root=LABEL=tos-root rw console=tty0 quiet\n\
              \tinitrd /boot/initramfs.gz\n\
-             }}\n\
+             }\n\
              \n\
-             menuentry \"tOS (verbose)\" {{\n\
+             menuentry \"tOS (verbose)\" {\n\
              \tsearch --no-floppy --label --set=root tos-root\n\
              \tlinux /boot/vmlinuz root=LABEL=tos-root rw console=tty0\n\
              \tinitrd /boot/initramfs.gz\n\
-             }}\n"
-        )
+             }\n".to_string()
     }
 
     fn finish(&mut self) -> Result<(), String> {

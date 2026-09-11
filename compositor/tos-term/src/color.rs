@@ -47,17 +47,14 @@ impl Rgb {
 /// `Default` is resolved late, at paint time, so that changing the theme does
 /// not require rewriting the grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum Color {
+    #[default]
     Default,
     Indexed(u8),
     Rgb(Rgb),
 }
 
-impl Default for Color {
-    fn default() -> Self {
-        Color::Default
-    }
-}
 
 /// The 256 color palette plus the default foreground/background/cursor colors.
 #[derive(Debug, Clone)]

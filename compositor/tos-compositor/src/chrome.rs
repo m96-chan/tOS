@@ -37,6 +37,9 @@ impl Default for Chrome {
 /// Draw text starting at a pixel position, one cell per character.
 ///
 /// Returns the x position just past the text.
+// The arguments are the drawing context plus what to draw; bundling them into
+// a struct would only move the same list somewhere else.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_text(
     surface: &mut Surface<'_>,
     fonts: &mut FontStack,
@@ -241,7 +244,7 @@ mod tests {
                 false,
             );
         }
-        assert!(fb.pixels().iter().any(|&px| px == 0xffffff));
+        assert!(fb.pixels().contains(&0xffffff));
     }
 
     #[test]
