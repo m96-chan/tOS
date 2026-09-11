@@ -50,7 +50,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "tOS $GITHUB_REF_NAME" \
-            --generate-notes \
-            dist/*.iso dist/SHA256SUMS
+          # A tag that moves is a release being rebuilt: the image had a bug
+          # worth fixing before anyone else downloads it. Replace what the
+          # release carries instead of failing on the one already there, and
+          # keep its notes, which someone may have edited by hand.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --clobber \
+              dist/*.iso dist/SHA256SUMS
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "tOS $GITHUB_REF_NAME" \
+              --generate-notes \
+              dist/*.iso dist/SHA256SUMS
+          fi
