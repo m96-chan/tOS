@@ -3,17 +3,19 @@
 Bootable image where the compositor **is** userspace:
 
 ```text
-GRUB -> Linux (Alpine linux-virt) -> initramfs /init -> tos (DRM backend)
+GRUB -> Linux (Debian linux-image) -> initramfs /init -> tos (DRM backend)
 ```
 
-There is no distribution underneath — the initramfs holds a static `tos`
-binary, busybox, and the kernel's driver modules. `tos` falls back to
-`/bin/sh` (busybox) for its panes.
+Per the top-level README, tOS targets a **Debian** userspace; this image
+is the Debian-based kernel/compositor half of that. The initramfs holds
+a static `tos` binary, busybox, and the display/input driver modules.
+`tos` falls back to `/bin/sh` (busybox) for its panes until the real
+Debian rootfs stage (squashfs via `rootfs/debian/`) exists.
 
 ## Building
 
 Needs Docker or Podman on the host; the build itself runs in a
-`rust:1-alpine` container.
+`rust:1-bookworm` container.
 
 ```sh
 iso/build.sh          # -> dist/tos-x86_64.iso
@@ -45,11 +47,12 @@ emergency busybox shell on the console.
 
 ## Known limits
 
-- x86_64 only for now; `ARCH=aarch64` is plumbed through `build.sh` but
-  the GRUB/kernel side of `mkiso.sh` has only been designed for x86_64.
-- The full `linux-virt` module tree is copied into the initramfs. It
-  boots everywhere QEMU-shaped but the ISO is larger than it needs to
-  be; pruning to gpu/input/virtio subtrees is a later optimization.
-- Real-hardware boot (USB stick) should work via GRUB's hybrid image but
-  is untested; `linux-virt` lacks most bare-metal drivers, so a
-  `linux-lts` variant will be needed for that.
+- x86_64 only for now; `ARCH=aarch64` is plumbed through `build.sh` and
+  `mkiso.sh` but untested, and arm64 needs a different boot path anyway.
+- The initramfs carries only the QEMU-shaped display/input modules and
+  their dependency closure. Real hardware needs its GPU driver added to
+  the `MODULES` list in `mkiso.sh` (and matching firmware, which is not
+  packed at all yet).
+- No persistent storage and no real rootfs: the next step per the
+  top-level README is a Debian rootfs (mmdebstrap → squashfs) that
+  `/init` mounts and pivots into before starting `tos`.

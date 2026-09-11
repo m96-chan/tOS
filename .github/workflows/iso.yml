@@ -18,6 +18,10 @@ on:
       - ".github/workflows/iso.yml"
   workflow_dispatch:
 
+concurrency:
+  group: iso-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest

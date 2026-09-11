@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the tOS ISO on the host. Needs Docker or Podman; everything else
-# happens inside a rust:alpine container (see iso/mkiso.sh).
+# happens inside a Debian-based rust container (see iso/mkiso.sh).
 #
 #   iso/build.sh                # x86_64 ISO -> dist/tos-x86_64.iso
 #   ARCH=aarch64 iso/build.sh   # aarch64 ISO (kernel/GRUB support pending)
@@ -33,5 +33,5 @@ exec "$engine" run --rm --platform "$platform" \
     -v "tos-iso-cargo-$ARCH":/usr/local/cargo/registry \
     -v "tos-iso-target-$ARCH":/src/target \
     -w /src \
-    rust:1-alpine \
+    rust:1-bookworm \
     sh iso/mkiso.sh
