@@ -470,6 +470,41 @@ impl Drop for Card {
 }
 
 // ---------------------------------------------------------------------------
+// The seam
+// ---------------------------------------------------------------------------
+
+/// The calls that change what a CRTC is showing.
+///
+/// None of this file can run where the tests run: CI has no graphics card, so
+/// anything decided on the way to an ioctl is decided in code nothing ever
+/// exercises. This is the narrow part of that — two requests, both of them
+/// pure structures — kept behind a trait so the state around them can be
+/// driven against a recorder, the way `tos-system` drives audio and bluetooth
+/// without an audio card or a radio.
+///
+/// It stays private to this module because nothing outside it sets a mode;
+/// the backend the compositor sees is still [`Display`].
+trait Control {
+    /// `DRM_IOCTL_MODE_SETCRTC`: point a CRTC at a framebuffer and a mode, or
+    /// with neither of them, switch it off.
+    fn set_crtc(&mut self, request: &mut Crtc) -> io::Result<()>;
+
+    /// `DRM_IOCTL_MODE_PAGE_FLIP`: show a different framebuffer at the next
+    /// vertical blank, without touching the mode.
+    fn page_flip(&mut self, request: &mut PageFlip) -> io::Result<()>;
+}
+
+impl Control for Card {
+    fn set_crtc(&mut self, request: &mut Crtc) -> io::Result<()> {
+        ioctl(self.fd, ioctl_num::<Crtc>(0xa2), request)
+    }
+
+    fn page_flip(&mut self, request: &mut PageFlip) -> io::Result<()> {
+        ioctl(self.fd, ioctl_num::<PageFlip>(0xb0), request)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Dumb buffers
 // ---------------------------------------------------------------------------
 
@@ -571,6 +606,11 @@ impl DumbBuffer {
     fn stride_pixels(&self) -> u32 {
         self.pitch / 4
     }
+
+    /// Paint the whole buffer black.
+    fn clear(&mut self) {
+        self.pixels().fill(0);
+    }
 }
 
 impl Drop for DumbBuffer {
@@ -617,6 +657,176 @@ struct EventVblank {
 }
 
 // ---------------------------------------------------------------------------
+// What the CRTC is showing
+// ---------------------------------------------------------------------------
+
+/// The state of the one CRTC tOS drives, and the decisions made about it.
+///
+/// Separate from the buffers and from the device descriptor because this is
+/// where the judgement lives — whether a frame needs a full mode set or can
+/// be flipped, and whether the screen has been switched off on purpose and
+/// must be left that way — and none of that needs a card to be exercised.
+struct Scanout {
+    crtc_id: u32,
+    connector_id: u32,
+    mode: ModeInfo,
+    /// Whether the CRTC is currently configured with tOS's mode.
+    mode_set: bool,
+    flip_pending: bool,
+    /// Whether scanout has been switched off on purpose.
+    ///
+    /// Not the same as having released the display. tOS still holds DRM
+    /// master and still owns the VT while blanked, so nothing else can put
+    /// anything on the screen in the meantime and coming back is one mode set
+    /// away; a session that has been switched away from has given up both.
+    blanked: bool,
+}
+
+impl Scanout {
+    fn new(output: &ConnectedOutput, mode: ModeInfo) -> Scanout {
+        Scanout {
+            crtc_id: output.crtc_id,
+            connector_id: output.connector_id,
+            mode,
+            mode_set: false,
+            flip_pending: false,
+            blanked: false,
+        }
+    }
+
+    /// Configure the CRTC to scan out `fb_id`.
+    fn set_crtc(&mut self, device: &mut dyn Control, fb_id: u32) -> io::Result<()> {
+        let mut connectors = [self.connector_id];
+        let mut crtc = Crtc {
+            set_connectors_ptr: connectors.as_mut_ptr() as u64,
+            count_connectors: 1,
+            crtc_id: self.crtc_id,
+            fb_id,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 1,
+            mode: self.mode,
+        };
+        device.set_crtc(&mut crtc)?;
+        self.mode_set = true;
+        Ok(())
+    }
+
+    /// Switch the CRTC off, which is how the panel is put to sleep.
+    ///
+    /// The same ioctl as a mode set, with nothing to set: no framebuffer and
+    /// no mode. The connector list has to be empty alongside them, because
+    /// the kernel refuses a request that names connectors it has been given
+    /// no mode to drive them with. Scanout stops, the panel loses its signal
+    /// and sleeps.
+    ///
+    /// The connector's `DPMS` property would reach the same place, but it
+    /// means first looking up each property by name to find it, and on an
+    /// atomic driver the legacy property is emulated with exactly this.
+    fn disable(&mut self, device: &mut dyn Control) -> io::Result<()> {
+        let mut crtc = Crtc {
+            crtc_id: self.crtc_id,
+            fb_id: 0,
+            mode_valid: 0,
+            ..Crtc::default()
+        };
+        device.set_crtc(&mut crtc)?;
+        // The CRTC has no mode at all now, so whatever comes back has to
+        // arrive as a mode set and can never be a page flip.
+        self.mode_set = false;
+        // Nothing is queued against a CRTC that is off either. The caller
+        // collected any flip that was still in flight before getting here,
+        // and a flag left standing would have the next frame wait for an
+        // event that has already been read.
+        self.flip_pending = false;
+        Ok(())
+    }
+
+    /// Put `fb_id` on the screen, by whichever means the CRTC is in a state
+    /// to accept.
+    fn present(&mut self, device: &mut dyn Control, fb_id: u32) -> io::Result<()> {
+        if self.blanked {
+            // Frames go on arriving behind a blanked screen: panes keep
+            // producing output while nobody is looking, and the compositor
+            // goes on drawing it. Handing one to the CRTC would light the
+            // panel back up, so the frame is painted and left in its buffer.
+            return Ok(());
+        }
+        if !self.mode_set {
+            return self.set_crtc(device, fb_id);
+        }
+        let mut flip = PageFlip {
+            crtc_id: self.crtc_id,
+            fb_id,
+            flags: DRM_MODE_PAGE_FLIP_EVENT,
+            reserved: 0,
+            user_data: 0,
+        };
+        match device.page_flip(&mut flip) {
+            Ok(()) => {
+                self.flip_pending = true;
+                Ok(())
+            }
+            // Some drivers reject flips while the CRTC is being reconfigured;
+            // falling back to a mode set keeps the screen updating.
+            Err(e)
+                if e.raw_os_error() == Some(libc::EBUSY)
+                    || e.raw_os_error() == Some(libc::EINVAL) =>
+            {
+                self.set_crtc(device, fb_id)?;
+                self.flip_pending = false;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Blank or unblank. `front` is the framebuffer the last frame was drawn
+    /// into, when there has been one.
+    fn blank(
+        &mut self,
+        device: &mut dyn Control,
+        blank: bool,
+        front: Option<u32>,
+    ) -> io::Result<()> {
+        if blank == self.blanked {
+            return Ok(());
+        }
+        if blank {
+            // Only on success: a screen that is still lit must not be
+            // remembered as dark, or unblanking would do nothing to it.
+            self.disable(device)?;
+            self.blanked = true;
+            return Ok(());
+        }
+        self.blanked = false;
+        // Unblanking has to light the panel itself rather than leave it to
+        // the next frame. The compositor only draws when something changed,
+        // and coming back from blanked is exactly the case where nothing has:
+        // waiting would leave the screen dark until the user typed something.
+        if let Some(fb_id) = front {
+            self.set_crtc(device, fb_id)?;
+        }
+        Ok(())
+    }
+
+    /// The display has just been taken back from whoever else had it.
+    fn reacquired(&mut self, device: &mut dyn Control) -> io::Result<()> {
+        // Whatever held the device set its own mode on the way past, so the
+        // next frame has to be a mode set rather than a flip.
+        self.mode_set = false;
+        // A session that was blanked when it was switched away must not come
+        // back showing the other terminal's screen, and it will not draw a
+        // frame of its own to cover it: blanked means nothing is happening.
+        if self.blanked {
+            self.disable(device)?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The display
 // ---------------------------------------------------------------------------
 
@@ -628,9 +838,10 @@ pub struct DrmDisplay {
     buffers: [DumbBuffer; 2],
     /// Which buffer the next frame is drawn into.
     back: usize,
-    /// Whether the CRTC has been configured yet.
-    mode_set: bool,
-    flip_pending: bool,
+    scanout: Scanout,
+    /// Whether anything has been drawn yet. Unblanking puts the last frame
+    /// back on the screen, and before the first one there is none to put.
+    has_frame: bool,
     saved_crtc: Crtc,
     /// Sequence number of the last completed flip, for frame pacing.
     last_sequence: u32,
@@ -681,14 +892,15 @@ impl DrmDisplay {
         let front = DumbBuffer::create(card.fd(), width, height)?;
         let back = DumbBuffer::create(card.fd(), width, height)?;
 
+        let scanout = Scanout::new(&output, mode);
         Ok(DrmDisplay {
             card,
             output,
             mode,
             buffers: [front, back],
             back: 1,
-            mode_set: false,
-            flip_pending: false,
+            scanout,
+            has_frame: false,
             saved_crtc,
             last_sequence: 0,
         })
@@ -707,40 +919,15 @@ impl DrmDisplay {
         self.last_sequence
     }
 
-    /// Configure the CRTC to scan out `fb_id`.
-    fn set_crtc(&mut self, fb_id: u32) -> io::Result<()> {
-        let mut connectors = [self.output.connector_id];
-        let mut crtc = Crtc {
-            set_connectors_ptr: connectors.as_mut_ptr() as u64,
-            count_connectors: 1,
-            crtc_id: self.output.crtc_id,
-            fb_id,
-            x: 0,
-            y: 0,
-            gamma_size: 0,
-            mode_valid: 1,
-            mode: self.mode,
-        };
-        ioctl(self.card.fd(), ioctl_num::<Crtc>(0xa2), &mut crtc)
-    }
-
-    fn page_flip(&mut self, fb_id: u32) -> io::Result<()> {
-        let mut flip = PageFlip {
-            crtc_id: self.output.crtc_id,
-            fb_id,
-            flags: DRM_MODE_PAGE_FLIP_EVENT,
-            reserved: 0,
-            user_data: 0,
-        };
-        ioctl(self.card.fd(), ioctl_num::<PageFlip>(0xb0), &mut flip)?;
-        self.flip_pending = true;
-        Ok(())
+    /// The framebuffer that is on the screen, when a frame has been drawn.
+    fn front_fb(&self) -> Option<u32> {
+        self.has_frame.then(|| self.buffers[1 - self.back].fb_id)
     }
 
     /// Wait for an outstanding flip to complete, so the back buffer is safe
     /// to draw into again.
     fn wait_for_flip(&mut self) -> io::Result<()> {
-        if !self.flip_pending {
+        if !self.scanout.flip_pending {
             return Ok(());
         }
         let fd = self.card.fd();
@@ -754,7 +941,7 @@ impl DrmDisplay {
         // scanning out shows a torn frame, and the next flip is then rejected.
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_millis(FLIP_TIMEOUT_MS);
-        while self.flip_pending {
+        while self.scanout.flip_pending {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 break;
@@ -780,9 +967,9 @@ impl DrmDisplay {
         // A flip that never reported back leaves the compositor unsure which
         // buffer is live; the next frame falls back to a mode set, which is
         // unambiguous.
-        if self.flip_pending {
-            self.flip_pending = false;
-            self.mode_set = false;
+        if self.scanout.flip_pending {
+            self.scanout.flip_pending = false;
+            self.scanout.mode_set = false;
         }
         Ok(())
     }
@@ -804,13 +991,17 @@ impl DrmDisplay {
                     unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const EventVblank) };
                 self.last_sequence = event.sequence;
                 // The buffer that was being scanned out is now free to draw on.
-                self.flip_pending = false;
+                self.scanout.flip_pending = false;
             }
             bytes = &bytes[length..];
         }
     }
 
     /// Restore the console's original mode.
+    ///
+    /// This is also what undoes a blank on the way out: putting the console's
+    /// mode back on the CRTC is a mode set like any other, and the panel
+    /// wakes for it.
     fn restore_crtc(&mut self) {
         if self.saved_crtc.mode_valid != 0 {
             let mut connectors = [self.output.connector_id];
@@ -825,7 +1016,21 @@ impl DrmDisplay {
             crtc.y = self.saved_crtc.y;
             crtc.mode = self.saved_crtc.mode;
             crtc.mode_valid = 1;
-            let _ = ioctl(self.card.fd(), ioctl_num::<Crtc>(0xa2), &mut crtc);
+            let _ = self.card.set_crtc(&mut crtc);
+            return;
+        }
+        // There was no console mode to go back to, which on its own is what
+        // tOS has always left behind. A blanked display makes it worse: the
+        // panel would stay asleep with nothing ever waking it, and the
+        // machine would look dead rather than merely finished. Its own mode
+        // goes back on instead — over a cleared buffer, so that a session
+        // that was dark because it was locked does not flash into view on the
+        // way out.
+        if self.scanout.blanked {
+            let front = 1 - self.back;
+            self.buffers[front].clear();
+            let fb_id = self.buffers[front].fb_id;
+            let _ = self.scanout.set_crtc(&mut self.card, fb_id);
         }
     }
 }
@@ -858,19 +1063,8 @@ impl Display for DrmDisplay {
         }
 
         let fb_id = self.buffers[index].fb_id;
-        if !self.mode_set {
-            self.set_crtc(fb_id)?;
-            self.mode_set = true;
-        } else if let Err(e) = self.page_flip(fb_id) {
-            // Some drivers reject flips while the CRTC is being reconfigured;
-            // falling back to a mode set keeps the screen updating.
-            if e.raw_os_error() == Some(libc::EBUSY) || e.raw_os_error() == Some(libc::EINVAL) {
-                self.set_crtc(fb_id)?;
-                self.flip_pending = false;
-            } else {
-                return Err(e);
-            }
-        }
+        self.scanout.present(&mut self.card, fb_id)?;
+        self.has_frame = true;
         self.back = 1 - index;
         Ok(())
     }
@@ -882,13 +1076,30 @@ impl Display for DrmDisplay {
     }
 
     fn release(&mut self) -> io::Result<()> {
+        // A blanked display is released as it stands. There is no point
+        // turning the CRTC back on for whoever is taking over — they set
+        // their own mode — and the blank is remembered so that coming back
+        // does not hand the session's screen to the user unasked.
         self.card.drop_master()
     }
 
     fn restore(&mut self) -> io::Result<()> {
         self.card.set_master()?;
-        self.mode_set = false;
-        Ok(())
+        self.scanout.reacquired(&mut self.card)
+    }
+
+    fn blank(&mut self, blank: bool) -> io::Result<()> {
+        if blank {
+            // A flip already in the kernel's queue is against a framebuffer
+            // the CRTC is about to stop scanning out. Collecting its event
+            // here, while the screen is still on, is what keeps the buffer
+            // bookkeeping straight: left until after the blank it would turn
+            // up mixed in with whatever wakes the screen again, and the
+            // compositor would draw over a frame it thinks has been shown.
+            self.wait_for_flip()?;
+        }
+        let front = self.front_fb();
+        self.scanout.blank(&mut self.card, blank, front)
     }
 
     fn name(&self) -> String {
@@ -984,5 +1195,286 @@ mod tests {
             m.name[i] = *b as libc::c_char;
         }
         assert_eq!(m.name(), "1920x1080");
+    }
+
+    /// A card that writes down what it was asked to do instead of doing it,
+    /// the way `tos-system`'s bluetooth tests record HCI calls.
+    ///
+    /// It also enforces the one rule the kernel applies to these requests, so
+    /// that a mode set built wrong fails here rather than on hardware nobody
+    /// runs the tests on.
+    #[derive(Default)]
+    struct Recorder {
+        actions: Vec<String>,
+        /// An errno for `page_flip` to answer with, for the drivers that
+        /// refuse a flip.
+        flip_error: Option<i32>,
+    }
+
+    impl Recorder {
+        fn new() -> Recorder {
+            Recorder::default()
+        }
+
+        fn refusing_flips(errno: i32) -> Recorder {
+            Recorder {
+                flip_error: Some(errno),
+                ..Recorder::default()
+            }
+        }
+    }
+
+    impl Control for Recorder {
+        fn set_crtc(&mut self, request: &mut Crtc) -> io::Result<()> {
+            if request.mode_valid == 0 {
+                self.actions.push(format!(
+                    "disable crtc {} fb {} mode_valid {} connectors {}",
+                    request.crtc_id, request.fb_id, request.mode_valid, request.count_connectors
+                ));
+                // drm_mode_setcrtc refuses connectors it has been given no
+                // mode to drive, and refuses a mode with no framebuffer.
+                if request.count_connectors != 0 || request.fb_id != 0 {
+                    return Err(io::Error::from_raw_os_error(libc::EINVAL));
+                }
+                return Ok(());
+            }
+            self.actions.push(format!(
+                "set crtc {} fb {} mode {}x{} connectors {}",
+                request.crtc_id,
+                request.fb_id,
+                request.mode.hdisplay,
+                request.mode.vdisplay,
+                request.count_connectors
+            ));
+            if request.fb_id == 0 || request.count_connectors == 0 {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            Ok(())
+        }
+
+        fn page_flip(&mut self, request: &mut PageFlip) -> io::Result<()> {
+            self.actions.push(format!(
+                "flip crtc {} fb {}",
+                request.crtc_id, request.fb_id
+            ));
+            match self.flip_error {
+                Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn scanout() -> Scanout {
+        let output = ConnectedOutput {
+            connector_id: 42,
+            encoder_id: 3,
+            crtc_id: 7,
+            modes: vec![mode(1920, 1080, true)],
+            mm_width: 300,
+            mm_height: 200,
+        };
+        Scanout::new(&output, output.best_mode().unwrap())
+    }
+
+    /// A display showing something, which is the state blanking starts from.
+    fn showing(card: &mut Recorder) -> Scanout {
+        let mut scanout = scanout();
+        scanout.present(card, 10).expect("the first frame");
+        card.actions.clear();
+        scanout
+    }
+
+    #[test]
+    fn blanking_disables_the_crtc() {
+        let mut card = Recorder::new();
+        let mut scanout = showing(&mut card);
+        scanout.blank(&mut card, true, Some(10)).expect("blanking");
+        // No framebuffer, no mode and no connectors: the three together are
+        // the whole of how a CRTC is switched off.
+        assert_eq!(
+            card.actions,
+            vec!["disable crtc 7 fb 0 mode_valid 0 connectors 0"]
+        );
+        assert!(scanout.blanked);
+    }
+
+    #[test]
+    fn blanking_uses_the_ioctl_a_mode_set_already_uses() {
+        // The alternative was the connector's DPMS property, which would need
+        // DRM_IOCTL_MODE_OBJ_SETPROPERTY and a search for the property by
+        // name. Nothing here may reach for an ioctl that mode setting does
+        // not already speak.
+        let mut card = Recorder::new();
+        let mut scanout = showing(&mut card);
+        scanout.blank(&mut card, true, Some(10)).expect("blanking");
+        assert!(card.actions.iter().all(|a| a.starts_with("disable crtc")));
+    }
+
+    #[test]
+    fn blanking_twice_asks_the_kernel_once() {
+        let mut card = Recorder::new();
+        let mut scanout = showing(&mut card);
+        scanout.blank(&mut card, true, Some(10)).expect("blanking");
+        scanout.blank(&mut card, true, Some(10)).expect("again");
+        assert_eq!(card.actions.len(), 1);
+    }
+
+    #[test]
+    fn a_frame_drawn_while_blanked_stays_off_the_screen() {
+        // The compositor goes on rendering behind a blank — a pane that
+        // prints while nobody is looking is still a frame — and none of it
+        // may reach the CRTC, or the panel lights up on its own.
+        let mut card = Recorder::new();
+        let mut scanout = showing(&mut card);
+        scanout.blank(&mut card, true, Some(10)).expect("blanking");
+        card.actions.clear();
+        scanout
+            .present(&mut card, 11)
+            .expect("a frame while blanked");
+        assert!(card.actions.is_empty());
+    }
+
+    #[test]
+    fn unblanking_puts_the_last_frame_back_without_waiting_for_a_new_one() {
+        // The compositor only draws when something changed, and waking a
+        // screen changes nothing. Leaving the mode set to the next frame
+        // would leave the display dark until the user typed.
+        let mut card = Recorder::new();
+        let mut scanout = showing(&mut card);
+        scanout.blank(&mut card, true, Some(11)).expect("blanking");
+        card.actions.clear();
+        scanout
+            .blank(&mut card, false, Some(11))
+            .expect("unblanking");
+        assert_eq!(
+            card.actions,
+            vec!["set crtc 7 fb 11 mode 1920x1080 connectors 1"]
+        );
+        assert!(!scanout.blanked);
+        assert!(scanout.mode_set);
+    }
+
+    #[test]
+    fn coming_back_from_a_blank_is_a_mode_set_and_never_a_flip() {
+        // The CRTC has no mode at all while it is off, so there is nothing
+        // for a page flip to flip against; the kernel would reject one.
+        let mut card = Recorder::new();
+        let mut scanout = showing(&mut card);
+        assert!(scanout.mode_set);
+        scanout.blank(&mut card, true, Some(10)).expect("blanking");
+        assert!(!scanout.mode_set);
+        card.actions.clear();
+        scanout
+            .present(&mut card, 11)
+            .expect("a frame is not enough");
+        // Still blanked, so nothing happened; unblanking is what brings it
+        // back, and it comes back as a mode set.
+        assert!(card.actions.is_empty());
+        scanout
+            .blank(&mut card, false, Some(11))
+            .expect("unblanking");
+        assert!(card.actions[0].starts_with("set crtc"));
+    }
+
+    #[test]
+    fn unblanking_before_the_first_frame_leaves_the_mode_to_that_frame() {
+        // Nothing has been drawn, so there is no framebuffer to put on the
+        // screen and nothing to show even if there were.
+        let mut card = Recorder::new();
+        let mut scanout = scanout();
+        scanout.blank(&mut card, true, None).expect("blanking");
+        card.actions.clear();
+        scanout.blank(&mut card, false, None).expect("unblanking");
+        assert!(card.actions.is_empty());
+        assert!(!scanout.mode_set);
+        scanout.present(&mut card, 10).expect("the first frame");
+        assert_eq!(
+            card.actions,
+            vec!["set crtc 7 fb 10 mode 1920x1080 connectors 1"]
+        );
+    }
+
+    #[test]
+    fn a_flip_in_flight_is_not_left_pending_across_a_blank() {
+        // The flip's event is collected before the CRTC goes off. A flag left
+        // standing would have the next frame poll for an event that has
+        // already been read, and give up on the buffer after the timeout.
+        let mut card = Recorder::new();
+        let mut scanout = showing(&mut card);
+        scanout
+            .present(&mut card, 11)
+            .expect("a second frame flips");
+        assert!(scanout.flip_pending);
+        scanout.blank(&mut card, true, Some(11)).expect("blanking");
+        assert!(!scanout.flip_pending);
+    }
+
+    #[test]
+    fn coming_back_from_a_vt_switch_while_blanked_blanks_again() {
+        // The other terminal set its own mode on the way past, so the CRTC is
+        // showing its screen. A blanked session will not draw a frame to
+        // cover that, and it is the session's screen the user must not see.
+        let mut card = Recorder::new();
+        let mut scanout = showing(&mut card);
+        scanout.blank(&mut card, true, Some(10)).expect("blanking");
+        card.actions.clear();
+        scanout.reacquired(&mut card).expect("coming back");
+        assert_eq!(
+            card.actions,
+            vec!["disable crtc 7 fb 0 mode_valid 0 connectors 0"]
+        );
+    }
+
+    #[test]
+    fn coming_back_from_a_vt_switch_unblanked_waits_for_the_next_frame() {
+        let mut card = Recorder::new();
+        let mut scanout = showing(&mut card);
+        scanout.reacquired(&mut card).expect("coming back");
+        assert!(card.actions.is_empty());
+        // And that frame is a mode set, because the mode on the CRTC is
+        // whoever had it last.
+        assert!(!scanout.mode_set);
+    }
+
+    #[test]
+    fn a_blank_that_the_kernel_refuses_is_not_recorded_as_dark() {
+        // Remembering a lit screen as blanked would make unblanking a no-op,
+        // and the screen would never be turned off or back on again.
+        struct Refusing;
+        impl Control for Refusing {
+            fn set_crtc(&mut self, _: &mut Crtc) -> io::Result<()> {
+                Err(io::Error::from_raw_os_error(libc::EACCES))
+            }
+            fn page_flip(&mut self, _: &mut PageFlip) -> io::Result<()> {
+                Err(io::Error::from_raw_os_error(libc::EACCES))
+            }
+        }
+        let mut scanout = scanout();
+        scanout.mode_set = true;
+        assert!(scanout.blank(&mut Refusing, true, Some(10)).is_err());
+        assert!(!scanout.blanked);
+    }
+
+    #[test]
+    fn an_ordinary_frame_still_flips() {
+        let mut card = Recorder::new();
+        let mut scanout = showing(&mut card);
+        scanout.present(&mut card, 11).expect("a second frame");
+        assert_eq!(card.actions, vec!["flip crtc 7 fb 11"]);
+    }
+
+    #[test]
+    fn a_refused_flip_still_falls_back_to_a_mode_set() {
+        let mut card = Recorder::refusing_flips(libc::EBUSY);
+        let mut scanout = showing(&mut card);
+        scanout.present(&mut card, 11).expect("a second frame");
+        assert_eq!(
+            card.actions,
+            vec![
+                "flip crtc 7 fb 11",
+                "set crtc 7 fb 11 mode 1920x1080 connectors 1"
+            ]
+        );
+        assert!(!scanout.flip_pending);
     }
 }
