@@ -1,0 +1,10 @@
+[package]
+name = "tos-crypt"
+description = "Password hashing for tOS: SHA-512 and the $6$ crypt scheme on top of it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

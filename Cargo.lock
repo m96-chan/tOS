@@ -47,6 +47,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tos-crypt"
+version = "0.0.4"
+
+[[package]]
 name = "tos-font"
 version = "0.0.4"
 dependencies = [

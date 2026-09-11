@@ -746,6 +746,7 @@ tOS/
 ├── iso/                 bootable image and its initramfs
 └── compositor/
     ├── tos-term/        terminal model: cells, grid, VT parser, graphics
+    ├── tos-crypt/       SHA-512 and the $6$ crypt scheme, for passwords
     ├── tos-font/        glyph engine: bitmap face, box drawing, TrueType
     ├── tos-render/      CPU renderer: surfaces, grid painting
     ├── tos-pty/         pseudoterminals

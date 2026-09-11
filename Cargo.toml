@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "compositor/tos-term",
+    "compositor/tos-crypt",
     "compositor/tos-font",
     "compositor/tos-render",
     "compositor/tos-pty",
@@ -22,6 +23,7 @@ repository = "https://github.com/m96-chan/tOS"
 
 [workspace.dependencies]
 tos-term = { path = "compositor/tos-term" }
+tos-crypt = { path = "compositor/tos-crypt" }
 tos-font = { path = "compositor/tos-font" }
 tos-render = { path = "compositor/tos-render" }
 tos-pty = { path = "compositor/tos-pty" }
