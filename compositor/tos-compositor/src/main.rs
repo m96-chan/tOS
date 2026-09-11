@@ -228,6 +228,15 @@ fn run_drm(config: Config) -> io::Result<()> {
     // keyboard and no chance to put it back.
     let mut vt = VirtualTerminal::current().ok();
     if let Some(vt) = vt.as_mut() {
+        // Clear `vt_dont_switch` before anything else, whoever set it. The
+        // kernel does not clear it when the process that took it dies — that
+        // was measured, in `docs/design/vt-lockswitch.md` — so a machine whose
+        // terminals cannot be switched stays that way until something calls
+        // this. tOS never takes the flag, and an installed system respawns
+        // `tos` from `/etc/inittab`, so one ioctl here turns a stuck flag into
+        // something a restart undoes. Failing means this is not a console or
+        // tOS lacks CAP_SYS_TTY_CONFIG, and neither is worth a word about.
+        let _ = vt.unlock_switching();
         let armed = tos_platform::install_switch_handlers(libc::SIGUSR1, libc::SIGUSR2)
             .and_then(|()| vt.take_over(libc::SIGUSR1, libc::SIGUSR2));
         if let Err(e) = armed {

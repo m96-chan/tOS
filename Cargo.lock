@@ -37,6 +37,7 @@ name = "tos-compositor"
 version = "0.0.4"
 dependencies = [
  "libc",
+ "tos-crypt",
  "tos-font",
  "tos-input",
  "tos-platform",

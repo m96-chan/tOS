@@ -93,6 +93,15 @@ pub struct Config {
     pub palette: Palette,
     /// The colours the compositor paints its own dividers and bars with.
     pub chrome: Chrome,
+    /// The file the screen lock checks a password against.
+    ///
+    /// A seam rather than a constant so that a test can point the whole state
+    /// machine at a credential it wrote itself. Deliberately not a command
+    /// line flag and not a configuration file setting: which file holds the
+    /// password is not a preference, and a session that could be told to
+    /// unlock against a file of the user's choosing would be a lock with a
+    /// spare key printed on it.
+    pub credential: PathBuf,
 }
 
 impl Default for Config {
@@ -115,6 +124,7 @@ impl Default for Config {
             warmup_frames: 1,
             palette: Palette::new(),
             chrome: Chrome::default(),
+            credential: PathBuf::from(crate::lock::CREDENTIAL_PATH),
         }
     }
 }

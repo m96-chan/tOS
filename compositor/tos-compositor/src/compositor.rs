@@ -21,6 +21,7 @@ use tos_term::TermEvent;
 use crate::chrome::{self, Chrome, StatusItem};
 use crate::config::Config;
 use crate::launcher;
+use crate::lock::{self, LockOutcome, LockScreen};
 use crate::notify::{self, Chosen, Notifications};
 use crate::overlay::{Overlay, OverlayItem, OverlayOutcome};
 use crate::pane::Pane;
@@ -94,6 +95,16 @@ pub struct Compositor {
     notifications: Notifications,
     /// The open menu, if any. While it is open it owns the keyboard.
     overlay: Option<(OverlayKind, Overlay)>,
+    /// The lock screen, if the session is locked. While it is up it owns the
+    /// input — every kind of it, not only the keys — and the screen shows
+    /// nothing of the session.
+    lock: Option<LockScreen>,
+    /// The last pane died while the screen was locked.
+    ///
+    /// Ending the session is a way out of a locked screen, so a locked one
+    /// cannot be allowed to take it. The session ends when the password is
+    /// accepted instead.
+    session_ended_while_locked: bool,
     needs_full_redraw: bool,
     running: bool,
     /// Pointer position in pixels, for mouse routing.
@@ -126,6 +137,8 @@ impl Compositor {
             last_blink: Instant::now(),
             notifications: Notifications::new(),
             overlay: None,
+            lock: None,
+            session_ended_while_locked: false,
             needs_full_redraw: true,
             running: true,
             pointer: (0, 0),
@@ -367,6 +380,17 @@ impl Compositor {
 
     /// Handle one input event. Returns true when something needs repainting.
     pub fn handle_input(&mut self, event: InputEvent) -> bool {
+        // The gate is here and not in `handle_key`, which is where an overlay
+        // puts its own. An overlay owns the keyboard; a lock has to own the
+        // input, and the two are not the same thing: `Mouse`, `Pointer` and
+        // `Paste` are routed below without ever passing through `handle_key`.
+        // A lock gated one level down would let a middle click paste the
+        // primary selection into a shell, let a drag select and copy what is
+        // on screen, and let the host terminal's bracketed paste type for the
+        // person who is not there.
+        if self.lock.is_some() {
+            return self.locked_input(event);
+        }
         match event {
             InputEvent::Key(key) => self.handle_key(key),
             // A host terminal reports cells; a device reports pixels. The two
@@ -397,6 +421,30 @@ impl Compositor {
             }
             InputEvent::FocusGained => self.forward_focus(true),
             InputEvent::FocusLost => self.forward_focus(false),
+        }
+    }
+
+    /// Everything that arrives while the screen is locked.
+    ///
+    /// One rule with no exceptions: a key goes to the lock, and nothing else
+    /// goes anywhere. Focus notifications are dropped along with the rest —
+    /// telling a pane it has the focus is still writing to a pane on behalf of
+    /// somebody who has not proved who they are, and an exception is how a
+    /// gate stops being one.
+    fn locked_input(&mut self, event: InputEvent) -> bool {
+        let InputEvent::Key(key) = event else {
+            return false;
+        };
+        let Some(lock) = &mut self.lock else {
+            return false;
+        };
+        match lock.handle_key(&key, Instant::now()) {
+            LockOutcome::Consumed => false,
+            LockOutcome::Changed => true,
+            LockOutcome::Unlocked => {
+                self.unlock();
+                true
+            }
         }
     }
 
@@ -849,10 +897,70 @@ impl Compositor {
                 self.needs_full_redraw = true;
                 true
             }
+            Action::Lock => self.lock_session(),
             Action::Quit => {
                 self.running = false;
                 true
             }
+        }
+    }
+
+    // ---- the lock -------------------------------------------------------
+
+    /// Put the lock screen up, or say why there is no lock to put up.
+    ///
+    /// Public because the binding is not the only way in: an idle deadline
+    /// reaches the same state machine, and a test reaches it without
+    /// synthesising a keypress.
+    ///
+    /// The credential is read here rather than when a password is offered, so
+    /// that a machine with no password never gets a locked screen at all. That
+    /// one rule is the whole of what makes the live ISO behave: nothing in the
+    /// compositor knows what live media is, only that this machine was never
+    /// given a password to unlock with.
+    pub fn lock_session(&mut self) -> bool {
+        if self.lock.is_some() {
+            return false;
+        }
+        match lock::read_credential(&self.config.credential) {
+            Ok(hash) => {
+                // A half-pressed leader and a drag in progress both belong to
+                // the person who was here before; neither should still be
+                // going when the session comes back.
+                self.keymap.cancel_pending();
+                self.release_grab();
+                self.lock = Some(LockScreen::new(hash));
+                self.needs_full_redraw = true;
+                true
+            }
+            Err(why) => {
+                self.notifications.status(format!("cannot lock: {why}"));
+                true
+            }
+        }
+    }
+
+    /// Whether the session is locked, which the DRM loop asks before it agrees
+    /// to a VT switch and before it lets go of the display.
+    pub fn is_locked(&self) -> bool {
+        self.lock.is_some()
+    }
+
+    pub fn lock_screen(&self) -> Option<&LockScreen> {
+        self.lock.as_ref()
+    }
+
+    /// The one way out, and there is no other.
+    fn unlock(&mut self) {
+        self.lock = None;
+        // Nothing under the lock was drawn while it was up, and the damage
+        // that would have said what to repaint was thrown away with each
+        // locked frame. The whole screen is the only honest answer.
+        self.needs_full_redraw = true;
+        // A pane that died while the screen was locked could not be allowed to
+        // end the session then. It ends it now.
+        if self.session_ended_while_locked {
+            self.running = false;
         }
     }
 
@@ -1042,7 +1150,16 @@ impl Compositor {
         if closed.is_empty() {
             // The session refused, which means this was the final pane.
             self.panes.remove(&id);
-            self.running = false;
+            // Quitting is a way out of a locked screen, and a program exiting
+            // is a way to quit that does not go through a binding: a shell
+            // that reaches its end of file while nobody is there would
+            // otherwise hand the machine back. The session is over, but it
+            // does not end until somebody says who they are.
+            if self.lock.is_some() {
+                self.session_ended_while_locked = true;
+            } else {
+                self.running = false;
+            }
             return;
         }
         for pane in closed {
@@ -1082,7 +1199,11 @@ impl Compositor {
         // A notification only spends its time on screen while it is on screen:
         // the leader indicator has the slot while the leader is armed, and one
         // shown there instead would be one nobody read.
-        if !self.keymap.is_pending() && self.notifications.advance(now) {
+        // A locked screen draws no status bar and no banner, so a message
+        // that spent its time there would have spent it unread. The queue
+        // stands still until the session comes back, which is the same reason
+        // the leader indicator holds it: time on screen means on screen.
+        if self.lock.is_none() && !self.keymap.is_pending() && self.notifications.advance(now) {
             // Without a status bar the notification is a banner over the panes,
             // and the cells it covered are only repainted on damage they have
             // not got. Retiring it has to uncover them.
@@ -1103,6 +1224,10 @@ impl Compositor {
 
     /// Paint a frame.
     pub fn render_frame(&mut self, surface: &mut Surface<'_>, retained: bool) {
+        if self.lock.is_some() {
+            self.render_locked(surface);
+            return;
+        }
         let force = self.needs_full_redraw || !retained;
         let (cw, ch) = self.cell_size();
         let area = self.grid_area();
@@ -1215,6 +1340,35 @@ impl Compositor {
             if !skipped {
                 pane.terminal.clear_damage();
             }
+        }
+        self.needs_full_redraw = false;
+    }
+
+    /// Paint a locked frame: the lock, and nothing else at all.
+    ///
+    /// The panes, the dividers, the status bar, the notification banner and
+    /// any open menu are all skipped rather than painted over. Painting over
+    /// is not erasing: a frame that is not a full redraw only repaints the
+    /// cells a pane marked as damaged, so a box drawn on top of a session
+    /// leaves every undamaged cell of that session exactly where it was, and
+    /// the status bar underneath it goes on saying what the panes are called.
+    ///
+    /// The clear happens on every locked frame and not only the first, because
+    /// a display with two buffers hands out the other one next time and a
+    /// clear that ran once cleared one of them.
+    fn render_locked(&mut self, surface: &mut Surface<'_>) {
+        surface.clear(self.chrome.background);
+        let area = PixelRect::new(0, 0, self.size.0, self.size.1);
+        if let Some(lock) = &self.lock {
+            lock.draw(surface, &mut self.fonts, area, &self.chrome, Instant::now());
+        }
+        // The panes are still running and still marking damage nobody is
+        // drawing. Dropping it is what lets the loop idle instead of finding
+        // work outstanding on every pass, and nothing is lost by it: unlocking
+        // asks for a full redraw, which repaints every cell whatever the
+        // damage says.
+        for pane in self.panes.values_mut() {
+            pane.terminal.clear_damage();
         }
         self.needs_full_redraw = false;
     }
@@ -2163,6 +2317,284 @@ mod tests {
             .terminal
             .advance_animations(due));
         assert!(compositor.needs_render());
+    }
+
+    // ---- the lock -------------------------------------------------------
+
+    /// A credential file of this test's own making, so that nothing here
+    /// depends on whether the machine running it has a password of its own.
+    /// The password is always "tos"; what varies is whether the file is there.
+    fn credential(name: &str, password: Option<&str>) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tos-lock-compositor-{}-{name}", std::process::id()));
+        match password {
+            Some(password) => {
+                let hash = tos_crypt::sha512crypt::hash(password.as_bytes(), b"tOScompositor");
+                std::fs::write(&path, format!("{hash}\n")).expect("credential file");
+            }
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        path
+    }
+
+    fn compositor_with_password(name: &str) -> Compositor {
+        compositor_with(Config {
+            credential: credential(name, Some("tos")),
+            ..Config::default()
+        })
+    }
+
+    /// Type a password into the lock and press enter.
+    fn answer(compositor: &mut Compositor, password: &str) {
+        type_into_overlay(compositor, password);
+        press_key(compositor, KeyCode::Enter, tos_input::Modifiers::NONE);
+    }
+
+    fn lock_binding(compositor: &mut Compositor) -> bool {
+        press_key(
+            compositor,
+            KeyCode::Char('l'),
+            tos_input::Modifiers::SUPER.union(tos_input::Modifiers::SHIFT),
+        )
+    }
+
+    #[test]
+    fn the_binding_locks_and_the_password_unlocks() {
+        let mut compositor = compositor_with_password("roundtrip");
+        assert!(lock_binding(&mut compositor));
+        assert!(compositor.is_locked());
+        answer(&mut compositor, "tos");
+        assert!(!compositor.is_locked());
+        assert!(compositor.is_running(), "unlocking is not quitting");
+    }
+
+    #[test]
+    fn a_wrong_password_leaves_the_screen_locked() {
+        let mut compositor = compositor_with_password("wrong");
+        compositor.lock_session();
+        answer(&mut compositor, "not it");
+        assert!(compositor.is_locked());
+        assert_eq!(compositor.lock_screen().unwrap().attempts(), 1);
+        // And the field is empty again, ready to be retyped.
+        assert_eq!(compositor.lock_screen().unwrap().typed_len(), 0);
+    }
+
+    #[test]
+    fn with_no_credential_the_lock_refuses_and_says_why() {
+        // The live ISO, and an installed machine whose owner declined a
+        // password. The compositor never asks what kind of machine it is on.
+        let mut compositor = compositor_with(Config {
+            credential: credential("none", None),
+            ..Config::default()
+        });
+        assert!(lock_binding(&mut compositor));
+        assert!(
+            !compositor.is_locked(),
+            "locked with nothing to unlock with"
+        );
+        let said = compositor.notifications.status_line().unwrap_or_default();
+        assert!(
+            said.starts_with("cannot lock: no password is set"),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_credential_that_does_not_parse_is_not_a_wrong_password() {
+        // It is a refusal to engage. Treating it as a wrong password would
+        // put up a screen that could never be opened.
+        let path = credential("yescrypt", None);
+        std::fs::write(&path, "$y$j9T$salt$digest\n").expect("credential file");
+        let mut compositor = compositor_with(Config {
+            credential: path,
+            ..Config::default()
+        });
+        compositor.lock_session();
+        assert!(!compositor.is_locked());
+        let said = compositor.notifications.status_line().unwrap_or_default();
+        assert!(said.contains("not a password tOS can check"), "{said:?}");
+    }
+
+    #[test]
+    fn no_binding_fires_while_the_screen_is_locked() {
+        let mut compositor = compositor_with_password("bindings");
+        compositor.lock_session();
+        for (code, modifiers) in [
+            (KeyCode::Char('d'), tos_input::Modifiers::SUPER),
+            (KeyCode::Char('q'), tos_input::Modifiers::SUPER),
+            (KeyCode::Char('x'), tos_input::Modifiers::SUPER),
+            (
+                KeyCode::Enter,
+                tos_input::Modifiers::CTRL.union(tos_input::Modifiers::SHIFT),
+            ),
+        ] {
+            press_key(&mut compositor, code, modifiers);
+        }
+        assert_eq!(compositor.panes.len(), 1, "a binding fired under the lock");
+        assert!(compositor.is_running(), "super+q quit a locked session");
+        assert!(compositor.is_locked());
+    }
+
+    #[test]
+    fn the_leader_cannot_reach_a_binding_while_locked() {
+        let mut compositor = compositor_with_password("leader");
+        compositor.lock_session();
+        press_key(
+            &mut compositor,
+            KeyCode::Char('a'),
+            tos_input::Modifiers::CTRL,
+        );
+        assert!(
+            !compositor.keymap.is_pending(),
+            "the leader armed under the lock"
+        );
+        press_key(
+            &mut compositor,
+            KeyCode::Char('q'),
+            tos_input::Modifiers::NONE,
+        );
+        assert!(compositor.is_running());
+    }
+
+    #[test]
+    fn nothing_typed_at_the_lock_reaches_a_pane() {
+        let mut compositor = compositor_with_password("typing");
+        compositor.lock_session();
+        type_into_overlay(&mut compositor, "tos");
+        let focus = compositor.session.focus();
+        assert_eq!(compositor.pane(focus).unwrap().pending_input(), 0);
+    }
+
+    /// The events `handle_key` would never have seen: routed straight through
+    /// `handle_input`, which is why the gate has to be there and not one level
+    /// further in.
+    #[test]
+    fn the_lock_gates_the_mouse_the_pointer_and_the_paste() {
+        let mut compositor = compositor_with_password("input");
+        compositor
+            .clipboard
+            .insert(PRIMARY, b"a command\n".to_vec());
+        compositor
+            .clipboard
+            .insert(CLIPBOARD, b"another command\n".to_vec());
+        compositor.lock_session();
+        let focus = compositor.session.focus();
+
+        // A middle click pastes primary into the focused pane when the screen
+        // is not locked, and it never passes through `handle_key` at all.
+        compositor.handle_input(InputEvent::Mouse(MouseEvent {
+            button: Some(MouseButton::Middle),
+            action: MouseAction::Press,
+            col: 2,
+            row: 2,
+            modifiers: tos_input::Modifiers::NONE,
+        }));
+        // A pointer press and drag, which is how the mouse selects and copies
+        // whatever is on the screen it is not supposed to be able to read.
+        for (action, y) in [(MouseAction::Press, 20.0), (MouseAction::Drag, 60.0)] {
+            compositor.handle_input(InputEvent::Pointer(tos_input::PointerEvent {
+                x: 20.0,
+                y,
+                button: Some(MouseButton::Left),
+                action,
+                modifiers: tos_input::Modifiers::NONE,
+            }));
+        }
+        // And a bracketed paste, which is how a host terminal types.
+        compositor.handle_input(InputEvent::Paste("a pasted command\n".into()));
+        // Focus notifications are input too.
+        compositor.handle_input(InputEvent::FocusGained);
+
+        assert!(compositor.is_locked());
+        let pane = compositor.pane(focus).unwrap();
+        assert_eq!(
+            pane.pending_input(),
+            0,
+            "input reached the pane under the lock"
+        );
+        assert!(
+            pane.selection.is_none(),
+            "the mouse selected under the lock"
+        );
+        assert!(!pane.selecting);
+        assert!(compositor.mouse_grab.is_none());
+    }
+
+    #[test]
+    fn the_last_pane_dying_while_locked_does_not_end_the_session() {
+        // A shell reaching its end of file is a way out of a locked screen
+        // that does not go through a binding at all.
+        let mut compositor = compositor_with_password("lastpane");
+        compositor.lock_session();
+        let focus = compositor.session.focus();
+        compositor.close_pane(focus);
+        assert!(compositor.is_running(), "the session ended under the lock");
+        assert!(compositor.is_locked());
+        // It ends when somebody has said who they are, and not before.
+        answer(&mut compositor, "tos");
+        assert!(!compositor.is_locked());
+        assert!(!compositor.is_running());
+    }
+
+    #[test]
+    fn resizing_the_display_while_locked_keeps_the_lock() {
+        let mut compositor = compositor_with_password("resize");
+        compositor.lock_session();
+        compositor.resize((320, 240));
+        assert!(compositor.is_locked());
+        // Even down to a display with no room to draw the box in, which is
+        // the one direction the lock is allowed to fail in: it stops being
+        // legible, and it does not stop being a lock.
+        compositor.resize((32, 24));
+        let mut framebuffer = tos_render::OwnedFramebuffer::new(32, 24);
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, false);
+        }
+        assert!(compositor.is_locked());
+        answer(&mut compositor, "tos");
+        assert!(!compositor.is_locked());
+    }
+
+    #[test]
+    fn a_notification_raised_while_locked_waits_instead_of_being_shown() {
+        let mut compositor = compositor_with_password("notify");
+        compositor.lock_session();
+        let focus = compositor.session.focus();
+        notify_from(&mut compositor, focus, "the build finished");
+        // Nothing is drawn, so nothing spends its time on screen: the queue
+        // stands still, and the message is still there afterwards.
+        for _ in 0..4 {
+            compositor.tick();
+        }
+        assert!(compositor.is_locked());
+        answer(&mut compositor, "tos");
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("pane 1: the build finished")
+        );
+    }
+
+    #[test]
+    fn unlocking_asks_for_the_whole_screen_back() {
+        let mut compositor = compositor_with_password("redraw");
+        compositor.lock_session();
+        let mut framebuffer = tos_render::OwnedFramebuffer::new(640, 360);
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, true);
+        }
+        assert!(
+            !compositor.needs_full_redraw,
+            "a locked frame leaves nothing outstanding"
+        );
+        answer(&mut compositor, "tos");
+        assert!(
+            compositor.needs_full_redraw,
+            "the session came back on damage that was thrown away"
+        );
     }
 
     #[test]

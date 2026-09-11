@@ -228,6 +228,16 @@ impl VirtualTerminal {
     }
 
     /// Switch to another virtual terminal.
+    ///
+    /// Two things this cannot tell the caller, both measured in
+    /// `docs/design/vt-lockswitch.md`. `VT_ACTIVATE` returns zero whether or
+    /// not the console moved — the kernel throws away `set_console`'s result —
+    /// so success here means the ioctl was accepted and nothing more; reading
+    /// `VT_GETSTATE` afterwards is the only way to know. And `VT_WAITACTIVE`
+    /// never returns while `vt_dont_switch` is set, so this blocks for good on
+    /// a machine where something took `VT_LOCKSWITCH` and did not give it
+    /// back. Nothing in tOS calls this yet, and nothing should call it
+    /// without having cleared that flag first, which `tos` does at startup.
     pub fn activate(&self, number: u16) -> io::Result<()> {
         ioctl_value(self.fd, VT_ACTIVATE, number as libc::c_long)?;
         ioctl_value(self.fd, VT_WAITACTIVE, number as libc::c_long)

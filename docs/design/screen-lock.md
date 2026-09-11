@@ -535,3 +535,178 @@ image, and a decision nobody has made for an installed one. Neither is a bug
 in the lock; both are the reason a lock needs its limits written down. Decide
 each for the installed system, leave the live image as it is, and record the
 result next to the design. Labels: `design`, `security`, `area:iso`.
+
+---
+
+## What building #50 settled
+
+The state machine and its screen landed on branch `lock-screen`. The shape is
+the one above; these are the questions the shape did not answer, recorded here
+because each of them is a decision rather than a detail.
+
+### The binding is `super+shift+l`
+
+One row in the table, which registers it as `super+shift+l` and as `leader`
+then `L` for free. Not `super+l`: `l` is already "move focus right", because
+that is what `l` does in vi, and taking it would be trading a key people use
+every minute for one they use twice a day. Shift and the `l` key keeps the L
+that every other desktop locks with.
+
+### The gate is at the top of `handle_input`, and it catches three things
+
+`handle_key` is where an overlay takes the keyboard, and it is the wrong place
+for a lock by three events: `Mouse`, `Pointer` and `Paste` are all routed in
+`handle_input` without ever passing through it. A lock gated one level further
+in would let a middle click paste the primary selection straight into the
+focused pane's shell, let a press and drag select and copy whatever is on the
+screen it is meant to be hiding, and let a host terminal's bracketed paste type
+for the person who is not there. `FocusGained` and `FocusLost` are gated with
+the rest rather than excepted: telling a pane it has the focus is still writing
+to a pane on behalf of somebody who has not said who they are, and an exception
+is how a gate stops being one.
+
+Two pieces of state are put down when the lock engages, because both belong to
+the person who was there before it: a half-armed leader key is cancelled, and a
+mouse grab in progress is released so that a drag cannot resume across the lock.
+
+### What the screen shows, and how it erases
+
+The locked frame draws the lock and nothing else. The panes, the dividers, the
+status bar, the notification banner and any open menu are skipped rather than
+painted over, for the reason the design gives: a frame where `force` is false
+repaints only the cells a pane marked as damaged, so a box painted on top of a
+session leaves the whole of the rest of that session where it was, status bar
+and pane titles included.
+
+The clear runs on **every** locked frame and not only on the first. A DRM
+display has two buffers and hands out the one it is not scanning out, so a
+clear that ran once cleared one of them and the next flip would put the session
+back on the screen. `tests/lock.rs` renders into two framebuffers in turn to
+say so.
+
+A screen too small to draw the box in is still locked; it simply has nowhere to
+say so. That is the one direction the drawing is allowed to fail in, and it is
+tested: legibility is not what makes a lock a lock.
+
+### A wrong password: what is shown, and what is waited
+
+The field clears, the box does not move, and the message line under it changes
+from "type your password and press enter" to "wrong password". The box keeps
+its height either way, so that getting it wrong cannot shift the field out from
+under the cursor at the worst possible moment.
+
+**Rejection is rate limited, and the limit is on checking rather than on
+typing.** A `$6$` verification is about five milliseconds, so an unthrottled
+prompt is a couple of hundred guesses a second at the keyboard of a machine
+somebody has walked up to. After a wrong password the lock will not look at
+another for a second, then two, then four, then eight, and no longer than
+eight. Doubling makes guessing expensive quickly; the cap is there because the
+person being kept waiting is overwhelmingly the owner who mistyped, and a
+punishment that grows without limit is one that has stopped being able to tell
+the two apart. The countdown is shown in whole seconds, and the frame that
+moves it is the blink phase the compositor already ticks twice a second — the
+lock keeps no clock of its own.
+
+Typing is never held up, only submitting: a field that stopped taking
+characters would read as a compositor that had stopped reading the keyboard,
+which is the one thing a lock must not look like. An enter that arrives during
+the wait is refused without extending it, because a held enter key would
+otherwise lock the owner out for as long as they leant on it.
+
+An empty line is submitted like any other. Whether an empty password is allowed
+is the installer's decision (#48), and a lock that refused to submit one would
+be a lock that machine could never open. The cost is that a stray enter spends
+a second, which is the same second a wrong password spends.
+
+### The panes keep running, and none of it reaches the screen
+
+A pane's program is not told anything. It runs, its output arrives, its
+terminal takes it, and the damage that would say which cells to repaint is
+discarded with each locked frame — which is what lets the loop idle instead of
+finding work outstanding on every pass. Nothing is lost by discarding it,
+because unlocking asks for a full redraw and a full redraw repaints every cell
+whatever the damage says.
+
+**A pane that exits while the screen is locked must not end the session**, and
+this is the route the design warned about: `Action::Quit` and `ClosePane` are
+unreachable, but the last pane's program reaching its end of file is a
+different way to the same place. The session is remembered as over and the
+compositor keeps running; `running` goes false when the password is accepted.
+Somebody who walks up to a locked machine and kills the shell gets a locked
+screen, not a shell.
+
+### Resize, the bell, and notifications
+
+A resize while locked is a resize: the panes are told their new size, because
+the programs in them should not be lied to about it, and the box re-centres on
+the next frame. The lock is untouched by it.
+
+A bell and an application notification are the same path, and while the screen
+is locked that path ends in the queue rather than on the screen. The status bar
+is not drawn and neither is the banner that stands in for it, so nothing can be
+shown; and the queue is not advanced either, so nothing spends its time on
+screen unread. Whatever was waiting is still waiting when the session comes
+back. Not even a count is shown on the lock screen: a count is still something
+about the session, and the lock's job is to show none of it.
+
+### The credential
+
+Read once, when the lock engages, and not per attempt. That is what makes "no
+credential, no lock" a decision taken before the screen goes up, and it means a
+credential file removed, renamed or made unreadable while the screen is locked
+cannot lock the owner out of their own session.
+
+A file that does not parse is a refusal to engage with a message, not a wrong
+password — a wrong password would be a screen nobody could ever open. A missing
+file, an unreadable file and a `$y$` yescrypt line from `/etc/shadow` all land
+there, each saying which it was.
+
+The mode of the file is not checked. It should be 0600 and the installer writes
+it that way, but refusing to lock because the hash is more readable than it
+ought to be would trade a lock that works for one that does not, over a file
+only root can reach in the first place.
+
+The path is a field on `Config` and deliberately not a command line flag or a
+configuration file setting. Which file holds the password is not a preference,
+and a session that could be told to unlock against a file of the user's
+choosing would be a lock with a spare key printed on it. Tests set the field.
+
+### `VT_UNLOCKSWITCH` at startup
+
+From the experiment in [`vt-lockswitch.md`](vt-lockswitch.md): `tos` now clears
+`vt_dont_switch` once, unconditionally, before it takes the terminal. tOS never
+sets the flag, so this is purely a rescue — the kernel does not clear it when
+the process that set it dies, and an installed system respawns `tos` from
+`/etc/inittab`, so one ioctl here turns a stuck flag from anything at all into
+something a restart undoes. `VirtualTerminal::activate` has gained the warning
+the experiment asked for: `VT_ACTIVATE` returns zero whether or not the console
+moved, and `VT_WAITACTIVE` never returns while the flag is set.
+
+### The `/run` marker is a follow-up, not this issue
+
+[#54](https://github.com/m96-chan/tOS/issues/54) observes that a crashed or
+restarted compositor comes back unlocked, and proposes a marker under `/run` —
+tmpfs, so a reboot clears it — as the shape of the fix. **That belongs in its
+own issue.** Three reasons:
+
+1. It defends a path that does not run yet. The only thing that restarts `tos`
+   automatically is `::respawn:` in `/etc/inittab`, and `lock-other-doors.md`
+   records that the installed system does not read that file yet. A marker
+   written today would be read by nothing.
+2. It changes the startup contract rather than adding to the lock. `tos` would
+   have to come up already locked, before the first frame and before any pane
+   exists, and that state has to be reachable and drawable before the things a
+   lock normally has behind it. None of the state machine here is shaped for
+   it, and none of the tests here would exercise it.
+3. It collides with the rule that makes the live ISO behave. A marker plus no
+   credential is a machine that starts locked with nothing to unlock it, which
+   is the "machine nobody can reach" failure this document refuses
+   `VT_LOCKSWITCH` for. Deciding what a marker means when there is no password
+   to check it against is the substance of that issue, and it is not a line of
+   code here.
+
+So: a compositor that is killed while locked comes back unlocked, today, and
+that is written down rather than fixed. It is worth saying plainly that this is
+the weakest joint in the chain — everything else here holds against somebody at
+the keyboard, and this one does not hold against somebody who can make the
+compositor die.

@@ -510,6 +510,7 @@ answered with an error, and frames carry the same raw formats images do.
 - [ ] Bluetooth controls
 - [x] audio controls
 - [x] configuration file
+- [ ] screen lock
 
 Sound is driven straight through the kernel's control interface. `tos-system`
 opens `/dev/snd/controlC<N>` and issues `SNDRV_CTL_IOCTL_CARD_INFO`,
@@ -616,6 +617,55 @@ for back: the workspace forgets it was ever named, so renumbering moves it
 along with the rest again when a workspace before it closes. A name belongs to
 the workspace rather than to the position, which is why a named workspace keeps
 its name while its neighbours are renumbered around it.
+
+`super+shift+l`, or `ctrl+a` then `L`, locks the screen. The lock is a password
+field, and it is its own type rather than another use of that box for exactly
+that reason: the box echoes what is typed, refilters a list on every keystroke
+and closes on escape, and a password field is the opposite of all three. This
+one masks, it always submits, and escape clears the line because there is
+nothing to close.
+
+The password is checked against `/etc/tos/shadow`: tOS's own file, one `$6$`
+crypt line, hashed and verified by `tos-crypt` in this tree rather than by
+`crypt(3)`, which the workspace cannot link and which could not read the
+yescrypt hashes Debian writes anyway. The file is read when the lock engages
+rather than when a password is offered, so a machine with no password does not
+lock — the binding says there is nothing to unlock with and the session carries
+on. That one rule is what makes the live ISO behave without the compositor ever
+being told what live media is, and it is the same rule on an installed machine
+whose owner declined a password.
+
+What the lock owns is the input, not merely the keyboard. The gate is at the top
+of `handle_input` and not in `handle_key`, because mouse, pointer and paste
+events never pass through `handle_key`: a lock one level further in would still
+let a middle click paste the primary selection into a shell and a drag select
+what is on the screen. What it draws is a frame with the panes, the dividers,
+the status bar and any open menu *skipped* rather than painted over — a frame
+that is not a full redraw only repaints the cells a pane marked as damaged, so
+a box drawn on top of a session leaves the rest of that session exactly where it
+was. The screen is cleared on every locked frame rather than the first, because
+a display with two buffers hands out the other one next time.
+
+Underneath it, everything goes on running. A pane's program is not told the
+screen is locked; its output arrives, its terminal takes it, and none of it is
+drawn until the password is accepted, at which point the whole screen is
+repainted rather than the damage replayed. Notifications queue and none is
+shown, so neither a bell nor a build finishing can put anything on a locked
+screen, and nothing is lost by it: the queue stands still and says its piece
+when the session comes back. A pane whose program exits cannot end the session
+either, because exiting is a way out of a locked screen — the last pane dying is
+remembered and acted on once somebody has said who they are. A wrong password
+clears the field and waits a second, then two, four and eight; the wait is on
+checking a guess rather than on typing one, since checking is what a guess
+costs.
+
+Three parts of the design are not here yet, and the lock claims nothing it has
+not got: refusing a VT switch with `VT_RELDISP 0`
+([#47](https://github.com/m96-chan/tOS/issues/47)), blanking the display
+([#51](https://github.com/m96-chan/tOS/issues/51)) and locking on an idle
+deadline ([#52](https://github.com/m96-chan/tOS/issues/52)). Until the first of
+those, the lock defends the session rather than the machine — which on the
+nested and headless backends is all there was ever going to be to defend.
 
 ### 0.1 — Portable tOS
 
@@ -795,8 +845,9 @@ To render a frame without a display at all:
 `ctrl+a`; on hardware the same bindings work directly with `super`. The two
 bindings that grow a session are also where most people expect them:
 `ctrl+shift+enter` splits the focused pane and `ctrl+shift+t` opens a new
-workspace. `super+space` opens the launcher, `super+m` opens the notifications
-and `super+,` names the workspace. From inside a session, `leader ?` puts the
+workspace. `super+space` opens the launcher, `super+m` opens the notifications,
+`super+,` names the workspace and `super+shift+l` locks the screen on a machine
+that has a password to unlock with. From inside a session, `leader ?` puts the
 binding list over the panes; both it and `--help` are generated from the keymap
 that is running, so neither can fall behind it.
 

@@ -132,6 +132,7 @@ pub fn describe(action: &Action) -> String {
         Action::ShowNotifications => "notifications, including the ones gone".into(),
         Action::ShowBindings => "show these bindings".into(),
         Action::Refresh => "redraw the screen".into(),
+        Action::Lock => "lock the screen".into(),
         Action::Quit => "quit tOS".into(),
     }
 }
@@ -247,7 +248,8 @@ fn rank(action: &Action) -> (u16, u16) {
         Action::ShowNotifications => (8, 1),
         Action::ShowBindings => (8, 2),
         Action::Refresh => (9, 0),
-        Action::Quit => (9, 1),
+        Action::Lock => (9, 1),
+        Action::Quit => (9, 2),
     }
 }
 
