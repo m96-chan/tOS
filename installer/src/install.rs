@@ -340,21 +340,22 @@ impl<'a> Installer<'a> {
     /// Written directly rather than through `grub-mkconfig`, which needs a
     /// Debian userspace the live image does not have yet.
     fn grub_config(&self) -> String {
-        "set timeout=2\n\
+        format!(
+            "set timeout=2\n\
              set default=0\n\
              \n\
-             menuentry \"tOS\" {\n\
+             menuentry \"tOS\" {{\n\
              \tsearch --no-floppy --label --set=root tos-root\n\
-             \tlinux /boot/vmlinuz root=LABEL=tos-root rw console=tty0 quiet\n\
+             \tlinux /boot/vmlinuz {CMDLINE} quiet\n\
              \tinitrd /boot/initramfs.gz\n\
-             }\n\
+             }}\n\
              \n\
-             menuentry \"tOS (verbose)\" {\n\
+             menuentry \"tOS (verbose)\" {{\n\
              \tsearch --no-floppy --label --set=root tos-root\n\
-             \tlinux /boot/vmlinuz root=LABEL=tos-root rw console=tty0\n\
+             \tlinux /boot/vmlinuz {CMDLINE}\n\
              \tinitrd /boot/initramfs.gz\n\
-             }\n"
-        .to_string()
+             }}\n"
+        )
     }
 
     fn finish(&mut self) -> Result<(), String> {
@@ -462,6 +463,31 @@ pub const COPIED_DIRECTORIES: &[&str] = &["/bin", "/sbin", "/lib", "/etc", "/roo
 
 /// The files GRUB loads, taken from the live medium.
 pub const BOOT_FILES: &[&str] = &["vmlinuz", "initramfs.gz"];
+
+/// The kernel command line an installed tOS machine boots with.
+///
+/// Two of these four words are a security decision rather than a convenience,
+/// and a third decision is a word that is deliberately not here.
+/// `docs/design/lock-other-doors.md` argues all three.
+///
+/// `console=tty0` and no `console=ttyS0`: `/init` execs a shell on
+/// `/dev/console` when the compositor exits, so a serial console on an
+/// installed machine is an unauthenticated root shell on a wire. The live
+/// image wants one and says so in `iso/mkiso.sh`; a machine somebody leaves
+/// alone does not.
+///
+/// No `tos.rescue`, which is the word `/init` wants before it execs that
+/// shell at all. An installed machine that will not start its compositor is
+/// rescued by adding it at the GRUB prompt.
+///
+/// `sysctl.kernel.sysrq=434` is `0x1b2`: the Debian kernel's own default mask
+/// of `0x1b6` with `SYSRQ_ENABLE_KEYBOARD` (`0x4`) taken out. That bit carries
+/// `Alt+SysRq+k` and `Alt+SysRq+r`, the two SysRq functions that take a locked
+/// session away from the compositor; the sync, remount-read-only and reboot
+/// bits stay, so S-U-B still gets a wedged machine down without losing the
+/// filesystem. There is no `sysrq=` boot parameter — the mask is a sysctl, and
+/// `sysctl.*=` is the generic form the kernel applies just before `/init`.
+const CMDLINE: &str = "root=LABEL=tos-root rw console=tty0 sysctl.kernel.sysrq=434";
 
 /// A recorder primed to look like a live session with its medium mounted.
 ///
@@ -802,6 +828,44 @@ mod tests {
         assert!(config.contains("--label --set=root tos-root"));
         assert!(config.contains("root=LABEL=tos-root"));
         assert!(config.contains("menuentry \"tOS\""));
+    }
+
+    /// The doors a screen lock cannot close on its own, closed on the command
+    /// line instead. See `docs/design/lock-other-doors.md`.
+    #[test]
+    fn the_installed_command_line_shuts_the_doors_the_lock_cannot() {
+        let backend = install(Firmware::Uefi);
+        let config = backend
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                crate::exec::Action::WriteFile { path, contents } if path.ends_with("grub.cfg") => {
+                    Some(contents.clone())
+                }
+                _ => None,
+            })
+            .expect("no grub.cfg");
+
+        // 0x1b2: Debian's own 0x1b6 without SYSRQ_ENABLE_KEYBOARD (0x4).
+        // Alt+SysRq+k and Alt+SysRq+r are what that bit carries, and both take
+        // a locked session away from the compositor.
+        assert!(
+            config.contains("sysctl.kernel.sysrq=434"),
+            "SysRq policy must be stated, not inherited: {config}"
+        );
+        // /init execs a shell on /dev/console when the compositor exits, so a
+        // serial console here would be an unauthenticated root shell.
+        assert!(
+            !config.contains("ttyS0"),
+            "an installed machine gets no serial console: {config}"
+        );
+        // And the shell itself is not asked for. Only the live image asks.
+        assert!(
+            !config.contains("tos.rescue"),
+            "the emergency shell is not a boot menu entry: {config}"
+        );
+        // Both entries, not just the quiet one.
+        assert_eq!(config.matches("sysctl.kernel.sysrq=434").count(), 2);
     }
 
     #[test]
