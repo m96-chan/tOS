@@ -12,7 +12,7 @@ use tos_input::host::HostInput;
 use tos_platform::tty::ReadOutcome;
 use tos_platform::{Display, HeadlessDisplay, NestedDisplay};
 
-use tos_compositor::config::{parse_args, Backend, Config, USAGE};
+use tos_compositor::config::{parse_args, usage, Backend, Config};
 use tos_compositor::Compositor;
 
 /// Set from a signal handler when the host terminal changes size.
@@ -48,7 +48,7 @@ fn main() -> ExitCode {
         None => &args[..],
     };
     if own_args.iter().any(|a| a == "-h" || a == "--help") {
-        print!("{USAGE}");
+        print!("{}", usage());
         return ExitCode::SUCCESS;
     }
     if own_args.iter().any(|a| a == "-V" || a == "--version") {

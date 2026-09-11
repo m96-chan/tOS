@@ -682,3 +682,79 @@ fn a_device_pointer_click_lands_in_the_right_pane() {
     click(&mut c, rect_of(bottom));
     assert_eq!(c.session().focus(), bottom);
 }
+
+#[test]
+fn the_cheat_sheet_is_the_running_keymap() {
+    // The sheet the compositor shows and the sheet the keymap describes are
+    // the same list, because there is only one of them. Nothing here is a
+    // second copy that could fall behind.
+    let mut c = compositor(&["/bin/sh", "-c", "sleep 5"]);
+    assert!(c.perform(Action::ShowBindings));
+
+    let overlay = c.overlay().expect("the sheet should be open");
+    assert!(overlay.title().contains("leader ctrl+a"), "{:?}", overlay.title());
+    let expected = tos_session::cheat_sheet(&tos_session::Keymap::default_bindings());
+    let shown: Vec<(&str, &str)> = overlay
+        .items()
+        .iter()
+        .map(|item| (item.label.as_str(), item.detail.as_str()))
+        .collect();
+    let wanted: Vec<(&str, &str)> = expected
+        .iter()
+        .map(|row| (row.action.as_str(), row.keys.as_str()))
+        .collect();
+    assert_eq!(shown, wanted);
+
+    // And the sheet says how to get the sheet back.
+    let (_, keys) = shown
+        .iter()
+        .find(|(action, _)| *action == "show these bindings")
+        .expect("the sheet should list itself");
+    assert!(keys.contains("leader ?"), "{keys:?}");
+}
+
+#[test]
+fn a_question_mark_after_the_leader_opens_the_sheet() {
+    use tos_input::{InputEvent, KeyCode, KeyEvent, Modifiers};
+
+    let mut c = compositor(&["/bin/sh", "-c", "sleep 5"]);
+    let press = |c: &mut Compositor, code, modifiers| {
+        c.handle_input(InputEvent::Key(KeyEvent::new(code, modifiers)));
+    };
+    press(&mut c, KeyCode::Char('a'), Modifiers::CTRL);
+    press(&mut c, KeyCode::Char('/'), Modifiers::SHIFT);
+    assert!(c.overlay().is_some(), "leader ? should open the sheet");
+
+    // It draws, which is the part a list of long rows could break.
+    render(&mut c);
+
+    press(&mut c, KeyCode::Escape, Modifiers::NONE);
+    assert!(c.overlay().is_none());
+}
+
+#[test]
+fn reading_a_row_does_nothing_but_close_the_sheet() {
+    use tos_input::{InputEvent, KeyCode, KeyEvent, Modifiers};
+
+    // Enter on a launcher row starts a program; on the sheet there is nothing
+    // to start, and pressing it must not leave a pane behind.
+    let mut c = compositor(&["/bin/sh", "-c", "sleep 5"]);
+    let before = c.session().all_panes().len();
+    c.perform(Action::ShowBindings);
+    c.handle_input(InputEvent::Key(KeyEvent::new(KeyCode::Enter, Modifiers::NONE)));
+    assert!(c.overlay().is_none());
+    assert_eq!(c.session().all_panes().len(), before);
+}
+
+#[test]
+fn every_row_has_room_for_its_keys() {
+    // The keys are drawn to the right of the description and only when both
+    // fit, so a row that is too wide loses the one thing it is there to say.
+    // The overlay is at most 64 columns, which leaves 62 inside the border,
+    // and it keeps a space either side of the keys.
+    const INNER: usize = 62;
+    for row in tos_session::cheat_sheet(&tos_session::Keymap::default_bindings()) {
+        let width = row.action.chars().count() + 1 + row.keys.chars().count() + 2;
+        assert!(width <= INNER, "{row:?} needs {width} columns");
+    }
+}

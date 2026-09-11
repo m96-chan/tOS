@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use tos_session::{describe, Keymap};
+
 /// Which display backend to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -74,8 +76,8 @@ impl Default for Config {
     }
 }
 
-/// The usage text shown by `tos --help`.
-pub const USAGE: &str = "\
+/// The half of `tos --help` that describes the command line.
+const OPTIONS: &str = "\
 tOS, a terminal-native compositor
 
 usage: tos [options] [-e command [args...]]
@@ -93,20 +95,39 @@ options:
   -e, --command <program> [args...]      program to run instead of the shell
   -h, --help                             show this message
   -V, --version                          show the version
-
-key bindings (leader is ctrl+a; super works without the leader):
-  ctrl+shift+enter  split the focused pane
-  ctrl+shift+t      new workspace
-  leader d / s      split into columns / rows
-  leader h j k l    move focus
-  leader z          zoom the focused pane
-  leader x          close the focused pane
-  leader c / n / p  new / next / previous workspace
-  leader 1..9       select a workspace
-  leader space      launcher: run a program in a new pane
-  leader q          quit
-  shift+pageup      scroll back
 ";
+
+/// The usage text shown by `tos --help`.
+///
+/// The bindings half is generated from the keymap the compositor is about to
+/// run rather than written out here, so `--help` and the sheet `leader ?` puts
+/// over the panes cannot come to disagree about what a key does. A list of
+/// bindings kept by hand is wrong within a release of being written.
+pub fn usage() -> String {
+    let mut text = String::from(OPTIONS);
+    text.push('\n');
+    text.push_str(&bindings(&Keymap::default_bindings()));
+    text
+}
+
+/// The `key bindings` section, for the map it describes.
+pub fn bindings(keymap: &Keymap) -> String {
+    let mut text = String::from("key bindings");
+    if let Some(leader) = describe::leader_name(keymap) {
+        text.push_str(&format!(" (leader is {leader}"));
+        // Worth mentioning only when there are super bindings to mention; a
+        // keymap that binds none would be claiming something untrue.
+        if describe::super_works_alone(keymap) {
+            text.push_str("; super works without the leader");
+        }
+        text.push(')');
+    }
+    text.push_str(":\n");
+    for row in describe::cheat_sheet(keymap) {
+        text.push_str(&format!("  {:<30} {}\n", row.keys, row.action));
+    }
+    text
+}
 
 /// Parse command line arguments.
 pub fn parse_args(args: &[String]) -> Result<Config, String> {
@@ -251,5 +272,39 @@ mod tests {
     #[test]
     fn unknown_options_are_errors() {
         assert!(parse_args(&args(&["--wayland"])).is_err());
+    }
+
+    #[test]
+    fn the_help_lists_the_bindings_the_compositor_will_run() {
+        // The reason the section is generated: no line of it can survive a
+        // binding being moved, because no line of it is written down.
+        let text = usage();
+        for row in describe::cheat_sheet(&Keymap::default_bindings()) {
+            assert!(text.contains(&row.keys), "{:?} missing from --help", row.keys);
+            assert!(text.contains(&row.action), "{:?} missing", row.action);
+        }
+        assert!(text.contains("key bindings (leader is ctrl+a"));
+        assert!(text.contains("super works without the leader"));
+    }
+
+    #[test]
+    fn the_help_still_describes_the_options() {
+        let text = usage();
+        assert!(text.starts_with("tOS, a terminal-native compositor"));
+        assert!(text.contains("--backend"));
+        assert!(text.contains("-e, --command"));
+    }
+
+    #[test]
+    fn a_map_with_no_leader_and_no_super_says_neither() {
+        use tos_input::{KeyCode, Modifiers};
+        use tos_session::{Action, Binding};
+
+        let mut keymap = Keymap::empty();
+        keymap.bind(Binding::new(KeyCode::Function(1), Modifiers::NONE), Action::Quit);
+        let text = bindings(&keymap);
+        assert!(text.starts_with("key bindings:\n"), "{text:?}");
+        assert!(text.contains("f1"));
+        assert!(text.contains("quit tOS"));
     }
 }

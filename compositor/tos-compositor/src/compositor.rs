@@ -15,13 +15,13 @@ use tos_input::{
 };
 use tos_platform::Display;
 use tos_render::{render, RenderOptions, Rect as PixelRect, Selection, Surface};
-use tos_session::{Action, Axis, Keymap, PaneId, Rect, Resolution, Session};
+use tos_session::{describe, Action, Axis, Keymap, PaneId, Rect, Resolution, Session};
 use tos_term::TermEvent;
 
 use crate::chrome::{self, Chrome, StatusItem};
 use crate::config::Config;
 use crate::launcher;
-use crate::overlay::{Overlay, OverlayOutcome};
+use crate::overlay::{Overlay, OverlayItem, OverlayOutcome};
 use crate::pane::Pane;
 
 /// How often the cursor and blinking text change phase.
@@ -42,6 +42,8 @@ const MESSAGE_TIMEOUT: Duration = Duration::from_secs(3);
 pub enum OverlayKind {
     /// A program from `$PATH`, which starts in a new pane.
     Launcher,
+    /// The key bindings, which are a list to read rather than to choose from.
+    Bindings,
 }
 
 /// The running compositor.
@@ -678,6 +680,10 @@ impl Compositor {
                 self.open_overlay(OverlayKind::Launcher, overlay);
                 true
             }
+            Action::ShowBindings => {
+                self.open_overlay(OverlayKind::Bindings, self.binding_sheet());
+                true
+            }
             Action::Refresh => {
                 self.needs_full_redraw = true;
                 true
@@ -735,7 +741,32 @@ impl Compositor {
     fn choose(&mut self, kind: OverlayKind, label: &str) {
         match kind {
             OverlayKind::Launcher => self.launch(label),
+            // Nothing to choose: the sheet is there to be read, so enter
+            // closes it the way escape does.
+            OverlayKind::Bindings => {}
         }
+    }
+
+    /// The cheat sheet, built from the keymap that is resolving these keys.
+    ///
+    /// Not from the `--help` text, and not from a copy of the defaults: a
+    /// sheet that is a second telling of the bindings is one that will
+    /// eventually be telling you about a key that no longer does that. This
+    /// one cannot be wrong, and a keymap that was customised at startup
+    /// describes itself here without anything being taught about it.
+    fn binding_sheet(&self) -> Overlay {
+        let title = match describe::leader_name(&self.keymap) {
+            Some(leader) => format!("key bindings (leader {leader})"),
+            None => "key bindings".to_string(),
+        };
+        // The description is the label, so that typing "split" finds the key
+        // rather than only the other way round: what you have forgotten is
+        // the key, and what you can still name is what you wanted to do.
+        let items = describe::cheat_sheet(&self.keymap)
+            .into_iter()
+            .map(|row| OverlayItem::with_detail(row.action, row.keys))
+            .collect();
+        Overlay::new(title, items)
     }
 
     /// Open a pane running `program`, using the same path a split does.

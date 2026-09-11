@@ -12,6 +12,6 @@ pub mod overlay;
 pub mod pane;
 
 pub use compositor::{Compositor, OverlayKind};
-pub use config::{parse_args, Backend, Config, USAGE};
+pub use config::{parse_args, usage, Backend, Config};
 pub use overlay::{Overlay, OverlayItem, OverlayOutcome};
 pub use pane::Pane;

@@ -152,6 +152,22 @@ pub fn lookup(code: u16) -> Option<KeyMapping> {
     })
 }
 
+/// The highest scancode [`lookup`] knows about.
+const LAST_SCANCODE: u16 = 194;
+
+/// What the key that plainly types `plain` produces when shift is held.
+///
+/// The table is keyed by scancode, so answering this walks it. That is fine
+/// for the only caller, which names a binding for a cheat sheet once rather
+/// than once per keypress, and asking the layout is what keeps the name of a
+/// binding tied to the key that actually produces it.
+pub fn shifted(plain: char) -> Option<char> {
+    (0..=LAST_SCANCODE)
+        .filter_map(lookup)
+        .find(|mapping| mapping.plain == Some(plain))
+        .and_then(|mapping| mapping.shifted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +222,14 @@ mod tests {
     fn unmapped_codes_return_nothing() {
         assert!(lookup(0).is_none());
         assert!(lookup(1000).is_none());
+    }
+
+    #[test]
+    fn shifted_characters_come_from_the_layout() {
+        assert_eq!(shifted('/'), Some('?'));
+        assert_eq!(shifted(';'), Some(':'));
+        assert_eq!(shifted('t'), Some('T'));
+        // A key nothing on this layout types plainly has no shifted form.
+        assert_eq!(shifted('?'), None);
     }
 }

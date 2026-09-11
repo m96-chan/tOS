@@ -47,6 +47,8 @@ pub enum Action {
     /// Open the launcher: a filtered list of programs, one of which starts in
     /// a new pane.
     OpenLauncher,
+    /// Show what the bindings are, read out of this keymap.
+    ShowBindings,
     /// Leave the compositor.
     Quit,
     /// Redraw everything.
@@ -86,9 +88,12 @@ pub enum Resolution {
 #[derive(Debug, Clone)]
 pub struct Keymap {
     /// Bindings that fire directly.
-    direct: HashMap<Binding, Action>,
+    ///
+    /// Visible to the crate so that [`crate::describe`] can tell the user what
+    /// is bound without the table having to be restated anywhere.
+    pub(crate) direct: HashMap<Binding, Action>,
     /// Bindings that fire only after the leader key.
-    after_leader: HashMap<Binding, Action>,
+    pub(crate) after_leader: HashMap<Binding, Action>,
     pub leader: Option<Binding>,
     leader_armed: bool,
 }
@@ -144,6 +149,9 @@ impl Keymap {
             // Space is the one key nothing else wants, and super+space is
             // where a launcher lives on every other desktop.
             (KeyCode::Char(' '), Modifiers::NONE, Action::OpenLauncher),
+            // Shift and the slash key is the question mark, which is where
+            // every other program with a leader key keeps its own help.
+            (KeyCode::Char('/'), Modifiers::SHIFT, Action::ShowBindings),
             (KeyCode::Char('q'), Modifiers::NONE, Action::Quit),
         ];
         for (code, modifiers, action) in bindings {
@@ -493,6 +501,30 @@ mod tests {
         // A plain space is still a space, which is most of what a pane gets.
         assert_eq!(
             keymap.resolve(&press(KeyCode::Char(' '), Modifiers::NONE)),
+            Resolution::Passthrough
+        );
+    }
+
+    #[test]
+    fn a_question_mark_asks_what_the_bindings_are() {
+        // The question mark arrives as the slash key with shift, because a
+        // `KeyCode::Char` is the unshifted key.
+        let mut keymap = Keymap::default_bindings();
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('/'), Modifiers::SHIFT)),
+            Resolution::Action(Action::ShowBindings)
+        );
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('/'),
+                Modifiers::SUPER.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::ShowBindings)
+        );
+        // An unshifted slash is still a slash, which panes need for paths.
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('/'), Modifiers::NONE)),
             Resolution::Passthrough
         );
     }
