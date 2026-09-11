@@ -80,7 +80,7 @@ impl Compositor {
             panes: HashMap::new(),
             fonts,
             keymap: Keymap::default_bindings(),
-            chrome: Chrome::default(),
+            chrome: config.chrome,
             size,
             clipboard: HashMap::new(),
             blink_visible: true,
@@ -116,7 +116,13 @@ impl Compositor {
 
     /// Start a pane on a particular command rather than the configured one.
     fn spawn_pane_running(&self, area: Rect, command: Option<&[String]>) -> io::Result<Pane> {
-        Pane::spawn(area, self.cell_size(), self.config.scrollback, command)
+        Pane::spawn(
+            area,
+            self.cell_size(),
+            self.config.scrollback,
+            &self.config.palette,
+            command,
+        )
     }
 
     pub fn cell_size(&self) -> (u32, u32) {

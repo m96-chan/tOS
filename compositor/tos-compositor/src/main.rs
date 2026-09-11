@@ -12,7 +12,8 @@ use tos_input::host::HostInput;
 use tos_platform::tty::ReadOutcome;
 use tos_platform::{Display, HeadlessDisplay, NestedDisplay};
 
-use tos_compositor::config::{parse_args, Backend, Config, USAGE};
+use tos_compositor::config::{Backend, Config, USAGE};
+use tos_compositor::config_file;
 use tos_compositor::Compositor;
 
 /// Set from a signal handler when the host terminal changes size.
@@ -56,14 +57,21 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let config = match parse_args(&args) {
-        Ok(config) => config,
+    let startup = match config_file::startup(&args) {
+        Ok(startup) => startup,
         Err(message) => {
             eprintln!("tos: {message}");
             eprintln!("try 'tos --help'");
             return ExitCode::from(2);
         }
     };
+    // A file this machine cannot read is not a reason to leave someone without
+    // a terminal, any more than a missing display backend is. Say what was
+    // wrong with it and carry on with the settings that did make sense.
+    for problem in &startup.problems {
+        eprintln!("tos: {problem}");
+    }
+    let config = startup.config;
 
     install_signal_handlers();
     match run(config) {

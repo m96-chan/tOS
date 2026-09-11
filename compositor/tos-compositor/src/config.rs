@@ -1,6 +1,14 @@
 //! Compositor configuration.
+//!
+//! This module holds the settings themselves and the command line that can set
+//! any of them. [`crate::config_file`] fills the same struct in from a file
+//! first, so a flag always lands on top of what the file said.
 
 use std::path::PathBuf;
+
+use tos_term::Palette;
+
+use crate::chrome::Chrome;
 
 /// Which display backend to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,10 +35,24 @@ impl Backend {
     }
 }
 
+/// Which configuration file a run should read, if any.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ConfigSource {
+    /// The XDG search path, where not finding anything is normal.
+    #[default]
+    Search,
+    /// One file named by `--config`, where not finding it is worth saying.
+    File(PathBuf),
+    /// `--no-config`: defaults and flags, nothing else.
+    None,
+}
+
 /// Everything the compositor reads at startup.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub backend: Backend,
+    /// Where the settings underneath the flags come from.
+    pub source: ConfigSource,
     /// A font file to use instead of the built-in bitmap face.
     pub font: Option<PathBuf>,
     /// Font size in pixels; `None` derives one from the display.
@@ -53,12 +75,18 @@ pub struct Config {
     pub preload: Option<String>,
     /// Frames to render before a screenshot is taken.
     pub warmup_frames: u32,
+    /// The colours applications paint with, and what a palette reset returns
+    /// to.
+    pub palette: Palette,
+    /// The colours the compositor paints its own dividers and bars with.
+    pub chrome: Chrome,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             backend: Backend::Auto,
+            source: ConfigSource::Search,
             font: None,
             font_size: None,
             bitmap_scale: None,
@@ -70,6 +98,8 @@ impl Default for Config {
             screenshot: None,
             preload: None,
             warmup_frames: 1,
+            palette: Palette::new(),
+            chrome: Chrome::default(),
         }
     }
 }
@@ -90,9 +120,18 @@ options:
   --screenshot <path.ppm>                render one frame, save it and exit
   --preload <text>                       feed text to the first pane first
   --no-status-bar                        hide the status bar
+  --config <path>                        read this file instead of searching
+  --no-config                            ignore the configuration file
   -e, --command <program> [args...]      program to run instead of the shell
   -h, --help                             show this message
   -V, --version                          show the version
+
+configuration file, first one found wins:
+  $XDG_CONFIG_HOME/tos/tos.conf, or ~/.config/tos/tos.conf
+  $XDG_CONFIG_DIRS/tos/tos.conf, or /etc/xdg/tos/tos.conf
+  /etc/tos/tos.conf
+Options given here always win over the file. A line the file gets wrong is
+reported and skipped; see the README for the settings it understands.
 
 key bindings (leader is ctrl+a; super works without the leader):
   ctrl+shift+enter  split the focused pane
@@ -108,9 +147,20 @@ key bindings (leader is ctrl+a; super works without the leader):
   shift+pageup      scroll back
 ";
 
-/// Parse command line arguments.
+/// Parse command line arguments over the built-in defaults.
 pub fn parse_args(args: &[String]) -> Result<Config, String> {
-    let mut config = Config::default();
+    parse_args_over(Config::default(), args)
+}
+
+/// Parse command line arguments over settings that came from somewhere else.
+///
+/// Taking the starting point as an argument is the whole of "flags win": the
+/// file is read into `base` and every flag then overwrites what it named.
+pub fn parse_args_over(base: Config, args: &[String]) -> Result<Config, String> {
+    let mut config = base;
+    // Whether the backend was chosen on the command line rather than by the
+    // file, which decides whether `--screenshot` may claim it.
+    let mut backend_from_flag = false;
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
@@ -125,7 +175,10 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
                 let name = value("--backend")?;
                 config.backend = Backend::parse(&name)
                     .ok_or_else(|| format!("unknown backend: {name}"))?;
+                backend_from_flag = true;
             }
+            "--config" => config.source = ConfigSource::File(PathBuf::from(value("--config")?)),
+            "--no-config" => config.source = ConfigSource::None,
             "--font" => config.font = Some(PathBuf::from(value("--font")?)),
             "--font-size" => {
                 let text = value("--font-size")?;
@@ -147,20 +200,13 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
                     .parse()
                     .map_err(|_| format!("not a number: {text}"))?;
             }
-            "--size" => {
-                let text = value("--size")?;
-                let (w, h) = text
-                    .split_once(['x', 'X'])
-                    .ok_or_else(|| format!("expected WxH, got {text}"))?;
-                config.size = (
-                    w.parse().map_err(|_| format!("not a number: {w}"))?,
-                    h.parse().map_err(|_| format!("not a number: {h}"))?,
-                );
-            }
+            "--size" => config.size = parse_size(&value("--size")?)?,
             "--screenshot" => {
                 config.screenshot = Some(PathBuf::from(value("--screenshot")?));
-                // A screenshot is inherently off screen.
-                if config.backend == Backend::Auto {
+                // A screenshot is inherently off screen. A backend the file
+                // asked for is a standing preference rather than a decision
+                // about this run, so it does not stand in the way.
+                if !backend_from_flag {
                     config.backend = Backend::Headless;
                 }
             }
@@ -185,6 +231,18 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
         index += 1;
     }
     Ok(config)
+}
+
+/// Parse a `WxH` size, which is spelled the same way on the command line and
+/// in the file.
+pub fn parse_size(text: &str) -> Result<(u32, u32), String> {
+    let (w, h) = text
+        .split_once(['x', 'X'])
+        .ok_or_else(|| format!("expected WxH, got {text}"))?;
+    Ok((
+        w.parse().map_err(|_| format!("not a number: {w}"))?,
+        h.parse().map_err(|_| format!("not a number: {h}"))?,
+    ))
 }
 
 #[cfg(test)]
@@ -251,5 +309,42 @@ mod tests {
     #[test]
     fn unknown_options_are_errors() {
         assert!(parse_args(&args(&["--wayland"])).is_err());
+    }
+
+    #[test]
+    fn the_config_file_can_be_named_or_refused() {
+        assert_eq!(parse_args(&[]).unwrap().source, ConfigSource::Search);
+        assert_eq!(
+            parse_args(&args(&["--config", "/tmp/tos.conf"])).unwrap().source,
+            ConfigSource::File(PathBuf::from("/tmp/tos.conf"))
+        );
+        assert_eq!(
+            parse_args(&args(&["--no-config"])).unwrap().source,
+            ConfigSource::None
+        );
+        assert!(parse_args(&args(&["--config"])).is_err());
+    }
+
+    #[test]
+    fn flags_land_on_top_of_the_file() {
+        let from_file = Config {
+            scrollback: 500,
+            font_size: Some(12.0),
+            ..Config::default()
+        };
+        let config = parse_args_over(from_file, &args(&["--scrollback", "9"])).unwrap();
+        assert_eq!(config.scrollback, 9);
+        // Nothing the flags did not mention is disturbed.
+        assert_eq!(config.font_size, Some(12.0));
+    }
+
+    #[test]
+    fn a_screenshot_beats_a_backend_the_file_asked_for() {
+        let from_file = Config {
+            backend: Backend::Drm,
+            ..Config::default()
+        };
+        let config = parse_args_over(from_file, &args(&["--screenshot", "out.ppm"])).unwrap();
+        assert_eq!(config.backend, Backend::Headless);
     }
 }

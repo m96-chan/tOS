@@ -682,3 +682,29 @@ fn a_device_pointer_click_lands_in_the_right_pane() {
     click(&mut c, rect_of(bottom));
     assert_eq!(c.session().focus(), bottom);
 }
+
+#[test]
+fn colours_from_the_configuration_reach_the_screen() {
+    let mut palette = tos_term::Palette::new();
+    palette.background = tos_term::Rgb::new(0x12, 0x34, 0x56);
+    let config = Config {
+        command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()]),
+        bitmap_scale: Some(2),
+        font: Some("/nonexistent".into()),
+        palette,
+        chrome: tos_compositor::chrome::Chrome {
+            background: tos_term::Rgb::new(0x65, 0x43, 0x21),
+            ..tos_compositor::chrome::Chrome::default()
+        },
+        ..Config::default()
+    };
+    let mut c = Compositor::new(config, SIZE, None).expect("compositor");
+    let (_, ch) = c.cell_size();
+    let bar = c.grid_area().height * ch;
+    let framebuffer = render(&mut c);
+
+    // The middle of the pane is empty, so it shows the terminal's own
+    // background; the far right of the status bar is past every label.
+    assert_eq!(framebuffer.pixel(SIZE.0 / 2, SIZE.1 / 2), 0x123456);
+    assert_eq!(framebuffer.pixel(SIZE.0 - 1, bar + ch / 2), 0x654321);
+}
