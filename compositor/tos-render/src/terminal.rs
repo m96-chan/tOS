@@ -10,6 +10,7 @@ use tos_term::cell::{Cell, Flags, Underline};
 use tos_term::{Color, CursorShape, Palette, Rgb, Terminal};
 
 use crate::surface::{Rect, Surface};
+use crate::texture::{TextureCache, TextureKey};
 
 /// A selected region of the grid, in cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,11 +159,17 @@ fn resolve_colors(
 /// Only rows the terminal marked as damaged are repainted unless
 /// [`RenderOptions::force`] is set. The caller clears the damage once the
 /// frame has been presented.
+///
+/// `textures` holds the scaled image textures between frames. It belongs to
+/// the caller because rendering is otherwise stateless, and because the cache
+/// is per pane: two panes showing different images should not compete for one
+/// budget.
 pub fn render(
     surface: &mut Surface<'_>,
     area: Rect,
     term: &Terminal,
     fonts: &mut FontStack,
+    textures: &mut TextureCache,
     options: &RenderOptions,
 ) {
     let metrics = fonts.metrics();
@@ -250,7 +257,7 @@ pub fn render(
         }
 
         // Images sit above the text layer.
-        draw_graphics(surface, area, term, cw, ch, options);
+        draw_graphics(surface, area, term, cw, ch, textures, options);
 
         if options.draw_cursor {
             draw_cursor(surface, area, term, fonts, options);
@@ -413,6 +420,7 @@ fn draw_graphics(
     term: &Terminal,
     cell_width: u32,
     cell_height: u32,
+    textures: &mut TextureCache,
     options: &RenderOptions,
 ) {
     let store = term.graphics();
@@ -459,7 +467,22 @@ fn draw_graphics(
             placement.src_w,
             placement.src_h,
         );
-        surface.blit_rgba_region(dest, &image.data, image.width, image.height, region);
+        // The same placement is usually the same size on every frame, so the
+        // scale is done once and the frames after it are just the blend.
+        let key = TextureKey::new(
+            placement.image_id,
+            image.generation(),
+            image.current_frame(),
+            region,
+            dest.width,
+            dest.height,
+        );
+        match textures.get_or_scale(key, &image.data, image.width, image.height) {
+            Some(texture) => surface.blit_texture(dest.x, dest.y, texture),
+            // One texture bigger than the whole budget, or nothing to draw.
+            // Scaling straight into the surface gives the same pixels.
+            None => surface.blit_rgba_region(dest, &image.data, image.width, image.height, region),
+        }
     }
 }
 

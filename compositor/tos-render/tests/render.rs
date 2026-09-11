@@ -1,13 +1,14 @@
 //! End to end rendering: bytes in, pixels out.
 
 use tos_font::{BitmapFont, FontStack};
-use tos_render::{render, OwnedFramebuffer, Rect, RenderOptions, Selection};
+use tos_render::{render, OwnedFramebuffer, Rect, RenderOptions, Selection, TextureCache};
 use tos_term::{Terminal, TerminalConfig};
 
 struct Harness {
     fb: OwnedFramebuffer,
     fonts: FontStack,
     term: Terminal,
+    textures: TextureCache,
 }
 
 impl Harness {
@@ -27,6 +28,7 @@ impl Harness {
             fb,
             fonts,
             term: Terminal::new(cols, rows, config),
+            textures: TextureCache::default(),
         }
     }
 
@@ -46,7 +48,14 @@ impl Harness {
     fn draw_with(&mut self, options: &RenderOptions) -> &mut Self {
         let area = Rect::new(0, 0, self.fb.width(), self.fb.height());
         let mut surface = self.fb.surface();
-        render(&mut surface, area, &self.term, &mut self.fonts, options);
+        render(
+            &mut surface,
+            area,
+            &self.term,
+            &mut self.fonts,
+            &mut self.textures,
+            options,
+        );
         self
     }
 
@@ -355,6 +364,7 @@ fn a_pane_only_paints_inside_its_area() {
             area,
             &h.term,
             &mut h.fonts,
+            &mut h.textures,
             &RenderOptions {
                 force: true,
                 draw_cursor: false,
@@ -513,4 +523,92 @@ fn images_scroll_with_the_text_they_sit_on() {
     // Wherever it is now, it must not still be painted on screen row 0.
     let top_row_is_image = h.cell_pixel(0, 0, 1, 1) == 0x00ff00;
     assert!(!top_row_is_image, "the image stayed pinned to the display");
+}
+
+// ---------------------------------------------------------------------------
+// Texture cache
+// ---------------------------------------------------------------------------
+
+/// A scene with an image scaled to a size it was not transmitted at, whose
+/// alpha covers the transparent, blended and opaque cases. Those three are
+/// exactly what the cached blit has to reproduce.
+fn scaled_image_over_a_backdrop(h: &mut Harness) {
+    let pixels: Vec<u8> = (0..3u32 * 5)
+        .flat_map(|i| {
+            let alpha = match i % 3 {
+                0 => 0x00,
+                1 => 0x80,
+                _ => 0xff,
+            };
+            [(0x20 * (i % 8)) as u8, 0xff, 0x40, alpha]
+        })
+        .collect();
+    let payload = tos_term::graphics::encode_base64(&pixels);
+    h.feed(b"\x1b[44mbackdrop\r\n");
+    h.feed(format!("\x1b_Ga=T,f=32,s=3,v=5,c=3,r=2,i=1;{payload}\x1b\\").as_bytes());
+}
+
+#[test]
+fn the_texture_cache_changes_no_pixels() {
+    let options = RenderOptions {
+        force: true,
+        draw_cursor: false,
+        ..RenderOptions::default()
+    };
+
+    let mut cached = Harness::new(8, 4);
+    scaled_image_over_a_backdrop(&mut cached);
+    cached.draw_with(&options);
+    // The second frame is the one that comes out of the cache.
+    cached.draw_with(&options);
+
+    let mut uncached = Harness::new(8, 4);
+    // A budget nothing fits in forces every frame down the scaling path.
+    uncached.textures = TextureCache::new(0);
+    scaled_image_over_a_backdrop(&mut uncached);
+    uncached.draw_with(&options);
+    uncached.draw_with(&options);
+
+    assert!(cached.textures.hits() > 0, "the scene never hit the cache");
+    assert!(uncached.textures.is_empty(), "nothing should have been kept");
+    assert_eq!(cached.fb.pixels(), uncached.fb.pixels());
+}
+
+#[test]
+fn repeat_frames_do_not_rescale() {
+    let options = RenderOptions {
+        force: true,
+        draw_cursor: false,
+        ..RenderOptions::default()
+    };
+    let mut h = Harness::new(8, 4);
+    scaled_image_over_a_backdrop(&mut h);
+    for _ in 0..5 {
+        h.draw_with(&options);
+    }
+    assert_eq!(h.textures.misses(), 1, "the image was scaled more than once");
+    assert_eq!(h.textures.hits(), 4);
+}
+
+#[test]
+fn retransmitting_an_image_invalidates_its_texture() {
+    let options = RenderOptions {
+        force: true,
+        draw_cursor: false,
+        ..RenderOptions::default()
+    };
+    let mut h = Harness::new(8, 4);
+    let green: Vec<u8> = (0..4u32).flat_map(|_| [0, 0xff, 0, 0xff]).collect();
+    let red: Vec<u8> = (0..4u32).flat_map(|_| [0xff, 0, 0, 0xff]).collect();
+
+    let payload = tos_term::graphics::encode_base64(&green);
+    h.feed(format!("\x1b[H\x1b_Ga=T,f=32,s=2,v=2,c=2,r=2,i=1;{payload}\x1b\\").as_bytes());
+    h.draw_with(&options);
+    assert_eq!(h.cell_pixel(0, 0, 1, 1), 0x00ff00);
+
+    // The same image id, the same placement size: only the pixels changed.
+    let payload = tos_term::graphics::encode_base64(&red);
+    h.feed(format!("\x1b[H\x1b_Ga=T,f=32,s=2,v=2,c=2,r=2,i=1;{payload}\x1b\\").as_bytes());
+    h.draw_with(&options);
+    assert_eq!(h.cell_pixel(0, 0, 1, 1), 0xff0000, "stale texture on screen");
 }

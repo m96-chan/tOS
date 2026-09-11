@@ -730,9 +730,19 @@ impl Compositor {
 
     // ---- rendering ------------------------------------------------------
 
-    /// Advance the blink phase. Returns true when it changed.
+    /// Advance the blink phase and any animations. Returns true when anything
+    /// changed.
     pub fn tick(&mut self) -> bool {
         let mut changed = false;
+        // Animated images move on their own clock. The compositor owns that
+        // clock and hands the time to each terminal, which keeps the terminal
+        // model free of time of its own.
+        let now = Instant::now();
+        for pane in self.panes.values_mut() {
+            if pane.terminal.advance_animations(now) {
+                changed = true;
+            }
+        }
         if self.last_blink.elapsed() >= BLINK_INTERVAL {
             self.blink_visible = !self.blink_visible;
             self.last_blink = Instant::now();
@@ -770,7 +780,9 @@ impl Compositor {
 
         let mut drawn: Vec<PaneId> = Vec::with_capacity(geometry.len());
         for (id, rect) in &geometry {
-            let Some(pane) = self.panes.get(id) else {
+            // Mutable because the pane owns its texture cache, which the
+            // renderer fills in as it draws.
+            let Some(pane) = self.panes.get_mut(id) else {
                 continue;
             };
             // A pane that is synchronising its output asked not to be drawn
@@ -794,7 +806,14 @@ impl Compositor {
                 force,
                 inactive_fade: self.config.inactive_fade,
             };
-            render(surface, pixel_rect, &pane.terminal, &mut self.fonts, &options);
+            render(
+                surface,
+                pixel_rect,
+                &pane.terminal,
+                &mut self.fonts,
+                &mut pane.textures,
+                &options,
+            );
         }
 
         if force {
@@ -902,6 +921,22 @@ impl Compositor {
         }
     }
 
+    /// How long the loop may wait for something to happen. An animation with a
+    /// frame due sooner than the idle timeout pulls the wait in, so playback
+    /// keeps its own pace instead of the poll timer's.
+    fn frame_timeout_ms(&self) -> i32 {
+        let now = Instant::now();
+        let soonest = self
+            .panes
+            .values()
+            .filter_map(|pane| pane.terminal.next_animation_delay(now))
+            .min();
+        match soonest {
+            Some(delay) => delay.as_millis().clamp(1, IDLE_TIMEOUT_MS as u128) as i32,
+            None => IDLE_TIMEOUT_MS,
+        }
+    }
+
     /// Run one iteration: poll, read, handle, and render if needed.
     pub fn run_once(
         &mut self,
@@ -916,7 +951,7 @@ impl Compositor {
         let timeout = if self.pending_writes {
             WRITE_RETRY_TIMEOUT_MS
         } else {
-            IDLE_TIMEOUT_MS
+            self.frame_timeout_ms()
         };
         self.pending_writes = false;
         let ready = tos_platform::tty::poll_readable(&fds, timeout)?;
@@ -1173,6 +1208,50 @@ mod tests {
             framebuffer.pixels().iter().any(|&px| px != background),
             "the frame should not be blank"
         );
+    }
+
+    /// Transmit a two frame animation into the focused pane and start it.
+    fn inject_animation(compositor: &mut Compositor) {
+        let pixels = tos_term::graphics::encode_base64(&[0x80u8; 8 * 16 * 4]);
+        compositor.inject(format!("\x1b_Ga=T,f=32,s=8,v=16,i=1;{pixels}\x1b\\").as_bytes());
+        compositor.inject(format!("\x1b_Ga=f,f=32,s=8,v=16,i=1,z=40;{pixels}\x1b\\").as_bytes());
+        compositor.inject(b"\x1b_Ga=a,i=1,r=1,z=40,s=3\x1b\\");
+    }
+
+    #[test]
+    fn a_running_animation_shortens_the_wait_for_the_next_frame() {
+        let mut compositor = compositor();
+        assert_eq!(compositor.frame_timeout_ms(), IDLE_TIMEOUT_MS);
+        inject_animation(&mut compositor);
+        // The first tick only starts the clock; after it the wait is a gap.
+        compositor.tick();
+        let timeout = compositor.frame_timeout_ms();
+        assert!(timeout > 0 && timeout <= 40, "waited {timeout}ms");
+    }
+
+    #[test]
+    fn a_new_animation_frame_asks_for_a_repaint() {
+        let mut compositor = compositor();
+        inject_animation(&mut compositor);
+        // The first tick starts the animation's clock.
+        compositor.tick();
+        let mut framebuffer = tos_render::OwnedFramebuffer::new(640, 360);
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, true);
+        }
+        assert!(!compositor.needs_render());
+
+        // Step past the first frame's gap the way the tick does, but with a
+        // time of the test's choosing.
+        let focus = compositor.session.focus();
+        let due = Instant::now() + Duration::from_millis(40);
+        assert!(compositor
+            .pane_mut(focus)
+            .unwrap()
+            .terminal
+            .advance_animations(due));
+        assert!(compositor.needs_render());
     }
 
     #[test]

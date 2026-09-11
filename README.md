@@ -460,14 +460,41 @@ wrapped lines rather than re-wrapping them.
 
 - [x] Kitty Graphics Protocol
 - [x] image surfaces
-- [ ] GPU-backed texture cache
-- [ ] image previews
-- [ ] video experiments
+- [x] scaled texture cache
+- [x] image previews
+- [x] video experiments
 
 Raw RGB and RGBA transmission work, including chunked transfers, placements
-and deletion. PNG payloads and zlib compression are parsed and answered with
-the protocol's error response rather than being silently dropped, so
-applications can fall back instead of hanging.
+and deletion. PNG payloads (`f=100`) and zlib-compressed payloads (`o=z`) are
+decoded in-tree by a hand-written DEFLATE and a PNG reader covering every
+colour type, bit depths 1 through 16, all five scanline filters and Adam7
+interlacing, which is the shape an image preview arrives in. A payload that
+cannot be decoded is still answered with the protocol's error response rather
+than being silently dropped, so applications can fall back instead of hanging.
+
+Only inline transmission is read, though. `t=f` and `t=t`, where the
+application hands over a path instead of the bytes, are still refused, and
+that is the route some file managers take for a large image. No preview tool
+has been run against tOS yet, so what is verified is the decoding, not the
+integration.
+
+Placements are scaled once and the result is kept, so a repeat frame costs a
+blend instead of a resample. The cache is a plain CPU one, bounded in bytes
+and evicted least-recently-used; there is no GPU pipeline under it to upload
+textures to, which is why the roadmap item no longer says there is.
+
+Moving pictures reach a terminal as animation frames, and those play. An
+image can carry frames sent with `a=f`, each one a rectangle of new pixels
+composed over an earlier frame or over a flat background colour, blended or
+copied; `a=a` starts and stops the animation, sets the frame on screen, the
+loop count and each frame's gap. The compositor steps every pane's
+animations from its tick, wakes in time for the next frame rather than on
+its idle timer, and repaints only the rows the moving image covers.
+
+`cargo run --example graphics_animation -- /tmp/tos-animation` transmits a
+thirty frame animation into a real pane and saves ten pictures of it
+playing. Composing between two frames that already exist (`a=c`) is still
+answered with an error, and frames carry the same raw formats images do.
 
 ### 0.0.5 — System UI
 

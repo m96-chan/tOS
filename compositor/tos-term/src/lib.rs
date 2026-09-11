@@ -10,8 +10,10 @@ pub mod cell;
 pub mod color;
 pub mod graphics;
 pub mod grid;
+pub mod inflate;
 pub mod modes;
 pub mod parser;
+pub mod png;
 pub mod term;
 pub mod width;
 

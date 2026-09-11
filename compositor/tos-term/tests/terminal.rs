@@ -1,5 +1,7 @@
 //! Behavioural tests for the terminal: what a stream of bytes does to the grid.
 
+use std::time::{Duration, Instant};
+
 use tos_term::graphics::encode_base64;
 use tos_term::{Color, CursorShape, Flags, MouseTracking, TermEvent, Terminal, TerminalConfig};
 
@@ -378,13 +380,65 @@ fn kitty_graphics_places_an_image_and_tags_cells() {
     assert_eq!(t.take_output(), b"\x1b_Gi=5;OK\x1b\\".to_vec());
 }
 
+/// A 2x2 RGBA PNG: red, green on the top row, blue and half-transparent
+/// white on the bottom. Written by CPython's zlib rather than by anything in
+/// this repository, so the decoder is checked against a real encoder's
+/// output: `IDAT` here is a genuine compressed deflate block, not stored
+/// bytes. IHDR says 8-bit colour type 6, no interlacing.
+const PNG_2X2: [u8; 76] = [
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x72, 0xb6, 0x0d,
+    0x24, 0x00, 0x00, 0x00, 0x13, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xf8, 0xcf, 0xc0, 0xf0,
+    0x1f, 0x0c, 0x81, 0x34, 0x08, 0x34, 0x00, 0x00, 0x49, 0x49, 0x09, 0x78, 0x9c, 0x51, 0x17, 0x92,
+    0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
 #[test]
-fn kitty_graphics_reports_unsupported_formats() {
+fn kitty_graphics_transmits_a_png() {
+    let mut t = term(10, 4);
+    let payload = encode_base64(&PNG_2X2);
+    t.advance(format!("\x1b_Ga=t,f=100,i=9;{payload}\x1b\\").as_bytes());
+
+    let image = t.graphics().image(9).expect("the PNG should be stored");
+    assert_eq!((image.width, image.height), (2, 2));
+    assert_eq!(
+        image.data,
+        vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 128]
+    );
+    assert_eq!(t.take_output(), b"\x1b_Gi=9;OK\x1b\\".to_vec());
+}
+
+#[test]
+fn kitty_graphics_transmits_a_zlib_compressed_image() {
+    let mut t = term(10, 4);
+    // A PNG is already deflated, so `o=z` on top of it is the doubly
+    // compressed shape a file manager can send. Deflate is content-agnostic,
+    // so a stored block is a legitimate stream to send here.
+    let mut compressed = vec![0x78u8, 0x01, 0x01];
+    compressed.extend_from_slice(&(PNG_2X2.len() as u16).to_le_bytes());
+    compressed.extend_from_slice(&(!(PNG_2X2.len() as u16)).to_le_bytes());
+    compressed.extend_from_slice(&PNG_2X2);
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in PNG_2X2.iter() {
+        a = (a + byte as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    compressed.extend_from_slice(&(((b << 16) | a).to_be_bytes()));
+
+    let payload = encode_base64(&compressed);
+    t.advance(format!("\x1b_Ga=t,f=100,o=z,i=11;{payload}\x1b\\").as_bytes());
+    assert_eq!(t.graphics().image(11).unwrap().data.len(), 2 * 2 * 4);
+    assert_eq!(t.take_output(), b"\x1b_Gi=11;OK\x1b\\".to_vec());
+}
+
+#[test]
+fn kitty_graphics_reports_undecodable_payloads() {
     let mut t = term(10, 4);
     t.advance(b"\x1b_Ga=T,f=100,s=1,v=1,i=9;AAAA\x1b\\");
     let out = String::from_utf8(t.take_output()).unwrap();
     assert!(out.contains("i=9"), "response should identify the image: {out}");
     assert!(out.contains("EINVAL"), "response should be an error: {out}");
+    assert!(t.graphics().image(9).is_none());
 }
 
 #[test]
@@ -514,4 +568,118 @@ fn resizing_on_the_primary_screen_still_keeps_the_newest_output() {
     t.resize(10, 2);
     assert_eq!(screen(&t)[0], "l3");
     assert_eq!(screen(&t)[1], "l4");
+}
+
+#[test]
+fn kitty_graphics_plays_an_animation_and_damages_the_rows_it_covers() {
+    let mut t = term(10, 4);
+    // An 8x16 image is one cell, placed on row zero.
+    let red = encode_base64(&[255, 0, 0, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=T,f=32,s=8,v=16,i=5;{red}\x1b\\").as_bytes());
+    let green = encode_base64(&[0, 255, 0, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=f,f=32,s=8,v=16,i=5,z=40;{green}\x1b\\").as_bytes());
+    t.advance(b"\x1b_Ga=a,i=5,r=1,z=40,s=3\x1b\\");
+    assert!(String::from_utf8(t.take_output()).unwrap().contains("OK"));
+
+    let start = Instant::now();
+    assert!(!t.advance_animations(start));
+    t.clear_damage();
+
+    assert!(!t.advance_animations(start + Duration::from_millis(20)));
+    assert!(!t.damage().is_row_dirty(0));
+
+    assert!(t.advance_animations(start + Duration::from_millis(40)));
+    assert!(t.damage().is_row_dirty(0));
+    assert!(!t.damage().is_row_dirty(2));
+    assert_eq!(t.graphics().image(5).unwrap().data[..4], [0, 255, 0, 255]);
+}
+
+#[test]
+fn an_animation_scrolled_out_of_view_asks_for_no_repaint() {
+    // A playing animation off the top of the viewport is still playing, but
+    // nothing about the screen changes. Calling that a repaint would flip the
+    // whole page every gap for a picture nobody can see.
+    //
+    // It has to be a tall image to get into that state at all: a placement one
+    // row high is dropped the moment it scrolls off, so it is gone before
+    // there is any history to look back through.
+    let mut t = term(10, 6);
+    let red = encode_base64(&[255, 0, 0, 255].repeat(8 * 48));
+    t.advance(format!("\x1b_Ga=T,f=32,s=8,v=48,i=5;{red}\x1b\\").as_bytes());
+    let green = encode_base64(&[0, 255, 0, 255].repeat(8 * 48));
+    t.advance(format!("\x1b_Ga=f,f=32,s=8,v=48,i=5,z=40;{green}\x1b\\").as_bytes());
+    t.advance(b"\x1b_Ga=a,i=5,r=1,z=40,s=3\x1b\\");
+    t.take_output();
+
+    for _ in 0..6 {
+        t.advance(b"\r\n");
+    }
+    assert!(t.scroll_display(3), "the test needs scrollback to look at");
+    let placed: Vec<i64> = t
+        .graphics()
+        .placements()
+        .map(|p| p.row as i64 - t.display_offset() as i64)
+        .collect();
+    assert_eq!(placed, vec![-3], "the image should be just off the top");
+
+    let start = Instant::now();
+    t.advance_animations(start);
+    t.clear_damage();
+    assert!(
+        !t.advance_animations(start + Duration::from_millis(40)),
+        "an animation nobody can see asked for a repaint"
+    );
+    assert!(!t.damage().is_dirty());
+    // It is still playing; only the repaint was declined.
+    assert_eq!(t.graphics().image(5).unwrap().current_frame(), 2);
+}
+
+#[test]
+fn an_animation_half_on_screen_still_repaints() {
+    // The other side of the same rule: one row of it showing is still showing.
+    let mut t = term(10, 6);
+    let red = encode_base64(&[255, 0, 0, 255].repeat(8 * 48));
+    t.advance(format!("\x1b_Ga=T,f=32,s=8,v=48,i=5;{red}\x1b\\").as_bytes());
+    let green = encode_base64(&[0, 255, 0, 255].repeat(8 * 48));
+    t.advance(format!("\x1b_Ga=f,f=32,s=8,v=48,i=5,z=40;{green}\x1b\\").as_bytes());
+    t.advance(b"\x1b_Ga=a,i=5,r=1,z=40,s=3\x1b\\");
+    t.take_output();
+
+    for _ in 0..4 {
+        t.advance(b"\r\n");
+    }
+    assert!(t.scroll_display(1));
+
+    let start = Instant::now();
+    t.advance_animations(start);
+    t.clear_damage();
+    assert!(t.advance_animations(start + Duration::from_millis(40)));
+    assert!(t.damage().is_row_dirty(0));
+}
+
+#[test]
+fn kitty_graphics_rejects_frames_for_images_that_were_never_sent() {
+    let mut t = term(10, 4);
+    t.advance(b"\x1b_Ga=f,f=32,s=1,v=1,i=9;AAAAAA==\x1b\\");
+    let out = String::from_utf8(t.take_output()).unwrap();
+    assert!(out.contains("i=9"), "response should identify the image: {out}");
+    assert!(out.contains("ENOENT"), "response should be an error: {out}");
+}
+
+#[test]
+fn an_unplaced_animation_asks_for_no_repaint() {
+    let mut t = term(10, 4);
+    let pixels = encode_base64(&[0u8; 4]);
+    // a=t stores without placing, so nothing on screen shows these frames.
+    t.advance(format!("\x1b_Ga=t,f=32,s=1,v=1,i=6;{pixels}\x1b\\").as_bytes());
+    t.advance(format!("\x1b_Ga=f,f=32,s=1,v=1,i=6,z=40;{pixels}\x1b\\").as_bytes());
+    t.advance(b"\x1b_Ga=a,i=6,r=1,z=40,s=3\x1b\\");
+
+    let start = Instant::now();
+    t.advance_animations(start);
+    t.clear_damage();
+    assert!(!t.advance_animations(start + Duration::from_millis(40)));
+    assert!(!t.damage().is_dirty());
+    // The frame still moved on, so the next placement shows the right one.
+    assert_eq!(t.graphics().image(6).unwrap().current_frame(), 2);
 }
