@@ -32,6 +32,12 @@ const IDLE_TIMEOUT_MS: i32 = 100;
 const WRITE_RETRY_TIMEOUT_MS: i32 = 4;
 /// How long a transient status message stays up.
 const MESSAGE_TIMEOUT: Duration = Duration::from_secs(3);
+/// The most a program may put into one selection with OSC 52. The clipboard
+/// carries text a person copies and pastes, and 64 KiB is already a thousand
+/// full lines — far more than anyone pastes into a shell. The cap is what
+/// keeps a pane from parking megabytes in the compositor that nobody will
+/// ever paste.
+const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
 
 /// Which menu an open overlay is, and so what choosing a row means.
 ///
@@ -268,10 +274,48 @@ impl Compositor {
                     changed = true;
                 }
                 TermEvent::ClipboardStore { selection, data } => {
-                    self.clipboard.insert(selection, data);
+                    // An oversized selection is dropped whole rather than
+                    // truncated: half a copied command line is exactly the
+                    // kind of thing that does damage when it lands in a
+                    // shell, and what the user already had is worth more than
+                    // a mangled replacement. They are told, because from the
+                    // pane's side the copy looked like it worked.
+                    if data.len() > MAX_CLIPBOARD_BYTES {
+                        self.message = Some((
+                            format!(
+                                "clipboard write refused: over {} KiB",
+                                MAX_CLIPBOARD_BYTES / 1024
+                            ),
+                            Instant::now(),
+                        ));
+                        changed = true;
+                    } else if is_clipboard_selector(selection) {
+                        self.clipboard.insert(selection, data);
+                    }
                 }
                 TermEvent::ClipboardLoad { selection } => {
-                    let data = self.clipboard.get(&selection).cloned().unwrap_or_default();
+                    // Reads are off unless the user asked for them. The query
+                    // is just bytes on a PTY, so a `cat` of a hostile file, or
+                    // anything running over ssh in that pane, can send it, and
+                    // what comes back is whatever was last copied — a password
+                    // as readily as a path. xterm and kitty refuse by default
+                    // for the same reason.
+                    //
+                    // The refusal is an empty selection rather than silence:
+                    // OSC 52 has no way to spell "no", a program that gets
+                    // nothing back waits out its own timeout, and an empty
+                    // answer is both indistinguishable from an empty clipboard
+                    // and a case every reader already handles.
+                    let data = if self.config.allow_clipboard_read {
+                        self.clipboard.get(&selection).cloned().unwrap_or_default()
+                    } else {
+                        self.message = Some((
+                            format!("clipboard read refused in pane {}", id.0 + 1),
+                            Instant::now(),
+                        ));
+                        changed = true;
+                        Vec::new()
+                    };
                     if let Some(pane) = self.panes.get_mut(&id) {
                         pane.terminal.report_clipboard(selection, &data);
                     }
@@ -1096,6 +1140,15 @@ impl Compositor {
     }
 }
 
+/// The selectors OSC 52 defines: the clipboard, primary, secondary, select,
+/// and the eight cut buffers. The selector arrives as a raw character, so
+/// without this a pane could invent a new one per store and grow the clipboard
+/// map for as long as it liked; with it the map holds at most thirteen
+/// selections of [`MAX_CLIPBOARD_BYTES`] each.
+fn is_clipboard_selector(selection: char) -> bool {
+    matches!(selection, 'c' | 'p' | 'q' | 's' | '0'..='7')
+}
+
 /// Assemble the font stack from configuration and display characteristics.
 fn build_fonts(config: &Config, size: (u32, u32), physical_mm: Option<(u32, u32)>) -> FontStack {
     let pixel_size = config
@@ -1134,11 +1187,17 @@ mod tests {
     use tos_input::KeyCode;
 
     fn compositor() -> Compositor {
+        compositor_with(Config::default())
+    }
+
+    /// Build a compositor on top of a config, filling in the parts every test
+    /// wants: a child that only sleeps, and the built-in bitmap font.
+    fn compositor_with(config: Config) -> Compositor {
         let config = Config {
             command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()]),
             bitmap_scale: Some(1),
             font: Some("/nonexistent-so-the-bitmap-font-is-used".into()),
-            ..Config::default()
+            ..config
         };
         Compositor::new(config, (640, 360), None).expect("compositor")
     }
@@ -1264,21 +1323,69 @@ mod tests {
         assert_eq!(compositor.clipboard('c'), Some(&b"from the app"[..]));
     }
 
-    #[test]
-    fn a_clipboard_query_is_answered() {
-        let mut compositor = compositor();
-        compositor.clipboard.insert('c', b"stored".to_vec());
+    /// Send an OSC 52 query and return what went back down the PTY.
+    fn query_clipboard(compositor: &mut Compositor) -> String {
         compositor.inject(b"\x1b]52;c;?\x07");
         let focus = compositor.session.focus();
         compositor.handle_terminal_events(focus);
-        let response = compositor
-            .pane_mut(focus)
-            .unwrap()
-            .terminal
-            .take_output();
-        let text = String::from_utf8(response).unwrap();
+        let response = compositor.pane_mut(focus).unwrap().terminal.take_output();
+        String::from_utf8(response).unwrap()
+    }
+
+    #[test]
+    fn a_clipboard_query_is_refused_by_default() {
+        let mut compositor = compositor();
+        compositor.clipboard.insert('c', b"a password".to_vec());
+        let text = query_clipboard(&mut compositor);
+        // An empty selection, well formed: the program gets an answer instead
+        // of waiting out a timeout, and none of the real one leaks.
+        assert_eq!(text, "\x1b]52;c;\x1b\\", "got {text:?}");
+        assert!(!text.contains(&tos_term::graphics::encode_base64(b"a password")));
+    }
+
+    #[test]
+    fn a_clipboard_query_is_answered_once_the_user_allows_it() {
+        let mut compositor = compositor_with(Config {
+            allow_clipboard_read: true,
+            ..Config::default()
+        });
+        compositor.clipboard.insert('c', b"stored".to_vec());
+        let text = query_clipboard(&mut compositor);
         assert!(text.starts_with("\x1b]52;c;"), "got {text:?}");
         assert!(text.contains(&tos_term::graphics::encode_base64(b"stored")));
+    }
+
+    #[test]
+    fn an_oversized_clipboard_write_is_refused() {
+        let mut compositor = compositor();
+        compositor.clipboard.insert('c', b"kept".to_vec());
+        let payload = tos_term::graphics::encode_base64(&vec![b'x'; MAX_CLIPBOARD_BYTES + 1]);
+        compositor.inject(format!("\x1b]52;c;{payload}\x07").as_bytes());
+        let focus = compositor.session.focus();
+        compositor.handle_terminal_events(focus);
+        // Dropped whole, so what the user had is still what they have.
+        assert_eq!(compositor.clipboard('c'), Some(&b"kept"[..]));
+    }
+
+    #[test]
+    fn a_clipboard_write_at_the_cap_still_lands() {
+        let mut compositor = compositor();
+        let data = vec![b'x'; MAX_CLIPBOARD_BYTES];
+        let payload = tos_term::graphics::encode_base64(&data);
+        compositor.inject(format!("\x1b]52;c;{payload}\x07").as_bytes());
+        let focus = compositor.session.focus();
+        compositor.handle_terminal_events(focus);
+        assert_eq!(compositor.clipboard('c'), Some(&data[..]));
+    }
+
+    #[test]
+    fn a_made_up_selector_never_reaches_the_clipboard() {
+        let mut compositor = compositor();
+        let payload = tos_term::graphics::encode_base64(b"junk");
+        compositor.inject(format!("\x1b]52;Z;{payload}\x07").as_bytes());
+        let focus = compositor.session.focus();
+        compositor.handle_terminal_events(focus);
+        assert_eq!(compositor.clipboard('Z'), None);
     }
 
     #[test]
