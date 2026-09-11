@@ -14,7 +14,7 @@ use tos_input::{
     MouseAction, MouseButton, MouseEvent,
 };
 use tos_platform::Display;
-use tos_render::{render, RenderOptions, Rect as PixelRect, Selection, Surface};
+use tos_render::{render, RenderOptions, Rect as PixelRect, Surface};
 use tos_session::{Action, Axis, Keymap, PaneId, Rect, Resolution, Session};
 use tos_term::TermEvent;
 
@@ -23,6 +23,7 @@ use crate::config::Config;
 use crate::launcher;
 use crate::overlay::{Overlay, OverlayOutcome};
 use crate::pane::Pane;
+use crate::selection::{Selection, SelectionMode};
 
 /// How often the cursor and blinking text change phase.
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
@@ -38,6 +39,24 @@ const MESSAGE_TIMEOUT: Duration = Duration::from_secs(3);
 /// keeps a pane from parking megabytes in the compositor that nobody will
 /// ever paste.
 const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
+/// How close together two presses have to be to count as a double click.
+const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+/// The OSC 52 selector for the clipboard, which an explicit copy writes.
+const CLIPBOARD: char = 'c';
+/// The selector for primary, which is where the mouse puts what it selects
+/// and where a middle click pastes from.
+const PRIMARY: char = 'p';
+
+/// The last left press, kept so that the one after it can tell whether it is
+/// a second or a third click of the same gesture.
+#[derive(Debug, Clone, Copy)]
+struct Click {
+    pane: PaneId,
+    col: usize,
+    row: usize,
+    at: Instant,
+    count: u32,
+}
 
 /// Which menu an open overlay is, and so what choosing a row means.
 ///
@@ -60,7 +79,8 @@ pub struct Compositor {
     chrome: Chrome,
     /// Display size in pixels.
     size: (u32, u32),
-    /// Selections stored by OSC 52 selector; 'c' is the clipboard.
+    /// Selections stored by OSC 52 selector: 'c' is the clipboard, which an
+    /// explicit copy writes, and 'p' is primary, which the mouse writes.
     clipboard: HashMap<char, Vec<u8>>,
     blink_visible: bool,
     last_blink: Instant,
@@ -73,6 +93,8 @@ pub struct Compositor {
     pointer: (u32, u32),
     /// The pane a mouse button went down on.
     mouse_grab: Option<PaneId>,
+    /// The previous left press, for double and triple click.
+    last_click: Option<Click>,
     /// Some pane still has input queued, so the loop must not idle.
     pending_writes: bool,
 }
@@ -97,6 +119,7 @@ impl Compositor {
             running: true,
             pointer: (0, 0),
             mouse_grab: None,
+            last_click: None,
             pending_writes: false,
             config,
         };
@@ -461,7 +484,9 @@ impl Compositor {
 
         let mut changed = false;
         if action == MouseAction::Press && self.session.focus() != pane_id {
+            let previous = self.session.focus();
             self.session.set_focus(pane_id);
+            self.clear_selection(previous);
             self.needs_full_redraw = true;
             changed = true;
         }
@@ -503,23 +528,26 @@ impl Compositor {
         }
 
         // Otherwise the mouse belongs to the compositor, and selects text.
+        let mode = if action == MouseAction::Press && button == Some(MouseButton::Left) {
+            SelectionMode::for_clicks(self.count_click(pane_id, local.col, local.row))
+        } else {
+            SelectionMode::Cell
+        };
         let mut copied = None;
         let mut paste = false;
         if let Some(pane) = self.panes.get_mut(&pane_id) {
+            let at = pane.anchor_at(local.col, local.row);
             match action {
                 MouseAction::Press if button == Some(MouseButton::Left) => {
                     pane.selecting = true;
-                    pane.selection = Some(Selection::new(
-                        (local.col, local.row),
-                        (local.col, local.row),
-                        modifiers.alt(),
-                    ));
+                    pane.set_selection(Some(Selection::new(at, modifiers.alt(), mode)));
                     self.mouse_grab = Some(pane_id);
                     changed = true;
                 }
                 MouseAction::Drag | MouseAction::Motion if pane.selecting => {
-                    if let Some(selection) = &mut pane.selection {
-                        selection.end = (local.col, local.row);
+                    if let Some(mut selection) = pane.selection {
+                        selection.drag_to(at);
+                        pane.set_selection(Some(selection));
                     }
                     changed = true;
                 }
@@ -536,17 +564,57 @@ impl Compositor {
             }
         }
 
+        // What the mouse selects goes to primary, the way X11 has always done
+        // it, so that dragging over a word does not throw away whatever was
+        // deliberately copied to the clipboard.
         if let Some(text) = copied {
-            self.clipboard.insert('c', text.into_bytes());
-            self.message = Some(("copied".to_string(), Instant::now()));
+            self.clipboard.insert(PRIMARY, text.into_bytes());
         }
         if paste {
-            let data = self.clipboard.get(&'c').cloned().unwrap_or_default();
+            let data = self.clipboard.get(&PRIMARY).cloned().unwrap_or_default();
             let text = String::from_utf8_lossy(&data).into_owned();
             self.paste_text(&text);
             changed = true;
         }
         changed
+    }
+
+    /// How many presses in a row this one is, counting only presses close
+    /// enough in time and on the same cell of the same pane to be one gesture.
+    ///
+    /// This lives here rather than in `tos-input` because the count is about
+    /// where the presses landed, and only the compositor knows that: it owns
+    /// the pane geometry that turns a pointer position into a cell. A device
+    /// driver sees pixels, and a host terminal hands over reports that never
+    /// carried a click count in the first place.
+    fn count_click(&mut self, pane: PaneId, col: usize, row: usize) -> u32 {
+        let now = Instant::now();
+        let count = match self.last_click {
+            Some(last)
+                if last.pane == pane
+                    && (last.col, last.row) == (col, row)
+                    && now.duration_since(last.at) <= MULTI_CLICK_INTERVAL =>
+            {
+                last.count + 1
+            }
+            _ => 1,
+        };
+        self.last_click = Some(Click {
+            pane,
+            col,
+            row,
+            at: now,
+            count,
+        });
+        count
+    }
+
+    /// Forget a pane's selection, which is what every event that moves the
+    /// text out from under it has to do.
+    fn clear_selection(&mut self, id: PaneId) {
+        if let Some(pane) = self.panes.get_mut(&id) {
+            pane.clear_selection();
+        }
     }
 
     /// Abandon an interaction that was still in progress in another pane.
@@ -597,6 +665,17 @@ impl Compositor {
 
     /// Carry out a compositor action. Returns true when a repaint is needed.
     pub fn perform(&mut self, action: Action) -> bool {
+        let before = self.session.focus();
+        let changed = self.perform_action(action);
+        // Moving focus away ends whatever was being selected there: the
+        // selection belongs to an interaction the user has left behind.
+        if self.session.focus() != before {
+            self.clear_selection(before);
+        }
+        changed
+    }
+
+    fn perform_action(&mut self, action: Action) -> bool {
         let area = self.grid_area();
         match action {
             Action::Split(axis) => self.split(axis),
@@ -700,14 +779,14 @@ impl Compositor {
             Action::Copy => {
                 let focus = self.session.focus();
                 if let Some(text) = self.panes.get(&focus).and_then(|p| p.selected_text()) {
-                    self.clipboard.insert('c', text.into_bytes());
+                    self.clipboard.insert(CLIPBOARD, text.into_bytes());
                     self.message = Some(("copied".to_string(), Instant::now()));
                     return true;
                 }
                 false
             }
             Action::Paste => {
-                let data = self.clipboard.get(&'c').cloned().unwrap_or_default();
+                let data = self.clipboard.get(&CLIPBOARD).cloned().unwrap_or_default();
                 let text = String::from_utf8_lossy(&data).into_owned();
                 self.paste_text(&text);
                 true
@@ -716,8 +795,8 @@ impl Compositor {
                 let focus = self.session.focus();
                 if let Some(pane) = self.panes.get_mut(&focus) {
                     let cursor = pane.terminal.cursor();
-                    pane.selection =
-                        Some(Selection::new((cursor.x, cursor.y), (cursor.x, cursor.y), false));
+                    let at = pane.anchor_at(cursor.x, cursor.y);
+                    pane.set_selection(Some(Selection::new(at, false, SelectionMode::Cell)));
                     return true;
                 }
                 false
@@ -959,7 +1038,7 @@ impl Compositor {
                 blink_visible: self.blink_visible,
                 focused: *id == focus,
                 draw_cursor: true,
-                selection: pane.selection,
+                selection: pane.display_selection(),
                 selection_background: self.chrome.accent,
                 force,
                 inactive_fade: self.config.inactive_fade,
