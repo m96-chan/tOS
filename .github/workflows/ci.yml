@@ -47,7 +47,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.LINT_TOOLCHAIN }}
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           key: lint
@@ -56,6 +56,12 @@ jobs:
         # workspace and not to its dependencies, whose warnings are not ours
         # to fix and would otherwise break the build on a compiler upgrade.
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Format
+        # Pinned for the same reason clippy is: rustfmt's output changes
+        # between releases, and a floating one would reformat code nobody
+        # touched. The tree was formatted once with this toolchain; this is
+        # what stops it drifting back out again.
+        run: cargo fmt --all -- --check
 
   cross:
     name: ${{ matrix.target }}

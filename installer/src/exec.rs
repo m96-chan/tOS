@@ -28,8 +28,7 @@ pub trait Backend {
     fn run(&mut self, program: &str, args: &[&str]) -> io::Result<Output>;
 
     /// Run a program, feeding it `input` on standard input.
-    fn run_with_input(&mut self, program: &str, args: &[&str], input: &str)
-        -> io::Result<Output>;
+    fn run_with_input(&mut self, program: &str, args: &[&str], input: &str) -> io::Result<Output>;
 
     /// Write a file, creating parent directories.
     fn write_file(&mut self, path: &str, contents: &str) -> io::Result<()>;
@@ -57,12 +56,7 @@ impl Backend for System {
         })
     }
 
-    fn run_with_input(
-        &mut self,
-        program: &str,
-        args: &[&str],
-        input: &str,
-    ) -> io::Result<Output> {
+    fn run_with_input(&mut self, program: &str, args: &[&str], input: &str) -> io::Result<Output> {
         use std::io::Write;
         use std::process::Stdio;
 
@@ -268,12 +262,7 @@ impl Backend for Recorder {
         Ok(self.response(program))
     }
 
-    fn run_with_input(
-        &mut self,
-        program: &str,
-        args: &[&str],
-        input: &str,
-    ) -> io::Result<Output> {
+    fn run_with_input(&mut self, program: &str, args: &[&str], input: &str) -> io::Result<Output> {
         self.actions.push(Action::Run {
             program: program.to_string(),
             args: args.iter().map(|a| a.to_string()).collect(),
@@ -407,9 +396,7 @@ mod tests {
         let dir = std::env::temp_dir().join("tos-install-exec-test");
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("etc").join("hostname");
-        backend
-            .write_file(path.to_str().unwrap(), "tos\n")
-            .unwrap();
+        backend.write_file(path.to_str().unwrap(), "tos\n").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "tos\n");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -6,12 +6,18 @@
 //! decide what choosing means. The power, network, Bluetooth and audio menus
 //! are the same surface over a different list, so they belong here too rather
 //! than each growing their own box.
+//!
+//! Drop the list and the same box is a prompt: a title and one line to type
+//! into, which is all renaming a workspace needs. Everything about typing —
+//! which keys are text and which are bindings to swallow, where the cursor is
+//! drawn, how a line too long for the box is shown — is the same question in
+//! both, and worth answering once.
 
 use tos_font::FontStack;
 use tos_input::{KeyCode, KeyEvent, Modifiers};
 use tos_render::{Rect, Surface};
 
-use crate::chrome::{draw_text, Chrome};
+use crate::chrome::{clip, draw_text, Chrome};
 
 /// The widest the overlay grows, however wide the display is. A launcher that
 /// spans a 4K screen is harder to read, not easier.
@@ -59,6 +65,10 @@ pub enum OverlayOutcome {
     Changed,
     /// This index into [`Overlay::items`] was chosen; the overlay is finished.
     Chosen(usize),
+    /// A prompt's line was accepted; the text is [`Overlay::query`] and the
+    /// overlay is finished. An empty line is accepted like any other, since
+    /// only the caller knows whether clearing it means something.
+    Accepted,
     /// Escape: the overlay is finished and nothing should happen.
     Cancelled,
 }
@@ -80,6 +90,9 @@ pub struct Overlay {
     /// First visible row, kept in range by [`Overlay::draw`], which is the
     /// only place the number of visible rows is known.
     scroll: usize,
+    /// Whether the line itself is the answer rather than a filter over the
+    /// list. A prompt has no list to choose from, so enter takes the text.
+    prompt: bool,
 }
 
 impl Overlay {
@@ -91,8 +104,22 @@ impl Overlay {
             matches: Vec::new(),
             cursor: 0,
             scroll: 0,
+            prompt: false,
         };
         overlay.refilter();
+        overlay
+    }
+
+    /// The same box with one line to type into and nothing underneath it.
+    ///
+    /// The line starts on `initial` so that the usual edit — fixing a name
+    /// that is nearly right — is a few keys rather than retyping it, and
+    /// because it is the only place the current value is shown. Enter reports
+    /// [`OverlayOutcome::Accepted`] whatever is on the line, empty included.
+    pub fn prompt(title: impl Into<String>, initial: impl Into<String>) -> Self {
+        let mut overlay = Overlay::new(title, Vec::new());
+        overlay.query = initial.into();
+        overlay.prompt = true;
         overlay
     }
 
@@ -145,12 +172,15 @@ impl Overlay {
         match key.code {
             KeyCode::Escape => return OverlayOutcome::Cancelled,
             KeyCode::Enter => {
+                if self.prompt {
+                    return OverlayOutcome::Accepted;
+                }
                 return match self.selected() {
                     Some(index) => OverlayOutcome::Chosen(index),
                     // Nothing matches, so there is nothing to choose. The
                     // overlay stays open rather than closing on an empty list.
                     None => OverlayOutcome::Consumed,
-                }
+                };
             }
             KeyCode::Backspace => {
                 return match self.query.pop() {
@@ -234,19 +264,25 @@ impl Overlay {
         // every side. Below that there is no honest way to draw this, and a
         // box with no room inside it is worse than none.
         // An empty list still gets a row, so that it has somewhere to say so.
-        let wanted = if self.matches.is_empty() {
-            1
+        // A prompt has no list at all, and so no divider either.
+        let chrome_rows = if self.prompt {
+            CHROME_ROWS - 1
         } else {
-            self.matches.len()
+            CHROME_ROWS
+        };
+        let wanted = match (self.prompt, self.matches.is_empty()) {
+            (true, _) => 0,
+            (false, true) => 1,
+            (false, false) => self.matches.len(),
         };
         let list_rows = wanted
             .min(MAX_LIST_ROWS)
-            .min(rows.saturating_sub(CHROME_ROWS + 2));
+            .min(rows.saturating_sub(chrome_rows + 2));
         let box_cols = cols.saturating_sub(2).min(MAX_WIDTH);
-        if list_rows == 0 || box_cols < 12 {
+        if (list_rows == 0 && !self.prompt) || rows < chrome_rows + 2 || box_cols < 12 {
             return;
         }
-        let box_rows = list_rows + CHROME_ROWS;
+        let box_rows = list_rows + chrome_rows;
         let inner = box_cols - 2;
         let x0 = area.x + (((cols - box_cols) / 2) * cw as usize) as i32;
         let y0 = area.y + (((rows - box_rows) / 2) * ch as usize) as i32;
@@ -254,7 +290,7 @@ impl Overlay {
         // Keep the cursor on screen now that the row count is known.
         if self.cursor < self.scroll {
             self.scroll = self.cursor;
-        } else if self.cursor >= self.scroll + list_rows {
+        } else if list_rows > 0 && self.cursor >= self.scroll + list_rows {
             self.scroll = self.cursor + 1 - list_rows;
         }
 
@@ -270,32 +306,108 @@ impl Overlay {
         let mut top = format!("┌─ {title} ");
         pad_to(&mut top, box_cols - 1, '─');
         top.push('┐');
-        draw_text(surface, fonts, x0, row_y(0), &top, border, Some(chrome.background), false);
+        draw_text(
+            surface,
+            fonts,
+            x0,
+            row_y(0),
+            &top,
+            border,
+            Some(chrome.background),
+            false,
+        );
 
         // The query line, ending in a block cursor so it is obvious where the
         // keyboard is going.
         let y = row_y(1);
-        let mut x = draw_text(surface, fonts, x0, y, "│ ", border, Some(chrome.background), false);
-        x = draw_text(surface, fonts, x, y, "> ", chrome.accent, Some(chrome.background), true);
+        let mut x = draw_text(
+            surface,
+            fonts,
+            x0,
+            y,
+            "│ ",
+            border,
+            Some(chrome.background),
+            false,
+        );
+        x = draw_text(
+            surface,
+            fonts,
+            x,
+            y,
+            "> ",
+            chrome.accent,
+            Some(chrome.background),
+            true,
+        );
         let shown = clip_end(&self.query, inner.saturating_sub(5));
-        x = draw_text(surface, fonts, x, y, &shown, chrome.foreground, Some(chrome.background), false);
+        x = draw_text(
+            surface,
+            fonts,
+            x,
+            y,
+            &shown,
+            chrome.foreground,
+            Some(chrome.background),
+            false,
+        );
         surface.fill(Rect::new(x, y, cw, ch), chrome.accent);
         x += cw as i32;
         let used = 4 + width_of(&shown);
         let mut tail = " ".repeat(inner.saturating_sub(used.min(inner)));
         tail.push('│');
-        draw_text(surface, fonts, x, y, &tail, border, Some(chrome.background), false);
+        draw_text(
+            surface,
+            fonts,
+            x,
+            y,
+            &tail,
+            border,
+            Some(chrome.background),
+            false,
+        );
 
-        let mut divider = "├".to_string();
-        pad_to(&mut divider, box_cols - 1, '─');
-        divider.push('┤');
-        draw_text(surface, fonts, x0, row_y(2), &divider, border, Some(chrome.background), false);
+        // With no list under it there is nothing for a divider to divide, and
+        // the loop below has no rows to draw.
+        if list_rows > 0 {
+            let mut divider = "├".to_string();
+            pad_to(&mut divider, box_cols - 1, '─');
+            divider.push('┤');
+            draw_text(
+                surface,
+                fonts,
+                x0,
+                row_y(2),
+                &divider,
+                border,
+                Some(chrome.background),
+                false,
+            );
+        }
 
         for row in 0..list_rows {
             let y = row_y(3 + row);
-            draw_text(surface, fonts, x0, y, "│", border, Some(chrome.background), false);
+            draw_text(
+                surface,
+                fonts,
+                x0,
+                y,
+                "│",
+                border,
+                Some(chrome.background),
+                false,
+            );
             let right = x0 + ((box_cols - 1) as u32 * cw) as i32;
-            draw_text(surface, fonts, right, y, "│", border, Some(chrome.background), false);
+            draw_text(
+                surface,
+                fonts,
+                right,
+                y,
+                "│",
+                border,
+                Some(chrome.background),
+                false,
+            );
             let x = x0 + cw as i32;
             let position = self.scroll + row;
             let Some(&index) = self.matches.get(position) else {
@@ -304,10 +416,28 @@ impl Overlay {
                 if self.matches.is_empty() && row == 0 {
                     let mut text = clip(" (no matches)", inner);
                     pad_to(&mut text, inner, ' ');
-                    draw_text(surface, fonts, x, y, &text, chrome.dim, Some(chrome.background), false);
+                    draw_text(
+                        surface,
+                        fonts,
+                        x,
+                        y,
+                        &text,
+                        chrome.dim,
+                        Some(chrome.background),
+                        false,
+                    );
                 } else {
                     let blank = " ".repeat(inner);
-                    draw_text(surface, fonts, x, y, &blank, chrome.dim, Some(chrome.background), false);
+                    draw_text(
+                        surface,
+                        fonts,
+                        x,
+                        y,
+                        &blank,
+                        chrome.dim,
+                        Some(chrome.background),
+                        false,
+                    );
                 }
                 continue;
             };
@@ -328,7 +458,11 @@ impl Overlay {
             let label_width = width_of(&item.label) + 1;
             if detail_width > 0 && label_width + detail_width + 2 <= inner {
                 let offset = inner - detail_width - 1;
-                let detail_fg = if selected { chrome.accent_text } else { chrome.dim };
+                let detail_fg = if selected {
+                    chrome.accent_text
+                } else {
+                    chrome.dim
+                };
                 draw_text(
                     surface,
                     fonts,
@@ -407,21 +541,6 @@ fn lower(c: char) -> char {
 
 fn width_of(text: &str) -> usize {
     tos_term::str_width(text)
-}
-
-/// Cut text to `cols` cells, never slicing a double width character in half.
-fn clip(text: &str, cols: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0;
-    for c in text.chars() {
-        let w = tos_term::char_width(c).max(1) as usize;
-        if used + w > cols {
-            break;
-        }
-        out.push(c);
-        used += w;
-    }
-    out
 }
 
 /// Like [`clip`] but keeps the end, for a query that has outgrown its line:
@@ -681,6 +800,55 @@ mod tests {
         assert_eq!(labels(&overlay), ["two"]);
     }
 
+    #[test]
+    fn a_prompt_starts_on_the_text_it_was_given_and_hands_back_what_was_typed() {
+        let mut overlay = Overlay::prompt("rename workspace", "2");
+        assert_eq!(overlay.query(), "2");
+        assert!(overlay.items().is_empty(), "a prompt has no list");
+        overlay.handle_key(&KeyEvent::new(KeyCode::Backspace, Modifiers::NONE));
+        type_text(&mut overlay, "build");
+        assert_eq!(
+            overlay.handle_key(&KeyEvent::new(KeyCode::Enter, Modifiers::NONE)),
+            OverlayOutcome::Accepted
+        );
+        assert_eq!(overlay.query(), "build");
+    }
+
+    #[test]
+    fn an_empty_prompt_is_accepted_rather_than_swallowed() {
+        // A list with nothing selected has nothing to choose, but an empty
+        // line is a thing to say, so the caller gets to hear it.
+        let mut overlay = Overlay::prompt("rename workspace", "");
+        assert_eq!(
+            overlay.handle_key(&KeyEvent::new(KeyCode::Enter, Modifiers::NONE)),
+            OverlayOutcome::Accepted
+        );
+        assert_eq!(overlay.query(), "");
+    }
+
+    #[test]
+    fn a_prompt_cancels_like_a_list_does() {
+        let mut overlay = Overlay::prompt("rename workspace", "1");
+        type_text(&mut overlay, "half typed");
+        assert_eq!(
+            overlay.handle_key(&KeyEvent::new(KeyCode::Escape, Modifiers::NONE)),
+            OverlayOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn a_prompt_still_swallows_bindings_and_arrows() {
+        let mut overlay = Overlay::prompt("rename workspace", "");
+        for key in [
+            KeyEvent::new(KeyCode::Char('d'), Modifiers::SUPER),
+            KeyEvent::new(KeyCode::Up, Modifiers::NONE),
+            KeyEvent::new(KeyCode::Down, Modifiers::NONE),
+        ] {
+            assert_eq!(overlay.handle_key(&key), OverlayOutcome::Consumed);
+        }
+        assert_eq!(overlay.query(), "");
+    }
+
     fn fonts() -> FontStack {
         FontStack::new(Box::new(BitmapFont::new(1)))
     }
@@ -718,10 +886,48 @@ mod tests {
         }
         {
             let mut surface = fb.surface();
-            overlay.draw(&mut surface, &mut fonts, Rect::new(0, 0, w, h), &Chrome::default());
+            overlay.draw(
+                &mut surface,
+                &mut fonts,
+                Rect::new(0, 0, w, h),
+                &Chrome::default(),
+            );
         }
         assert!(overlay.scroll > 0, "the list should have scrolled");
         assert!(overlay.scroll <= overlay.cursor);
+    }
+
+    #[test]
+    fn a_prompt_is_drawn_in_the_rows_a_list_would_not_fit_in() {
+        let mut fonts = fonts();
+        let metrics = fonts.metrics();
+        // Five rows: the borders, the line, and a row of margin either side.
+        // A list needs one more for its own row and one for the divider.
+        let (w, h) = (metrics.cell_width * 40, metrics.cell_height * 5);
+        let chrome = Chrome::default();
+        let area = Rect::new(0, 0, w, h);
+
+        let mut list = overlay(&["ls"]);
+        let mut fb = OwnedFramebuffer::new(w, h);
+        {
+            let mut surface = fb.surface();
+            list.draw(&mut surface, &mut fonts, area, &chrome);
+        }
+        assert!(
+            fb.pixels().iter().all(|&px| px == 0),
+            "the list should not fit"
+        );
+
+        let mut prompt = Overlay::prompt("rename workspace", "build");
+        let mut fb = OwnedFramebuffer::new(w, h);
+        {
+            let mut surface = fb.surface();
+            prompt.draw(&mut surface, &mut fonts, area, &chrome);
+        }
+        // The block cursor at the end of the line is accent coloured, so the
+        // line was drawn and the box under it was filled.
+        assert!(fb.pixels().iter().any(|&px| px == chrome.accent.pack()));
+        assert!(fb.pixels().iter().any(|&px| px == chrome.background.pack()));
     }
 
     #[test]
@@ -733,9 +939,17 @@ mod tests {
         let mut overlay = overlay(&["ls"]);
         {
             let mut surface = fb.surface();
-            overlay.draw(&mut surface, &mut fonts, Rect::new(0, 0, w, h), &Chrome::default());
+            overlay.draw(
+                &mut surface,
+                &mut fonts,
+                Rect::new(0, 0, w, h),
+                &Chrome::default(),
+            );
         }
-        assert!(fb.pixels().iter().all(|&px| px == 0), "nothing should be drawn");
+        assert!(
+            fb.pixels().iter().all(|&px| px == 0),
+            "nothing should be drawn"
+        );
     }
 
     #[test]

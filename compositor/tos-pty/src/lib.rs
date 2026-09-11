@@ -73,7 +73,10 @@ impl PtyConfig {
                 ("TERM".into(), "xterm-256color".into()),
                 ("COLORTERM".into(), "truecolor".into()),
                 ("TERM_PROGRAM".into(), "tOS".into()),
-                ("TERM_PROGRAM_VERSION".into(), env!("CARGO_PKG_VERSION").into()),
+                (
+                    "TERM_PROGRAM_VERSION".into(),
+                    env!("CARGO_PKG_VERSION").into(),
+                ),
             ],
             unset_env: vec!["COLUMNS".into(), "LINES".into()],
             cwd: None,
@@ -111,8 +114,7 @@ impl Pty {
         for arg in &config.args {
             argv_owned.push(cstring(OsStr::new(arg))?);
         }
-        let mut argv: Vec<*const libc::c_char> =
-            argv_owned.iter().map(|s| s.as_ptr()).collect();
+        let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|s| s.as_ptr()).collect();
         argv.push(std::ptr::null());
 
         let env_pairs = build_env(config)?;
@@ -212,13 +214,7 @@ impl Pty {
 
     /// Write input to the child. May write less than the whole buffer.
     pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = unsafe {
-            libc::write(
-                self.master,
-                buf.as_ptr() as *const libc::c_void,
-                buf.len(),
-            )
-        };
+        let n = unsafe { libc::write(self.master, buf.as_ptr() as *const libc::c_void, buf.len()) };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -379,7 +375,13 @@ unsafe fn child_setup(master: RawFd, slave: RawFd, cwd: Option<&CStr>) {
 
     // Signal dispositions are inherited across exec; reset the ones the
     // compositor may have ignored so the child behaves like a normal process.
-    for signal in [libc::SIGPIPE, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+    for signal in [
+        libc::SIGPIPE,
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGTERM,
+    ] {
         libc::signal(signal, libc::SIG_DFL);
     }
     let mut empty: libc::sigset_t = std::mem::zeroed();

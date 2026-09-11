@@ -34,6 +34,8 @@ pub enum Action {
     SelectWorkspace(usize),
     /// Move the focused pane to a workspace by number.
     MovePaneToWorkspace(usize),
+    /// Ask for a name for the active workspace.
+    RenameWorkspace,
     /// Scroll the focused pane's viewport, in lines. Negative is back in time.
     Scroll(i32),
     /// Scroll by a screenful.
@@ -47,6 +49,11 @@ pub enum Action {
     /// Open the launcher: a filtered list of programs, one of which starts in
     /// a new pane.
     OpenLauncher,
+    /// Open the notification history: everything that has been on the status
+    /// bar, including whatever went past while the screen was not being read.
+    ShowNotifications,
+    /// Show what the bindings are, read out of this keymap.
+    ShowBindings,
     /// Leave the compositor.
     Quit,
     /// Redraw everything.
@@ -86,9 +93,12 @@ pub enum Resolution {
 #[derive(Debug, Clone)]
 pub struct Keymap {
     /// Bindings that fire directly.
-    direct: HashMap<Binding, Action>,
+    ///
+    /// Visible to the crate so that [`crate::describe`] can tell the user what
+    /// is bound without the table having to be restated anywhere.
+    pub(crate) direct: HashMap<Binding, Action>,
     /// Bindings that fire only after the leader key.
-    after_leader: HashMap<Binding, Action>,
+    pub(crate) after_leader: HashMap<Binding, Action>,
     pub leader: Option<Binding>,
     leader_armed: bool,
 }
@@ -115,26 +125,85 @@ impl Keymap {
         keymap.leader = Some(Binding::new(KeyCode::Char('a'), Modifiers::CTRL));
 
         let bindings: &[(KeyCode, Modifiers, Action)] = &[
-            (KeyCode::Char('d'), Modifiers::NONE, Action::Split(Axis::Columns)),
-            (KeyCode::Char('s'), Modifiers::NONE, Action::Split(Axis::Rows)),
+            (
+                KeyCode::Char('d'),
+                Modifiers::NONE,
+                Action::Split(Axis::Columns),
+            ),
+            (
+                KeyCode::Char('s'),
+                Modifiers::NONE,
+                Action::Split(Axis::Rows),
+            ),
             (KeyCode::Char('x'), Modifiers::NONE, Action::ClosePane),
-            (KeyCode::Left, Modifiers::NONE, Action::Focus(Direction::Left)),
-            (KeyCode::Right, Modifiers::NONE, Action::Focus(Direction::Right)),
+            (
+                KeyCode::Left,
+                Modifiers::NONE,
+                Action::Focus(Direction::Left),
+            ),
+            (
+                KeyCode::Right,
+                Modifiers::NONE,
+                Action::Focus(Direction::Right),
+            ),
             (KeyCode::Up, Modifiers::NONE, Action::Focus(Direction::Up)),
-            (KeyCode::Down, Modifiers::NONE, Action::Focus(Direction::Down)),
-            (KeyCode::Char('h'), Modifiers::NONE, Action::Focus(Direction::Left)),
-            (KeyCode::Char('l'), Modifiers::NONE, Action::Focus(Direction::Right)),
-            (KeyCode::Char('k'), Modifiers::NONE, Action::Focus(Direction::Up)),
-            (KeyCode::Char('j'), Modifiers::NONE, Action::Focus(Direction::Down)),
-            (KeyCode::Left, Modifiers::SHIFT, Action::Resize(Direction::Left, 2)),
-            (KeyCode::Right, Modifiers::SHIFT, Action::Resize(Direction::Right, 2)),
-            (KeyCode::Up, Modifiers::SHIFT, Action::Resize(Direction::Up, 1)),
-            (KeyCode::Down, Modifiers::SHIFT, Action::Resize(Direction::Down, 1)),
+            (
+                KeyCode::Down,
+                Modifiers::NONE,
+                Action::Focus(Direction::Down),
+            ),
+            (
+                KeyCode::Char('h'),
+                Modifiers::NONE,
+                Action::Focus(Direction::Left),
+            ),
+            (
+                KeyCode::Char('l'),
+                Modifiers::NONE,
+                Action::Focus(Direction::Right),
+            ),
+            (
+                KeyCode::Char('k'),
+                Modifiers::NONE,
+                Action::Focus(Direction::Up),
+            ),
+            (
+                KeyCode::Char('j'),
+                Modifiers::NONE,
+                Action::Focus(Direction::Down),
+            ),
+            (
+                KeyCode::Left,
+                Modifiers::SHIFT,
+                Action::Resize(Direction::Left, 2),
+            ),
+            (
+                KeyCode::Right,
+                Modifiers::SHIFT,
+                Action::Resize(Direction::Right, 2),
+            ),
+            (
+                KeyCode::Up,
+                Modifiers::SHIFT,
+                Action::Resize(Direction::Up, 1),
+            ),
+            (
+                KeyCode::Down,
+                Modifiers::SHIFT,
+                Action::Resize(Direction::Down, 1),
+            ),
             (KeyCode::Char('z'), Modifiers::NONE, Action::ToggleZoom),
             (KeyCode::Char('='), Modifiers::NONE, Action::Balance),
             (KeyCode::Char('c'), Modifiers::NONE, Action::NewWorkspace),
             (KeyCode::Char('n'), Modifiers::NONE, Action::NextWorkspace),
-            (KeyCode::Char('p'), Modifiers::NONE, Action::PreviousWorkspace),
+            (
+                KeyCode::Char('p'),
+                Modifiers::NONE,
+                Action::PreviousWorkspace,
+            ),
+            // Comma is where tmux renames a window, and nothing else here
+            // wants the key.
+            (KeyCode::Char(','), Modifiers::NONE, Action::RenameWorkspace),
             (KeyCode::PageUp, Modifiers::NONE, Action::ScrollPage(-1)),
             (KeyCode::PageDown, Modifiers::NONE, Action::ScrollPage(1)),
             (KeyCode::Char('['), Modifiers::NONE, Action::BeginSelection),
@@ -144,6 +213,15 @@ impl Keymap {
             // Space is the one key nothing else wants, and super+space is
             // where a launcher lives on every other desktop.
             (KeyCode::Char(' '), Modifiers::NONE, Action::OpenLauncher),
+            // m for messages: the notifications that have been and gone.
+            (
+                KeyCode::Char('m'),
+                Modifiers::NONE,
+                Action::ShowNotifications,
+            ),
+            // Shift and the slash key is the question mark, which is where
+            // every other program with a leader key keeps its own help.
+            (KeyCode::Char('/'), Modifiers::SHIFT, Action::ShowBindings),
             (KeyCode::Char('q'), Modifiers::NONE, Action::Quit),
         ];
         for (code, modifiers, action) in bindings {
@@ -234,10 +312,7 @@ impl Keymap {
         // trigger a binding nor consume a leader that is waiting.
         if matches!(
             event.code,
-            KeyCode::ModifierKey(_)
-                | KeyCode::CapsLock
-                | KeyCode::NumLock
-                | KeyCode::ScrollLock
+            KeyCode::ModifierKey(_) | KeyCode::CapsLock | KeyCode::NumLock | KeyCode::ScrollLock
         ) {
             return Resolution::Passthrough;
         }
@@ -382,8 +457,7 @@ mod tests {
             Resolution::Pending
         );
         for _ in 0..5 {
-            let repeat =
-                press(KeyCode::Char('a'), Modifiers::CTRL).with_state(KeyState::Repeat);
+            let repeat = press(KeyCode::Char('a'), Modifiers::CTRL).with_state(KeyState::Repeat);
             assert_eq!(keymap.resolve(&repeat), Resolution::Pending);
             assert!(keymap.is_pending());
         }
@@ -493,6 +567,49 @@ mod tests {
         // A plain space is still a space, which is most of what a pane gets.
         assert_eq!(
             keymap.resolve(&press(KeyCode::Char(' '), Modifiers::NONE)),
+            Resolution::Passthrough
+        );
+    }
+
+    #[test]
+    fn comma_renames_the_workspace_with_or_without_the_leader() {
+        let mut keymap = Keymap::default_bindings();
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char(','), Modifiers::SUPER)),
+            Resolution::Action(Action::RenameWorkspace)
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char(','), Modifiers::NONE)),
+            Resolution::Action(Action::RenameWorkspace)
+        );
+        // A plain comma is a comma, which the pane is owed.
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char(','), Modifiers::NONE)),
+            Resolution::Passthrough
+        );
+    }
+
+    #[test]
+    fn a_question_mark_asks_what_the_bindings_are() {
+        // The question mark arrives as the slash key with shift, because a
+        // `KeyCode::Char` is the unshifted key.
+        let mut keymap = Keymap::default_bindings();
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('/'), Modifiers::SHIFT)),
+            Resolution::Action(Action::ShowBindings)
+        );
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('/'),
+                Modifiers::SUPER.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::ShowBindings)
+        );
+        // An unshifted slash is still a slash, which panes need for paths.
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('/'), Modifiers::NONE)),
             Resolution::Passthrough
         );
     }

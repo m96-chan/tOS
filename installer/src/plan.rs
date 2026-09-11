@@ -207,9 +207,7 @@ impl Plan {
         let mut script = String::from("label: gpt\n");
         match self.firmware {
             Firmware::Uefi => {
-                script.push_str(&format!(
-                    "size={ESP_MIB}MiB, type=uefi, name=\"tOS ESP\"\n"
-                ));
+                script.push_str(&format!("size={ESP_MIB}MiB, type=uefi, name=\"tOS ESP\"\n"));
             }
             Firmware::Bios => {
                 script.push_str(&format!(

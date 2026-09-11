@@ -464,18 +464,10 @@ impl Layout {
             self.collect_dividers(child, child_area, out);
             if !is_last && self.gap > 0 {
                 let divider = match axis {
-                    Axis::Columns => Rect::new(
-                        area.x + offset + size,
-                        area.y,
-                        self.gap,
-                        area.height,
-                    ),
-                    Axis::Rows => Rect::new(
-                        area.x,
-                        area.y + offset + size,
-                        area.width,
-                        self.gap,
-                    ),
+                    Axis::Columns => {
+                        Rect::new(area.x + offset + size, area.y, self.gap, area.height)
+                    }
+                    Axis::Rows => Rect::new(area.x, area.y + offset + size, area.width, self.gap),
                 };
                 out.push((*axis, divider));
             }
@@ -547,9 +539,7 @@ impl Layout {
         let mut node = leaf;
         while let Some(parent) = self.node(node).parent {
             let (parent_axis, index, count) = match &self.node(parent).kind {
-                NodeKind::Split {
-                    axis, children, ..
-                } => (
+                NodeKind::Split { axis, children, .. } => (
                     *axis,
                     children.iter().position(|&c| c == node).expect("child"),
                     children.len(),
@@ -918,7 +908,11 @@ mod tests {
         // enough for eleven halvings along each axis.
         let area = Rect::new(0, 0, 4096, 4096);
         for i in 1..12u32 {
-            let axis = if i % 2 == 0 { Axis::Columns } else { Axis::Rows };
+            let axis = if i % 2 == 0 {
+                Axis::Columns
+            } else {
+                Axis::Rows
+            };
             assert!(layout.split(area, PaneId(i - 1), axis, PaneId(i)));
         }
         assert_eq!(layout.len(), 12);
@@ -952,10 +946,8 @@ mod review_regressions {
         }
         for (i, (a_pane, a)) in geometry.iter().enumerate() {
             for (b_pane, b) in geometry.iter().skip(i + 1) {
-                let overlap = a.x < b.right()
-                    && b.x < a.right()
-                    && a.y < b.bottom()
-                    && b.y < a.bottom();
+                let overlap =
+                    a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom();
                 assert!(!overlap, "{a_pane:?} {a:?} overlaps {b_pane:?} {b:?}");
             }
         }
@@ -993,7 +985,11 @@ mod review_regressions {
         let mut layout = Layout::new(PaneId(0));
         let area = Rect::new(0, 0, 100, 30);
         for i in 1..20u32 {
-            let axis = if i % 2 == 0 { Axis::Columns } else { Axis::Rows };
+            let axis = if i % 2 == 0 {
+                Axis::Columns
+            } else {
+                Axis::Rows
+            };
             layout.split(area, PaneId(i - 1), axis, PaneId(i));
             assert_tiles(&layout, area);
         }
@@ -1020,7 +1016,11 @@ mod review_regressions {
         layout.gap = 0;
         let area = Rect::new(0, 0, 80, 24);
         for i in 1..8u32 {
-            let axis = if i % 3 == 0 { Axis::Rows } else { Axis::Columns };
+            let axis = if i % 3 == 0 {
+                Axis::Rows
+            } else {
+                Axis::Columns
+            };
             layout.split(area, PaneId(i - 1), axis, PaneId(i));
         }
         for (pane, rect) in layout.geometry(area) {

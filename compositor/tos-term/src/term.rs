@@ -11,8 +11,8 @@ use crate::color::{Color, Palette, Rgb};
 use crate::graphics::{Action, GraphicsCommand, GraphicsStore};
 use crate::grid::{Grid, Region};
 use crate::modes::{
-    CursorShape, CursorStyle, KeyboardFlags, KeyboardStack, MouseEncoding, MouseState,
-    MouseTracking, Modes,
+    CursorShape, CursorStyle, KeyboardFlags, KeyboardStack, Modes, MouseEncoding, MouseState,
+    MouseTracking,
 };
 use crate::parser::{Params, Parser, Perform};
 use crate::width::char_width;
@@ -31,14 +31,37 @@ impl Charset {
         match self {
             Charset::Ascii => c,
             Charset::DecSpecial => match c {
-                '`' => '◆', 'a' => '▒', 'b' => '\t', 'c' => '\u{c}',
-                'd' => '\r', 'e' => '\n', 'f' => '°', 'g' => '±',
-                'h' => '␤', 'i' => '\u{b}', 'j' => '┘', 'k' => '┐',
-                'l' => '┌', 'm' => '└', 'n' => '┼', 'o' => '⎺',
-                'p' => '⎻', 'q' => '─', 'r' => '⎼', 's' => '⎽',
-                't' => '├', 'u' => '┤', 'v' => '┴', 'w' => '┬',
-                'x' => '│', 'y' => '≤', 'z' => '≥', '{' => 'π',
-                '|' => '≠', '}' => '£', '~' => '·',
+                '`' => '◆',
+                'a' => '▒',
+                'b' => '\t',
+                'c' => '\u{c}',
+                'd' => '\r',
+                'e' => '\n',
+                'f' => '°',
+                'g' => '±',
+                'h' => '␤',
+                'i' => '\u{b}',
+                'j' => '┘',
+                'k' => '┐',
+                'l' => '┌',
+                'm' => '└',
+                'n' => '┼',
+                'o' => '⎺',
+                'p' => '⎻',
+                'q' => '─',
+                'r' => '⎼',
+                's' => '⎽',
+                't' => '├',
+                'u' => '┤',
+                'v' => '┴',
+                'w' => '┬',
+                'x' => '│',
+                'y' => '≤',
+                'z' => '≥',
+                '{' => 'π',
+                '|' => '≠',
+                '}' => '£',
+                '~' => '·',
                 '_' => ' ',
                 other => other,
             },
@@ -87,11 +110,19 @@ pub enum TermEvent {
     /// OSC 7: the shell reported its working directory.
     CwdChanged(String),
     /// OSC 9 / OSC 777: a desktop notification.
-    Notify { title: String, body: String },
+    Notify {
+        title: String,
+        body: String,
+    },
     /// OSC 52 store; `selection` is the raw selector character.
-    ClipboardStore { selection: char, data: Vec<u8> },
+    ClipboardStore {
+        selection: char,
+        data: Vec<u8>,
+    },
     /// OSC 52 query; the compositor answers with [`Terminal::report_clipboard`].
-    ClipboardLoad { selection: char },
+    ClipboardLoad {
+        selection: char,
+    },
     /// The application changed the cursor shape.
     CursorStyleChanged(CursorStyle),
     /// Mouse or keyboard reporting changed; input encoding must be re-read.
@@ -305,6 +336,16 @@ impl Terminal {
         &self.palette
     }
 
+    /// Replace the palette, including the one a reset goes back to.
+    ///
+    /// Colours that came from configuration have to become this terminal's
+    /// idea of default as well, or the first `OSC 104` an application sends
+    /// would quietly put the built-in palette back.
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.default_palette = palette.clone();
+        self.palette = palette;
+    }
+
     pub fn mouse(&self) -> MouseState {
         self.mouse
     }
@@ -350,7 +391,10 @@ impl Terminal {
         self.output.extend_from_slice(bytes);
     }
 
-    /// Answer an OSC 52 clipboard query.
+    /// Answer an OSC 52 clipboard query. Whether the real selection or an
+    /// empty one goes back is the compositor's call — reading the clipboard is
+    /// a privilege the pane has to be granted, and the terminal does not know
+    /// what the user granted.
     pub fn report_clipboard(&mut self, selection: char, data: &[u8]) {
         let encoded = crate::graphics::encode_base64(data);
         let response = format!("\x1b]52;{selection};{encoded}\x1b\\");
@@ -1315,7 +1359,8 @@ impl Perform for Terminal {
             (None, b'X') => self.erase_chars(arg(0)),
             (None, b'S') => {
                 let attrs = self.cursor.attrs;
-                self.screen.scroll_up(self.scroll_region, arg(0), &attrs, true);
+                self.screen
+                    .scroll_up(self.scroll_region, arg(0), &attrs, true);
                 self.graphics.scroll(arg(0) as u16);
                 self.damage.mark_all();
             }
@@ -1432,7 +1477,8 @@ impl Perform for Terminal {
                 self.events.push(TermEvent::ReportingChanged);
             }
             (Some(b'>'), b'u') => {
-                self.keyboard.push(KeyboardFlags(params.get_raw(0, 0) as u8));
+                self.keyboard
+                    .push(KeyboardFlags(params.get_raw(0, 0) as u8));
                 self.events.push(TermEvent::ReportingChanged);
             }
             (Some(b'<'), b'u') => {

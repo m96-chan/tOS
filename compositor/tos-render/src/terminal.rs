@@ -204,10 +204,7 @@ pub fn render(
             let mut run_color: Option<Rgb> = None;
             for x in 0..cols {
                 let cell = &row.cells()[x];
-                let selected = options
-                    .selection
-                    .map(|s| s.contains(x, y))
-                    .unwrap_or(false);
+                let selected = options.selection.map(|s| s.contains(x, y)).unwrap_or(false);
                 let colors =
                     resolve_colors(cell, palette, term.modes.reverse_video, selected, options);
                 match run_color {
@@ -245,10 +242,7 @@ pub fn render(
                 if cell.attrs.flags.contains(Flags::WIDE_SPACER) {
                     continue;
                 }
-                let selected = options
-                    .selection
-                    .map(|s| s.contains(x, y))
-                    .unwrap_or(false);
+                let selected = options.selection.map(|s| s.contains(x, y)).unwrap_or(false);
                 let colors =
                     resolve_colors(cell, palette, term.modes.reverse_video, selected, options);
                 let px = area.x + (x as u32 * cw) as i32;

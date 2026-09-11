@@ -32,7 +32,11 @@ impl Rgb {
             let t = t as u32;
             ((a * (255 - t) + b * t) / 255) as u8
         };
-        Rgb::new(mix(self.r, other.r), mix(self.g, other.g), mix(self.b, other.b))
+        Rgb::new(
+            mix(self.r, other.r),
+            mix(self.g, other.g),
+            mix(self.b, other.b),
+        )
     }
 
     /// Scale every channel by `num/den`, used for the SGR "dim" attribute.
@@ -46,15 +50,13 @@ impl Rgb {
 ///
 /// `Default` is resolved late, at paint time, so that changing the theme does
 /// not require rewriting the grid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Color {
     #[default]
     Default,
     Indexed(u8),
     Rgb(Rgb),
 }
-
 
 /// The 256 color palette plus the default foreground/background/cursor colors.
 #[derive(Debug, Clone)]

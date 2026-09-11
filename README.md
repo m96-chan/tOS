@@ -509,6 +509,7 @@ answered with an error, and frames carry the same raw formats images do.
 - [x] network controls
 - [ ] Bluetooth controls
 - [x] audio controls
+- [x] configuration file
 
 Sound is driven straight through the kernel's control interface. `tos-system`
 opens `/dev/snd/controlC<N>` and issues `SNDRV_CTL_IOCTL_CARD_INFO`,
@@ -571,6 +572,50 @@ a title, a list of labels and their details, and reports which one was chosen �
 which is exactly the shape the four remaining items need. Power, network,
 Bluetooth and audio are the same overlay over a different list, and none of
 them exists yet: there is no system layer behind them to list.
+
+Settings now come from a file as well as from flags. The format and the search
+order are under [Configuration](#configuration); what matters to the rest of
+this milestone is the shape. Every setting is a plain field on one `Config`
+struct, the file is applied to that struct before the flags are, and adding a
+setting is one arm of one match. The sections for key bindings, the status
+bar's segments and the font fallback list are named but not answered yet, and
+land with the code behind them.
+Notifications are a queue rather than a slot. The status bar shows one at a
+time — three seconds each, or one second while others are waiting, so a burst
+drains at a pace that can be read instead of one that has to be waited out —
+and `super+m` opens the list of what has been raised, newest first, saying what
+each one said, which pane said it and how long ago. Choosing one goes to the
+pane that raised it, wherever that pane has since ended up; the first row of
+the list clears it. Applications raise them with `OSC 9;body` or
+`OSC 777;notify;title;body`, and a bell becomes one too, because a display
+server with no audio stack has nothing to ring. The compositor's own messages —
+copied, no room to split, a split that failed and what the kernel said about it
+— queue and are kept the same way, and the leader indicator is not one of them:
+it is drawn from the keymap, so arming the leader no longer wipes whatever was
+on the bar.
+
+The body is whatever was on the other end of a pipe, so it is read only as far
+as it could possibly matter, stripped of control characters and of combining
+marks that have no base to attach to in a cell grid, collapsed at every run of
+whitespace into a single space, and cut to two hundred cells with an ellipsis.
+What is still too long for the bar is clipped there rather than dropped, which
+is what used to happen: a message that did not fit was not drawn at all, and
+the messages that do not fit are the ones carrying an `io::Error`. With
+`--no-status-bar` there is no bar to clip into, so the same line is drawn over
+the top right of the panes — a failure has to look like something, and it used
+to look like a dead key. Kitty's OSC 99, with its ids, urgency and dismissal
+from the application, is not implemented: it belongs on top of this queue
+rather than beside it.
+Take the list away and the same box is a prompt: a title and one line to type
+into. That is what `super+,`, or `ctrl+a` then `,`, uses to name a workspace —
+the comma is where tmux renames a window. The line opens holding the name the
+workspace has now, so correcting one is a few keys rather than retyping it;
+enter takes the line and the status bar says it in the next frame, and escape
+leaves the old name alone. Accepting an empty line is how the number is asked
+for back: the workspace forgets it was ever named, so renumbering moves it
+along with the rest again when a workspace before it closes. A name belongs to
+the workspace rather than to the position, which is why a named workspace keeps
+its name while its neighbours are renumbered around it.
 
 ### 0.1 — Portable tOS
 
@@ -680,6 +725,7 @@ What has been exercised, and how:
 | Input encoding, both legacy and Kitty | unit tests, plus a decode round trip |
 | Layout, focus, workspaces, key bindings | unit tests |
 | Whole compositor | tests that run shells in split panes and inspect pixels |
+| Configuration file | unit tests over the parser and the search order, plus a compositor built from a configuration and read back off the framebuffer |
 | DRM/KMS, evdev, VT ownership | compile for x86_64 and arm64 Linux; ioctl numbers and structure layouts are unit-tested against the kernel headers |
 | Installer | the whole sequence against a recorded backend, plus the real binary driven on a pseudoterminal with its output read back through tOS's own terminal emulator |
 
@@ -748,7 +794,87 @@ To render a frame without a display at all:
 `ctrl+a`; on hardware the same bindings work directly with `super`. The two
 bindings that grow a session are also where most people expect them:
 `ctrl+shift+enter` splits the focused pane and `ctrl+shift+t` opens a new
-workspace. `super+space` opens the launcher.
+workspace. `super+space` opens the launcher, `super+m` opens the notifications
+and `super+,` names the workspace. From inside a session, `leader ?` puts the
+binding list over the panes; both it and `--help` are generated from the keymap
+that is running, so neither can fall behind it.
+
+## Configuration
+
+An installed machine starts the compositor from `/init`, so anything that can
+only be said on the command line is fixed until the image is rebuilt. tOS
+therefore reads a file, and looks for it in this order, stopping at the first
+one that exists:
+
+```text
+$XDG_CONFIG_HOME/tos/tos.conf   or ~/.config/tos/tos.conf
+$XDG_CONFIG_DIRS/tos/tos.conf   or /etc/xdg/tos/tos.conf
+/etc/tos/tos.conf
+```
+
+The last of those is not XDG. It is there because `/init` has no home
+directory and often no environment at all, and a machine that boots straight
+into tOS still has to be configurable. `--config <path>` reads one named file
+instead of searching, and `--no-config` skips the file entirely.
+
+The format is `key = value` lines under `[section]` headers, with `#` starting
+a comment on a line of its own. It is hand-parsed, like the command line, the
+PNG decoder and the DEFLATE decoder before it: the compositor is what an
+installed machine runs as PID 1, and a dependency in that path should earn its
+place. A comment has to be a whole line because values begin with `#` all the
+time — every colour does.
+
+```ini
+# General settings. The [general] heading is optional; this is the top of the
+# file, which is the same place.
+backend = auto
+font = /usr/share/fonts/TTF/DejaVuSansMono.ttf
+font-size = 16
+# Used for the built-in face, when no font file is given.
+bitmap-scale = 2
+scrollback = 10000
+# The program each pane runs; -e on the command line overrides it.
+shell = /bin/sh -l
+status-bar = true
+# How far unfocused panes are dimmed, 0 to 255.
+inactive-fade = 40
+# The headless size, and the fallback when a backend cannot report one.
+size = 1280x720
+
+# What applications paint with. color0 to color255 set the palette itself.
+[colors]
+background = #101012
+foreground = #d0d0d0
+cursor = #87b7ff
+cursor-text = #101012
+color0 = #1c1c1c
+color1 = #cc5757
+
+# What the compositor paints its own dividers, status bar and menus with.
+[chrome]
+background = #18181c
+foreground = #c8c8d0
+dim = #70707c
+accent = #5f87d7
+accent-text = #101014
+divider = #2c2c34
+divider-focused = #5f87d7
+```
+
+Colours are hex, with or without the `#`, in the three digit shorthand or the
+six digit form. Booleans take `true`, `yes`, `on` and `1` or their opposites.
+
+A flag always wins over the file, so `tos --scrollback 0` means what it says
+whatever the file asked for. A line the file gets wrong is reported by name and
+line number and then skipped — the rest of the file still applies, and tOS
+still boots into a usable terminal, the same way it degrades when a display
+backend is unavailable rather than refusing to start.
+
+Key bindings, the status bar's segments and the font fallback list each want a
+section of their own, and will get one as the code behind them lands. Until
+then a key the compositor does not know is reported rather than silently
+ignored, because a setting that quietly does nothing is indistinguishable from
+one that is broken.
 
 ## Installing
 

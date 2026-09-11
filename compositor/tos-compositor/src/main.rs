@@ -12,7 +12,8 @@ use tos_input::host::HostInput;
 use tos_platform::tty::ReadOutcome;
 use tos_platform::{Display, HeadlessDisplay, NestedDisplay};
 
-use tos_compositor::config::{parse_args, Backend, Config, USAGE};
+use tos_compositor::config::{usage, Backend, Config};
+use tos_compositor::config_file;
 use tos_compositor::Compositor;
 
 /// Set from a signal handler when the host terminal changes size.
@@ -31,8 +32,14 @@ extern "C" fn on_terminate(_: libc::c_int) {
 fn install_signal_handlers() {
     unsafe {
         libc::signal(libc::SIGWINCH, on_winch as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, on_terminate as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_terminate as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            on_terminate as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            on_terminate as *const () as libc::sighandler_t,
+        );
         // Writing to a PTY whose child has gone must return an error, not kill
         // the compositor.
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
@@ -48,7 +55,7 @@ fn main() -> ExitCode {
         None => &args[..],
     };
     if own_args.iter().any(|a| a == "-h" || a == "--help") {
-        print!("{USAGE}");
+        print!("{}", usage());
         return ExitCode::SUCCESS;
     }
     if own_args.iter().any(|a| a == "-V" || a == "--version") {
@@ -56,14 +63,21 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let config = match parse_args(&args) {
-        Ok(config) => config,
+    let startup = match config_file::startup(&args) {
+        Ok(startup) => startup,
         Err(message) => {
             eprintln!("tos: {message}");
             eprintln!("try 'tos --help'");
             return ExitCode::from(2);
         }
     };
+    // A file this machine cannot read is not a reason to leave someone without
+    // a terminal, any more than a missing display backend is. Say what was
+    // wrong with it and carry on with the settings that did make sense.
+    for problem in &startup.problems {
+        eprintln!("tos: {problem}");
+    }
+    let config = startup.config;
 
     install_signal_handlers();
     match run(config) {
@@ -338,7 +352,10 @@ mod tests {
 
     #[test]
     fn help_flags_before_dash_e_are_ours() {
-        let args: Vec<String> = ["--help", "-e", "sh"].iter().map(|s| s.to_string()).collect();
+        let args: Vec<String> = ["--help", "-e", "sh"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let at = args.iter().position(|a| a == "-e" || a == "--command");
         let own = &args[..at.unwrap()];
         assert!(own.iter().any(|a| a == "--help"));

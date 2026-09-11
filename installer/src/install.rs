@@ -177,10 +177,7 @@ impl<'a> Installer<'a> {
         }
 
         for directory in COPIED_DIRECTORIES {
-            let from = format!(
-                "{}{directory}",
-                self.plan.source_root.trim_end_matches('/')
-            );
+            let from = format!("{}{directory}", self.plan.source_root.trim_end_matches('/'));
             if !self.backend.exists(&from) {
                 continue;
             }
@@ -257,10 +254,7 @@ impl<'a> Installer<'a> {
         )?;
         self.write(
             &format!("{root}/etc/group"),
-            &format!(
-                "root:x:0:\n{user}:x:1000:\n",
-                user = settings.username
-            ),
+            &format!("root:x:0:\n{user}:x:1000:\n", user = settings.username),
         )?;
         let home = format!("{root}/home/{}", settings.username);
         self.backend
@@ -275,10 +269,7 @@ impl<'a> Installer<'a> {
             &format!("{root}/etc/inittab"),
             "::sysinit:/etc/rc\n::respawn:/sbin/tos\n::ctrlaltdel:/sbin/reboot\n",
         )?;
-        self.write(
-            &format!("{root}/etc/rc"),
-            RC_SCRIPT,
-        )?;
+        self.write(&format!("{root}/etc/rc"), RC_SCRIPT)?;
         let rc = format!("{root}/etc/rc");
         let _ = self.backend.run("chmod", &["755", &rc]);
         Ok(())
@@ -362,7 +353,8 @@ impl<'a> Installer<'a> {
              \tsearch --no-floppy --label --set=root tos-root\n\
              \tlinux /boot/vmlinuz root=LABEL=tos-root rw console=tty0\n\
              \tinitrd /boot/initramfs.gz\n\
-             }\n".to_string()
+             }\n"
+        .to_string()
     }
 
     fn finish(&mut self) -> Result<(), String> {
@@ -639,7 +631,10 @@ mod tests {
         let esp = backend
             .position_of("mount /dev/sda1 /mnt/target/boot/efi")
             .unwrap();
-        assert!(root < esp, "the ESP mount would be hidden by the root mount");
+        assert!(
+            root < esp,
+            "the ESP mount would be hidden by the root mount"
+        );
     }
 
     #[test]
@@ -798,9 +793,7 @@ mod tests {
             .actions
             .iter()
             .find_map(|action| match action {
-                crate::exec::Action::WriteFile { path, contents }
-                    if path.ends_with("grub.cfg") =>
-                {
+                crate::exec::Action::WriteFile { path, contents } if path.ends_with("grub.cfg") => {
                     Some(contents.clone())
                 }
                 _ => None,
@@ -886,10 +879,11 @@ mod tests {
         }
         assert_eq!(progress.log.len(), MAX_LOG_LINES);
         // It is the tail that is kept.
-        assert!(progress.log.last().unwrap().contains(&format!(
-            "line {}",
-            MAX_LOG_LINES * 3 - 1
-        )));
+        assert!(progress
+            .log
+            .last()
+            .unwrap()
+            .contains(&format!("line {}", MAX_LOG_LINES * 3 - 1)));
     }
 
     #[test]

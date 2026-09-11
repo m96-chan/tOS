@@ -118,10 +118,7 @@ pub fn art_width(art: &str) -> usize {
 /// Apply one SGR sequence's parameters to `style`.
 fn apply_sgr(params: &str, palette: &Palette, style: &mut Style) {
     // An omitted parameter means zero, which is the reset.
-    let numbers: Vec<u16> = params
-        .split(';')
-        .map(|p| p.parse().unwrap_or(0))
-        .collect();
+    let numbers: Vec<u16> = params.split(';').map(|p| p.parse().unwrap_or(0)).collect();
     let mut i = 0;
     while i < numbers.len() {
         match numbers[i] {
@@ -296,7 +293,10 @@ mod tests {
         // Hiding the cursor is a shell's business; the text must not keep it.
         let plain: String = art_lines(PICTURE).join("");
         assert!(!plain.contains('\x1b'), "{plain:?} still has an escape");
-        assert!(!plain.contains("25"), "{plain:?} kept a sequence's parameters");
+        assert!(
+            !plain.contains("25"),
+            "{plain:?} kept a sequence's parameters"
+        );
     }
 
     #[test]

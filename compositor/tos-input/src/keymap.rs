@@ -4,7 +4,7 @@
 //! the shape of this module is what matters, because everything above it works
 //! in [`KeyCode`] rather than in scancodes.
 
-use crate::event::{KeyCode, Keypad, ModifierKey};
+use crate::event::{ImeKey, KeyCode, Keypad, ModifierKey};
 
 /// What one physical key produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +47,8 @@ impl KeyMapping {
     }
 }
 
-/// Map an evdev key code to a logical key on the US layout.
+/// Map an evdev key code to a logical key on the US layout, together with the
+/// keys a JIS keyboard adds, which the US layout has no scancodes for.
 pub fn lookup(code: u16) -> Option<KeyMapping> {
     use KeyCode as K;
     Some(match code {
@@ -127,6 +128,15 @@ pub fn lookup(code: u16) -> Option<KeyMapping> {
         83 => KeyMapping::key(K::Keypad(Keypad::Decimal)),
         87 => KeyMapping::key(K::Function(11)),
         88 => KeyMapping::key(K::Function(12)),
+        // The keys only a JIS keyboard has. A US keyboard never sends these
+        // scancodes, so giving them their Japanese meaning here takes nothing
+        // away from the built in layout, and it beats dropping the events
+        // until layout files exist. The characters are the ones the kernel's
+        // own jp106 layout produces.
+        89 => KeyMapping::text('\\', '_'),
+        92 => KeyMapping::key(K::Ime(ImeKey::Convert)),
+        93 => KeyMapping::key(K::Ime(ImeKey::KanaMode)),
+        94 => KeyMapping::key(K::Ime(ImeKey::NonConvert)),
         96 => KeyMapping::key(K::Keypad(Keypad::Enter)),
         97 => KeyMapping::key(K::ModifierKey(ModifierKey::RightCtrl)),
         98 => KeyMapping::key(K::Keypad(Keypad::Divide)),
@@ -144,12 +154,30 @@ pub fn lookup(code: u16) -> Option<KeyMapping> {
         111 => KeyMapping::key(K::Delete),
         117 => KeyMapping::key(K::Keypad(Keypad::Equal)),
         119 => KeyMapping::key(K::Pause),
+        // The yen key, which sits where a US keyboard has nothing at all.
+        124 => KeyMapping::text('¥', '|'),
         125 => KeyMapping::key(K::ModifierKey(ModifierKey::LeftSuper)),
         126 => KeyMapping::key(K::ModifierKey(ModifierKey::RightSuper)),
         127 => KeyMapping::key(K::Menu),
         183..=194 => KeyMapping::key(K::Function((code - 183 + 13) as u8)),
         _ => return None,
     })
+}
+
+/// The highest scancode [`lookup`] knows about.
+const LAST_SCANCODE: u16 = 194;
+
+/// What the key that plainly types `plain` produces when shift is held.
+///
+/// The table is keyed by scancode, so answering this walks it. That is fine
+/// for the only caller, which names a binding for a cheat sheet once rather
+/// than once per keypress, and asking the layout is what keeps the name of a
+/// binding tied to the key that actually produces it.
+pub fn shifted(plain: char) -> Option<char> {
+    (0..=LAST_SCANCODE)
+        .filter_map(lookup)
+        .find(|mapping| mapping.plain == Some(plain))
+        .and_then(|mapping| mapping.shifted)
 }
 
 #[cfg(test)]
@@ -203,8 +231,46 @@ mod tests {
     }
 
     #[test]
+    fn jis_typing_keys_produce_their_characters() {
+        let ro = lookup(89).unwrap();
+        assert_eq!(ro.code, KeyCode::Char('\\'));
+        assert_eq!(ro.character(false, false), Some('\\'));
+        assert_eq!(ro.character(true, false), Some('_'));
+
+        let yen = lookup(124).unwrap();
+        assert_eq!(yen.code, KeyCode::Char('¥'));
+        assert_eq!(yen.character(false, false), Some('¥'));
+        assert_eq!(yen.character(true, false), Some('|'));
+
+        // Neither is a letter, so caps lock leaves both alone.
+        assert_eq!(ro.character(false, true), Some('\\'));
+        assert_eq!(yen.character(false, true), Some('¥'));
+    }
+
+    #[test]
+    fn conversion_keys_are_named_rather_than_typed() {
+        assert_eq!(lookup(92).unwrap().code, KeyCode::Ime(ImeKey::Convert));
+        assert_eq!(lookup(93).unwrap().code, KeyCode::Ime(ImeKey::KanaMode));
+        assert_eq!(lookup(94).unwrap().code, KeyCode::Ime(ImeKey::NonConvert));
+        for code in [92, 93, 94] {
+            let key = lookup(code).unwrap();
+            assert_eq!(key.character(false, false), None);
+            assert_eq!(key.character(true, false), None);
+        }
+    }
+
+    #[test]
     fn unmapped_codes_return_nothing() {
         assert!(lookup(0).is_none());
         assert!(lookup(1000).is_none());
+    }
+
+    #[test]
+    fn shifted_characters_come_from_the_layout() {
+        assert_eq!(shifted('/'), Some('?'));
+        assert_eq!(shifted(';'), Some(':'));
+        assert_eq!(shifted('t'), Some('T'));
+        // A key nothing on this layout types plainly has no shifted form.
+        assert_eq!(shifted('?'), None);
     }
 }

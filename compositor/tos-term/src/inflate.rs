@@ -295,12 +295,13 @@ const LENGTH_EXTRA: [u8; 29] = [
 ];
 /// Distance codes 0..=29.
 const DIST_BASE: [u16; 30] = [
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049,
-    3073, 4097, 6145, 8193, 12289, 16385, 24577,
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
 ];
 /// Extra bits read after each distance code.
 const DIST_EXTRA: [u8; 30] = [
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
 ];
 /// The order in which a dynamic block writes the code-length code lengths.
 const CODE_LENGTH_ORDER: [usize; 19] = [
@@ -311,7 +312,11 @@ const CODE_LENGTH_ORDER: [usize; 19] = [
 // Block decoding
 // ---------------------------------------------------------------------------
 
-fn inflate_into(reader: &mut BitReader, out: &mut Vec<u8>, limit: usize) -> Result<(), InflateError> {
+fn inflate_into(
+    reader: &mut BitReader,
+    out: &mut Vec<u8>,
+    limit: usize,
+) -> Result<(), InflateError> {
     let (fixed_literals, fixed_distances) = fixed_tables()?;
     loop {
         let last = reader.bits(1)? == 1;
@@ -350,7 +355,11 @@ fn fixed_tables() -> Result<(Huffman, Huffman), InflateError> {
     ))
 }
 
-fn stored_block(reader: &mut BitReader, out: &mut Vec<u8>, limit: usize) -> Result<(), InflateError> {
+fn stored_block(
+    reader: &mut BitReader,
+    out: &mut Vec<u8>,
+    limit: usize,
+) -> Result<(), InflateError> {
     reader.align();
     let header = reader.bytes(4)?;
     let len = u16::from_le_bytes([header[0], header[1]]) as usize;
@@ -555,7 +564,10 @@ pub(crate) mod tests {
         fixed_literal(&mut bits, 264); // length 10, no extra bits
         bits.write_msb(0, 5); // distance 1
         fixed_literal(&mut bits, 256);
-        assert_eq!(inflate(&bits.finish(), 64).unwrap(), b"xxxxxxxxxxx".to_vec());
+        assert_eq!(
+            inflate(&bits.finish(), 64).unwrap(),
+            b"xxxxxxxxxxx".to_vec()
+        );
     }
 
     #[test]
@@ -616,7 +628,10 @@ pub(crate) mod tests {
         let mut stream = zlib_stored(b"abcd");
         let last = stream.len() - 1;
         stream[last] ^= 0xff;
-        assert_eq!(zlib_decompress(&stream, 4096), Err(InflateError::BadChecksum));
+        assert_eq!(
+            zlib_decompress(&stream, 4096),
+            Err(InflateError::BadChecksum)
+        );
     }
 
     #[test]

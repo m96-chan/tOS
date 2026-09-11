@@ -304,8 +304,7 @@ fn box_drawing_joins_across_cells() {
     let background = h.term.palette().background.pack();
     let mid = metrics.cell_height / 2;
     for x in 0..h.fb.width() {
-        let inked = (mid.saturating_sub(1)..=mid + 1)
-            .any(|y| h.fb.pixel(x, y) != background);
+        let inked = (mid.saturating_sub(1)..=mid + 1).any(|y| h.fb.pixel(x, y) != background);
         assert!(inked, "gap in the line at column {x}");
     }
 }
@@ -447,13 +446,20 @@ fn a_double_underline_stays_inside_its_cell() {
     });
     let metrics = h.fonts.metrics();
     let rows = inked_rows(&h, 0, 0);
-    assert_eq!(rows.len(), 2, "a double underline has two strokes: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        2,
+        "a double underline has two strokes: {rows:?}"
+    );
     assert!(
         rows.iter().all(|&y| y < metrics.cell_height),
         "strokes must stay in the cell: {rows:?}"
     );
     // And nothing leaked into the row below.
-    assert!(inked_rows(&h, 0, 1).is_empty(), "ink spilled into the next row");
+    assert!(
+        inked_rows(&h, 0, 1).is_empty(),
+        "ink spilled into the next row"
+    );
 }
 
 #[test]
@@ -468,7 +474,10 @@ fn a_curly_underline_stays_inside_its_cell() {
     let rows = inked_rows(&h, 0, 0);
     assert!(!rows.is_empty());
     assert!(rows.iter().all(|&y| y < metrics.cell_height), "{rows:?}");
-    assert!(inked_rows(&h, 0, 1).is_empty(), "ink spilled into the next row");
+    assert!(
+        inked_rows(&h, 0, 1).is_empty(),
+        "ink spilled into the next row"
+    );
 }
 
 #[test]
@@ -514,7 +523,11 @@ fn images_scroll_with_the_text_they_sit_on() {
         ..RenderOptions::default()
     };
     h.draw_with(&options);
-    assert_eq!(h.cell_pixel(0, 0, 1, 1), 0x00ff00, "image should be on row 0");
+    assert_eq!(
+        h.cell_pixel(0, 0, 1, 1),
+        0x00ff00,
+        "image should be on row 0"
+    );
 
     // Push the image off the top of the screen, then look at history.
     h.feed(b"\r\n\r\n\r\n\r\n\r\n");
@@ -570,7 +583,10 @@ fn the_texture_cache_changes_no_pixels() {
     uncached.draw_with(&options);
 
     assert!(cached.textures.hits() > 0, "the scene never hit the cache");
-    assert!(uncached.textures.is_empty(), "nothing should have been kept");
+    assert!(
+        uncached.textures.is_empty(),
+        "nothing should have been kept"
+    );
     assert_eq!(cached.fb.pixels(), uncached.fb.pixels());
 }
 
@@ -586,7 +602,11 @@ fn repeat_frames_do_not_rescale() {
     for _ in 0..5 {
         h.draw_with(&options);
     }
-    assert_eq!(h.textures.misses(), 1, "the image was scaled more than once");
+    assert_eq!(
+        h.textures.misses(),
+        1,
+        "the image was scaled more than once"
+    );
     assert_eq!(h.textures.hits(), 4);
 }
 
@@ -610,5 +630,9 @@ fn retransmitting_an_image_invalidates_its_texture() {
     let payload = tos_term::graphics::encode_base64(&red);
     h.feed(format!("\x1b[H\x1b_Ga=T,f=32,s=2,v=2,c=2,r=2,i=1;{payload}\x1b\\").as_bytes());
     h.draw_with(&options);
-    assert_eq!(h.cell_pixel(0, 0, 1, 1), 0xff0000, "stale texture on screen");
+    assert_eq!(
+        h.cell_pixel(0, 0, 1, 1),
+        0xff0000,
+        "stale texture on screen"
+    );
 }

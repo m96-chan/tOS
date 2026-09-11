@@ -73,6 +73,13 @@ impl Workspace {
         self.name = name.into();
         self.renamed = true;
     }
+
+    /// Forget the name the user gave, so the workspace answers to its position
+    /// again. The number itself comes from the session, which is the only
+    /// thing that knows what position this is.
+    pub fn clear_name(&mut self) {
+        self.renamed = false;
+    }
 }
 
 /// Everything the compositor knows about panes and workspaces.
@@ -190,11 +197,7 @@ impl Session {
     /// Close a pane. Returns the panes that should be torn down: the pane
     /// itself, or nothing when it was the last pane of the last workspace.
     pub fn close_pane(&mut self, pane: PaneId) -> Vec<PaneId> {
-        let Some(index) = self
-            .workspaces
-            .iter()
-            .position(|w| w.layout.contains(pane))
-        else {
+        let Some(index) = self.workspaces.iter().position(|w| w.layout.contains(pane)) else {
             return Vec::new();
         };
 
@@ -258,7 +261,10 @@ impl Session {
     pub fn focus_next(&mut self) -> PaneId {
         let workspace = self.active_mut();
         let panes = workspace.layout.panes();
-        let current = panes.iter().position(|&p| p == workspace.focus).unwrap_or(0);
+        let current = panes
+            .iter()
+            .position(|&p| p == workspace.focus)
+            .unwrap_or(0);
         let next = panes[(current + 1) % panes.len()];
         workspace.set_focus(next);
         next
@@ -266,11 +272,7 @@ impl Session {
 
     pub fn set_focus(&mut self, pane: PaneId) -> bool {
         // Focusing a pane on another workspace switches to that workspace.
-        let Some(index) = self
-            .workspaces
-            .iter()
-            .position(|w| w.layout.contains(pane))
-        else {
+        let Some(index) = self.workspaces.iter().position(|w| w.layout.contains(pane)) else {
             return false;
         };
         self.active = index;
@@ -311,6 +313,24 @@ impl Session {
         self.workspaces.push(Workspace::new(id, position, pane));
         self.active = position;
         pane
+    }
+
+    /// Name the active workspace.
+    ///
+    /// An empty name is how the user asks for the number back: a blank label
+    /// would leave the status bar with nothing to address the workspace by.
+    /// Surrounding space cannot be seen there either, so a name made only of
+    /// it is the same as no name at all.
+    pub fn rename_active(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.active_mut().clear_name();
+        } else {
+            self.active_mut().rename(name);
+        }
+        // A workspace that just lost its name needs its number back, and
+        // renumbering leaves every name that is still wanted alone.
+        self.renumber();
     }
 
     pub fn next_workspace(&mut self) -> WorkspaceId {
@@ -523,6 +543,43 @@ mod tests {
     }
 
     #[test]
+    fn a_named_workspace_keeps_its_name_when_the_others_are_renumbered() {
+        let mut session = Session::new();
+        let middle = session.new_workspace();
+        session.new_workspace();
+        session.rename_active("build");
+        // Closing an earlier workspace moves this one down a place. A number
+        // would have to follow the position; a name must not.
+        session.close_pane(middle);
+        assert_eq!(session.workspaces()[0].name, "1");
+        assert_eq!(session.workspaces()[1].name, "build");
+    }
+
+    #[test]
+    fn an_empty_name_gives_the_workspace_its_number_back() {
+        let mut session = Session::new();
+        session.new_workspace();
+        session.rename_active("build");
+        assert_eq!(session.active().name, "build");
+        session.rename_active("   ");
+        assert_eq!(session.active().name, "2", "space is not a name");
+        // And the number follows the position again, which it only can if the
+        // rename was forgotten rather than merely overwritten.
+        let root = session.root_pane();
+        session.close_pane(root);
+        assert_eq!(session.workspaces()[0].name, "1");
+    }
+
+    #[test]
+    fn renaming_touches_only_the_active_workspace() {
+        let mut session = Session::new();
+        session.new_workspace();
+        session.rename_active("build");
+        session.select_workspace(1);
+        assert_eq!(session.active().name, "1");
+    }
+
+    #[test]
     fn a_pane_can_move_to_another_workspace() {
         let mut session = Session::new();
         let moving = session.split_focused(area(), Axis::Columns).unwrap();
@@ -532,7 +589,11 @@ mod tests {
 
         assert!(session.move_focused_to_workspace(area(), 2));
         assert_eq!(session.workspace_of(moving), Some(WorkspaceId(1)));
-        assert_eq!(session.active_index(), 0, "the source workspace stays active");
+        assert_eq!(
+            session.active_index(),
+            0,
+            "the source workspace stays active"
+        );
         assert!(!session.workspaces()[0].layout.contains(moving));
     }
 

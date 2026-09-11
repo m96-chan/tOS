@@ -22,7 +22,11 @@ fn compositor(command: &[&str]) -> Compositor {
 }
 
 /// Pump the compositor until `predicate` holds or time runs out.
-fn wait_for(compositor: &mut Compositor, timeout: Duration, predicate: impl Fn(&Compositor) -> bool) -> bool {
+fn wait_for(
+    compositor: &mut Compositor,
+    timeout: Duration,
+    predicate: impl Fn(&Compositor) -> bool,
+) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         compositor.pump_panes();
@@ -109,10 +113,15 @@ fn each_pane_runs_its_own_process() {
     let mut c = compositor(&["/bin/sh", "-c", "echo $$; sleep 5"]);
     c.perform(Action::Split(Axis::Rows));
     assert!(wait_for(&mut c, Duration::from_secs(5), |c| {
-        c.session()
-            .all_panes()
-            .iter()
-            .all(|id| !c.pane(*id).unwrap().terminal.grid().to_text().trim().is_empty())
+        c.session().all_panes().iter().all(|id| {
+            !c.pane(*id)
+                .unwrap()
+                .terminal
+                .grid()
+                .to_text()
+                .trim()
+                .is_empty()
+        })
     }));
 
     let pids: Vec<String> = c
@@ -292,7 +301,11 @@ fn a_zoomed_pane_fills_the_workspace() {
 
 #[test]
 fn output_scrolls_into_history_and_can_be_read_back() {
-    let mut c = compositor(&["/bin/sh", "-c", "i=0; while [ $i -lt 200 ]; do echo line$i; i=$((i+1)); done; sleep 5"]);
+    let mut c = compositor(&[
+        "/bin/sh",
+        "-c",
+        "i=0; while [ $i -lt 200 ]; do echo line$i; i=$((i+1)); done; sleep 5",
+    ]);
     let focus = c.session().focus();
     assert!(wait_for(&mut c, Duration::from_secs(5), |c| {
         c.pane(focus).unwrap().terminal.grid().scrollback_len() > 50
@@ -331,6 +344,33 @@ fn a_program_can_set_the_pane_title() {
     assert!(wait_for(&mut c, Duration::from_secs(5), |c| {
         c.pane(focus).unwrap().title == "my title"
     }));
+}
+
+#[test]
+fn a_program_can_raise_a_notification_and_it_is_kept() {
+    // Two of them, close together, which is what used to lose the first: the
+    // status bar had one slot and the second overwrote it inside the three
+    // seconds nobody had read it in.
+    let mut c = compositor(&[
+        "/bin/sh",
+        "-c",
+        "printf '\\033]9;first\\007\\033]777;notify;build;finished\\007'; sleep 5",
+    ]);
+    assert!(wait_for(&mut c, Duration::from_secs(5), |c| {
+        c.notifications().waiting() > 0
+    }));
+    // The first is on the bar with the second behind it, and both name the
+    // pane that raised them.
+    assert_eq!(
+        c.notifications().status_line().as_deref(),
+        Some("pane 1: first (+1)")
+    );
+    let kept: Vec<String> = c
+        .notifications()
+        .history()
+        .map(|notification| notification.status_text())
+        .collect();
+    assert_eq!(kept, ["pane 1: build: finished", "pane 1: first"]);
 }
 
 #[test]
@@ -425,11 +465,7 @@ fn a_large_paste_is_not_truncated() {
     // The PTY input buffer is a few kilobytes, so a big paste needs several
     // writes; dropping the remainder used to take the bracketed paste
     // terminator with it.
-    let mut c = compositor(&[
-        "/bin/sh",
-        "-c",
-        "cat > /dev/null; sleep 5",
-    ]);
+    let mut c = compositor(&["/bin/sh", "-c", "cat > /dev/null; sleep 5"]);
     let focus = c.session().focus();
     let payload = vec![b'x'; 200_000];
     c.pane_mut(focus).unwrap().write(&payload);
@@ -493,7 +529,10 @@ fn every_byte_of_a_large_paste_reaches_the_child() {
     });
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let _ = std::fs::remove_file(&path);
-    assert!(arrived, "the child never finished reading; got {size} bytes");
+    assert!(
+        arrived,
+        "the child never finished reading; got {size} bytes"
+    );
     assert_eq!(size, payload.len() as u64, "bytes were lost on the way");
 }
 
@@ -526,7 +565,7 @@ fn a_pane_too_small_to_split_is_left_alone() {
 
 #[test]
 fn a_closed_pane_does_not_wedge_the_mouse() {
-    use tos_input::{InputEvent, MouseAction, MouseButton, Modifiers, PointerEvent};
+    use tos_input::{InputEvent, Modifiers, MouseAction, MouseButton, PointerEvent};
 
     let mut c = compositor(&["/bin/sh", "-c", "sleep 30"]);
     c.perform(Action::Split(Axis::Columns));
@@ -601,7 +640,11 @@ fn a_synchronized_update_is_painted_once_it_ends() {
         let mut surface = framebuffer.surface();
         c.render_frame(&mut surface, true);
     }
-    assert_eq!(framebuffer.pixel(1, 1), 0xcc5757, "the update was never drawn");
+    assert_eq!(
+        framebuffer.pixel(1, 1),
+        0xcc5757,
+        "the update was never drawn"
+    );
 }
 
 #[test]
@@ -681,4 +724,113 @@ fn a_device_pointer_click_lands_in_the_right_pane() {
     assert_eq!(c.session().focus(), top);
     click(&mut c, rect_of(bottom));
     assert_eq!(c.session().focus(), bottom);
+}
+
+#[test]
+fn colours_from_the_configuration_reach_the_screen() {
+    let mut palette = tos_term::Palette::new();
+    palette.background = tos_term::Rgb::new(0x12, 0x34, 0x56);
+    let config = Config {
+        command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()]),
+        bitmap_scale: Some(2),
+        font: Some("/nonexistent".into()),
+        palette,
+        chrome: tos_compositor::chrome::Chrome {
+            background: tos_term::Rgb::new(0x65, 0x43, 0x21),
+            ..tos_compositor::chrome::Chrome::default()
+        },
+        ..Config::default()
+    };
+    let mut c = Compositor::new(config, SIZE, None).expect("compositor");
+    let (_, ch) = c.cell_size();
+    let bar = c.grid_area().height * ch;
+    let framebuffer = render(&mut c);
+
+    // The middle of the pane is empty, so it shows the terminal's own
+    // background; the far right of the status bar is past every label.
+    assert_eq!(framebuffer.pixel(SIZE.0 / 2, SIZE.1 / 2), 0x123456);
+    assert_eq!(framebuffer.pixel(SIZE.0 - 1, bar + ch / 2), 0x654321);
+}
+
+#[test]
+fn the_cheat_sheet_is_the_running_keymap() {
+    // The sheet the compositor shows and the sheet the keymap describes are
+    // the same list, because there is only one of them. Nothing here is a
+    // second copy that could fall behind.
+    let mut c = compositor(&["/bin/sh", "-c", "sleep 5"]);
+    assert!(c.perform(Action::ShowBindings));
+
+    let overlay = c.overlay().expect("the sheet should be open");
+    assert!(
+        overlay.title().contains("leader ctrl+a"),
+        "{:?}",
+        overlay.title()
+    );
+    let expected = tos_session::cheat_sheet(&tos_session::Keymap::default_bindings());
+    let shown: Vec<(&str, &str)> = overlay
+        .items()
+        .iter()
+        .map(|item| (item.label.as_str(), item.detail.as_str()))
+        .collect();
+    let wanted: Vec<(&str, &str)> = expected
+        .iter()
+        .map(|row| (row.action.as_str(), row.keys.as_str()))
+        .collect();
+    assert_eq!(shown, wanted);
+
+    // And the sheet says how to get the sheet back.
+    let (_, keys) = shown
+        .iter()
+        .find(|(action, _)| *action == "show these bindings")
+        .expect("the sheet should list itself");
+    assert!(keys.contains("leader ?"), "{keys:?}");
+}
+
+#[test]
+fn a_question_mark_after_the_leader_opens_the_sheet() {
+    use tos_input::{InputEvent, KeyCode, KeyEvent, Modifiers};
+
+    let mut c = compositor(&["/bin/sh", "-c", "sleep 5"]);
+    let press = |c: &mut Compositor, code, modifiers| {
+        c.handle_input(InputEvent::Key(KeyEvent::new(code, modifiers)));
+    };
+    press(&mut c, KeyCode::Char('a'), Modifiers::CTRL);
+    press(&mut c, KeyCode::Char('/'), Modifiers::SHIFT);
+    assert!(c.overlay().is_some(), "leader ? should open the sheet");
+
+    // It draws, which is the part a list of long rows could break.
+    render(&mut c);
+
+    press(&mut c, KeyCode::Escape, Modifiers::NONE);
+    assert!(c.overlay().is_none());
+}
+
+#[test]
+fn reading_a_row_does_nothing_but_close_the_sheet() {
+    use tos_input::{InputEvent, KeyCode, KeyEvent, Modifiers};
+
+    // Enter on a launcher row starts a program; on the sheet there is nothing
+    // to start, and pressing it must not leave a pane behind.
+    let mut c = compositor(&["/bin/sh", "-c", "sleep 5"]);
+    let before = c.session().all_panes().len();
+    c.perform(Action::ShowBindings);
+    c.handle_input(InputEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        Modifiers::NONE,
+    )));
+    assert!(c.overlay().is_none());
+    assert_eq!(c.session().all_panes().len(), before);
+}
+
+#[test]
+fn every_row_has_room_for_its_keys() {
+    // The keys are drawn to the right of the description and only when both
+    // fit, so a row that is too wide loses the one thing it is there to say.
+    // The overlay is at most 64 columns, which leaves 62 inside the border,
+    // and it keeps a space either side of the keys.
+    const INNER: usize = 62;
+    for row in tos_session::cheat_sheet(&tos_session::Keymap::default_bindings()) {
+        let width = row.action.chars().count() + 1 + row.keys.chars().count() + 2;
+        assert!(width <= INNER, "{row:?} needs {width} columns");
+    }
 }

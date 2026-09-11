@@ -149,9 +149,8 @@ impl App {
         match event.code {
             KeyCode::Enter => {
                 if !self.has_installable_disk() {
-                    self.notice = Some(
-                        "No disk on this machine can be installed onto.".to_string(),
-                    );
+                    self.notice =
+                        Some("No disk on this machine can be installed onto.".to_string());
                     return Command::None;
                 }
                 self.stage = Stage::PickDisk;
@@ -178,7 +177,10 @@ impl App {
                 Command::None
             }
             KeyCode::Enter => {
-                match self.disk().map(|disk| (disk.is_installable(), disk.refusal())) {
+                match self
+                    .disk()
+                    .map(|disk| (disk.is_installable(), disk.refusal()))
+                {
                     Some((true, _)) => {
                         self.stage = Stage::Configure;
                         self.field = Field::Hostname;
@@ -390,7 +392,12 @@ impl App {
 
     fn draw_welcome(&self, screen: &mut Screen, area: Rect) {
         let mut y = self.draw_banner(screen, area, 1) + 1;
-        screen.centre(area, y, "Install tOS on this machine", Style::default().bold());
+        screen.centre(
+            area,
+            y,
+            "Install tOS on this machine",
+            Style::default().bold(),
+        );
         y += 2;
 
         let firmware = format!("This machine booted with {}.", self.firmware.label());
@@ -428,7 +435,12 @@ impl App {
     }
 
     fn draw_disks(&self, screen: &mut Screen, area: Rect) {
-        let frame = Rect::new(2, 1, area.width.saturating_sub(4), area.height.saturating_sub(3));
+        let frame = Rect::new(
+            2,
+            1,
+            area.width.saturating_sub(4),
+            area.height.saturating_sub(3),
+        );
         screen.frame(frame, Some("Where should tOS go?"), Style::fg(ACCENT));
         let inner = frame.inset(1);
 
@@ -563,7 +575,12 @@ impl App {
     fn draw_progress(&self, screen: &mut Screen, area: Rect) {
         let steps = self.plan().map(|plan| plan.steps()).unwrap_or_default();
         let list_height = steps.len() as u16 + 2;
-        let list = Rect::new(2, 1, area.width.saturating_sub(4), list_height.min(area.height));
+        let list = Rect::new(
+            2,
+            1,
+            area.width.saturating_sub(4),
+            list_height.min(area.height),
+        );
         let title = if self.dry_run {
             "What would happen"
         } else {
@@ -626,15 +643,17 @@ impl App {
 
     fn draw_footer(&self, screen: &mut Screen, area: Rect) {
         let y = area.bottom().saturating_sub(1);
-        screen.fill(Rect::new(0, y, area.width, 1), ' ', Style::default().reversed());
+        screen.fill(
+            Rect::new(0, y, area.width, 1),
+            ' ',
+            Style::default().reversed(),
+        );
 
         let text = match &self.notice {
             Some(notice) => notice.clone(),
             None => match self.stage {
                 Stage::Welcome => "Enter  begin      Esc  leave".to_string(),
-                Stage::PickDisk => {
-                    "↑↓  choose      Enter  continue      Esc  back".to_string()
-                }
+                Stage::PickDisk => "↑↓  choose      Enter  continue      Esc  back".to_string(),
                 Stage::Configure => "Tab  next field   Enter  continue      Esc  back".to_string(),
                 Stage::Confirm => "Enter  erase and install      Esc  back".to_string(),
                 Stage::Installing => "Installing; this cannot be interrupted.".to_string(),
@@ -753,7 +772,11 @@ mod tests {
     }
 
     fn app() -> App {
-        App::new(vec![disk("sda", 64), disk("sdb", 32)], Firmware::Uefi, false)
+        App::new(
+            vec![disk("sda", 64), disk("sdb", 32)],
+            Firmware::Uefi,
+            false,
+        )
     }
 
     /// A backend that looks like the live image with its medium mounted.
@@ -899,10 +922,7 @@ mod tests {
         let mut screen = Screen::new(80, 24);
         app().draw(&mut screen);
         for line in screen.to_text().lines() {
-            assert!(
-                tos_term::str_width(line) <= 80,
-                "line overflows: {line:?}"
-            );
+            assert!(tos_term::str_width(line) <= 80, "line overflows: {line:?}");
         }
     }
 
@@ -1049,7 +1069,10 @@ mod tests {
         type_text(&mut app, "sda");
         app.key(&press(KeyCode::Escape));
         assert_eq!(app.stage, Stage::Configure);
-        assert!(app.confirmation.is_empty(), "a stale confirmation is a trap");
+        assert!(
+            app.confirmation.is_empty(),
+            "a stale confirmation is a trap"
+        );
     }
 
     #[test]
@@ -1069,7 +1092,11 @@ mod tests {
         let event = KeyEvent::new(KeyCode::Char('c'), Modifiers::CTRL);
         assert_eq!(app.key(&event), Command::None);
         assert!(!app.should_quit());
-        assert!(app.notice.as_ref().unwrap().contains("cannot be interrupted"));
+        assert!(app
+            .notice
+            .as_ref()
+            .unwrap()
+            .contains("cannot be interrupted"));
     }
 
     #[test]

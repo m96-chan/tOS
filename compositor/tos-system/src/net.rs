@@ -587,8 +587,12 @@ impl<K: Kernel> Network<K> {
             return Kind::Loopback;
         }
         if devtype.as_deref() == Some("wlan")
-            || self.sysfs.exists(&format!("/sys/class/net/{name}/wireless"))
-            || self.sysfs.exists(&format!("/sys/class/net/{name}/phy80211"))
+            || self
+                .sysfs
+                .exists(&format!("/sys/class/net/{name}/wireless"))
+            || self
+                .sysfs
+                .exists(&format!("/sys/class/net/{name}/phy80211"))
         {
             return Kind::Wireless;
         }
@@ -620,8 +624,26 @@ const RTF_GATEWAY: u32 = 0x2;
 
 /// `DEVTYPE` values that mean the kernel made this interface up.
 const VIRTUAL_DEVTYPES: &[&str] = &[
-    "bridge", "bond", "vlan", "veth", "tun", "tap", "gre", "gretap", "ip6gre", "ip6tnl", "sit",
-    "vxlan", "macvlan", "macvtap", "ipvlan", "wireguard", "dummy", "geneve", "ppp", "team",
+    "bridge",
+    "bond",
+    "vlan",
+    "veth",
+    "tun",
+    "tap",
+    "gre",
+    "gretap",
+    "ip6gre",
+    "ip6tnl",
+    "sit",
+    "vxlan",
+    "macvlan",
+    "macvtap",
+    "ipvlan",
+    "wireguard",
+    "dummy",
+    "geneve",
+    "ppp",
+    "team",
 ];
 
 /// `flags` is hex with a `0x` on the front.
@@ -1038,10 +1060,8 @@ mod tests {
         fn new(name: &str) -> Tree {
             static COUNTER: AtomicUsize = AtomicUsize::new(0);
             let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "tos-net-{name}-{}-{unique}",
-                std::process::id()
-            ));
+            let root = std::env::temp_dir()
+                .join(format!("tos-net-{name}-{}-{unique}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
             Tree { root }
@@ -1087,7 +1107,10 @@ mod tests {
             &format!("{dir}/operstate"),
             if carrier { "up\n" } else { "down\n" },
         )
-        .file(&format!("{dir}/carrier"), if carrier { "1\n" } else { "0\n" })
+        .file(
+            &format!("{dir}/carrier"),
+            if carrier { "1\n" } else { "0\n" },
+        )
         .file(&format!("{dir}/address"), "aa:bb:cc:dd:ee:01\n")
         .file(&format!("{dir}/mtu"), "1500\n")
         .file(&format!("{dir}/type"), "1\n")

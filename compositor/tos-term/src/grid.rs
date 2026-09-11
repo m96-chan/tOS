@@ -200,6 +200,31 @@ impl Grid {
         self.scrollback.get(i)
     }
 
+    /// How many lines the grid holds in all: history first, then the screen.
+    pub fn total_lines(&self) -> usize {
+        self.scrollback.len() + self.rows
+    }
+
+    /// A row by absolute line number, which counts history first: line 0 is
+    /// the oldest line still in scrollback and [`Grid::scrollback_len`] is the
+    /// top of the screen.
+    ///
+    /// This is the coordinate a selection is anchored in. A displayed row is
+    /// the wrong thing to remember, because the viewport moves while the text
+    /// stays where it is, and the selection belongs to the text.
+    pub fn line(&self, line: usize) -> Option<&Row> {
+        match line.checked_sub(self.scrollback.len()) {
+            Some(y) => self.screen.get(y),
+            None => self.scrollback.get(line),
+        }
+    }
+
+    /// The absolute line the viewport is showing in its row `y`.
+    pub fn display_line(&self, y: usize) -> usize {
+        // The offset can never exceed the history, so this cannot go negative.
+        self.scrollback.len() + y - self.display_offset
+    }
+
     pub fn clear_screen(&mut self, attrs: &Attrs) {
         for row in &mut self.screen {
             row.clear(attrs);
@@ -250,7 +275,8 @@ impl Grid {
         let to_history = keep_history && region.top == 0 && self.max_scrollback > 0;
 
         for i in 0..n {
-            let row = std::mem::replace(&mut self.screen[region.top + i], Row::new(self.cols, attrs));
+            let row =
+                std::mem::replace(&mut self.screen[region.top + i], Row::new(self.cols, attrs));
             if to_history {
                 self.push_history(row);
             }
@@ -410,6 +436,29 @@ mod tests {
         grid.scroll_display(1);
         assert_eq!(grid.display_row(0).to_text(), "one");
         assert_eq!(grid.display_row(1).to_text(), "two");
+    }
+
+    #[test]
+    fn absolute_lines_address_history_and_screen_alike() {
+        let mut grid = Grid::new(8, 2, 10);
+        let attrs = Attrs::default();
+        put(&mut grid, 0, "one");
+        put(&mut grid, 1, "two");
+        grid.scroll_up(Region::new(0, 2), 1, &attrs, true);
+        put(&mut grid, 1, "three");
+
+        assert_eq!(grid.total_lines(), 3);
+        assert_eq!(grid.line(0).unwrap().to_text(), "one");
+        assert_eq!(grid.line(1).unwrap().to_text(), "two");
+        assert_eq!(grid.line(2).unwrap().to_text(), "three");
+        assert!(grid.line(3).is_none());
+
+        // Scrolling the viewport moves which lines are shown, not which line
+        // a piece of text is on.
+        assert_eq!(grid.display_line(0), 1);
+        grid.scroll_display(1);
+        assert_eq!(grid.display_line(0), 0);
+        assert_eq!(grid.line(0).unwrap().to_text(), "one");
     }
 
     #[test]

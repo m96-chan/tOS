@@ -72,7 +72,12 @@ fn eviocgname(len: u64) -> u64 {
 }
 
 fn eviocgrab() -> u64 {
-    ioc(IOC_WRITE, b'E' as u64, 0x90, std::mem::size_of::<libc::c_int>() as u64)
+    ioc(
+        IOC_WRITE,
+        b'E' as u64,
+        0x90,
+        std::mem::size_of::<libc::c_int>() as u64,
+    )
 }
 
 /// What a device can produce.
@@ -161,13 +166,7 @@ impl Device {
     /// Read whatever events are pending.
     fn read_raw(&mut self, out: &mut Vec<RawEvent>) -> io::Result<usize> {
         let mut buf = [0u8; EVENT_SIZE * 64];
-        let n = unsafe {
-            libc::read(
-                self.fd,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-            )
-        };
+        let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
@@ -179,9 +178,8 @@ impl Device {
         for i in 0..count {
             let offset = i * EVENT_SIZE;
             // The kernel guarantees alignment and layout of these structs.
-            let event = unsafe {
-                std::ptr::read_unaligned(buf[offset..].as_ptr() as *const RawEvent)
-            };
+            let event =
+                unsafe { std::ptr::read_unaligned(buf[offset..].as_ptr() as *const RawEvent) };
             out.push(event);
         }
         Ok(count)
@@ -224,13 +222,7 @@ fn probe_capabilities(fd: RawFd) -> Capabilities {
 
 fn read_name(fd: RawFd) -> Option<String> {
     let mut buf = [0u8; 256];
-    let n = unsafe {
-        libc::ioctl(
-            fd,
-            eviocgname(buf.len() as u64) as _,
-            buf.as_mut_ptr(),
-        )
-    };
+    let n = unsafe { libc::ioctl(fd, eviocgname(buf.len() as u64) as _, buf.as_mut_ptr()) };
     if n <= 0 {
         return None;
     }
@@ -464,9 +456,7 @@ impl InputBackend {
         // With num lock off the keypad is a navigation cluster, which is what
         // the labels on the keys say and what applications expect.
         let code = match mapping.code {
-            crate::event::KeyCode::Keypad(key)
-                if !self.modifiers.contains(Modifiers::NUM_LOCK) =>
-            {
+            crate::event::KeyCode::Keypad(key) if !self.modifiers.contains(Modifiers::NUM_LOCK) => {
                 keypad_navigation(key).unwrap_or(mapping.code)
             }
             other => other,
@@ -502,7 +492,7 @@ impl InputBackend {
 
 /// What a keypad key means when num lock is off.
 fn keypad_navigation(key: crate::event::Keypad) -> Option<crate::event::KeyCode> {
-    use crate::event::{Keypad, KeyCode as K};
+    use crate::event::{KeyCode as K, Keypad};
     Some(match key {
         Keypad::Digit(0) => K::Insert,
         Keypad::Digit(1) => K::End,

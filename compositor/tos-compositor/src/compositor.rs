@@ -10,19 +10,21 @@ use std::time::{Duration, Instant};
 use tos_font::{BitmapFont, FontStack, GlyphSource};
 use tos_input::encode::{encode_alternate_scroll, EncodeContext};
 use tos_input::{
-    encode_focus, encode_key, encode_mouse, encode_paste, InputEvent, KeyEvent,
-    MouseAction, MouseButton, MouseEvent,
+    encode_focus, encode_key, encode_mouse, encode_paste, InputEvent, KeyEvent, MouseAction,
+    MouseButton, MouseEvent,
 };
 use tos_platform::Display;
-use tos_render::{render, RenderOptions, Rect as PixelRect, Selection, Surface};
-use tos_session::{Action, Axis, Keymap, PaneId, Rect, Resolution, Session};
+use tos_render::{render, Rect as PixelRect, RenderOptions, Surface};
+use tos_session::{describe, Action, Axis, Keymap, PaneId, Rect, Resolution, Session};
 use tos_term::TermEvent;
 
 use crate::chrome::{self, Chrome, StatusItem};
 use crate::config::Config;
 use crate::launcher;
-use crate::overlay::{Overlay, OverlayOutcome};
+use crate::notify::{self, Chosen, Notifications};
+use crate::overlay::{Overlay, OverlayItem, OverlayOutcome};
 use crate::pane::Pane;
+use crate::selection::{Selection, SelectionMode};
 
 /// How often the cursor and blinking text change phase.
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
@@ -30,8 +32,30 @@ const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const IDLE_TIMEOUT_MS: i32 = 100;
 /// How long to wait when a pane still has input queued for its child.
 const WRITE_RETRY_TIMEOUT_MS: i32 = 4;
-/// How long a transient status message stays up.
-const MESSAGE_TIMEOUT: Duration = Duration::from_secs(3);
+/// The most a program may put into one selection with OSC 52. The clipboard
+/// carries text a person copies and pastes, and 64 KiB is already a thousand
+/// full lines — far more than anyone pastes into a shell. The cap is what
+/// keeps a pane from parking megabytes in the compositor that nobody will
+/// ever paste.
+const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
+/// How close together two presses have to be to count as a double click.
+const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+/// The OSC 52 selector for the clipboard, which an explicit copy writes.
+const CLIPBOARD: char = 'c';
+/// The selector for primary, which is where the mouse puts what it selects
+/// and where a middle click pastes from.
+const PRIMARY: char = 'p';
+
+/// The last left press, kept so that the one after it can tell whether it is
+/// a second or a third click of the same gesture.
+#[derive(Debug, Clone, Copy)]
+struct Click {
+    pane: PaneId,
+    col: usize,
+    row: usize,
+    at: Instant,
+    count: u32,
+}
 
 /// Which menu an open overlay is, and so what choosing a row means.
 ///
@@ -42,6 +66,12 @@ const MESSAGE_TIMEOUT: Duration = Duration::from_secs(3);
 pub enum OverlayKind {
     /// A program from `$PATH`, which starts in a new pane.
     Launcher,
+    /// What has been said on the status bar, newest first.
+    Notifications,
+    /// A line of text: the new name for the active workspace.
+    RenameWorkspace,
+    /// The key bindings, which are a list to read rather than to choose from.
+    Bindings,
 }
 
 /// The running compositor.
@@ -54,11 +84,14 @@ pub struct Compositor {
     chrome: Chrome,
     /// Display size in pixels.
     size: (u32, u32),
-    /// Selections stored by OSC 52 selector; 'c' is the clipboard.
+    /// Selections stored by OSC 52 selector: 'c' is the clipboard, which an
+    /// explicit copy writes, and 'p' is primary, which the mouse writes.
     clipboard: HashMap<char, Vec<u8>>,
     blink_visible: bool,
     last_blink: Instant,
-    message: Option<(String, Instant)>,
+    /// Everything the compositor and its panes have had to say, queued for the
+    /// status bar and kept for the history list.
+    notifications: Notifications,
     /// The open menu, if any. While it is open it owns the keyboard.
     overlay: Option<(OverlayKind, Overlay)>,
     needs_full_redraw: bool,
@@ -67,30 +100,37 @@ pub struct Compositor {
     pointer: (u32, u32),
     /// The pane a mouse button went down on.
     mouse_grab: Option<PaneId>,
+    /// The previous left press, for double and triple click.
+    last_click: Option<Click>,
     /// Some pane still has input queued, so the loop must not idle.
     pending_writes: bool,
 }
 
 impl Compositor {
     /// Build a compositor for a display of this size.
-    pub fn new(config: Config, size: (u32, u32), physical_mm: Option<(u32, u32)>) -> io::Result<Self> {
+    pub fn new(
+        config: Config,
+        size: (u32, u32),
+        physical_mm: Option<(u32, u32)>,
+    ) -> io::Result<Self> {
         let fonts = build_fonts(&config, size, physical_mm);
         let mut compositor = Compositor {
             session: Session::new(),
             panes: HashMap::new(),
             fonts,
             keymap: Keymap::default_bindings(),
-            chrome: Chrome::default(),
+            chrome: config.chrome,
             size,
             clipboard: HashMap::new(),
             blink_visible: true,
             last_blink: Instant::now(),
-            message: None,
+            notifications: Notifications::new(),
             overlay: None,
             needs_full_redraw: true,
             running: true,
             pointer: (0, 0),
             mouse_grab: None,
+            last_click: None,
             pending_writes: false,
             config,
         };
@@ -116,7 +156,13 @@ impl Compositor {
 
     /// Start a pane on a particular command rather than the configured one.
     fn spawn_pane_running(&self, area: Rect, command: Option<&[String]>) -> io::Result<Pane> {
-        Pane::spawn(area, self.cell_size(), self.config.scrollback, command)
+        Pane::spawn(
+            area,
+            self.cell_size(),
+            self.config.scrollback,
+            &self.config.palette,
+            command,
+        )
     }
 
     pub fn cell_size(&self) -> (u32, u32) {
@@ -129,7 +175,11 @@ impl Compositor {
         let (cw, ch) = self.cell_size();
         let cols = (self.size.0 / cw).max(1);
         let rows = (self.size.1 / ch).max(1);
-        let status = if self.config.status_bar && rows > 2 { 1 } else { 0 };
+        let status = if self.config.status_bar && rows > 2 {
+            1
+        } else {
+            0
+        };
         Rect::new(0, 0, cols, rows - status)
     }
 
@@ -151,6 +201,10 @@ impl Compositor {
 
     pub fn clipboard(&self, selector: char) -> Option<&[u8]> {
         self.clipboard.get(&selector).map(|v| v.as_slice())
+    }
+
+    pub fn notifications(&self) -> &Notifications {
+        &self.notifications
     }
 
     /// File descriptors that should be polled for readiness.
@@ -211,8 +265,8 @@ impl Compositor {
                     self.pending_writes = true;
                 }
                 if pane.input_overflowed() {
-                    self.message =
-                        Some(("input dropped: pane is not reading".into(), Instant::now()));
+                    self.notifications
+                        .status("input dropped: pane is not reading");
                     changed = true;
                 }
             }
@@ -249,23 +303,55 @@ impl Compositor {
                 TermEvent::Bell => {
                     // A visible bell is the only kind a display server with no
                     // audio stack can offer.
-                    self.message = Some((format!("bell in pane {}", id.0 + 1), Instant::now()));
+                    self.notifications.from_pane(id, "", "bell");
                     changed = true;
                 }
                 TermEvent::Notify { title, body } => {
-                    let text = if title.is_empty() {
-                        body
-                    } else {
-                        format!("{title}: {body}")
-                    };
-                    self.message = Some((text, Instant::now()));
+                    // Which pane asked is part of the notification: it is the
+                    // one thing the application cannot say for itself, and the
+                    // history list uses it to take you there.
+                    self.notifications.from_pane(id, title, body);
                     changed = true;
                 }
                 TermEvent::ClipboardStore { selection, data } => {
-                    self.clipboard.insert(selection, data);
+                    // An oversized selection is dropped whole rather than
+                    // truncated: half a copied command line is exactly the
+                    // kind of thing that does damage when it lands in a
+                    // shell, and what the user already had is worth more than
+                    // a mangled replacement. They are told, because from the
+                    // pane's side the copy looked like it worked.
+                    if data.len() > MAX_CLIPBOARD_BYTES {
+                        self.notifications.status(format!(
+                            "clipboard write refused in pane {}: over {} KiB",
+                            id.0 + 1,
+                            MAX_CLIPBOARD_BYTES / 1024
+                        ));
+                        changed = true;
+                    } else if is_clipboard_selector(selection) {
+                        self.clipboard.insert(selection, data);
+                    }
                 }
                 TermEvent::ClipboardLoad { selection } => {
-                    let data = self.clipboard.get(&selection).cloned().unwrap_or_default();
+                    // Reads are off unless the user asked for them. The query
+                    // is just bytes on a PTY, so a `cat` of a hostile file, or
+                    // anything running over ssh in that pane, can send it, and
+                    // what comes back is whatever was last copied — a password
+                    // as readily as a path. xterm and kitty refuse by default
+                    // for the same reason.
+                    //
+                    // The refusal is an empty selection rather than silence:
+                    // OSC 52 has no way to spell "no", a program that gets
+                    // nothing back waits out its own timeout, and an empty
+                    // answer is both indistinguishable from an empty clipboard
+                    // and a case every reader already handles.
+                    let data = if self.config.allow_clipboard_read {
+                        self.clipboard.get(&selection).cloned().unwrap_or_default()
+                    } else {
+                        self.notifications
+                            .status(format!("clipboard read refused in pane {}", id.0 + 1));
+                        changed = true;
+                        Vec::new()
+                    };
                     if let Some(pane) = self.panes.get_mut(&id) {
                         pane.terminal.report_clipboard(selection, &data);
                     }
@@ -331,12 +417,15 @@ impl Compositor {
         if self.overlay.is_some() {
             return self.overlay_key(&key);
         }
-        match self.keymap.resolve(&key) {
+        // The leader indicator is drawn from the keymap rather than queued as
+        // a notification: arming the leader is not news, and a message that
+        // says so would cost whatever is in the queue its turn on screen. The
+        // keypress that disarms it still needs a frame, though, even when the
+        // action it ran changed nothing else.
+        let was_armed = self.keymap.is_pending();
+        let changed = match self.keymap.resolve(&key) {
             Resolution::Action(action) => self.perform(action),
-            Resolution::Pending => {
-                self.message = Some(("leader".to_string(), Instant::now()));
-                true
-            }
+            Resolution::Pending => true,
             Resolution::Passthrough => {
                 let focus = self.session.focus();
                 let Some(pane) = self.panes.get_mut(&focus) else {
@@ -354,7 +443,8 @@ impl Compositor {
                 pane.write(&bytes);
                 scrolled
             }
-        }
+        };
+        changed || was_armed != self.keymap.is_pending()
     }
 
     /// Route a mouse event that is already in display cell coordinates.
@@ -411,7 +501,9 @@ impl Compositor {
 
         let mut changed = false;
         if action == MouseAction::Press && self.session.focus() != pane_id {
+            let previous = self.session.focus();
             self.session.set_focus(pane_id);
+            self.clear_selection(previous);
             self.needs_full_redraw = true;
             changed = true;
         }
@@ -453,23 +545,26 @@ impl Compositor {
         }
 
         // Otherwise the mouse belongs to the compositor, and selects text.
+        let mode = if action == MouseAction::Press && button == Some(MouseButton::Left) {
+            SelectionMode::for_clicks(self.count_click(pane_id, local.col, local.row))
+        } else {
+            SelectionMode::Cell
+        };
         let mut copied = None;
         let mut paste = false;
         if let Some(pane) = self.panes.get_mut(&pane_id) {
+            let at = pane.anchor_at(local.col, local.row);
             match action {
                 MouseAction::Press if button == Some(MouseButton::Left) => {
                     pane.selecting = true;
-                    pane.selection = Some(Selection::new(
-                        (local.col, local.row),
-                        (local.col, local.row),
-                        modifiers.alt(),
-                    ));
+                    pane.set_selection(Some(Selection::new(at, modifiers.alt(), mode)));
                     self.mouse_grab = Some(pane_id);
                     changed = true;
                 }
                 MouseAction::Drag | MouseAction::Motion if pane.selecting => {
-                    if let Some(selection) = &mut pane.selection {
-                        selection.end = (local.col, local.row);
+                    if let Some(mut selection) = pane.selection {
+                        selection.drag_to(at);
+                        pane.set_selection(Some(selection));
                     }
                     changed = true;
                 }
@@ -486,17 +581,57 @@ impl Compositor {
             }
         }
 
+        // What the mouse selects goes to primary, the way X11 has always done
+        // it, so that dragging over a word does not throw away whatever was
+        // deliberately copied to the clipboard.
         if let Some(text) = copied {
-            self.clipboard.insert('c', text.into_bytes());
-            self.message = Some(("copied".to_string(), Instant::now()));
+            self.clipboard.insert(PRIMARY, text.into_bytes());
         }
         if paste {
-            let data = self.clipboard.get(&'c').cloned().unwrap_or_default();
+            let data = self.clipboard.get(&PRIMARY).cloned().unwrap_or_default();
             let text = String::from_utf8_lossy(&data).into_owned();
             self.paste_text(&text);
             changed = true;
         }
         changed
+    }
+
+    /// How many presses in a row this one is, counting only presses close
+    /// enough in time and on the same cell of the same pane to be one gesture.
+    ///
+    /// This lives here rather than in `tos-input` because the count is about
+    /// where the presses landed, and only the compositor knows that: it owns
+    /// the pane geometry that turns a pointer position into a cell. A device
+    /// driver sees pixels, and a host terminal hands over reports that never
+    /// carried a click count in the first place.
+    fn count_click(&mut self, pane: PaneId, col: usize, row: usize) -> u32 {
+        let now = Instant::now();
+        let count = match self.last_click {
+            Some(last)
+                if last.pane == pane
+                    && (last.col, last.row) == (col, row)
+                    && now.duration_since(last.at) <= MULTI_CLICK_INTERVAL =>
+            {
+                last.count + 1
+            }
+            _ => 1,
+        };
+        self.last_click = Some(Click {
+            pane,
+            col,
+            row,
+            at: now,
+            count,
+        });
+        count
+    }
+
+    /// Forget a pane's selection, which is what every event that moves the
+    /// text out from under it has to do.
+    fn clear_selection(&mut self, id: PaneId) {
+        if let Some(pane) = self.panes.get_mut(&id) {
+            pane.clear_selection();
+        }
     }
 
     /// Abandon an interaction that was still in progress in another pane.
@@ -547,6 +682,17 @@ impl Compositor {
 
     /// Carry out a compositor action. Returns true when a repaint is needed.
     pub fn perform(&mut self, action: Action) -> bool {
+        let before = self.session.focus();
+        let changed = self.perform_action(action);
+        // Moving focus away ends whatever was being selected there: the
+        // selection belongs to an interaction the user has left behind.
+        if self.session.focus() != before {
+            self.clear_selection(before);
+        }
+        changed
+    }
+
+    fn perform_action(&mut self, action: Action) -> bool {
         let area = self.grid_area();
         match action {
             Action::Split(axis) => self.split(axis),
@@ -628,6 +774,17 @@ impl Compositor {
                 }
                 moved
             }
+            Action::RenameWorkspace => {
+                // The prompt opens on the name the workspace has now, which is
+                // both the value to edit and the only place it is written
+                // down; clearing the line is how the number is asked back.
+                let name = self.session.active().name.clone();
+                self.open_overlay(
+                    OverlayKind::RenameWorkspace,
+                    Overlay::prompt("rename workspace", name),
+                );
+                true
+            }
             Action::Scroll(lines) => self.scroll_focused(lines as isize),
             Action::ScrollPage(pages) => {
                 let rows = self
@@ -650,14 +807,14 @@ impl Compositor {
             Action::Copy => {
                 let focus = self.session.focus();
                 if let Some(text) = self.panes.get(&focus).and_then(|p| p.selected_text()) {
-                    self.clipboard.insert('c', text.into_bytes());
-                    self.message = Some(("copied".to_string(), Instant::now()));
+                    self.clipboard.insert(CLIPBOARD, text.into_bytes());
+                    self.notifications.status("copied");
                     return true;
                 }
                 false
             }
             Action::Paste => {
-                let data = self.clipboard.get(&'c').cloned().unwrap_or_default();
+                let data = self.clipboard.get(&CLIPBOARD).cloned().unwrap_or_default();
                 let text = String::from_utf8_lossy(&data).into_owned();
                 self.paste_text(&text);
                 true
@@ -666,8 +823,8 @@ impl Compositor {
                 let focus = self.session.focus();
                 if let Some(pane) = self.panes.get_mut(&focus) {
                     let cursor = pane.terminal.cursor();
-                    pane.selection =
-                        Some(Selection::new((cursor.x, cursor.y), (cursor.x, cursor.y), false));
+                    let at = pane.anchor_at(cursor.x, cursor.y);
+                    pane.set_selection(Some(Selection::new(at, false, SelectionMode::Cell)));
                     return true;
                 }
                 false
@@ -676,6 +833,16 @@ impl Compositor {
                 // The scan happens here, once, rather than per keystroke.
                 let overlay = Overlay::new("run a program", launcher::programs_on_path());
                 self.open_overlay(OverlayKind::Launcher, overlay);
+                true
+            }
+            Action::ShowNotifications => {
+                let items = self.notifications.open_history(Instant::now());
+                let overlay = Overlay::new("notifications", items);
+                self.open_overlay(OverlayKind::Notifications, overlay);
+                true
+            }
+            Action::ShowBindings => {
+                self.open_overlay(OverlayKind::Bindings, self.binding_sheet());
                 true
             }
             Action::Refresh => {
@@ -725,17 +892,73 @@ impl Compositor {
             OverlayOutcome::Chosen(index) => {
                 let label = overlay.items()[index].label.clone();
                 self.close_overlay();
-                self.choose(kind, &label);
+                self.choose(kind, Some(index), &label);
+                true
+            }
+            OverlayOutcome::Accepted => {
+                let text = overlay.query().to_string();
+                self.close_overlay();
+                self.choose(kind, None, &text);
                 true
             }
         }
     }
 
-    /// Act on the row an overlay reported. One arm per menu.
-    fn choose(&mut self, kind: OverlayKind, label: &str) {
+    /// Act on what an overlay reported: the row that was chosen, or the line
+    /// a prompt accepted. One arm per menu.
+    ///
+    /// Both the row's position and its text are passed, because a menu built
+    /// out of names is answered by name and a menu built out of a list the
+    /// compositor already holds is answered by position. A prompt has no row,
+    /// which is what `None` means.
+    fn choose(&mut self, kind: OverlayKind, row: Option<usize>, label: &str) {
         match kind {
             OverlayKind::Launcher => self.launch(label),
+            OverlayKind::Notifications => {
+                let Some(index) = row else { return };
+                match self.notifications.choose(index) {
+                    Chosen::Clear => self.notifications.clear_history(),
+                    // Where a notification came from is the useful thing to do
+                    // with it: a build that finished is a pane to go and look
+                    // at, wherever that pane has ended up.
+                    Chosen::Pane(pane) => {
+                        if self.session.set_focus(pane) {
+                            self.sync_layout();
+                            self.needs_full_redraw = true;
+                        }
+                    }
+                    Chosen::Nowhere => {}
+                }
+            }
+            // Closing the overlay has already asked for the frame that puts
+            // the new name in the status bar.
+            OverlayKind::RenameWorkspace => self.session.rename_active(label),
+            // Nothing to choose: the sheet is there to be read, so enter
+            // closes it the way escape does.
+            OverlayKind::Bindings => {}
         }
+    }
+
+    /// The cheat sheet, built from the keymap that is resolving these keys.
+    ///
+    /// Not from the `--help` text, and not from a copy of the defaults: a
+    /// sheet that is a second telling of the bindings is one that will
+    /// eventually be telling you about a key that no longer does that. This
+    /// one cannot be wrong, and a keymap that was customised at startup
+    /// describes itself here without anything being taught about it.
+    fn binding_sheet(&self) -> Overlay {
+        let title = match describe::leader_name(&self.keymap) {
+            Some(leader) => format!("key bindings (leader {leader})"),
+            None => "key bindings".to_string(),
+        };
+        // The description is the label, so that typing "split" finds the key
+        // rather than only the other way round: what you have forgotten is
+        // the key, and what you can still name is what you wanted to do.
+        let items = describe::cheat_sheet(&self.keymap)
+            .into_iter()
+            .map(|row| OverlayItem::with_detail(row.action, row.keys))
+            .collect();
+        Overlay::new(title, items)
     }
 
     /// Open a pane running `program`, using the same path a split does.
@@ -743,7 +966,7 @@ impl Compositor {
         if tos_pty::which(program).is_none() {
             // The list came from $PATH, so this means it went away in between;
             // spawning would leave a pane that dies on its own.
-            self.message = Some((format!("not found: {program}"), Instant::now()));
+            self.notifications.status(format!("not found: {program}"));
             return;
         }
         let command = vec![program.to_string()];
@@ -780,7 +1003,7 @@ impl Compositor {
         let Some(new_id) = self.session.split_focused(area, axis) else {
             // Refusing is the right answer when the pane is too small; saying
             // so beats silently creating a pane with nowhere to go.
-            self.message = Some(("no room to split".to_string(), Instant::now()));
+            self.notifications.status("no room to split");
             return None;
         };
         let pane_area = self
@@ -833,7 +1056,7 @@ impl Compositor {
     }
 
     fn report_error(&mut self, what: &str, error: io::Error) {
-        self.message = Some((format!("{what} failed: {error}"), Instant::now()));
+        self.notifications.status(format!("{what} failed: {error}"));
     }
 
     // ---- rendering ------------------------------------------------------
@@ -856,11 +1079,15 @@ impl Compositor {
             self.last_blink = Instant::now();
             changed = true;
         }
-        if let Some((_, at)) = &self.message {
-            if at.elapsed() >= MESSAGE_TIMEOUT {
-                self.message = None;
-                changed = true;
-            }
+        // A notification only spends its time on screen while it is on screen:
+        // the leader indicator has the slot while the leader is armed, and one
+        // shown there instead would be one nobody read.
+        if !self.keymap.is_pending() && self.notifications.advance(now) {
+            // Without a status bar the notification is a banner over the panes,
+            // and the cells it covered are only repainted on damage they have
+            // not got. Retiring it has to uncover them.
+            self.needs_full_redraw |= !self.config.status_bar;
+            changed = true;
         }
         changed
     }
@@ -909,7 +1136,7 @@ impl Compositor {
                 blink_visible: self.blink_visible,
                 focused: *id == focus,
                 draw_cursor: true,
-                selection: pane.selection,
+                selection: pane.display_selection(),
                 selection_background: self.chrome.accent,
                 force,
                 inactive_fade: self.config.inactive_fade,
@@ -965,6 +1192,12 @@ impl Compositor {
 
         if self.config.status_bar {
             self.draw_status(surface, area, ch);
+        } else if let Some(text) = self.notifications.status_line() {
+            // With no bar there is nowhere for a message to live, and going
+            // quiet is the one thing it must not do: this used to be why
+            // `--no-status-bar` made a failed split look like a dead key.
+            let over = PixelRect::new(0, 0, area.width * cw, ch);
+            notify::draw_banner(surface, &mut self.fonts, over, &self.chrome, &text);
         }
 
         // Last, and over everything: the overlay is modal, and the panes below
@@ -986,35 +1219,46 @@ impl Compositor {
         self.needs_full_redraw = false;
     }
 
-    fn draw_status(&mut self, surface: &mut Surface<'_>, area: Rect, cell_height: u32) {
+    /// What the left of the status bar says: every workspace's name, in
+    /// position order, with the active one marked.
+    ///
+    /// Separate from the drawing so that a test can read the bar's own words
+    /// rather than infer them from pixels.
+    fn status_items(&self) -> Vec<StatusItem> {
         let active = self.session.active_index();
-        let items: Vec<StatusItem> = (0..self.session.workspace_count())
-            .map(|i| {
-                StatusItem::new(
-                    self.session.workspaces()[i].name.clone(),
-                    i == active,
-                )
-            })
-            .collect();
+        self.session
+            .workspaces()
+            .iter()
+            .enumerate()
+            .map(|(i, workspace)| StatusItem::new(workspace.name.clone(), i == active))
+            .collect()
+    }
+
+    fn draw_status(&mut self, surface: &mut Surface<'_>, area: Rect, cell_height: u32) {
+        let items = self.status_items();
 
         let focus = self.session.focus();
-        let right = match &self.message {
-            Some((text, _)) => text.clone(),
-            None => {
-                let panes = self.session.active().panes();
-                let index = panes.iter().position(|p| *p == focus).unwrap_or(0);
-                match self.panes.get(&focus) {
-                    Some(pane) => {
-                        let scrolled = pane.terminal.display_offset();
-                        let label = chrome::pane_label(index, &pane.terminal, &pane.title);
-                        if scrolled > 0 {
-                            format!("{label}  [scrollback {scrolled}]")
-                        } else {
-                            label
-                        }
+        // The leader indicator comes first: it is the state of the keyboard
+        // right now and it lasts only until the next key. Then the queue, and
+        // when it is empty, what the focused pane is.
+        let right = if self.keymap.is_pending() {
+            "leader".to_string()
+        } else if let Some(line) = self.notifications.status_line() {
+            line
+        } else {
+            let panes = self.session.active().panes();
+            let index = panes.iter().position(|p| *p == focus).unwrap_or(0);
+            match self.panes.get(&focus) {
+                Some(pane) => {
+                    let scrolled = pane.terminal.display_offset();
+                    let label = chrome::pane_label(index, &pane.terminal, &pane.title);
+                    if scrolled > 0 {
+                        format!("{label}  [scrollback {scrolled}]")
+                    } else {
+                        label
                     }
-                    None => String::new(),
                 }
+                None => String::new(),
             }
         };
 
@@ -1090,6 +1334,15 @@ impl Compositor {
     }
 }
 
+/// The selectors OSC 52 defines: the clipboard, primary, secondary, select,
+/// and the eight cut buffers. The selector arrives as a raw character, so
+/// without this a pane could invent a new one per store and grow the clipboard
+/// map for as long as it liked; with it the map holds at most thirteen
+/// selections of [`MAX_CLIPBOARD_BYTES`] each.
+fn is_clipboard_selector(selection: char) -> bool {
+    matches!(selection, 'c' | 'p' | 'q' | 's' | '0'..='7')
+}
+
 /// Assemble the font stack from configuration and display characteristics.
 fn build_fonts(config: &Config, size: (u32, u32), physical_mm: Option<(u32, u32)>) -> FontStack {
     let pixel_size = config
@@ -1108,6 +1361,23 @@ fn build_fonts(config: &Config, size: (u32, u32), physical_mm: Option<(u32, u32)
             FontStack::new(Box::new(scale))
         }
     };
+    let cell = stack.metrics();
+    for path in &config.font_fallback {
+        // A fallback that will not load is worth saying so about: the person
+        // named this file, unlike the ones found by searching.
+        match tos_font::TtfFont::from_path(path, pixel_size) {
+            Ok(font) => stack.push_fallback(Box::new(font.fit_wide_cell(cell))),
+            Err(e) => eprintln!("tos: font fallback {}: {e}", path.display()),
+        }
+    }
+    // Without kanji somewhere in the stack Japanese is a row of hollow boxes,
+    // so a face is looked for even when nothing asked for one. The ISO's own
+    // face is monospace and covers kana, so this usually finds nothing to do.
+    if !stack.covers(tos_font::ttf::FULL_WIDTH_PROBE) {
+        if let Some(font) = tos_font::TtfFont::system_cjk(pixel_size) {
+            stack.push_fallback(Box::new(font.fit_wide_cell(cell)));
+        }
+    }
     // The built-in face is always available as a last resort, so a missing
     // glyph in the main font never leaves a hole.
     stack.push_fallback(Box::new(BitmapFont::for_display(size.0, size.1)));
@@ -1128,13 +1398,81 @@ mod tests {
     use tos_input::KeyCode;
 
     fn compositor() -> Compositor {
+        compositor_with(Config::default())
+    }
+
+    /// Build a compositor on top of a config, filling in the parts every test
+    /// wants: a child that only sleeps, and the built-in bitmap font.
+    fn compositor_with(config: Config) -> Compositor {
         let config = Config {
             command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()]),
             bitmap_scale: Some(1),
             font: Some("/nonexistent-so-the-bitmap-font-is-used".into()),
-            ..Config::default()
+            ..config
         };
         Compositor::new(config, (640, 360), None).expect("compositor")
+    }
+
+    /// A font stack built from `config`, at a size the tests can reason about.
+    fn fonts(config: Config) -> FontStack {
+        build_fonts(&config, (640, 360), None)
+    }
+
+    /// Nothing to assert about CJK on a machine with no CJK face.
+    fn a_cjk_face() -> Option<std::path::PathBuf> {
+        tos_font::TtfFont::find_system_cjk_font()
+    }
+
+    #[test]
+    fn kanji_are_found_without_being_configured() {
+        if a_cjk_face().is_none() {
+            return;
+        }
+        let fonts = fonts(Config::default());
+        assert!(fonts.covers('漢'), "Japanese would render as boxes");
+        assert!(fonts.covers('あ') && fonts.covers('ア'));
+    }
+
+    #[test]
+    fn a_configured_fallback_supplies_the_glyphs() {
+        let Some(path) = a_cjk_face() else { return };
+        let fonts = fonts(Config {
+            // A primary with no kanji in it, so only the fallback can answer.
+            font: Some("/nonexistent-so-the-bitmap-font-is-used".into()),
+            bitmap_scale: Some(1),
+            font_fallback: vec![path],
+            ..Config::default()
+        });
+        assert!(fonts.covers('漢'));
+    }
+
+    #[test]
+    fn a_fallback_that_will_not_load_is_skipped() {
+        let fonts = fonts(Config {
+            font_fallback: vec!["/nonexistent.ttf".into()],
+            bitmap_scale: Some(1),
+            ..Config::default()
+        });
+        // ASCII still works, which is the whole point of not giving up here.
+        assert!(fonts.covers('A'));
+    }
+
+    #[test]
+    fn a_wide_glyph_fills_two_cells() {
+        if a_cjk_face().is_none() {
+            return;
+        }
+        let mut fonts = fonts(Config::default());
+        let cell = fonts.metrics();
+        let glyph = fonts.glyph('漢', tos_font::RasterStyle::REGULAR).clone();
+        assert!(
+            glyph.width > cell.cell_width,
+            "a kanji narrower than two cells is the missing box"
+        );
+        assert!(
+            glyph.left + glyph.width as i32 <= (cell.cell_width * 2) as i32,
+            "a kanji wider than two cells would overwrite its neighbour"
+        );
     }
 
     #[test]
@@ -1258,21 +1596,69 @@ mod tests {
         assert_eq!(compositor.clipboard('c'), Some(&b"from the app"[..]));
     }
 
-    #[test]
-    fn a_clipboard_query_is_answered() {
-        let mut compositor = compositor();
-        compositor.clipboard.insert('c', b"stored".to_vec());
+    /// Send an OSC 52 query and return what went back down the PTY.
+    fn query_clipboard(compositor: &mut Compositor) -> String {
         compositor.inject(b"\x1b]52;c;?\x07");
         let focus = compositor.session.focus();
         compositor.handle_terminal_events(focus);
-        let response = compositor
-            .pane_mut(focus)
-            .unwrap()
-            .terminal
-            .take_output();
-        let text = String::from_utf8(response).unwrap();
+        let response = compositor.pane_mut(focus).unwrap().terminal.take_output();
+        String::from_utf8(response).unwrap()
+    }
+
+    #[test]
+    fn a_clipboard_query_is_refused_by_default() {
+        let mut compositor = compositor();
+        compositor.clipboard.insert('c', b"a password".to_vec());
+        let text = query_clipboard(&mut compositor);
+        // An empty selection, well formed: the program gets an answer instead
+        // of waiting out a timeout, and none of the real one leaks.
+        assert_eq!(text, "\x1b]52;c;\x1b\\", "got {text:?}");
+        assert!(!text.contains(&tos_term::graphics::encode_base64(b"a password")));
+    }
+
+    #[test]
+    fn a_clipboard_query_is_answered_once_the_user_allows_it() {
+        let mut compositor = compositor_with(Config {
+            allow_clipboard_read: true,
+            ..Config::default()
+        });
+        compositor.clipboard.insert('c', b"stored".to_vec());
+        let text = query_clipboard(&mut compositor);
         assert!(text.starts_with("\x1b]52;c;"), "got {text:?}");
         assert!(text.contains(&tos_term::graphics::encode_base64(b"stored")));
+    }
+
+    #[test]
+    fn an_oversized_clipboard_write_is_refused() {
+        let mut compositor = compositor();
+        compositor.clipboard.insert('c', b"kept".to_vec());
+        let payload = tos_term::graphics::encode_base64(&vec![b'x'; MAX_CLIPBOARD_BYTES + 1]);
+        compositor.inject(format!("\x1b]52;c;{payload}\x07").as_bytes());
+        let focus = compositor.session.focus();
+        compositor.handle_terminal_events(focus);
+        // Dropped whole, so what the user had is still what they have.
+        assert_eq!(compositor.clipboard('c'), Some(&b"kept"[..]));
+    }
+
+    #[test]
+    fn a_clipboard_write_at_the_cap_still_lands() {
+        let mut compositor = compositor();
+        let data = vec![b'x'; MAX_CLIPBOARD_BYTES];
+        let payload = tos_term::graphics::encode_base64(&data);
+        compositor.inject(format!("\x1b]52;c;{payload}\x07").as_bytes());
+        let focus = compositor.session.focus();
+        compositor.handle_terminal_events(focus);
+        assert_eq!(compositor.clipboard('c'), Some(&data[..]));
+    }
+
+    #[test]
+    fn a_made_up_selector_never_reaches_the_clipboard() {
+        let mut compositor = compositor();
+        let payload = tos_term::graphics::encode_base64(b"junk");
+        compositor.inject(format!("\x1b]52;Z;{payload}\x07").as_bytes());
+        let focus = compositor.session.focus();
+        compositor.handle_terminal_events(focus);
+        assert_eq!(compositor.clipboard('Z'), None);
     }
 
     #[test]
@@ -1281,10 +1667,7 @@ mod tests {
         let typing = KeyEvent::new(KeyCode::Char('x'), tos_input::Modifiers::NONE);
         compositor.handle_input(InputEvent::Key(typing));
         // A binding is consumed by the compositor instead.
-        let split = KeyEvent::new(
-            KeyCode::Char('d'),
-            tos_input::Modifiers::SUPER,
-        );
+        let split = KeyEvent::new(KeyCode::Char('d'), tos_input::Modifiers::SUPER);
         compositor.handle_input(InputEvent::Key(split));
         assert_eq!(compositor.panes.len(), 2);
     }
@@ -1356,7 +1739,11 @@ mod tests {
             KeyCode::Char('d'),
             tos_input::Modifiers::SUPER,
         )));
-        assert_eq!(compositor.panes.len(), 1, "a binding fired under the overlay");
+        assert_eq!(
+            compositor.panes.len(),
+            1,
+            "a binding fired under the overlay"
+        );
         // And the pane below sees nothing of what is typed into the query.
         type_into_overlay(&mut compositor, "vi");
         let focus = compositor.session.focus();
@@ -1413,11 +1800,279 @@ mod tests {
             tos_input::Modifiers::NONE,
         )));
         assert_eq!(compositor.panes.len(), 1);
-        let message = compositor.message.as_ref().map(|(text, _)| text.clone());
         assert_eq!(
-            message.as_deref(),
+            compositor.notifications.status_line().as_deref(),
             Some("not found: definitely-not-a-program-1a2b3c")
         );
+    }
+
+    // ---- notifications --------------------------------------------------
+
+    /// Raise an application notification in a pane, the way OSC 9 does.
+    fn notify_from(compositor: &mut Compositor, id: PaneId, body: &str) {
+        compositor
+            .pane_mut(id)
+            .unwrap()
+            .terminal
+            .advance(format!("\x1b]9;{body}\x07").as_bytes());
+        compositor.handle_terminal_events(id);
+    }
+
+    #[test]
+    fn an_application_notification_is_attributed_to_its_pane() {
+        let mut compositor = compositor();
+        let focus = compositor.session.focus();
+        notify_from(&mut compositor, focus, "build finished");
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("pane 1: build finished")
+        );
+    }
+
+    #[test]
+    fn a_bell_says_which_pane_rang() {
+        let mut compositor = compositor();
+        let focus = compositor.session.focus();
+        compositor
+            .pane_mut(focus)
+            .unwrap()
+            .terminal
+            .advance(b"\x07");
+        compositor.handle_terminal_events(focus);
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("pane 1: bell")
+        );
+    }
+
+    #[test]
+    fn a_second_notification_waits_instead_of_replacing_the_first() {
+        let mut compositor = compositor();
+        let focus = compositor.session.focus();
+        notify_from(&mut compositor, focus, "first");
+        notify_from(&mut compositor, focus, "second");
+        // The first is still the one on screen, and the bar says something is
+        // behind it rather than the first having never existed.
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("pane 1: first (+1)")
+        );
+    }
+
+    #[test]
+    fn the_leader_key_does_not_wipe_a_notification() {
+        let mut compositor = compositor();
+        let focus = compositor.session.focus();
+        notify_from(&mut compositor, focus, "still here");
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            tos_input::Modifiers::CTRL,
+        )));
+        assert!(compositor.keymap.is_pending());
+        // The indicator is drawn from the keymap rather than queued, so the
+        // notification is untouched and has not spent its time behind it.
+        compositor.tick();
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("pane 1: still here")
+        );
+    }
+
+    #[test]
+    fn the_history_list_holds_what_went_past() {
+        let mut compositor = compositor();
+        let focus = compositor.session.focus();
+        notify_from(&mut compositor, focus, "one");
+        notify_from(&mut compositor, focus, "two");
+        assert!(compositor.perform(Action::ShowNotifications));
+        let overlay = compositor.overlay().expect("the list should be open");
+        let labels: Vec<&str> = overlay.items().iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["clear", "pane 1: two", "pane 1: one"]);
+        // Reading the list is seeing them, so the bar goes quiet.
+        assert!(compositor.notifications.status_line().is_none());
+    }
+
+    #[test]
+    fn choosing_a_notification_goes_to_the_pane_that_raised_it() {
+        let mut compositor = compositor();
+        let first = compositor.session.focus();
+        compositor.perform(Action::Split(Axis::Columns));
+        let second = compositor.session.focus();
+        assert_ne!(first, second);
+        notify_from(&mut compositor, first, "over here");
+
+        compositor.perform(Action::ShowNotifications);
+        // The first row clears the list; the second is the notification.
+        for code in [KeyCode::Down, KeyCode::Enter] {
+            compositor.handle_input(InputEvent::Key(KeyEvent::new(
+                code,
+                tos_input::Modifiers::NONE,
+            )));
+        }
+        assert!(compositor.overlay().is_none());
+        assert_eq!(compositor.session.focus(), first);
+    }
+
+    #[test]
+    fn the_first_row_of_the_list_clears_it() {
+        let mut compositor = compositor();
+        let focus = compositor.session.focus();
+        notify_from(&mut compositor, focus, "gone soon");
+        compositor.perform(Action::ShowNotifications);
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            tos_input::Modifiers::NONE,
+        )));
+        assert_eq!(compositor.notifications.history().count(), 0);
+    }
+
+    #[test]
+    fn without_a_status_bar_a_notification_is_drawn_over_the_panes() {
+        // The bar is where messages live, so with no bar they have to live
+        // somewhere else: a failure nobody sees looks like a dead key.
+        let mut compositor = compositor_with(Config {
+            status_bar: false,
+            ..Config::default()
+        });
+        let mut framebuffer = tos_render::OwnedFramebuffer::new(640, 360);
+        let accent = compositor.chrome.accent.pack();
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, false);
+        }
+        assert!(
+            !framebuffer.pixels().contains(&accent),
+            "nothing should be in the accent colour yet"
+        );
+
+        let focus = compositor.session.focus();
+        notify_from(&mut compositor, focus, "split failed");
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, false);
+        }
+        assert!(
+            framebuffer.pixels().contains(&accent),
+            "the notification was not drawn"
+        );
+    }
+
+    // ---- workspace rename -----------------------------------------------
+
+    fn press_key(
+        compositor: &mut Compositor,
+        code: KeyCode,
+        modifiers: tos_input::Modifiers,
+    ) -> bool {
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(code, modifiers)))
+    }
+
+    /// Open the rename prompt, clear the name it starts on and type `name`.
+    fn rename_to(compositor: &mut Compositor, name: &str) {
+        press_key(compositor, KeyCode::Char(','), tos_input::Modifiers::SUPER);
+        while !compositor.overlay().expect("the prompt").query().is_empty() {
+            press_key(compositor, KeyCode::Backspace, tos_input::Modifiers::NONE);
+        }
+        type_into_overlay(compositor, name);
+        press_key(compositor, KeyCode::Enter, tos_input::Modifiers::NONE);
+    }
+
+    #[test]
+    fn the_rename_binding_opens_a_prompt_holding_the_current_name() {
+        let mut compositor = compositor();
+        assert!(press_key(
+            &mut compositor,
+            KeyCode::Char(','),
+            tos_input::Modifiers::SUPER
+        ));
+        let overlay = compositor.overlay().expect("the prompt should be open");
+        assert_eq!(overlay.query(), "1");
+        assert!(overlay.items().is_empty(), "a prompt has no list");
+    }
+
+    #[test]
+    fn a_typed_name_reaches_the_status_bar() {
+        let mut compositor = compositor();
+        rename_to(&mut compositor, "build");
+        assert!(compositor.overlay().is_none(), "accepting should close it");
+        assert_eq!(compositor.session.active().name, "build");
+        let items = compositor.status_items();
+        assert_eq!(items[0].text, "build");
+        assert!(items[0].highlighted, "the active workspace is marked");
+    }
+
+    #[test]
+    fn a_renamed_workspace_is_wider_in_the_drawn_status_bar() {
+        // The bar is the one thing the name is for, so this asks the pixels
+        // rather than the items: a longer name highlights more of the row.
+        fn accent_in_the_bar(compositor: &mut Compositor) -> usize {
+            let mut framebuffer = tos_render::OwnedFramebuffer::new(640, 360);
+            {
+                let mut surface = framebuffer.surface();
+                compositor.render_frame(&mut surface, false);
+            }
+            let (_, ch) = compositor.cell_size();
+            let accent = compositor.chrome.accent.pack();
+            let above = (compositor.grid_area().height * ch * 640) as usize;
+            framebuffer
+                .pixels()
+                .iter()
+                .skip(above)
+                .filter(|&&px| px == accent)
+                .count()
+        }
+
+        let mut compositor = compositor();
+        let before = accent_in_the_bar(&mut compositor);
+        rename_to(&mut compositor, "development");
+        let after = accent_in_the_bar(&mut compositor);
+        assert!(after > before, "{after} should be more than {before}");
+    }
+
+    #[test]
+    fn cancelling_the_prompt_leaves_the_name_alone() {
+        let mut compositor = compositor();
+        compositor.perform(Action::RenameWorkspace);
+        type_into_overlay(&mut compositor, "half typed");
+        assert!(press_key(
+            &mut compositor,
+            KeyCode::Escape,
+            tos_input::Modifiers::NONE
+        ));
+        assert!(compositor.overlay().is_none());
+        assert_eq!(compositor.session.active().name, "1");
+    }
+
+    #[test]
+    fn an_emptied_prompt_gives_the_workspace_its_number_back() {
+        let mut compositor = compositor();
+        rename_to(&mut compositor, "build");
+        rename_to(&mut compositor, "");
+        assert_eq!(compositor.session.active().name, "1");
+        // And with the name forgotten the number follows the position again.
+        compositor.perform(Action::NewWorkspace);
+        compositor.perform(Action::SelectWorkspace(1));
+        compositor.perform(Action::ClosePane);
+        assert_eq!(compositor.status_items()[0].text, "1");
+    }
+
+    #[test]
+    fn the_prompt_takes_the_keys_the_pane_would_have_had() {
+        let mut compositor = compositor();
+        compositor.perform(Action::RenameWorkspace);
+        type_into_overlay(&mut compositor, "build");
+        press_key(
+            &mut compositor,
+            KeyCode::Char('d'),
+            tos_input::Modifiers::SUPER,
+        );
+        assert_eq!(
+            compositor.panes.len(),
+            1,
+            "a binding fired under the prompt"
+        );
+        let focus = compositor.session.focus();
+        assert_eq!(compositor.pane(focus).unwrap().pending_input(), 0);
     }
 
     #[test]

@@ -124,7 +124,11 @@ fn encode_legacy(event: &KeyEvent, ctx: &EncodeContext) -> Vec<u8> {
             }
             out.push(0x1b);
         }
-        KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left | KeyCode::Home
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Right
+        | KeyCode::Left
+        | KeyCode::Home
         | KeyCode::End => {
             let final_byte = cursor_final(event.code);
             if mods.is_empty() {
@@ -161,8 +165,13 @@ fn encode_legacy(event: &KeyEvent, ctx: &EncodeContext) -> Vec<u8> {
             }
         },
         KeyCode::Keypad(key) => out.extend_from_slice(&encode_keypad(key, ctx, mods)),
-        // Keys with no legacy representation send nothing at all.
+        // Keys with no legacy representation send nothing at all. The
+        // Japanese conversion keys are in that company on purpose: no terminal
+        // convention assigns them bytes, so anything invented here would land
+        // in a program that never agreed to read it. They travel as events for
+        // the compositor to route and stop at the encoder.
         KeyCode::ModifierKey(_)
+        | KeyCode::Ime(_)
         | KeyCode::CapsLock
         | KeyCode::NumLock
         | KeyCode::ScrollLock
@@ -350,6 +359,11 @@ fn kitty_key(code: KeyCode) -> Option<(u32, u8)> {
             },
             b'u',
         ),
+        // The Kitty protocol numbers every key it knows about, and the
+        // Japanese conversion keys are not among them. The private use range
+        // is the protocol's to hand out, so a number picked here would mean
+        // two terminals disagreeing about what it stood for.
+        KeyCode::Ime(_) => return None,
         KeyCode::Unknown(_) => return None,
     })
 }
@@ -439,8 +453,8 @@ fn encode_kitty(event: &KeyEvent, ctx: &EncodeContext) -> Vec<u8> {
     // The Kitty protocol does report caps lock and num lock, unlike the
     // legacy encoding, so the full modifier set is used for the parameter.
     let modifier_param = event.modifiers.xterm_param();
-    let report_event = flags.contains(KeyboardFlags::REPORT_EVENT_TYPES)
-        && event.state != KeyState::Press;
+    let report_event =
+        flags.contains(KeyboardFlags::REPORT_EVENT_TYPES) && event.state != KeyState::Press;
     let mut modifier_field = String::new();
     if modifier_param != 1 || report_event {
         modifier_field = modifier_param.to_string();
@@ -611,6 +625,7 @@ pub fn encode_focus(gained: bool) -> &'static [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::ImeKey;
 
     fn key(code: KeyCode, mods: Modifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
@@ -696,12 +711,18 @@ mod tests {
 
     #[test]
     fn keypad_follows_the_application_mode() {
-        assert_eq!(encode(KeyCode::Keypad(Keypad::Digit(5)), Modifiers::NONE), "5");
+        assert_eq!(
+            encode(KeyCode::Keypad(Keypad::Digit(5)), Modifiers::NONE),
+            "5"
+        );
         let ctx = EncodeContext {
             keypad_application: true,
             ..EncodeContext::default()
         };
-        let bytes = encode_key(&key(KeyCode::Keypad(Keypad::Digit(5)), Modifiers::NONE), &ctx);
+        let bytes = encode_key(
+            &key(KeyCode::Keypad(Keypad::Digit(5)), Modifiers::NONE),
+            &ctx,
+        );
         assert_eq!(bytes, b"\x1bOu");
         let enter = encode_key(&key(KeyCode::Keypad(Keypad::Enter), Modifiers::NONE), &ctx);
         assert_eq!(enter, b"\x1bOM");
@@ -775,6 +796,30 @@ mod tests {
     }
 
     #[test]
+    fn the_yen_key_reaches_an_application_as_utf8() {
+        // Every other key in the built in layout is ASCII, so the yen sign is
+        // the first character in it that takes more than one byte on the wire.
+        let ctx = EncodeContext::default();
+        let bytes = encode_key(&key(KeyCode::Char('¥'), Modifiers::NONE), &ctx);
+        assert_eq!(bytes, "¥".as_bytes());
+    }
+
+    #[test]
+    fn conversion_keys_send_nothing_to_an_application() {
+        for ime in [ImeKey::Convert, ImeKey::NonConvert, ImeKey::KanaMode] {
+            assert_eq!(encode(KeyCode::Ime(ime), Modifiers::NONE), "");
+        }
+        // Not even in the escape-everything mode, which reports every key the
+        // Kitty protocol has a number for. These have none, and a guessed one
+        // would send an application bytes it cannot interpret.
+        let ctx = kitty_ctx(KeyboardFlags(
+            KeyboardFlags::DISAMBIGUATE.0 | KeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE.0,
+        ));
+        let event = key(KeyCode::Ime(ImeKey::Convert), Modifiers::NONE);
+        assert!(encode_key(&event, &ctx).is_empty());
+    }
+
+    #[test]
     fn kitty_keeps_legacy_finals_for_arrows() {
         let ctx = kitty_ctx(KeyboardFlags::DISAMBIGUATE);
         let bytes = encode_key(&key(KeyCode::Up, Modifiers::CTRL), &ctx);
@@ -836,7 +881,8 @@ mod tests {
     #[test]
     fn sgr_encoding_is_one_based() {
         let state = mouse_state(MouseTracking::Normal, MouseEncoding::Sgr);
-        let bytes = encode_mouse(&mouse(MouseAction::Press, Some(MouseButton::Left)), state).unwrap();
+        let bytes =
+            encode_mouse(&mouse(MouseAction::Press, Some(MouseButton::Left)), state).unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), "\x1b[<0;5;10M");
     }
 
@@ -851,7 +897,8 @@ mod tests {
     #[test]
     fn x10_encoding_offsets_by_32() {
         let state = mouse_state(MouseTracking::Normal, MouseEncoding::X10);
-        let bytes = encode_mouse(&mouse(MouseAction::Press, Some(MouseButton::Left)), state).unwrap();
+        let bytes =
+            encode_mouse(&mouse(MouseAction::Press, Some(MouseButton::Left)), state).unwrap();
         assert_eq!(bytes, vec![0x1b, b'[', b'M', 32, 32 + 5, 32 + 10]);
     }
 
@@ -897,8 +944,11 @@ mod tests {
     #[test]
     fn wheel_buttons_report_in_the_high_range() {
         let state = mouse_state(MouseTracking::Normal, MouseEncoding::Sgr);
-        let bytes =
-            encode_mouse(&mouse(MouseAction::Press, Some(MouseButton::WheelUp)), state).unwrap();
+        let bytes = encode_mouse(
+            &mouse(MouseAction::Press, Some(MouseButton::WheelUp)),
+            state,
+        )
+        .unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), "\x1b[<64;5;10M");
     }
 

@@ -571,7 +571,6 @@ impl DumbBuffer {
     fn stride_pixels(&self) -> u32 {
         self.pitch / 4
     }
-
 }
 
 impl Drop for DumbBuffer {
@@ -753,7 +752,8 @@ impl DrmDisplay {
         // Waiting must not be open ended, but it also must not give up on the
         // first interruption: drawing into a buffer the display is still
         // scanning out shows a torn frame, and the next flip is then rejected.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(FLIP_TIMEOUT_MS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(FLIP_TIMEOUT_MS);
         while self.flip_pending {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {

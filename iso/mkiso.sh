@@ -38,7 +38,7 @@ apt-get update
 # kernel package then skips generating its own initrd, which would fail in
 # a container anyway.
 apt-get install -y --no-install-recommends \
-    musl-tools busybox-static cpio kmod \
+    musl-tools busybox-static cpio kmod fonts-vlgothic \
     "$KERNEL_PKG" \
     grub-common grub2-common $GRUB_PKGS xorriso mtools \
     fdisk dosfstools e2fsprogs
@@ -69,6 +69,27 @@ chmod 755 "$ROOT/init" "$ROOT/sbin/tos" "$ROOT/sbin/tos-install"
 mkdir -p "$ROOT/etc/tos" "$ROOT/run/live/medium"
 cp .motd_art "$ROOT/etc/tos/motd_art"
 cp iso/profile "$ROOT/etc/profile"
+
+# The font. Without one on the image the compositor finds nothing to load and
+# falls back to its built-in ASCII face, which draws every kana as a hollow
+# box; an image that cannot show Japanese is not much of a Japanese desktop.
+#
+# VL Gothic is the cheapest face Debian has that covers both Latin and
+# Japanese. It is 4,088,728 bytes on disk and costs 2,544,069 of them once the
+# initramfs is gzipped, which is 2.4 MiB on a 49.5 MiB image: measured by
+# regzipping the shipped archive with the file taken out. IPAGothic would cost
+# 4.3 MB and the smallest usable cut of Noto Sans CJK 13.6 MB, for a repertoire
+# this image has no use for.
+#
+# It is also exactly fixed pitch — every Latin glyph half an em, every kana and
+# kanji a full em — which is the 1:2 ratio tos-term's width table already
+# assumes, so a wide character lands on two cells with nothing rescaled. That
+# makes it the primary face here rather than only a fallback.
+#
+# Licence: M+ / Sazanami / BSD-3-Clause, all redistributable.
+VLGOTHIC=usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf
+mkdir -p "$ROOT/$(dirname "$VLGOTHIC")"
+cp "/$VLGOTHIC" "$ROOT/$VLGOTHIC"
 
 # The tools the installer shells out to. Unlike the compositor these are
 # Debian binaries, so their libraries have to come along; the installer is

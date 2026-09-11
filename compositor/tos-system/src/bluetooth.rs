@@ -359,7 +359,9 @@ pub enum Error {
     NoAdapter(String),
     /// A kill switch is in the way. `hardware` means a physical switch, which
     /// software cannot undo: the user has to flip it.
-    Blocked { hardware: bool },
+    Blocked {
+        hardware: bool,
+    },
     /// The adapter is down, and what was asked needs it up.
     NotPowered(String),
     /// The kernel refused for want of privilege. Taking an adapter up needs
@@ -949,7 +951,9 @@ mod imp {
         fn set_soft_blocked(&mut self, rfkill_index: u32, blocked: bool) -> io::Result<()> {
             use std::io::Write;
 
-            let mut device = std::fs::OpenOptions::new().write(true).open("/dev/rfkill")?;
+            let mut device = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/rfkill")?;
             device.write_all(&rfkill_event_bytes(rfkill_index, blocked))
         }
 
@@ -1317,7 +1321,8 @@ mod tests {
     #[test]
     fn a_soft_block_is_read_from_the_switch_under_the_adapter() {
         let tree = Tree::new("soft");
-        tree.adapter("hci0", "00:1A:7D:DA:71:13").switch("hci0", 3, 1, 0);
+        tree.adapter("hci0", "00:1A:7D:DA:71:13")
+            .switch("hci0", 3, 1, 0);
         let mut bluetooth = Bluetooth::new(tree.sysfs(), Recorder::new());
         let adapter = bluetooth.adapter("hci0").unwrap();
         assert_eq!(
@@ -1336,7 +1341,8 @@ mod tests {
     #[test]
     fn a_hardware_switch_is_told_apart_from_a_software_one() {
         let tree = Tree::new("hard");
-        tree.adapter("hci0", "00:1A:7D:DA:71:13").switch("hci0", 0, 1, 1);
+        tree.adapter("hci0", "00:1A:7D:DA:71:13")
+            .switch("hci0", 0, 1, 1);
         let mut bluetooth = Bluetooth::new(tree.sysfs(), Recorder::new());
         let adapter = bluetooth.adapter("hci0").unwrap();
         assert!(adapter.is_hard_blocked());
@@ -1384,7 +1390,8 @@ mod tests {
     #[test]
     fn powering_on_a_blocked_adapter_unblocks_it_before_bringing_it_up() {
         let tree = Tree::new("unblock-then-up");
-        tree.adapter("hci0", "00:1A:7D:DA:71:13").switch("hci0", 3, 1, 0);
+        tree.adapter("hci0", "00:1A:7D:DA:71:13")
+            .switch("hci0", 3, 1, 0);
         let mut bluetooth = Bluetooth::new(tree.sysfs(), Recorder::new());
         let adapter = bluetooth.adapter("hci0").unwrap();
         bluetooth.power_on(&adapter).unwrap();
@@ -1398,7 +1405,8 @@ mod tests {
     #[test]
     fn a_hardware_switch_cannot_be_undone_from_software() {
         let tree = Tree::new("hard-refuses");
-        tree.adapter("hci0", "00:1A:7D:DA:71:13").switch("hci0", 3, 1, 1);
+        tree.adapter("hci0", "00:1A:7D:DA:71:13")
+            .switch("hci0", 3, 1, 1);
         let mut bluetooth = Bluetooth::new(tree.sysfs(), Recorder::new());
         let adapter = bluetooth.adapter("hci0").unwrap();
         let refusal = bluetooth.power_on(&adapter).unwrap_err();
@@ -1455,7 +1463,8 @@ mod tests {
     #[test]
     fn powering_off_leaves_the_kill_switch_alone() {
         let tree = Tree::new("down");
-        tree.adapter("hci0", "00:1A:7D:DA:71:13").switch("hci0", 3, 0, 0);
+        tree.adapter("hci0", "00:1A:7D:DA:71:13")
+            .switch("hci0", 3, 0, 0);
         let control = Recorder::new().with_flags(0, HCI_UP);
         let mut bluetooth = Bluetooth::new(tree.sysfs(), control);
         let adapter = bluetooth.adapter("hci0").unwrap();
@@ -1470,7 +1479,8 @@ mod tests {
     #[test]
     fn blocking_an_adapter_writes_a_soft_block() {
         let tree = Tree::new("block");
-        tree.adapter("hci0", "00:1A:7D:DA:71:13").switch("hci0", 3, 0, 0);
+        tree.adapter("hci0", "00:1A:7D:DA:71:13")
+            .switch("hci0", 3, 0, 0);
         let mut bluetooth = Bluetooth::new(tree.sysfs(), Recorder::new());
         let adapter = bluetooth.adapter("hci0").unwrap();
         bluetooth.set_blocked(&adapter, true).unwrap();
@@ -1494,11 +1504,18 @@ mod tests {
     #[test]
     fn the_links_the_kernel_holds_are_listed_with_their_kind() {
         let tree = Tree::new("links");
-        tree.adapter("hci0", "00:1A:7D:DA:71:13").switch("hci0", 3, 0, 0);
-        tree.file("/sys/class/bluetooth/hci0/hci0:256/address", "4C:87:5D:11:22:33\n")
-            .file("/sys/class/bluetooth/hci0/hci0:256/type", "ACL\n");
-        tree.file("/sys/class/bluetooth/hci0/hci0:257/address", "00:0C:8A:AA:BB:CC\n")
-            .file("/sys/class/bluetooth/hci0/hci0:257/type", "LE\n");
+        tree.adapter("hci0", "00:1A:7D:DA:71:13")
+            .switch("hci0", 3, 0, 0);
+        tree.file(
+            "/sys/class/bluetooth/hci0/hci0:256/address",
+            "4C:87:5D:11:22:33\n",
+        )
+        .file("/sys/class/bluetooth/hci0/hci0:256/type", "ACL\n");
+        tree.file(
+            "/sys/class/bluetooth/hci0/hci0:257/address",
+            "00:0C:8A:AA:BB:CC\n",
+        )
+        .file("/sys/class/bluetooth/hci0/hci0:257/type", "LE\n");
         let bluetooth = Bluetooth::new(tree.sysfs(), Recorder::new());
         let links = bluetooth.connections("hci0");
         assert_eq!(links.len(), 2);
@@ -1512,12 +1529,16 @@ mod tests {
     #[test]
     fn a_child_directory_that_is_not_a_link_is_not_listed() {
         let tree = Tree::new("not-links");
-        tree.adapter("hci0", "00:1A:7D:DA:71:13").switch("hci0", 3, 0, 0);
+        tree.adapter("hci0", "00:1A:7D:DA:71:13")
+            .switch("hci0", 3, 0, 0);
         tree.dir("/sys/class/bluetooth/hci0/subsystem");
         // A link directory with nothing readable in it is not a device either.
         tree.dir("/sys/class/bluetooth/hci0/hci0:260");
         // Another adapter's link, which is not this adapter's business.
-        tree.file("/sys/class/bluetooth/hci0/hci1:256/address", "00:11:22:33:44:55\n");
+        tree.file(
+            "/sys/class/bluetooth/hci0/hci1:256/address",
+            "00:11:22:33:44:55\n",
+        );
         let bluetooth = Bluetooth::new(tree.sysfs(), Recorder::new());
         assert!(bluetooth.connections("hci0").is_empty());
     }
@@ -1543,7 +1564,8 @@ mod tests {
     #[test]
     fn scanning_an_adapter_that_is_off_refuses_before_touching_the_socket() {
         let tree = Tree::new("scan-off");
-        tree.adapter("hci0", "00:1A:7D:DA:71:13").switch("hci0", 3, 1, 0);
+        tree.adapter("hci0", "00:1A:7D:DA:71:13")
+            .switch("hci0", 3, 1, 0);
         let mut bluetooth = Bluetooth::new(tree.sysfs(), Recorder::new());
         let adapter = bluetooth.adapter("hci0").unwrap();
         assert!(matches!(
