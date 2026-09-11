@@ -47,6 +47,9 @@ pub enum Action {
     /// Open the launcher: a filtered list of programs, one of which starts in
     /// a new pane.
     OpenLauncher,
+    /// Open the notification history: everything that has been on the status
+    /// bar, including whatever went past while the screen was not being read.
+    ShowNotifications,
     /// Leave the compositor.
     Quit,
     /// Redraw everything.
@@ -144,6 +147,8 @@ impl Keymap {
             // Space is the one key nothing else wants, and super+space is
             // where a launcher lives on every other desktop.
             (KeyCode::Char(' '), Modifiers::NONE, Action::OpenLauncher),
+            // m for messages: the notifications that have been and gone.
+            (KeyCode::Char('m'), Modifiers::NONE, Action::ShowNotifications),
             (KeyCode::Char('q'), Modifiers::NONE, Action::Quit),
         ];
         for (code, modifiers, action) in bindings {

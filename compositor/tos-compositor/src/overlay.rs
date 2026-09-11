@@ -11,7 +11,7 @@ use tos_font::FontStack;
 use tos_input::{KeyCode, KeyEvent, Modifiers};
 use tos_render::{Rect, Surface};
 
-use crate::chrome::{draw_text, Chrome};
+use crate::chrome::{clip, draw_text, Chrome};
 
 /// The widest the overlay grows, however wide the display is. A launcher that
 /// spans a 4K screen is harder to read, not easier.
@@ -407,21 +407,6 @@ fn lower(c: char) -> char {
 
 fn width_of(text: &str) -> usize {
     tos_term::str_width(text)
-}
-
-/// Cut text to `cols` cells, never slicing a double width character in half.
-fn clip(text: &str, cols: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0;
-    for c in text.chars() {
-        let w = tos_term::char_width(c).max(1) as usize;
-        if used + w > cols {
-            break;
-        }
-        out.push(c);
-        used += w;
-    }
-    out
 }
 
 /// Like [`clip`] but keeps the end, for a query that has outgrown its line:
