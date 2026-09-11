@@ -8,6 +8,7 @@ members = [
     "compositor/tos-input",
     "compositor/tos-session",
     "compositor/tos-platform",
+    "compositor/tos-system",
     "compositor/tos-compositor",
     "installer",
 ]
@@ -27,6 +28,7 @@ tos-pty = { path = "compositor/tos-pty" }
 tos-input = { path = "compositor/tos-input" }
 tos-session = { path = "compositor/tos-session" }
 tos-platform = { path = "compositor/tos-platform" }
+tos-system = { path = "compositor/tos-system" }
 tos-install = { path = "installer" }
 libc = "0.2"
 

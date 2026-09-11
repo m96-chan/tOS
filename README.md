@@ -504,11 +504,73 @@ answered with an error, and frames carry the same raw formats images do.
 
 - [x] status interface
 - [x] notifications
-- [ ] launcher
-- [ ] power controls
-- [ ] network controls
+- [x] launcher
+- [x] power controls
+- [x] network controls
 - [ ] Bluetooth controls
-- [ ] audio controls
+- [x] audio controls
+
+Sound is driven straight through the kernel's control interface. `tos-system`
+opens `/dev/snd/controlC<N>` and issues `SNDRV_CTL_IOCTL_CARD_INFO`,
+`ELEM_LIST`, `ELEM_INFO`, `ELEM_READ` and `ELEM_WRITE` against structures
+declared by hand from `asound.h`, so there is no libasound and no sound
+daemon. It takes the first card that can actually play, then whichever of
+`Master`, `PCM`, `Speaker` or `Headphone` playback volume that hardware
+happens to expose, converts between that control's own range — rarely
+`0..=100` — and a percentage, steps up and down within it, and mutes with the
+card's switch or, on a card that has none, by turning the level down and
+remembering where it was. Every ioctl goes through a trait, so all of it is
+tested against a card built out of structures in a test; none of it has been
+run against real hardware yet, and no part of the interface calls it so far.
+
+
+
+`tos-system`'s `power` module reads `/sys/class/power_supply`: which supplies
+are batteries and which are chargers, charge from `capacity` or worked out
+from `energy_*` or `charge_*` when it is missing, charging state, and time to
+empty or to full where a rate is reported — absent rather than invented where
+it is not, which covers the idle battery whose `power_now` is zero. Two
+batteries are weighted into one reading, and a machine with none says so.
+Powering off and rebooting call `reboot(2)` directly, after `sync(2)`, because
+tOS may be PID 1 with no init to ask; suspend writes `mem` to
+`/sys/power/state`. All three sit behind a trait, so the tests assert what was
+asked for without the machine acting on it. There is no UI on any of this yet,
+and the syscall path itself is only exercised on a real Linux machine.
+
+The network is read out of `/sys/class/net` and `/proc/net` with no
+NetworkManager under it: every interface and what sort it is, link and carrier
+state, MAC, MTU, speed, byte counters, IPv4 and IPv6 addresses from
+`getifaddrs`, and which interface holds the default route. It can also bring a
+link administratively up or down, which is one `SIOCSIFFLAGS` ioctl. Joining a
+wireless network is not part of it: an associated interface's SSID and signal
+are reported, but scanning, WPA and DHCP need nl80211 and a supplicant, and
+those are a later item of their own.
+
+Bluetooth is read out of `/sys/class/bluetooth` and acted on over an
+`AF_BLUETOOTH` socket. `tos-system` lists the adapters, reads each one's
+address, whether it is up and whether rfkill has it blocked, takes an adapter
+up or down with `HCIDEVUP` and `HCIDEVDOWN`, sets and clears the soft block by
+writing to `/dev/rfkill`, lists the links the kernel currently holds, and runs
+an inquiry for devices in range. Pairing and connecting are not there, and the
+box stays unticked for that reason: both are BlueZ, BlueZ is D-Bus, and doing
+them here instead means implementing SMP and an agent to answer for the user,
+which is a piece of work in its own right rather than a missing function.
+
+`super+space`, or `ctrl+a` then space, opens the launcher: a bordered box over
+the panes with a query line and a list of every executable on `$PATH`. Typing
+filters it by subsequence, so "gi" finds `git` and `gifbuild`, with shorter and
+earlier matches first; the arrows or `ctrl+p` / `ctrl+n` move, enter runs the
+selected program in a new pane, and escape closes the box without touching
+anything. While it is up it owns the keyboard, so neither the pane underneath
+nor the other bindings see a key. `$PATH` is read once when it opens, and a
+directory that is missing, unreadable or enormous costs the launcher nothing
+worse than the names it would have contributed.
+
+The box itself is not the launcher. It is a list-and-filter surface that takes
+a title, a list of labels and their details, and reports which one was chosen —
+which is exactly the shape the four remaining items need. Power, network,
+Bluetooth and audio are the same overlay over a different list, and none of
+them exists yet: there is no system layer behind them to list.
 
 ### 0.1 — Portable tOS
 
@@ -686,7 +748,7 @@ To render a frame without a display at all:
 `ctrl+a`; on hardware the same bindings work directly with `super`. The two
 bindings that grow a session are also where most people expect them:
 `ctrl+shift+enter` splits the focused pane and `ctrl+shift+t` opens a new
-workspace.
+workspace. `super+space` opens the launcher.
 
 ## Installing
 

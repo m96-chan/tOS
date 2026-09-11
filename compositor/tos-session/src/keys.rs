@@ -44,6 +44,9 @@ pub enum Action {
     Paste,
     /// Start a selection with the keyboard.
     BeginSelection,
+    /// Open the launcher: a filtered list of programs, one of which starts in
+    /// a new pane.
+    OpenLauncher,
     /// Leave the compositor.
     Quit,
     /// Redraw everything.
@@ -138,6 +141,9 @@ impl Keymap {
             (KeyCode::Char(']'), Modifiers::NONE, Action::Paste),
             (KeyCode::Char('y'), Modifiers::NONE, Action::Copy),
             (KeyCode::Char('r'), Modifiers::NONE, Action::Refresh),
+            // Space is the one key nothing else wants, and super+space is
+            // where a launcher lives on every other desktop.
+            (KeyCode::Char(' '), Modifiers::NONE, Action::OpenLauncher),
             (KeyCode::Char('q'), Modifiers::NONE, Action::Quit),
         ];
         for (code, modifiers, action) in bindings {
@@ -470,6 +476,25 @@ mod tests {
                 "{code:?} with {modifiers:?} should reach the pane"
             );
         }
+    }
+
+    #[test]
+    fn space_opens_the_launcher_with_or_without_the_leader() {
+        let mut keymap = Keymap::default_bindings();
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char(' '), Modifiers::SUPER)),
+            Resolution::Action(Action::OpenLauncher)
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char(' '), Modifiers::NONE)),
+            Resolution::Action(Action::OpenLauncher)
+        );
+        // A plain space is still a space, which is most of what a pane gets.
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char(' '), Modifiers::NONE)),
+            Resolution::Passthrough
+        );
     }
 
     #[test]

@@ -20,6 +20,8 @@ use tos_term::TermEvent;
 
 use crate::chrome::{self, Chrome, StatusItem};
 use crate::config::Config;
+use crate::launcher;
+use crate::overlay::{Overlay, OverlayOutcome};
 use crate::pane::Pane;
 
 /// How often the cursor and blinking text change phase.
@@ -30,6 +32,17 @@ const IDLE_TIMEOUT_MS: i32 = 100;
 const WRITE_RETRY_TIMEOUT_MS: i32 = 4;
 /// How long a transient status message stays up.
 const MESSAGE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Which menu an open overlay is, and so what choosing a row means.
+///
+/// The overlay itself is generic; this is the compositor's side of it. The
+/// other system menus — power, network, Bluetooth, audio — each add a variant
+/// here and a match arm in [`Compositor::choose`], and reuse everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayKind {
+    /// A program from `$PATH`, which starts in a new pane.
+    Launcher,
+}
 
 /// The running compositor.
 pub struct Compositor {
@@ -46,6 +59,8 @@ pub struct Compositor {
     blink_visible: bool,
     last_blink: Instant,
     message: Option<(String, Instant)>,
+    /// The open menu, if any. While it is open it owns the keyboard.
+    overlay: Option<(OverlayKind, Overlay)>,
     needs_full_redraw: bool,
     running: bool,
     /// Pointer position in pixels, for mouse routing.
@@ -71,6 +86,7 @@ impl Compositor {
             blink_visible: true,
             last_blink: Instant::now(),
             message: None,
+            overlay: None,
             needs_full_redraw: true,
             running: true,
             pointer: (0, 0),
@@ -95,12 +111,12 @@ impl Compositor {
     }
 
     fn spawn_pane(&self, area: Rect) -> io::Result<Pane> {
-        Pane::spawn(
-            area,
-            self.cell_size(),
-            self.config.scrollback,
-            self.config.command.as_deref(),
-        )
+        self.spawn_pane_running(area, self.config.command.as_deref())
+    }
+
+    /// Start a pane on a particular command rather than the configured one.
+    fn spawn_pane_running(&self, area: Rect, command: Option<&[String]>) -> io::Result<Pane> {
+        Pane::spawn(area, self.cell_size(), self.config.scrollback, command)
     }
 
     pub fn cell_size(&self) -> (u32, u32) {
@@ -310,6 +326,11 @@ impl Compositor {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // An open overlay owns the keyboard: not the bindings, not the pane
+        // underneath. Anything else and a menu would be typing into a shell.
+        if self.overlay.is_some() {
+            return self.overlay_key(&key);
+        }
         match self.keymap.resolve(&key) {
             Resolution::Action(action) => self.perform(action),
             Resolution::Pending => {
@@ -651,6 +672,12 @@ impl Compositor {
                 }
                 false
             }
+            Action::OpenLauncher => {
+                // The scan happens here, once, rather than per keystroke.
+                let overlay = Overlay::new("run a program", launcher::programs_on_path());
+                self.open_overlay(OverlayKind::Launcher, overlay);
+                true
+            }
             Action::Refresh => {
                 self.needs_full_redraw = true;
                 true
@@ -658,6 +685,73 @@ impl Compositor {
             Action::Quit => {
                 self.running = false;
                 true
+            }
+        }
+    }
+
+    // ---- overlays -------------------------------------------------------
+
+    /// Put a menu up over the panes.
+    pub fn open_overlay(&mut self, kind: OverlayKind, overlay: Overlay) {
+        self.overlay = Some((kind, overlay));
+        // The overlay covers cells the panes are not going to repaint, and
+        // closing it uncovers them again, so both ends need a full frame.
+        self.needs_full_redraw = true;
+    }
+
+    pub fn overlay(&self) -> Option<&Overlay> {
+        self.overlay.as_ref().map(|(_, overlay)| overlay)
+    }
+
+    fn close_overlay(&mut self) {
+        self.overlay = None;
+        self.needs_full_redraw = true;
+    }
+
+    /// Give a key to the open overlay. Returns true when a repaint is needed.
+    fn overlay_key(&mut self, key: &KeyEvent) -> bool {
+        let Some((kind, overlay)) = &mut self.overlay else {
+            return false;
+        };
+        let kind = *kind;
+        match overlay.handle_key(key) {
+            OverlayOutcome::Consumed => false,
+            OverlayOutcome::Changed => true,
+            OverlayOutcome::Cancelled => {
+                // Cancelling changes nothing but the screen.
+                self.close_overlay();
+                true
+            }
+            OverlayOutcome::Chosen(index) => {
+                let label = overlay.items()[index].label.clone();
+                self.close_overlay();
+                self.choose(kind, &label);
+                true
+            }
+        }
+    }
+
+    /// Act on the row an overlay reported. One arm per menu.
+    fn choose(&mut self, kind: OverlayKind, label: &str) {
+        match kind {
+            OverlayKind::Launcher => self.launch(label),
+        }
+    }
+
+    /// Open a pane running `program`, using the same path a split does.
+    fn launch(&mut self, program: &str) {
+        if tos_pty::which(program).is_none() {
+            // The list came from $PATH, so this means it went away in between;
+            // spawning would leave a pane that dies on its own.
+            self.message = Some((format!("not found: {program}"), Instant::now()));
+            return;
+        }
+        let command = vec![program.to_string()];
+        if let Some(id) = self.split_running(Axis::Columns, Some(&command)) {
+            // Until the program sets a title of its own, its name is the most
+            // truthful thing the status bar can say about the pane.
+            if let Some(pane) = self.panes.get_mut(&id) {
+                pane.title = program.to_string();
             }
         }
     }
@@ -672,12 +766,22 @@ impl Compositor {
     }
 
     fn split(&mut self, axis: Axis) -> bool {
+        self.split_running(axis, None);
+        true
+    }
+
+    /// Split the focused pane, running `command` in the new one. `None` runs
+    /// whatever the configuration says a pane runs.
+    ///
+    /// Returns the new pane, or `None` when there was no room or the process
+    /// could not be started; either way the message says so.
+    fn split_running(&mut self, axis: Axis, command: Option<&[String]>) -> Option<PaneId> {
         let area = self.grid_area();
         let Some(new_id) = self.session.split_focused(area, axis) else {
             // Refusing is the right answer when the pane is too small; saying
             // so beats silently creating a pane with nowhere to go.
             self.message = Some(("no room to split".to_string(), Instant::now()));
-            return true;
+            return None;
         };
         let pane_area = self
             .session
@@ -688,19 +792,23 @@ impl Compositor {
             .map(|(_, rect)| rect)
             .unwrap_or(Rect::new(0, 0, 80, 24));
 
-        match self.spawn_pane(pane_area) {
+        let spawned = match command {
+            Some(command) => self.spawn_pane_running(pane_area, Some(command)),
+            None => self.spawn_pane(pane_area),
+        };
+        match spawned {
             Ok(pane) => {
                 self.panes.insert(new_id, pane);
                 self.sync_layout();
                 self.needs_full_redraw = true;
-                true
+                Some(new_id)
             }
             Err(e) => {
                 // The layout must not keep a pane with no process behind it.
                 self.session.close_pane(new_id);
                 self.sync_layout();
                 self.report_error("split", e);
-                true
+                None
             }
         }
     }
@@ -857,6 +965,13 @@ impl Compositor {
 
         if self.config.status_bar {
             self.draw_status(surface, area, ch);
+        }
+
+        // Last, and over everything: the overlay is modal, and the panes below
+        // it have already painted whatever they wanted to this frame.
+        if let Some((_, overlay)) = &mut self.overlay {
+            let over = PixelRect::new(0, 0, area.width * cw, area.height * ch);
+            overlay.draw(surface, &mut self.fonts, over, &self.chrome);
         }
 
         for (id, pane) in self.panes.iter_mut() {
@@ -1191,6 +1306,147 @@ mod tests {
             compositor.session.workspace_count(),
             2,
             "ctrl+shift+t should open a workspace"
+        );
+    }
+
+    // ---- launcher -------------------------------------------------------
+
+    /// An overlay of the compositor's own making, so a test does not depend on
+    /// what happens to be installed on the machine running it.
+    fn open_with(compositor: &mut Compositor, labels: &[&str]) {
+        let items = labels
+            .iter()
+            .map(|label| crate::overlay::OverlayItem::new(*label))
+            .collect();
+        compositor.open_overlay(OverlayKind::Launcher, Overlay::new("run a program", items));
+    }
+
+    fn type_into_overlay(compositor: &mut Compositor, text: &str) {
+        for c in text.chars() {
+            compositor.handle_input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                tos_input::Modifiers::NONE,
+            )));
+        }
+    }
+
+    #[test]
+    fn the_launcher_binding_opens_an_overlay_of_programs() {
+        let mut compositor = compositor();
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            tos_input::Modifiers::SUPER,
+        )));
+        let overlay = compositor.overlay().expect("the launcher should be open");
+        assert!(!overlay.items().is_empty(), "no programs on $PATH");
+        // The list is whatever is on this machine, so check it by a property
+        // rather than by name.
+        assert!(overlay
+            .items()
+            .iter()
+            .all(|item| tos_pty::which(&item.label).is_some()));
+    }
+
+    #[test]
+    fn the_overlay_swallows_keys_the_pane_and_the_bindings_would_get() {
+        let mut compositor = compositor();
+        open_with(&mut compositor, &["ls", "vim"]);
+        // Super+d splits when no overlay is open.
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('d'),
+            tos_input::Modifiers::SUPER,
+        )));
+        assert_eq!(compositor.panes.len(), 1, "a binding fired under the overlay");
+        // And the pane below sees nothing of what is typed into the query.
+        type_into_overlay(&mut compositor, "vi");
+        let focus = compositor.session.focus();
+        assert_eq!(compositor.pane(focus).unwrap().pending_input(), 0);
+        let overlay = compositor.overlay().unwrap();
+        assert_eq!(overlay.query(), "vi");
+        assert_eq!(overlay.selected_item().unwrap().label, "vim");
+    }
+
+    #[test]
+    fn escape_leaves_the_panes_alone() {
+        let mut compositor = compositor();
+        open_with(&mut compositor, &["ls"]);
+        assert!(compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Escape,
+            tos_input::Modifiers::NONE,
+        ))));
+        assert!(compositor.overlay().is_none());
+        assert_eq!(compositor.panes.len(), 1);
+    }
+
+    #[test]
+    fn choosing_a_program_opens_a_pane_running_it() {
+        // cat is on every machine this could run on, and it stays up, so a
+        // pane that is still alive afterwards is one where the exec worked.
+        let mut compositor = compositor();
+        let before = compositor.session.focus();
+        open_with(&mut compositor, &["ls", "cat"]);
+        type_into_overlay(&mut compositor, "cat");
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            tos_input::Modifiers::NONE,
+        )));
+
+        assert!(compositor.overlay().is_none(), "choosing should close it");
+        assert_eq!(compositor.panes.len(), 2);
+        let (&id, pane) = compositor
+            .panes
+            .iter_mut()
+            .find(|(id, _)| **id != before)
+            .expect("a new pane");
+        assert!(pane.program.ends_with("cat"), "ran {:?}", pane.program);
+        assert_eq!(pane.title, "cat");
+        assert!(pane.pty.is_alive());
+        assert!(compositor.session.active().panes().contains(&id));
+    }
+
+    #[test]
+    fn choosing_a_program_that_has_gone_says_so_instead_of_spawning() {
+        let mut compositor = compositor();
+        open_with(&mut compositor, &["definitely-not-a-program-1a2b3c"]);
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            tos_input::Modifiers::NONE,
+        )));
+        assert_eq!(compositor.panes.len(), 1);
+        let message = compositor.message.as_ref().map(|(text, _)| text.clone());
+        assert_eq!(
+            message.as_deref(),
+            Some("not found: definitely-not-a-program-1a2b3c")
+        );
+    }
+
+    #[test]
+    fn the_overlay_is_drawn_over_the_panes() {
+        let mut compositor = compositor();
+        compositor.inject(b"tOS");
+        let mut framebuffer = tos_render::OwnedFramebuffer::new(640, 360);
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, true);
+        }
+        // The status bar already highlights the active workspace in the accent
+        // colour, so this counts rather than asks whether any is present.
+        let accent = compositor.chrome.accent.pack();
+        let count = |fb: &tos_render::OwnedFramebuffer| {
+            fb.pixels().iter().filter(|&&px| px == accent).count()
+        };
+        let before = count(&framebuffer);
+
+        open_with(&mut compositor, &["ls", "vim"]);
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, true);
+        }
+        // The query cursor and the selected row are both accent coloured, and
+        // both are far bigger than anything the status bar draws.
+        assert!(
+            count(&framebuffer) > before,
+            "the overlay should be on top of the panes"
         );
     }
 

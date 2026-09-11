@@ -1,6 +1,7 @@
 //! A pane: one terminal, one PTY, one child process.
 
 use std::io;
+use std::path::PathBuf;
 
 use tos_pty::{Pty, PtyConfig, Winsize};
 use tos_render::TextureCache;
@@ -12,6 +13,10 @@ pub struct Pane {
     pub terminal: Terminal,
     pub pty: Pty,
     pub title: String,
+    /// The program the child was started on, already resolved against `$PATH`.
+    /// The pane is the only thing that knows what it is running, and a
+    /// launcher pane is only worth anything if that is the chosen program.
+    pub program: PathBuf,
     /// Where the pane sits, in cells.
     pub area: Rect,
     /// Set once the child has exited and the terminal has drained.
@@ -49,6 +54,7 @@ impl Pane {
             config.program = program;
             config.args = command[1..].to_vec();
         }
+        let program = config.program.clone();
         let pty = Pty::spawn(&config)?;
 
         let terminal = Terminal::new(
@@ -66,6 +72,7 @@ impl Pane {
             terminal,
             pty,
             title: String::new(),
+            program,
             area,
             exited: false,
             selection: None,
