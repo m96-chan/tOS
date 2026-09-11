@@ -795,7 +795,9 @@ To render a frame without a display at all:
 bindings that grow a session are also where most people expect them:
 `ctrl+shift+enter` splits the focused pane and `ctrl+shift+t` opens a new
 workspace. `super+space` opens the launcher, `super+m` opens the notifications
-and `super+,` names the workspace.
+and `super+,` names the workspace. From inside a session, `leader ?` puts the
+binding list over the panes; both it and `--help` are generated from the keymap
+that is running, so neither can fall behind it.
 
 ## Configuration
 
