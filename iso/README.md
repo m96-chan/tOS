@@ -41,6 +41,13 @@ line that matters:
   Type tos-install to install tOS on this machine.
 ```
 
+The banner is `/etc/tos/motd_art` on the machine, so it can be changed without
+rebuilding anything. It does not have to be letters: a picture turned into
+coloured blocks, the way `chafa image.png` does it, works in both the shell and
+the installer, which reads the colours rather than printing them. The installer
+falls back to the built-in banner when the one it finds needs more of the
+screen than the welcome text can spare.
+
 `tos-install` is a TUI that runs in a pane, which makes installing tOS the
 first real use of the platform as a platform. It picks a disk, writes a GPT
 with a boot partition and an ext4 root, copies the live system onto it,

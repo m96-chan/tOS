@@ -153,8 +153,10 @@ fn the_welcome_screen_carries_the_banner_and_the_disk_count() {
     );
     assert!(screen.contains("Install tOS on this machine"));
     assert!(screen.contains("2 disks can be installed onto"));
-    // The banner is the art file, not something the installer made up.
-    assert!(screen.contains(tos_install::motd::ART.lines().last().unwrap().trim()));
+    // The banner is the art file, not something the installer made up. The art
+    // carries its own colours, so it is the drawn text that has to match.
+    let art = tos_install::motd::art_lines(tos_install::motd::ART);
+    assert!(screen.contains(art.last().unwrap().trim()));
 }
 
 #[test]

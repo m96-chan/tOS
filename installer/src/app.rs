@@ -361,14 +361,28 @@ impl App {
     }
 
     fn draw_banner(&self, screen: &mut Screen, area: Rect, top: u16) -> u16 {
-        let art = motd::art();
-        let lines = motd::art_lines(&art);
+        let lines = banner_lines(&motd::art(), area, top);
+        if lines.is_empty() {
+            return top;
+        }
+        let width = banner_width(&lines);
+        let left = area.x + area.width.saturating_sub(width) / 2;
         let mut y = top;
         for line in &lines {
             if y >= area.bottom() {
                 break;
             }
-            screen.centre(area, y, line, Style::fg(ACCENT));
+            let mut x = left;
+            for run in line {
+                // A banner that brings no colours of its own is drawn in the
+                // accent colour, which is what the tOS banner has always been.
+                let style = if run.style == Style::default() {
+                    Style::fg(ACCENT)
+                } else {
+                    run.style
+                };
+                x = screen.text(x, y, &run.text, style);
+            }
             y += 1;
         }
         y
@@ -656,6 +670,45 @@ impl App {
     }
 }
 
+/// The banner to draw: the largest one that leaves the welcome screen room for
+/// what it has to say.
+///
+/// The banner on a machine can be anything, including a picture that wants
+/// more of the screen than there is. A welcome screen with no room left for
+/// its own words would be a worse trade than a smaller banner, so the picture
+/// gives way to the built-in one, that to a single line, and that to nothing.
+fn banner_lines(art: &str, area: Rect, top: u16) -> Vec<Vec<motd::Run>> {
+    for candidate in [art, motd::ART, motd::ART_SMALL] {
+        let lines = motd::art_runs(candidate);
+        if banner_fits(&lines, area, top) {
+            return lines;
+        }
+    }
+    Vec::new()
+}
+
+/// How wide a parsed banner is, in cells.
+fn banner_width(lines: &[Vec<motd::Run>]) -> u16 {
+    lines
+        .iter()
+        .map(|line| {
+            line.iter()
+                .map(|run| tos_term::str_width(&run.text))
+                .sum::<usize>() as u16
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether a banner leaves the welcome screen room for what it has to say.
+fn banner_fits(lines: &[Vec<motd::Run>], area: Rect, top: u16) -> bool {
+    let height = top + lines.len() as u16 + WELCOME_ROWS;
+    banner_width(lines) <= area.width && height <= area.height
+}
+
+/// The rows `draw_welcome` needs under the banner, dry run note included.
+const WELCOME_ROWS: u16 = 10;
+
 const ACCENT: Color = Color::rgb(0x5f, 0x87, 0xd7);
 const DANGER: Color = Color::rgb(0xff, 0x7b, 0x7b);
 const WARN: Color = Color::rgb(0xc7, 0xa1, 0x4f);
@@ -722,6 +775,96 @@ mod tests {
         assert_eq!(app.stage, Stage::Configure);
         app.key(&press(KeyCode::Enter));
         assert_eq!(app.stage, Stage::Confirm);
+    }
+
+    /// A banner in the shape `chafa` produces: `rows` lines of `cols` coloured
+    /// blocks, with the cursor hiding it wraps its output in.
+    fn picture(rows: usize, cols: usize) -> String {
+        let mut art = String::from("\x1b[?25l");
+        for _ in 0..rows {
+            art.push_str("\x1b[38;2;200;100;50m");
+            art.extend(std::iter::repeat('\u{2580}').take(cols));
+            art.push('\n');
+        }
+        art.push_str("\x1b[?25h");
+        art
+    }
+
+    #[test]
+    fn a_picture_that_fits_is_the_banner() {
+        let area = Rect::new(0, 0, 80, 23);
+        let lines = banner_lines(&picture(6, 46), area, 1);
+        assert_eq!(lines.len(), 6);
+        assert_eq!(banner_width(&lines), 46, "escapes take up no cells");
+        assert_eq!(lines[0][0].style.fg, Color::rgb(200, 100, 50));
+    }
+
+    #[test]
+    fn a_banner_that_crowds_out_the_welcome_screen_gives_way() {
+        // 34 rows of picture on a 23 row console would leave nothing to read.
+        let area = Rect::new(0, 0, 80, 23);
+        let lines = banner_lines(&picture(34, 46), area, 1);
+        assert_eq!(lines, motd::art_runs(motd::ART), "should fall back");
+    }
+
+    #[test]
+    fn a_banner_wider_than_the_screen_gives_way_too() {
+        let area = Rect::new(0, 0, 80, 23);
+        let lines = banner_lines(&picture(4, 200), area, 1);
+        assert_eq!(lines, motd::art_runs(motd::ART));
+    }
+
+    #[test]
+    fn the_picture_that_ships_fits_the_smallest_screen_tested() {
+        // The banner is only worth shipping if it is the one people see.
+        let area = Rect::new(0, 0, 80, 23);
+        assert_eq!(
+            banner_lines(motd::ART, area, 1),
+            motd::art_runs(motd::ART),
+            "the shipped picture should survive an eighty column console"
+        );
+    }
+
+    #[test]
+    fn a_screen_too_small_for_the_picture_still_gets_a_name() {
+        // Twelve rows of picture do not fit here, one line does.
+        let area = Rect::new(0, 0, 60, 14);
+        let lines = banner_lines(motd::ART, area, 1);
+        assert_eq!(lines, motd::art_runs(motd::ART_SMALL));
+    }
+
+    #[test]
+    fn the_words_win_when_nothing_fits() {
+        let area = Rect::new(0, 0, 20, 12);
+        assert!(banner_lines(motd::ART, area, 1).is_empty());
+    }
+
+    #[test]
+    fn a_tiny_screen_still_says_how_to_go_on() {
+        let mut screen = Screen::new(40, 14);
+        app().draw(&mut screen);
+        let text = screen.to_text();
+        assert!(text.contains("Install tOS on this machine"), "{text}");
+        assert!(text.contains("Enter to begin"), "{text}");
+    }
+
+    #[test]
+    fn a_tall_screen_keeps_a_tall_picture() {
+        // The same picture on hardware, where there are rows to spare.
+        let area = Rect::new(0, 0, 80, 60);
+        let lines = banner_lines(&picture(34, 46), area, 1);
+        assert_eq!(lines.len(), 34);
+    }
+
+    #[test]
+    fn the_welcome_screen_still_says_its_piece_under_any_banner() {
+        // Whatever the banner is, the words below it have to survive.
+        let mut screen = Screen::new(80, 24);
+        let app = app();
+        app.draw(&mut screen);
+        let text = screen.to_text();
+        assert!(text.contains("Install tOS on this machine"), "{text}");
+        assert!(text.contains("Enter to begin"), "{text}");
     }
 
     #[test]
