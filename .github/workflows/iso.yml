@@ -1,0 +1,49 @@
+name: iso
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "compositor/**"
+      - "iso/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/iso.yml"
+  pull_request:
+    paths:
+      - "compositor/**"
+      - "iso/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/iso.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ISO
+        run: iso/build.sh
+      - name: Smoke-boot in QEMU
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86
+          # Headless boot: success = the compositor announces itself on serial
+          # within the timeout. GRUB's serial console is not configured, so we
+          # wait through its 1s timeout blindly.
+          timeout 120 qemu-system-x86_64 \
+            -m 1024 -cdrom dist/tos-x86_64.iso \
+            -vga std -display none -serial file:serial.log &
+          qemu_pid=$!
+          for _ in $(seq 60); do
+            grep -q "tOS: starting compositor" serial.log 2>/dev/null && break
+            sleep 2
+          done
+          kill "$qemu_pid" 2>/dev/null || true
+          echo "--- serial log ---"
+          cat serial.log || true
+          grep -q "tOS: starting compositor" serial.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tos-iso-x86_64
+          path: dist/*.iso
