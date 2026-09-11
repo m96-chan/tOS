@@ -313,8 +313,11 @@ pub struct Image {
     /// Index into `frames` of the frame `data` holds.
     current: usize,
     state: AnimationState,
-    /// Changes whenever the pixels in `data` do. A cache that holds a prepared
-    /// copy of an image can compare this instead of the pixels themselves.
+    /// Changes when a frame's pixels are replaced, not when a different frame
+    /// is put on screen. A cache holding prepared copies pairs this with the
+    /// frame number: together they name which pixels, while a counter that
+    /// also moved on every advance would name a moment instead, and a
+    /// looping animation would never reuse anything it had already built.
     generation: u64,
     /// When the current frame went up. `None` means "start timing at the next
     /// advance", which is how the store avoids reading a clock of its own.
@@ -438,10 +441,12 @@ impl Image {
         // A tick that arrives late may have to cross several frames, but never
         // more than one cycle: frames older than that were never on screen and
         // replaying them would only delay catching up.
+        let mut caught_up = false;
         for _ in 0..self.frames.len() {
             let gap = self.frames[self.current].gap_ms as u128;
             if gap != 0 {
                 if elapsed < gap {
+                    caught_up = true;
                     break;
                 }
                 elapsed -= gap;
@@ -452,14 +457,25 @@ impl Image {
                 if self.state == AnimationState::Running {
                     self.state = AnimationState::Stopped;
                 }
+                caught_up = true;
                 break;
             };
             if !self.show_frame(next) {
+                caught_up = true;
                 break;
             }
         }
 
-        let leftover = Duration::from_millis(elapsed.min(u64::MAX as u128) as u64);
+        // Time still owed after a whole cycle went by belongs to frames that
+        // were never on screen. Carrying it forward would replay the cycle on
+        // the next tick too, and the one after that, for as long as the debt
+        // lasted: the animation would race through its loops while looking
+        // frozen. Starting the clock again here is what catching up means.
+        let leftover = if caught_up {
+            Duration::from_millis(elapsed.min(u64::MAX as u128) as u64)
+        } else {
+            Duration::ZERO
+        };
         self.shown_at = Some(now.checked_sub(leftover).unwrap_or(now));
         self.current != start
     }
@@ -958,8 +974,6 @@ impl GraphicsStore {
             }
             if moved {
                 image.shown_at = None;
-                self.generations += 1;
-                image.generation = self.generations;
                 changed = true;
             }
         }
@@ -987,15 +1001,11 @@ impl GraphicsStore {
     /// is what lets a test walk an animation frame by frame.
     pub fn advance_animations(&mut self, now: Instant) -> Vec<u32> {
         let mut changed = Vec::new();
-        let mut generations = self.generations;
         for image in self.images.values_mut() {
             if image.advance(now) {
-                generations += 1;
-                image.generation = generations;
                 changed.push(image.id);
             }
         }
-        self.generations = generations;
         changed
     }
 
@@ -1417,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn the_generation_moves_with_the_visible_pixels() {
+    fn the_generation_moves_when_pixels_are_replaced() {
         let mut store = GraphicsStore::new(1 << 20);
         two_frame_image(&mut store);
         let start = Instant::now();
@@ -1429,14 +1439,59 @@ mod tests {
         store.store_frame(&extra, &extra.payload).unwrap();
         assert_eq!(store.image(1).unwrap().generation(), before);
 
-        store.advance_animations(start + Duration::from_millis(40));
-        let after = store.image(1).unwrap().generation();
-        assert!(after > before, "{after} should be newer than {before}");
-
-        // A rewritten frame that happens to be the visible one counts too.
-        let edit = command("a=f,f=32,s=1,v=1,i=1,r=2", &[9, 9, 9, 255]);
+        // Rewriting the frame that is on screen is new pixels.
+        assert_eq!(store.image(1).unwrap().current_frame(), 1);
+        let edit = command("a=f,f=32,s=1,v=1,i=1,r=1", &[9, 9, 9, 255]);
         store.store_frame(&edit, &edit.payload).unwrap();
-        assert!(store.image(1).unwrap().generation() > after);
+        assert!(store.image(1).unwrap().generation() > before);
+    }
+
+    #[test]
+    fn a_long_stall_does_not_replay_itself() {
+        // A tick that arrives ten seconds late crosses at most one cycle. The
+        // seconds it did not use belong to frames nobody saw, so they have to
+        // be dropped: kept, the next tick would cross another cycle, and the
+        // one after that, racing through the animation while it looked frozen.
+        let mut store = GraphicsStore::new(1 << 20);
+        two_frame_image(&mut store);
+        let start = Instant::now();
+        store.advance_animations(start);
+
+        store.advance_animations(start + Duration::from_secs(10));
+        let after_stall = store.image(1).unwrap().current_frame();
+
+        // The tick right after the stall is only a millisecond later, so
+        // nothing is owed and the frame must hold still.
+        store.advance_animations(start + Duration::from_secs(10) + Duration::from_millis(1));
+        assert_eq!(
+            store.image(1).unwrap().current_frame(),
+            after_stall,
+            "the stall was replayed instead of being caught up on"
+        );
+
+        // And one gap later it moves exactly one frame, as usual.
+        store.advance_animations(start + Duration::from_secs(10) + Duration::from_millis(40));
+        assert_ne!(store.image(1).unwrap().current_frame(), after_stall);
+    }
+
+    #[test]
+    fn showing_a_different_frame_is_not_a_new_generation() {
+        // The pixels of each frame are untouched by the animation running, so
+        // the generation holds still and the frame number is what moves. A
+        // cache pairs the two; a generation that ticked here would hand a
+        // looping animation a fresh key every time round and it would rebuild
+        // work it already had.
+        let mut store = GraphicsStore::new(1 << 20);
+        two_frame_image(&mut store);
+        let start = Instant::now();
+        store.advance_animations(start);
+        let generation = store.image(1).unwrap().generation();
+        let frame = store.image(1).unwrap().current_frame();
+
+        store.advance_animations(start + Duration::from_millis(40));
+        let image = store.image(1).unwrap();
+        assert_eq!(image.generation(), generation, "the pixels did not change");
+        assert_ne!(image.current_frame(), frame, "a different frame is up");
     }
 
     #[test]

@@ -595,6 +595,69 @@ fn kitty_graphics_plays_an_animation_and_damages_the_rows_it_covers() {
 }
 
 #[test]
+fn an_animation_scrolled_out_of_view_asks_for_no_repaint() {
+    // A playing animation off the top of the viewport is still playing, but
+    // nothing about the screen changes. Calling that a repaint would flip the
+    // whole page every gap for a picture nobody can see.
+    //
+    // It has to be a tall image to get into that state at all: a placement one
+    // row high is dropped the moment it scrolls off, so it is gone before
+    // there is any history to look back through.
+    let mut t = term(10, 6);
+    let red = encode_base64(&[255, 0, 0, 255].repeat(8 * 48));
+    t.advance(format!("\x1b_Ga=T,f=32,s=8,v=48,i=5;{red}\x1b\\").as_bytes());
+    let green = encode_base64(&[0, 255, 0, 255].repeat(8 * 48));
+    t.advance(format!("\x1b_Ga=f,f=32,s=8,v=48,i=5,z=40;{green}\x1b\\").as_bytes());
+    t.advance(b"\x1b_Ga=a,i=5,r=1,z=40,s=3\x1b\\");
+    t.take_output();
+
+    for _ in 0..6 {
+        t.advance(b"\r\n");
+    }
+    assert!(t.scroll_display(3), "the test needs scrollback to look at");
+    let placed: Vec<i64> = t
+        .graphics()
+        .placements()
+        .map(|p| p.row as i64 - t.display_offset() as i64)
+        .collect();
+    assert_eq!(placed, vec![-3], "the image should be just off the top");
+
+    let start = Instant::now();
+    t.advance_animations(start);
+    t.clear_damage();
+    assert!(
+        !t.advance_animations(start + Duration::from_millis(40)),
+        "an animation nobody can see asked for a repaint"
+    );
+    assert!(!t.damage().is_dirty());
+    // It is still playing; only the repaint was declined.
+    assert_eq!(t.graphics().image(5).unwrap().current_frame(), 2);
+}
+
+#[test]
+fn an_animation_half_on_screen_still_repaints() {
+    // The other side of the same rule: one row of it showing is still showing.
+    let mut t = term(10, 6);
+    let red = encode_base64(&[255, 0, 0, 255].repeat(8 * 48));
+    t.advance(format!("\x1b_Ga=T,f=32,s=8,v=48,i=5;{red}\x1b\\").as_bytes());
+    let green = encode_base64(&[0, 255, 0, 255].repeat(8 * 48));
+    t.advance(format!("\x1b_Ga=f,f=32,s=8,v=48,i=5,z=40;{green}\x1b\\").as_bytes());
+    t.advance(b"\x1b_Ga=a,i=5,r=1,z=40,s=3\x1b\\");
+    t.take_output();
+
+    for _ in 0..4 {
+        t.advance(b"\r\n");
+    }
+    assert!(t.scroll_display(1));
+
+    let start = Instant::now();
+    t.advance_animations(start);
+    t.clear_damage();
+    assert!(t.advance_animations(start + Duration::from_millis(40)));
+    assert!(t.damage().is_row_dirty(0));
+}
+
+#[test]
 fn kitty_graphics_rejects_frames_for_images_that_were_never_sent() {
     let mut t = term(10, 4);
     t.advance(b"\x1b_Ga=f,f=32,s=1,v=1,i=9;AAAAAA==\x1b\\");

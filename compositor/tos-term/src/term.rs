@@ -1809,11 +1809,20 @@ impl Terminal {
             .filter(|p| p.image_id == image_id)
             .map(|p| (p.row as i64 - offset, p.rows))
             .collect();
-        let on_screen = !rows.is_empty();
+        // Having a placement is not the same as being visible. Scrolled back
+        // far enough, a playing animation is off the top of the viewport, and
+        // calling that a repaint would flip the whole page every frame for a
+        // picture nobody can see.
+        let height = self.grid().rows() as i64;
+        let mut on_screen = false;
         for (row, count) in rows {
-            let from = row.max(0) as usize;
-            let to = (row + count as i64).max(0) as usize;
-            self.damage.mark_range(from, to);
+            let from = row.max(0);
+            let to = (row + count as i64).min(height);
+            if to <= from {
+                continue;
+            }
+            on_screen = true;
+            self.damage.mark_range(from as usize, to as usize);
         }
         on_screen
     }

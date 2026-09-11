@@ -353,6 +353,14 @@ impl Header {
 
     /// Exactly how many bytes IDAT must decompress to: for every pass, one
     /// filter byte plus a packed scanline per row.
+    /// How many bytes the decoded picture occupies as RGBA8.
+    fn rgba_size(&self) -> Result<usize, PngError> {
+        self.width
+            .checked_mul(self.height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or(PngError::TooLarge)
+    }
+
     fn decompressed_size(&self) -> Result<usize, PngError> {
         let mut total = 0usize;
         for &pass in self.passes() {
@@ -420,6 +428,14 @@ fn render(
     limit: usize,
 ) -> Result<PngImage, PngError> {
     let expected = header.decompressed_size()?;
+    // The scanlines and the RGBA they turn into are both held at once, and
+    // the scanlines can be the larger of the two: sixteen bits a sample is
+    // twice the eight the output keeps. The budget is for what this costs to
+    // decode, so both have to fit inside it, not just the half that is kept.
+    let rgba = header.rgba_size()?;
+    if expected.checked_add(rgba).ok_or(PngError::TooLarge)? > limit {
+        return Err(PngError::TooLarge);
+    }
     // The inflater's limit is the exact size the header promised, so a bomb
     // in IDAT stops there rather than at whatever size it wanted to reach.
     let raw = inflate::zlib_decompress(compressed, expected).map_err(PngError::Deflate)?;
@@ -690,6 +706,29 @@ pub(crate) mod tests {
     }
 
     const LIMIT: usize = 1 << 20;
+
+    #[test]
+    fn the_scanlines_count_against_the_budget_too() {
+        // Sixteen bits a sample: the scanlines are twice the RGBA they become,
+        // and both are held at once. A budget that only weighed the output
+        // would let this through and then use three times it.
+        let (w, h) = (16u32, 16u32);
+        let mut scanlines = Vec::new();
+        for _ in 0..h {
+            scanlines.push(0);
+            scanlines.extend(std::iter::repeat_n(0x40u8, w as usize * 8));
+        }
+        let data = png(w, h, 16, 6, 0, &[], &scanlines);
+
+        let rgba = (w * h * 4) as usize;
+        let raw = h as usize * (w as usize * 8 + 1);
+        // Room for the picture but not for decoding it.
+        assert!(
+            decode(&data, rgba + raw - 1).is_err(),
+            "a budget smaller than the decode accepted the image"
+        );
+        assert!(decode(&data, rgba + raw).is_ok(), "an ample budget was refused");
+    }
 
     #[test]
     fn an_rgba_image_decodes_unchanged() {

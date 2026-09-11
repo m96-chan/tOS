@@ -472,6 +472,7 @@ fn draw_graphics(
         let key = TextureKey::new(
             placement.image_id,
             image.generation(),
+            image.current_frame(),
             region,
             dest.width,
             dest.height,

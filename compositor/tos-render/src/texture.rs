@@ -103,8 +103,14 @@ impl Texture {
 pub struct TextureKey {
     /// Graphics protocol image id.
     pub image_id: u32,
-    /// Generation of that id's pixel data, from `Image::version`.
+    /// Generation of that id's pixels, from [`tos_term::graphics::Image`].
     pub version: u64,
+    /// Which frame of an animation, 1 for a still image. Paired with the
+    /// generation because an animation changes the pixels on screen by
+    /// choosing a different frame, not by replacing any of them: keyed on the
+    /// generation alone a cache would freeze, and on a counter that moved with
+    /// every advance it would never reuse a frame it looped back to.
+    pub frame: u32,
     /// Source rectangle within the image.
     pub src: Rect,
     pub dest_width: u32,
@@ -112,10 +118,18 @@ pub struct TextureKey {
 }
 
 impl TextureKey {
-    pub fn new(image_id: u32, version: u64, src: Rect, dest_width: u32, dest_height: u32) -> Self {
+    pub fn new(
+        image_id: u32,
+        version: u64,
+        frame: u32,
+        src: Rect,
+        dest_width: u32,
+        dest_height: u32,
+    ) -> Self {
         TextureKey {
             image_id,
             version,
+            frame,
             src,
             dest_width,
             dest_height,
@@ -193,6 +207,14 @@ impl TextureCache {
             self.hits += 1;
         } else {
             self.misses += 1;
+            // How big the texture will be is arithmetic, and an application
+            // chooses it: `c=` and `r=` are its to send, clamped only to
+            // 65535 cells. Asking before allocating is the difference between
+            // declining the work and trying to build a terabyte of it.
+            let wanted = key.dest_width as u64 * key.dest_height as u64 * 4;
+            if wanted > self.budget as u64 {
+                return None;
+            }
             let texture = Texture::scale(
                 src,
                 src_width,
@@ -284,7 +306,7 @@ mod tests {
     }
 
     fn key(version: u64, width: u32, height: u32) -> TextureKey {
-        TextureKey::new(1, version, Rect::new(0, 0, 2, 2), width, height)
+        TextureKey::new(1, version, 1, Rect::new(0, 0, 2, 2), width, height)
     }
 
     #[test]
@@ -338,8 +360,8 @@ mod tests {
     fn a_different_source_region_is_a_different_texture() {
         let mut cache = TextureCache::default();
         let src = checker();
-        let whole = TextureKey::new(1, 1, Rect::new(0, 0, 2, 2), 2, 2);
-        let corner = TextureKey::new(1, 1, Rect::new(1, 1, 1, 1), 2, 2);
+        let whole = TextureKey::new(1, 1, 1, Rect::new(0, 0, 2, 2), 2, 2);
+        let corner = TextureKey::new(1, 1, 1, Rect::new(1, 1, 1, 1), 2, 2);
         assert_eq!(
             cache.get_or_scale(whole, &src, 2, 2).unwrap().pixels()[0],
             0xffff_0000
@@ -355,8 +377,8 @@ mod tests {
     fn an_overhanging_region_keys_the_same_as_its_clamped_self() {
         let mut cache = TextureCache::default();
         let src = checker();
-        let exact = TextureKey::new(1, 1, Rect::new(0, 0, 2, 2), 2, 2);
-        let overhanging = TextureKey::new(1, 1, Rect::new(0, 0, 9, 9), 2, 2);
+        let exact = TextureKey::new(1, 1, 1, Rect::new(0, 0, 2, 2), 2, 2);
+        let overhanging = TextureKey::new(1, 1, 1, Rect::new(0, 0, 9, 9), 2, 2);
         cache.get_or_scale(exact, &src, 2, 2);
         cache.get_or_scale(overhanging, &src, 2, 2);
         assert_eq!(cache.len(), 1);
@@ -396,7 +418,7 @@ mod tests {
     fn an_empty_region_has_no_texture() {
         let mut cache = TextureCache::default();
         let src = checker();
-        let outside = TextureKey::new(1, 1, Rect::new(8, 8, 2, 2), 4, 4);
+        let outside = TextureKey::new(1, 1, 1, Rect::new(8, 8, 2, 2), 4, 4);
         assert!(cache.get_or_scale(outside, &src, 2, 2).is_none());
         assert!(cache.is_empty());
     }
