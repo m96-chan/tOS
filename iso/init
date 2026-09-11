@@ -12,10 +12,13 @@ mount -t devpts none /dev/pts
 mount -t tmpfs none /dev/shm
 mount -t tmpfs none /tmp
 
-# linux-virt ships display and input drivers as modules. Load whatever the
-# machine has; missing hardware just means a harmless failure.
+# The kernel ships these as modules. Load whatever the machine has; missing
+# hardware just means a harmless failure.
 for mod in bochs virtio_gpu simpledrm cirrus \
-    evdev atkbd i8042 psmouse virtio_input hid_generic usbhid; do
+    evdev atkbd i8042 psmouse virtio_input hid_generic usbhid \
+    sd_mod sr_mod cdrom ata_piix ahci virtio_blk virtio_scsi \
+    nvme usb_storage uas xhci_pci ehci_pci ohci_pci sdhci_pci mmc_block \
+    isofs ext4 vfat; do
     modprobe "$mod" 2>/dev/null
 done
 # Give /dev/dri/card0 a moment to appear before tos probes for it.
@@ -28,8 +31,13 @@ done
 # installer needs the medium mounted to copy them onto a disk. Look for the
 # partition that carries /boot/vmlinuz.
 mkdir -p /run/live/medium
-modprobe isofs 2>/dev/null
-modprobe iso9660 2>/dev/null
+# Storage nodes appear a moment after their driver loads.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if [ -b /dev/sr0 ] || [ -b /dev/sda ] || [ -b /dev/vda ]; then
+        break
+    fi
+    sleep 0.2
+done
 for dev in /dev/sr* /dev/sd?? /dev/sd? /dev/vd?? /dev/vd? /dev/nvme*n*p* /dev/nvme*n*; do
     [ -b "$dev" ] || continue
     if mount -o ro "$dev" /run/live/medium 2>/dev/null; then
@@ -40,6 +48,9 @@ for dev in /dev/sr* /dev/sd?? /dev/sd? /dev/vd?? /dev/vd? /dev/nvme*n*p* /dev/nv
         umount /run/live/medium 2>/dev/null
     fi
 done
+if [ ! -f /run/live/medium/boot/vmlinuz ]; then
+    echo "tOS: no live medium found; the installer cannot copy a kernel"
+fi
 
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin
 export HOME=/root

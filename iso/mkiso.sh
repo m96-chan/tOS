@@ -126,8 +126,14 @@ mknod -m 666 "$ROOT/dev/null" c 1 3
 
 # Only the display/input drivers /init loads, plus their dependency
 # closure — the full Debian module tree would be hundreds of megabytes.
+# Display and input, then the storage stack the installer needs: without a
+# disk driver it sees no disks, and without the filesystem modules it cannot
+# mount what it just created.
 MODULES="bochs virtio_gpu simpledrm cirrus vmwgfx \
-    evdev atkbd i8042 psmouse virtio_input hid_generic usbhid virtio_pci"
+    evdev atkbd i8042 psmouse virtio_input hid_generic usbhid virtio_pci \
+    sd_mod sr_mod cdrom ata_piix ahci libahci virtio_blk virtio_scsi \
+    nvme usb_storage uas xhci_pci ehci_pci ohci_pci sdhci_pci mmc_block \
+    isofs ext4 vfat nls_cp437 nls_iso8859_1 nls_ascii"
 for mod in $MODULES; do
     modprobe -S "$KVER" --show-depends "$mod" 2>/dev/null || true
 done | sed -n 's/^insmod //p' | sort -u | while read -r path; do
