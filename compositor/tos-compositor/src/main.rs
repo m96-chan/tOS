@@ -207,6 +207,50 @@ fn run_nested(config: Config) -> io::Result<()> {
     Ok(())
 }
 
+/// One thing the DRM loop does about a VT switch the kernel is asking about.
+///
+/// The kernel suspends the switch until tOS answers, so every path through
+/// here has to end in an answer. Nothing may be silent: a switch left
+/// unanswered stays pending for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchStep {
+    /// Drop DRM master, so whoever is taking the console can set a mode.
+    ReleaseDisplay,
+    /// `VT_RELDISP 1`: the switch goes ahead and tOS is no longer foreground.
+    AllowSwitch,
+    /// `VT_RELDISP 0`: the kernel abandons the switch and tOS stays where it
+    /// is, still holding master.
+    RefuseSwitch,
+}
+
+/// What a switch away costs, given whether the session is locked.
+///
+/// A list rather than a boolean because the order is the whole trap. Giving
+/// up the display comes first and agreeing to the switch second, and a locked
+/// session has to skip *both*. Skipping only the second would be the worst of
+/// the three outcomes: master is gone, so any process that opens the card can
+/// set its own mode over a locked screen, while the kernel still believes tOS
+/// is the foreground terminal and leaves it there.
+///
+/// Refusing is decided afresh every time rather than armed once, because the
+/// kernel puts no timeout on the answer. Each Ctrl+Alt+Fn on a locked session
+/// costs one signal and one ioctl; the kernel keeps no queue of them, so
+/// holding the key down cannot build anything up, and `VT_RELDISP 0` leaves
+/// the terminal in the state it was in before the key — a switch asked for
+/// after the password is accepted is answered like any other.
+///
+/// A blanked screen needs nothing extra on either side. Refusing touches the
+/// CRTC not at all, so a session that switched its panel off while locked
+/// stays dark through the attempt, and an unlocked one releases exactly as it
+/// does today — `drm.rs` gives the device up as it stands and remembers the
+/// blank for the way back.
+fn switch_away_plan(locked: bool) -> &'static [SwitchStep] {
+    if locked {
+        return &[SwitchStep::RefuseSwitch];
+    }
+    &[SwitchStep::ReleaseDisplay, SwitchStep::AllowSwitch]
+}
+
 #[cfg(target_os = "linux")]
 fn run_drm(config: Config) -> io::Result<()> {
     use tos_input::evdev::InputBackend;
@@ -262,11 +306,33 @@ fn run_drm(config: Config) -> io::Result<()> {
         // A VT switch is acted on here rather than in the signal handler,
         // where releasing the display would not be safe.
         if tos_platform::take_switch_away() && !suspended {
-            let _ = display.release();
-            if let Some(vt) = vt.as_ref() {
-                let _ = vt.allow_switch_away();
+            // The plan rather than an `if` here so that there is exactly one
+            // place that decides what a switch costs, and it is a place a
+            // test can read.
+            for step in switch_away_plan(compositor.is_locked()) {
+                match step {
+                    SwitchStep::ReleaseDisplay => {
+                        let _ = display.release();
+                    }
+                    SwitchStep::AllowSwitch => {
+                        if let Some(vt) = vt.as_ref() {
+                            let _ = vt.allow_switch_away();
+                        }
+                        suspended = true;
+                    }
+                    SwitchStep::RefuseSwitch => {
+                        // Nothing else happens: the screen stays tOS's, the
+                        // panes keep running, and the next iteration draws the
+                        // lock again as though no key had been pressed. If
+                        // even the refusal fails the kernel is left holding a
+                        // switch it will never complete, which on a locked
+                        // session is the same answer by a worse road.
+                        if let Some(vt) = vt.as_ref() {
+                            let _ = vt.refuse_switch_away();
+                        }
+                    }
+                }
             }
-            suspended = true;
         }
         if tos_platform::take_switch_back() && suspended {
             if let Some(vt) = vt.as_ref() {
@@ -383,5 +449,41 @@ mod tests {
     fn auto_never_resolves_to_auto() {
         let config = Config::default();
         assert_ne!(choose_backend(&config), Backend::Auto);
+    }
+
+    #[test]
+    fn an_unlocked_session_gives_up_the_display_before_it_agrees_to_the_switch() {
+        // Both, and in this order: a process that answered the switch while
+        // still holding DRM master would hand the console to a terminal that
+        // cannot put anything on the screen.
+        assert_eq!(
+            switch_away_plan(false),
+            &[SwitchStep::ReleaseDisplay, SwitchStep::AllowSwitch]
+        );
+    }
+
+    #[test]
+    fn a_locked_session_skips_the_release_as_well_as_the_switch() {
+        // The trap the whole change exists for. Refusing the switch while
+        // still calling `display.release()` reads like a lock and is not one:
+        // master would already be gone by the time the answer was given, so
+        // anything that opened the card could draw over the locked screen.
+        let plan = switch_away_plan(true);
+        assert_eq!(plan, &[SwitchStep::RefuseSwitch]);
+        assert!(!plan.contains(&SwitchStep::ReleaseDisplay));
+    }
+
+    #[test]
+    fn every_plan_answers_the_kernel_exactly_once() {
+        // The kernel holds the switch until it is answered and never times
+        // out, so a plan that answered twice, or not at all, would be a
+        // console that cannot be switched by anyone.
+        for locked in [false, true] {
+            let answers = switch_away_plan(locked)
+                .iter()
+                .filter(|step| matches!(step, SwitchStep::AllowSwitch | SwitchStep::RefuseSwitch))
+                .count();
+            assert_eq!(answers, 1, "locked = {locked}");
+        }
     }
 }
