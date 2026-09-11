@@ -273,6 +273,46 @@ fn the_machine_can_be_named_before_installing() {
 }
 
 #[test]
+fn a_password_is_masked_and_has_to_be_typed_twice() {
+    let machine = FakeMachine::new("password").disk("vda", 64);
+    let mut session = Session::new(&machine, &["--dry-run"]);
+    assert!(session.wait_for("Enter to begin"));
+    session.type_keys(b"\r");
+    assert!(session.wait_for("GiB"));
+    session.type_keys(b"\r");
+    assert!(session.wait_for("Tab switches fields"));
+    assert!(
+        session.screen().contains("the screen will never lock"),
+        "an empty password should say what it costs:\n{}",
+        session.screen()
+    );
+
+    // Two tabs to the password field, then a password and a typo of it.
+    session.type_keys(b"\t\thunter2\thunterZ\r");
+    assert!(session.wait_for("do not match"), "{}", session.screen());
+    let screen = session.screen();
+    assert!(
+        !screen.contains("hunter2") && !screen.contains("hunterZ"),
+        "the password was echoed:\n{screen}"
+    );
+    assert!(
+        screen.contains("Set up this machine"),
+        "a mismatch must not leave the screen:\n{screen}"
+    );
+
+    // Both entries were cleared, so agreeing is typing it twice from here.
+    session.type_keys(b"hunter2\thunter2\r");
+    assert!(
+        session.wait_for("Type vda to confirm"),
+        "{}",
+        session.screen()
+    );
+    let screen = session.screen();
+    assert!(screen.contains("Password   set"), "{screen}");
+    assert!(!screen.contains("hunter2"), "{screen}");
+}
+
+#[test]
 fn a_machine_with_no_usable_disk_says_so() {
     let machine = FakeMachine::new("nodisk");
     let mut session = Session::new(&machine, &["--dry-run"]);

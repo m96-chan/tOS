@@ -156,12 +156,37 @@ and no PAM, because there is nothing to gain: `tos` already runs as root, owns
 the framebuffer and holds an exclusive grab on every keyboard. A helper would
 be a boundary between the process and itself.
 
-### What is deliberately not decided here
+### An empty password is allowed, and means no file at all
 
-Whether the installer *requires* a password or allows an empty one. Requiring
-it makes every installed machine lockable; allowing it keeps a single-user
-machine from being nagged. The rule below ("no credential, no lock") works
-either way, so this can be decided when the installer screen is written.
+This was left open here and settled when the installer screen was written
+([#48](https://github.com/m96-chan/tOS/issues/48)): the password field may be
+left empty, and when it is, `tos-install` writes **no** `/etc/tos/shadow`.
+
+Three reasons, in order of how much they matter.
+
+The empty string hashes perfectly well. A `$6$` line for it is a valid
+credential that a lock would engage on and then open for a bare Enter, which
+is worse than no lock — it looks like one. Declining a password therefore has
+to mean *no credential*, not *a credential of nothing*, and the rule below
+already gives that case a defined, honest behaviour.
+
+Requiring one would not buy what it looks like it buys. Nothing on the machine
+gates a login — the console starts the compositor directly — so this password
+protects the screen lock and nothing else. An installer that refuses to finish
+without one teaches the person in front of it to type `a` and press Enter
+twice, which is a credential in name only and a worse outcome than the empty
+field they chose on purpose.
+
+And it is not a silent choice. The configuration screen says "With no
+password, the screen will never lock" under the empty field, and the
+confirmation screen — the one nobody gets past without typing the disk's name
+— carries `Password   none, so the screen will not lock` in the warning
+colour.
+
+`/etc/passwd` was fixed in the same change. It said `x` in the password field,
+which means "the hash is in `/etc/shadow`" — a file tOS does not write. It now
+says `*`: nothing logs in through that file, which is both true today and the
+safe thing for Debian's PAM to read after [#20](https://github.com/m96-chan/tOS/issues/20).
 
 ---
 

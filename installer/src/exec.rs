@@ -30,8 +30,25 @@ pub trait Backend {
     /// Run a program, feeding it `input` on standard input.
     fn run_with_input(&mut self, program: &str, args: &[&str], input: &str) -> io::Result<Output>;
 
-    /// Write a file, creating parent directories.
-    fn write_file(&mut self, path: &str, contents: &str) -> io::Result<()>;
+    /// Write a file, creating parent directories, with whatever permissions
+    /// the umask gives it. That is right for everything in `/etc` that is
+    /// meant to be read.
+    fn write_file(&mut self, path: &str, contents: &str) -> io::Result<()> {
+        self.write_file_with_mode(path, contents, None)
+    }
+
+    /// Write a file, creating parent directories, and give it `mode` if one
+    /// is asked for.
+    ///
+    /// The mode is part of creating the file rather than something done to it
+    /// afterwards: a credential that exists for even a moment as a readable
+    /// file has been readable, and a `chmod` that fails leaves it that way.
+    fn write_file_with_mode(
+        &mut self,
+        path: &str,
+        contents: &str,
+        mode: Option<u32>,
+    ) -> io::Result<()>;
 
     /// Copy a directory tree.
     fn copy_tree(&mut self, from: &str, to: &str) -> io::Result<()>;
@@ -83,11 +100,32 @@ impl Backend for System {
         })
     }
 
-    fn write_file(&mut self, path: &str, contents: &str) -> io::Result<()> {
+    fn write_file_with_mode(
+        &mut self,
+        path: &str,
+        contents: &str,
+        mode: Option<u32>,
+    ) -> io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
         if let Some(parent) = std::path::Path::new(path).parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, contents)
+        let Some(mode) = mode else {
+            return std::fs::write(path, contents);
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(path)?;
+        // `mode` on the open only applies to a file that did not exist, and
+        // an install that is being repeated onto the same mount would find
+        // one that does. Say it again so the mode is the file's either way.
+        std::fs::set_permissions(path, PermissionsExt::from_mode(mode))?;
+        file.write_all(contents.as_bytes())
     }
 
     fn copy_tree(&mut self, from: &str, to: &str) -> io::Result<()> {
@@ -146,6 +184,8 @@ pub enum Action {
     WriteFile {
         path: String,
         contents: String,
+        /// The permissions the file was asked for, if any were.
+        mode: Option<u32>,
     },
     CopyTree {
         from: String,
@@ -179,6 +219,13 @@ impl Action {
                 }
                 text
             }
+            // The mode is in the description because a dry run is how someone
+            // checks that the credential is not about to be world readable.
+            Action::WriteFile {
+                path,
+                mode: Some(mode),
+                ..
+            } => format!("write {path} (mode {mode:04o})"),
             Action::WriteFile { path, .. } => format!("write {path}"),
             Action::CopyTree { from, to } => format!("copy {from} -> {to}"),
             Action::CreateDir { path } => format!("mkdir -p {path}"),
@@ -271,10 +318,16 @@ impl Backend for Recorder {
         Ok(self.response(program))
     }
 
-    fn write_file(&mut self, path: &str, contents: &str) -> io::Result<()> {
+    fn write_file_with_mode(
+        &mut self,
+        path: &str,
+        contents: &str,
+        mode: Option<u32>,
+    ) -> io::Result<()> {
         self.actions.push(Action::WriteFile {
             path: path.to_string(),
             contents: contents.to_string(),
+            mode,
         });
         Ok(())
     }
@@ -398,6 +451,56 @@ mod tests {
         let path = dir.join("etc").join("hostname");
         backend.write_file(path.to_str().unwrap(), "tos\n").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "tos\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_recorder_keeps_the_mode_that_was_asked_for() {
+        let mut backend = Recorder::new();
+        backend
+            .write_file("/mnt/etc/passwd", "root:*:0:0\n")
+            .unwrap();
+        backend
+            .write_file_with_mode("/mnt/etc/tos/shadow", "$6$\n", Some(0o600))
+            .unwrap();
+        assert_eq!(
+            backend.transcript(),
+            vec![
+                "write /mnt/etc/passwd",
+                "write /mnt/etc/tos/shadow (mode 0600)"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_real_backend_writes_a_file_only_root_can_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut backend = System;
+        let dir = std::env::temp_dir().join("tos-install-mode-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("etc").join("tos").join("shadow");
+        let name = path.to_str().unwrap().to_string();
+
+        backend
+            .write_file_with_mode(&name, "$6$salt$hash\n", Some(0o600))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "$6$salt$hash\n");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // A second install onto the same mount finds the file already there,
+        // and it must not keep whatever mode it had.
+        std::fs::set_permissions(&path, PermissionsExt::from_mode(0o644)).unwrap();
+        backend
+            .write_file_with_mode(&name, "$6$other$hash\n", Some(0o600))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "$6$other$hash\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

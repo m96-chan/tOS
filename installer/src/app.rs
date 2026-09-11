@@ -11,8 +11,8 @@ use crate::disk::Disk;
 use crate::exec::Backend;
 use crate::install::{Installer, Progress, StepOutcome};
 use crate::motd;
-use crate::plan::{Firmware, Plan, Settings};
-use crate::ui::{Color, Rect, Screen, Style};
+use crate::plan::{Firmware, Password, Plan, Settings};
+use crate::ui::{Color, Echo, Rect, Screen, Style};
 
 /// Which screen the installer is showing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,7 +21,7 @@ pub enum Stage {
     Welcome,
     /// Choosing a disk.
     PickDisk,
-    /// Host name and user name.
+    /// Host name, user name, and the password that user gets.
     Configure,
     /// The last chance to stop, with the disk name typed out.
     Confirm,
@@ -36,6 +36,37 @@ pub enum Stage {
 pub enum Field {
     Hostname,
     Username,
+    Password,
+    /// The password typed a second time. It is never installed anywhere; all
+    /// it has to do is agree with the first, which is the only check possible
+    /// on something neither the user nor the screen can read back.
+    Confirm,
+}
+
+impl Field {
+    fn next(self) -> Field {
+        match self {
+            Field::Hostname => Field::Username,
+            Field::Username => Field::Password,
+            Field::Password => Field::Confirm,
+            Field::Confirm => Field::Hostname,
+        }
+    }
+
+    fn previous(self) -> Field {
+        match self {
+            Field::Hostname => Field::Confirm,
+            Field::Username => Field::Hostname,
+            Field::Password => Field::Username,
+            Field::Confirm => Field::Password,
+        }
+    }
+
+    /// Whether what is typed here is a name, which only holds the characters
+    /// `/etc/passwd` and a host file can carry.
+    fn is_name(self) -> bool {
+        matches!(self, Field::Hostname | Field::Username)
+    }
 }
 
 /// What the application wants the caller to do next.
@@ -58,6 +89,8 @@ pub struct App {
     pub selected: usize,
     pub settings: Settings,
     pub field: Field,
+    /// The second entry of the password, which goes nowhere near the disk.
+    pub confirm_password: Password,
     pub firmware: Firmware,
     /// What the user has typed on the confirmation screen.
     pub confirmation: String,
@@ -81,6 +114,7 @@ impl App {
             selected,
             settings: Settings::default(),
             field: Field::Hostname,
+            confirm_password: Password::default(),
             firmware,
             confirmation: String::new(),
             progress: Progress::default(),
@@ -203,31 +237,41 @@ impl App {
     fn configure_key(&mut self, event: &KeyEvent) -> Command {
         match event.code {
             KeyCode::Tab | KeyCode::Down => {
-                self.field = match self.field {
-                    Field::Hostname => Field::Username,
-                    Field::Username => Field::Hostname,
-                };
+                self.field = self.field.next();
                 Command::None
             }
             KeyCode::Up => {
-                self.field = match self.field {
-                    Field::Hostname => Field::Username,
-                    Field::Username => Field::Hostname,
-                };
+                self.field = self.field.previous();
                 Command::None
             }
             KeyCode::Backspace => {
-                self.field_mut().pop();
+                match self.field {
+                    Field::Password => self.settings.password.pop(),
+                    Field::Confirm => self.confirm_password.pop(),
+                    Field::Hostname | Field::Username => {
+                        self.name_mut().pop();
+                    }
+                }
                 Command::None
             }
             KeyCode::Enter => {
-                match self.settings.problem() {
-                    Some(problem) => self.notice = Some(problem),
-                    None => {
-                        self.stage = Stage::Confirm;
-                        self.confirmation.clear();
-                    }
+                if let Some(problem) = self.settings.problem() {
+                    self.notice = Some(problem);
+                    return Command::None;
                 }
+                if self.confirm_password != self.settings.password {
+                    // Neither entry can be read back, so there is no way to
+                    // tell which one has the typo in it. Clearing both and
+                    // going back to the first is the only advice that cannot
+                    // send the user round a loop retyping the wrong one.
+                    self.settings.password.clear();
+                    self.confirm_password.clear();
+                    self.field = Field::Password;
+                    self.notice = Some("The passwords do not match; type both again.".into());
+                    return Command::None;
+                }
+                self.stage = Stage::Confirm;
+                self.confirmation.clear();
                 Command::None
             }
             KeyCode::Escape => {
@@ -236,18 +280,15 @@ impl App {
             }
             KeyCode::Char(_) => {
                 if let Some(text) = event.text {
-                    // Only the characters a name may contain are accepted, so
-                    // an invalid name cannot be typed in the first place.
-                    if text.is_ascii_lowercase() || text.is_ascii_digit() || text == '-' {
-                        let field = self.field_mut();
-                        if field.len() < 32 {
-                            field.push(text);
-                        }
-                    } else if text.is_ascii_uppercase() {
-                        let lower = text.to_ascii_lowercase();
-                        let field = self.field_mut();
-                        if field.len() < 32 {
-                            field.push(lower);
+                    if self.field.is_name() {
+                        self.type_into_name(text);
+                    } else if !text.is_control() {
+                        // A password is whatever was typed: no case folding
+                        // and no filtering, because every character of it has
+                        // to survive to the hash exactly as it was pressed.
+                        match self.field {
+                            Field::Confirm => self.confirm_password.push(text),
+                            _ => self.settings.password.push(text),
                         }
                     }
                 }
@@ -257,10 +298,27 @@ impl App {
         }
     }
 
-    fn field_mut(&mut self) -> &mut String {
+    /// Add a character to a name field, if a name can hold it.
+    fn type_into_name(&mut self, text: char) {
+        // Only the characters a name may contain are accepted, so an invalid
+        // name cannot be typed in the first place.
+        let accepted = if text.is_ascii_lowercase() || text.is_ascii_digit() || text == '-' {
+            text
+        } else if text.is_ascii_uppercase() {
+            text.to_ascii_lowercase()
+        } else {
+            return;
+        };
+        let field = self.name_mut();
+        if field.len() < 32 {
+            field.push(accepted);
+        }
+    }
+
+    fn name_mut(&mut self) -> &mut String {
         match self.field {
-            Field::Hostname => &mut self.settings.hostname,
             Field::Username => &mut self.settings.username,
+            _ => &mut self.settings.hostname,
         }
     }
 
@@ -478,15 +536,37 @@ impl App {
     }
 
     fn draw_configure(&self, screen: &mut Screen, area: Rect) {
-        let frame = Rect::centred(area, area.width.min(60), 9);
-        screen.frame(frame, Some("Name this machine"), Style::fg(ACCENT));
+        let frame = Rect::centred(area, area.width.min(60), 14);
+        screen.frame(frame, Some("Set up this machine"), Style::fg(ACCENT));
         let inner = frame.inset(2);
 
         let fields = [
-            (Field::Hostname, "Host name", &self.settings.hostname),
-            (Field::Username, "User", &self.settings.username),
+            (
+                Field::Hostname,
+                "Host name",
+                self.settings.hostname.as_str(),
+                Echo::Plain,
+            ),
+            (
+                Field::Username,
+                "User",
+                self.settings.username.as_str(),
+                Echo::Plain,
+            ),
+            (
+                Field::Password,
+                "Password",
+                self.settings.password.as_str(),
+                Echo::Masked,
+            ),
+            (
+                Field::Confirm,
+                "Confirm",
+                self.confirm_password.as_str(),
+                Echo::Masked,
+            ),
         ];
-        for (index, (field, label, value)) in fields.iter().enumerate() {
+        for (index, (field, label, value, echo)) in fields.iter().enumerate() {
             let y = inner.y + index as u16 * 2;
             let focused = *field == self.field;
             screen.text(inner.x, y, &format!("{label:<11}"), Style::default().dim());
@@ -498,24 +578,36 @@ impl App {
             } else {
                 Style::default()
             };
-            screen.fill(
+            let cursor = screen.input(
                 Rect::new(box_x, y, box_width, 1),
-                ' ',
-                Style::default().on(FIELD),
+                value,
+                *echo,
+                style.on(FIELD),
             );
-            screen.text_clipped(box_x, y, box_width, value, style.on(FIELD));
             if focused {
-                let cursor = box_x + tos_term::str_width(value) as u16;
-                screen.set_cursor(cursor.min(box_x + box_width.saturating_sub(1)), y);
+                screen.set_cursor(cursor, y);
             }
         }
 
-        screen.text(
+        screen.text_clipped(
             inner.x,
-            inner.y + 4,
+            inner.y + 8,
+            inner.width,
             "Tab switches fields, Enter continues.",
             Style::default().dim(),
         );
+        if self.settings.password.is_empty() {
+            // Leaving it empty is allowed, and it is also a decision about
+            // the machine, so it is said here and again on the last screen
+            // rather than discovered later.
+            screen.text_clipped(
+                inner.x,
+                inner.y + 9,
+                inner.width,
+                "With no password, the screen will never lock.",
+                Style::fg(WARN),
+            );
+        }
     }
 
     fn draw_confirm(&self, screen: &mut Screen, area: Rect) {
@@ -537,6 +629,8 @@ impl App {
             }
             let style = if line.contains("replacing everything") {
                 Style::fg(DANGER).bold()
+            } else if line.starts_with("Password   none") {
+                Style::fg(WARN)
             } else {
                 Style::default()
             };
@@ -1019,6 +1113,133 @@ mod tests {
         app.key(&press(KeyCode::Enter));
         assert_eq!(app.stage, Stage::Configure);
         assert!(app.notice.as_ref().unwrap().contains("empty"));
+    }
+
+    /// Move the cursor to a field from the top of the configuration screen.
+    fn focus(app: &mut App, field: Field) {
+        app.field = Field::Hostname;
+        while app.field != field {
+            app.key(&press(KeyCode::Tab));
+        }
+    }
+
+    #[test]
+    fn tab_walks_the_fields_and_shift_of_it_walks_back() {
+        let mut app = app();
+        app.stage = Stage::Configure;
+        for expected in [
+            Field::Username,
+            Field::Password,
+            Field::Confirm,
+            Field::Hostname,
+        ] {
+            app.key(&press(KeyCode::Tab));
+            assert_eq!(app.field, expected);
+        }
+        // Up is the way back, which two fields made indistinguishable before.
+        app.key(&press(KeyCode::Up));
+        assert_eq!(app.field, Field::Confirm);
+        app.key(&press(KeyCode::Up));
+        assert_eq!(app.field, Field::Password);
+    }
+
+    #[test]
+    fn a_password_keeps_what_a_name_would_have_thrown_away() {
+        let mut app = app();
+        app.stage = Stage::Configure;
+        focus(&mut app, Field::Password);
+        // Case folding and filtering would both change the password from the
+        // one the user believes they set.
+        type_text(&mut app, "Hunter2! /:");
+        assert_eq!(app.settings.password.as_str(), "Hunter2! /:");
+        app.key(&press(KeyCode::Backspace));
+        assert_eq!(app.settings.password.as_str(), "Hunter2! /");
+    }
+
+    #[test]
+    fn a_password_is_never_drawn() {
+        let mut app = app();
+        app.stage = Stage::Configure;
+        focus(&mut app, Field::Password);
+        type_text(&mut app, "hunter2");
+        focus(&mut app, Field::Confirm);
+        type_text(&mut app, "hunter2");
+
+        let mut screen = Screen::new(90, 30);
+        app.draw(&mut screen);
+        let text = screen.to_text();
+        assert!(
+            !text.contains("hunter2"),
+            "the password is on screen: {text}"
+        );
+        assert!(
+            text.contains("*******"),
+            "nothing showed it was typed: {text}"
+        );
+        assert!(text.contains("Password"));
+        assert!(text.contains("Confirm"));
+    }
+
+    #[test]
+    fn two_entries_that_disagree_do_not_get_past_the_screen() {
+        let mut app = app();
+        app.stage = Stage::Configure;
+        focus(&mut app, Field::Password);
+        type_text(&mut app, "hunter2");
+        focus(&mut app, Field::Confirm);
+        type_text(&mut app, "hunter3");
+
+        assert_eq!(app.key(&press(KeyCode::Enter)), Command::None);
+        assert_eq!(app.stage, Stage::Configure, "must not have continued");
+        assert!(app.notice.as_ref().unwrap().contains("do not match"));
+        // Neither entry can be read back, so both are cleared and the cursor
+        // goes to the first: retyping only the second could loop forever.
+        assert!(app.settings.password.is_empty());
+        assert!(app.confirm_password.is_empty());
+        assert_eq!(app.field, Field::Password);
+    }
+
+    #[test]
+    fn two_entries_that_agree_carry_the_password_forward() {
+        let mut app = app();
+        app.stage = Stage::Configure;
+        focus(&mut app, Field::Password);
+        type_text(&mut app, "hunter2");
+        focus(&mut app, Field::Confirm);
+        type_text(&mut app, "hunter2");
+
+        app.key(&press(KeyCode::Enter));
+        assert_eq!(app.stage, Stage::Confirm);
+        assert_eq!(app.settings.password.as_str(), "hunter2");
+        assert_eq!(
+            app.plan().unwrap().settings.password.as_str(),
+            "hunter2",
+            "the plan is what the installer gets"
+        );
+    }
+
+    #[test]
+    fn an_empty_password_is_allowed_and_says_what_it_costs() {
+        let mut app = app();
+        app.stage = Stage::Configure;
+        let mut screen = Screen::new(90, 30);
+        app.draw(&mut screen);
+        assert!(
+            screen.contains("the screen will never lock"),
+            "{}",
+            screen.to_text()
+        );
+
+        // It is a choice, not a refusal: Enter still continues.
+        app.key(&press(KeyCode::Enter));
+        assert_eq!(app.stage, Stage::Confirm);
+        let mut screen = Screen::new(90, 30);
+        app.draw(&mut screen);
+        assert!(
+            screen.contains("Password   none, so the screen will not lock"),
+            "the last screen has to say so too: {}",
+            screen.to_text()
+        );
     }
 
     #[test]
