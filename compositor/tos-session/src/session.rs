@@ -73,6 +73,13 @@ impl Workspace {
         self.name = name.into();
         self.renamed = true;
     }
+
+    /// Forget the name the user gave, so the workspace answers to its position
+    /// again. The number itself comes from the session, which is the only
+    /// thing that knows what position this is.
+    pub fn clear_name(&mut self) {
+        self.renamed = false;
+    }
 }
 
 /// Everything the compositor knows about panes and workspaces.
@@ -313,6 +320,24 @@ impl Session {
         pane
     }
 
+    /// Name the active workspace.
+    ///
+    /// An empty name is how the user asks for the number back: a blank label
+    /// would leave the status bar with nothing to address the workspace by.
+    /// Surrounding space cannot be seen there either, so a name made only of
+    /// it is the same as no name at all.
+    pub fn rename_active(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.active_mut().clear_name();
+        } else {
+            self.active_mut().rename(name);
+        }
+        // A workspace that just lost its name needs its number back, and
+        // renumbering leaves every name that is still wanted alone.
+        self.renumber();
+    }
+
     pub fn next_workspace(&mut self) -> WorkspaceId {
         self.active = (self.active + 1) % self.workspaces.len();
         self.active().id
@@ -520,6 +545,43 @@ mod tests {
         assert_eq!(session.active_index(), 0);
         assert!(!session.select_workspace(9));
         assert!(!session.select_workspace(0));
+    }
+
+    #[test]
+    fn a_named_workspace_keeps_its_name_when_the_others_are_renumbered() {
+        let mut session = Session::new();
+        let middle = session.new_workspace();
+        session.new_workspace();
+        session.rename_active("build");
+        // Closing an earlier workspace moves this one down a place. A number
+        // would have to follow the position; a name must not.
+        session.close_pane(middle);
+        assert_eq!(session.workspaces()[0].name, "1");
+        assert_eq!(session.workspaces()[1].name, "build");
+    }
+
+    #[test]
+    fn an_empty_name_gives_the_workspace_its_number_back() {
+        let mut session = Session::new();
+        session.new_workspace();
+        session.rename_active("build");
+        assert_eq!(session.active().name, "build");
+        session.rename_active("   ");
+        assert_eq!(session.active().name, "2", "space is not a name");
+        // And the number follows the position again, which it only can if the
+        // rename was forgotten rather than merely overwritten.
+        let root = session.root_pane();
+        session.close_pane(root);
+        assert_eq!(session.workspaces()[0].name, "1");
+    }
+
+    #[test]
+    fn renaming_touches_only_the_active_workspace() {
+        let mut session = Session::new();
+        session.new_workspace();
+        session.rename_active("build");
+        session.select_workspace(1);
+        assert_eq!(session.active().name, "1");
     }
 
     #[test]

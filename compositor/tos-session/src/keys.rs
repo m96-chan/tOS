@@ -34,6 +34,8 @@ pub enum Action {
     SelectWorkspace(usize),
     /// Move the focused pane to a workspace by number.
     MovePaneToWorkspace(usize),
+    /// Ask for a name for the active workspace.
+    RenameWorkspace,
     /// Scroll the focused pane's viewport, in lines. Negative is back in time.
     Scroll(i32),
     /// Scroll by a screenful.
@@ -135,6 +137,9 @@ impl Keymap {
             (KeyCode::Char('c'), Modifiers::NONE, Action::NewWorkspace),
             (KeyCode::Char('n'), Modifiers::NONE, Action::NextWorkspace),
             (KeyCode::Char('p'), Modifiers::NONE, Action::PreviousWorkspace),
+            // Comma is where tmux renames a window, and nothing else here
+            // wants the key.
+            (KeyCode::Char(','), Modifiers::NONE, Action::RenameWorkspace),
             (KeyCode::PageUp, Modifiers::NONE, Action::ScrollPage(-1)),
             (KeyCode::PageDown, Modifiers::NONE, Action::ScrollPage(1)),
             (KeyCode::Char('['), Modifiers::NONE, Action::BeginSelection),
@@ -493,6 +498,25 @@ mod tests {
         // A plain space is still a space, which is most of what a pane gets.
         assert_eq!(
             keymap.resolve(&press(KeyCode::Char(' '), Modifiers::NONE)),
+            Resolution::Passthrough
+        );
+    }
+
+    #[test]
+    fn comma_renames_the_workspace_with_or_without_the_leader() {
+        let mut keymap = Keymap::default_bindings();
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char(','), Modifiers::SUPER)),
+            Resolution::Action(Action::RenameWorkspace)
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char(','), Modifiers::NONE)),
+            Resolution::Action(Action::RenameWorkspace)
+        );
+        // A plain comma is a comma, which the pane is owed.
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char(','), Modifiers::NONE)),
             Resolution::Passthrough
         );
     }
