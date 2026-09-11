@@ -350,7 +350,10 @@ impl Terminal {
         self.output.extend_from_slice(bytes);
     }
 
-    /// Answer an OSC 52 clipboard query.
+    /// Answer an OSC 52 clipboard query. Whether the real selection or an
+    /// empty one goes back is the compositor's call — reading the clipboard is
+    /// a privilege the pane has to be granted, and the terminal does not know
+    /// what the user granted.
     pub fn report_clipboard(&mut self, selection: char, data: &[u8]) {
         let encoded = crate::graphics::encode_base64(data);
         let response = format!("\x1b]52;{selection};{encoded}\x1b\\");

@@ -44,6 +44,11 @@ pub struct Config {
     pub status_bar: bool,
     /// Fade panes that do not have focus.
     pub inactive_fade: u8,
+    /// Answer OSC 52 clipboard queries with the real selection. Off unless the
+    /// user asks for it: anything that can write to a pane can send that query,
+    /// so a `cat` of a hostile file, or a program on the far end of an ssh
+    /// session, would otherwise read back whatever was last copied.
+    pub allow_clipboard_read: bool,
     /// Headless size, and the fallback size when a backend cannot report one.
     pub size: (u32, u32),
     /// Write one frame here and exit.
@@ -66,6 +71,7 @@ impl Default for Config {
             command: None,
             status_bar: true,
             inactive_fade: 40,
+            allow_clipboard_read: false,
             size: (1280, 720),
             screenshot: None,
             preload: None,
@@ -90,6 +96,7 @@ options:
   --screenshot <path.ppm>                render one frame, save it and exit
   --preload <text>                       feed text to the first pane first
   --no-status-bar                        hide the status bar
+  --allow-clipboard-read                 let programs read the clipboard (OSC 52)
   -e, --command <program> [args...]      program to run instead of the shell
   -h, --help                             show this message
   -V, --version                          show the version
@@ -171,6 +178,7 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
                     text.parse().map_err(|_| format!("not a number: {text}"))?;
             }
             "--no-status-bar" => config.status_bar = false,
+            "--allow-clipboard-read" => config.allow_clipboard_read = true,
             "-e" | "--command" => {
                 // Everything after this is the command and its arguments.
                 let rest: Vec<String> = args[index + 1..].to_vec();
@@ -246,6 +254,13 @@ mod tests {
     fn missing_values_are_errors() {
         assert!(parse_args(&args(&["--font"])).is_err());
         assert!(parse_args(&args(&["-e"])).is_err());
+    }
+
+    #[test]
+    fn clipboard_reads_are_off_until_asked_for() {
+        assert!(!parse_args(&[]).unwrap().allow_clipboard_read);
+        let config = parse_args(&args(&["--allow-clipboard-read"])).unwrap();
+        assert!(config.allow_clipboard_read);
     }
 
     #[test]
