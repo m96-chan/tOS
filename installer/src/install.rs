@@ -1016,7 +1016,9 @@ mod tests {
             .actions
             .iter()
             .find_map(|action| match action {
-                crate::exec::Action::WriteFile { path, contents } if path.ends_with("grub.cfg") => {
+                crate::exec::Action::WriteFile { path, contents, .. }
+                    if path.ends_with("grub.cfg") =>
+                {
                     Some(contents.clone())
                 }
                 _ => None,
