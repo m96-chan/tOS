@@ -1,0 +1,25 @@
+[package]
+name = "tos-install"
+description = "Install tOS onto a disk, from a pane in the live session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tos-install"
+path = "src/main.rs"
+
+[lib]
+name = "tos_install"
+path = "src/lib.rs"
+
+[dependencies]
+tos-input = { workspace = true }
+tos-platform = { workspace = true }
+tos-term = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tos-pty = { workspace = true }

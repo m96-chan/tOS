@@ -24,10 +24,31 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     sleep 0.2
 done
 
+# The kernel and initramfs live on the medium, not in the initramfs, so the
+# installer needs the medium mounted to copy them onto a disk. Look for the
+# partition that carries /boot/vmlinuz.
+mkdir -p /run/live/medium
+modprobe isofs 2>/dev/null
+modprobe iso9660 2>/dev/null
+for dev in /dev/sr* /dev/sd?? /dev/sd? /dev/vd?? /dev/vd? /dev/nvme*n*p* /dev/nvme*n*; do
+    [ -b "$dev" ] || continue
+    if mount -o ro "$dev" /run/live/medium 2>/dev/null; then
+        if [ -f /run/live/medium/boot/vmlinuz ]; then
+            echo "tOS: live medium is $dev"
+            break
+        fi
+        umount /run/live/medium 2>/dev/null
+    fi
+done
+
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
 export HOME=/root
 export SHELL=/bin/sh
 export TERM=xterm-256color
 export TOS=1
+# busybox ash reads ENV for every interactive shell, which is how the message
+# of the day reaches each pane the compositor opens.
+export ENV=/etc/profile
 
 echo "tOS: starting compositor"
 /sbin/tos

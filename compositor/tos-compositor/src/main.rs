@@ -164,6 +164,13 @@ fn run_nested(config: Config) -> io::Result<()> {
         if RESIZED.swap(false, Ordering::Relaxed) && display.refresh_size()? {
             compositor.resize(display.size());
         }
+        // A bare escape is indistinguishable from the start of a sequence
+        // until nothing follows it, so the idle pass is what delivers the key.
+        if decoder.has_pending_escape() {
+            for event in decoder.flush() {
+                compositor.handle_input(event);
+            }
+        }
         compositor.run_once(&mut display, &[input_fd], |fd| {
             match tos_platform::tty::read_available(fd, &mut buf) {
                 Ok(ReadOutcome::Data(n)) => decoder.feed(&buf[..n]),

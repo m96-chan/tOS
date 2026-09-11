@@ -1,0 +1,11 @@
+# Sourced by every interactive shell in the live session, through ENV in
+# /init. This is where a person is told how to install tOS.
+[ -n "$TOS_MOTD_SHOWN" ] && return 2>/dev/null
+TOS_MOTD_SHOWN=1
+export TOS_MOTD_SHOWN
+
+if [ -x /sbin/tos-install ]; then
+    /sbin/tos-install --motd
+elif [ -f /etc/tos/motd_art ]; then
+    cat /etc/tos/motd_art
+fi

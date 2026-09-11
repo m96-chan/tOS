@@ -40,12 +40,14 @@ apt-get update
 apt-get install -y --no-install-recommends \
     musl-tools busybox-static cpio kmod \
     "$KERNEL_PKG" \
-    grub-common $GRUB_PKGS xorriso mtools
+    grub-common $GRUB_PKGS xorriso mtools \
+    fdisk dosfstools e2fsprogs
 
-# Fully static binary: it runs as PID 1's child with no libc on disk.
+# Fully static binaries: they run as PID 1's children with no libc on disk.
 rustup target add "$RUST_TARGET" 2>/dev/null || true
-cargo build --release --target "$RUST_TARGET" -p tos-compositor
+cargo build --release --target "$RUST_TARGET" -p tos-compositor -p tos-install
 TOS_BIN="target/$RUST_TARGET/release/tos"
+INSTALLER_BIN="target/$RUST_TARGET/release/tos-install"
 
 KVER=$(basename /lib/modules/*)
 WORK=$(mktemp -d)
@@ -58,8 +60,49 @@ mkdir -p "$ROOT/bin" "$ROOT/sbin" "$ROOT/dev" "$ROOT/proc" "$ROOT/sys" \
     "$ROOT/tmp" "$ROOT/root" "$ROOT/etc" "$ROOT/lib/modules/$KVER"
 cp /bin/busybox "$ROOT/bin/busybox"
 cp "$TOS_BIN" "$ROOT/sbin/tos"
+cp "$INSTALLER_BIN" "$ROOT/sbin/tos-install"
 cp iso/init "$ROOT/init"
-chmod 755 "$ROOT/init"
+chmod 755 "$ROOT/init" "$ROOT/sbin/tos" "$ROOT/sbin/tos-install"
+
+# The message of the day, which is where a person is told that this is a live
+# session and how to put it on a disk.
+mkdir -p "$ROOT/etc/tos" "$ROOT/run/live/medium"
+cp .motd_art "$ROOT/etc/tos/motd_art"
+cp iso/profile "$ROOT/etc/profile"
+
+# The tools the installer shells out to. Unlike the compositor these are
+# Debian binaries, so their libraries have to come along; the installer is
+# useless without them and finding that out mid-install is no good.
+INSTALL_TOOLS="sfdisk partx mkfs.ext4 mkfs.vfat mount umount sync"
+for tool in $INSTALL_TOOLS; do
+    path=$(command -v "$tool" 2>/dev/null) || {
+        echo "mkiso: $tool is missing from the build image" >&2
+        exit 1
+    }
+    cp "$path" "$ROOT/sbin/$(basename "$tool")"
+done
+# grub-install carries its own tree of modules and templates.
+cp "$(command -v grub-install)" "$ROOT/sbin/grub-install"
+for helper in grub-mkimage grub-bios-setup grub-probe grub-mkdevicemap grub-editenv; do
+    path=$(command -v "$helper" 2>/dev/null) && cp "$path" "$ROOT/sbin/$(basename "$helper")"
+done
+mkdir -p "$ROOT/usr/lib/grub" "$ROOT/usr/share/grub"
+cp -a /usr/lib/grub/. "$ROOT/usr/lib/grub/" 2>/dev/null || true
+cp -a /usr/share/grub/. "$ROOT/usr/share/grub/" 2>/dev/null || true
+
+# Every shared library those binaries need, resolved transitively by ldd.
+copy_libraries() {
+    for binary in "$@"; do
+        ldd "$binary" 2>/dev/null | sed -n \
+            -e 's/^[[:space:]]*\([^ ]*\) => \([^ ]*\).*/\2/p' \
+            -e 's/^[[:space:]]*\(\/[^ ]*\) (0x.*/\1/p'
+    done | sort -u | while read -r lib; do
+        [ -f "$lib" ] || continue
+        mkdir -p "$ROOT$(dirname "$lib")"
+        cp -L "$lib" "$ROOT$lib"
+    done
+}
+copy_libraries "$ROOT"/sbin/*
 # The kernel opens /dev/console for PID 1 before devtmpfs is mounted.
 mknod -m 600 "$ROOT/dev/console" c 5 1
 mknod -m 666 "$ROOT/dev/null" c 1 3
@@ -82,6 +125,11 @@ cp "/lib/modules/$KVER/modules.builtin.modinfo" \
     "$ROOT/lib/modules/$KVER/" 2>/dev/null || true
 depmod -b "$ROOT" "$KVER"
 
+# Busybox provides the small tools the installer expects on PATH but that
+# are not worth pulling a Debian binary in for.
+for applet in blkid mkdir rm chmod hostname reboot; do
+    ln -sf /bin/busybox "$ROOT/bin/$applet" 2>/dev/null || true
+done
 (cd "$ROOT" && find . | cpio -o -H newc --quiet | gzip -9) \
     >"$ISODIR/boot/initramfs.gz"
 
