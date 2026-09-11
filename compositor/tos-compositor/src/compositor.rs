@@ -16,6 +16,7 @@ use tos_input::{
 use tos_platform::Display;
 use tos_render::{render, Rect as PixelRect, RenderOptions, Surface};
 use tos_session::{describe, Action, Axis, Keymap, PaneId, Rect, Resolution, Session};
+use tos_system::Sysfs;
 use tos_term::TermEvent;
 
 use crate::chrome::{self, Chrome, StatusItem};
@@ -26,6 +27,7 @@ use crate::notify::{self, Chosen, Notifications};
 use crate::overlay::{Overlay, OverlayItem, OverlayOutcome};
 use crate::pane::Pane;
 use crate::selection::{Selection, SelectionMode};
+use crate::system::Machine;
 
 /// How often the cursor and blinking text change phase.
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
@@ -141,6 +143,10 @@ pub struct Compositor {
     idle_lock_done: bool,
     /// The display refused to go dark, so this idle period stops asking.
     blank_refused: bool,
+    /// The machine underneath the session: battery, link, volume and adapter,
+    /// re-read on a timer rather than on damage, because nothing a person does
+    /// to a pane is what makes a cable go in. See [`crate::system`].
+    machine: Machine,
 }
 
 impl Compositor {
@@ -175,6 +181,7 @@ impl Compositor {
             blanked: false,
             idle_lock_done: false,
             blank_refused: false,
+            machine: Machine::at(Sysfs::new(&config.system_root)),
             config,
         };
 
@@ -228,6 +235,16 @@ impl Compositor {
 
     pub fn is_running(&self) -> bool {
         self.running
+    }
+
+    /// The machine underneath: what the last poll found, and the seams that
+    /// change it.
+    pub fn machine(&self) -> &Machine {
+        &self.machine
+    }
+
+    pub fn machine_mut(&mut self) -> &mut Machine {
+        &mut self.machine
     }
 
     pub fn session(&self) -> &Session {
@@ -1399,6 +1416,13 @@ impl Compositor {
             self.needs_full_redraw |= !self.config.status_bar;
             changed = true;
         }
+        // The machine moves without anybody touching the session: a battery
+        // drains, a charger comes out, a link goes down. Nothing in the panes
+        // is damaged by any of it, so this poll is the only thing that would
+        // ever ask for the frame those changes belong on.
+        if self.machine.poll(now, self.blanked) {
+            changed = true;
+        }
         changed
     }
 
@@ -1649,7 +1673,12 @@ impl Compositor {
             .filter_map(|pane| pane.terminal.next_animation_delay(now))
             .min()
             .filter(|_| !self.blanked);
-        let soonest = [animation, self.next_idle_deadline(now)]
+        // The poll is a deadline like the others: folded into the wait rather
+        // than given a timer, so a clock turns over on the second instead of
+        // up to a tenth of one after it. Skipped while the screen is dark,
+        // because a dark screen is not polled either.
+        let poll = self.machine.next_poll(now).filter(|_| !self.blanked);
+        let soonest = [animation, poll, self.next_idle_deadline(now)]
             .into_iter()
             .flatten()
             .min();
@@ -1776,6 +1805,11 @@ mod tests {
             command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()]),
             bitmap_scale: Some(1),
             font: Some("/nonexistent-so-the-bitmap-font-is-used".into()),
+            // A machine with no battery, no card, no link and no adapter, so
+            // that what a test asserts about the session is not the
+            // developer's laptop showing through — and so that nothing here
+            // can reach a real sound card.
+            system_root: "/nonexistent-so-this-machine-has-no-hardware".into(),
             ..config
         };
         Compositor::new(config, (640, 360), None).expect("compositor")

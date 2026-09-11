@@ -14,6 +14,7 @@ pub mod notify;
 pub mod overlay;
 pub mod pane;
 pub mod selection;
+pub mod system;
 
 pub use compositor::{Compositor, OverlayKind};
 pub use config::{parse_args, usage, Backend, Config, ConfigSource};

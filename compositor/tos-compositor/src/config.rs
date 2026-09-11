@@ -119,6 +119,16 @@ pub struct Config {
     /// default locks first and blanks afterwards, so that a passer-by who
     /// wakes the screen finds the prompt rather than the session.
     pub idle_blank: Option<Duration>,
+    /// Where the readers in [`crate::system`] look for the machine.
+    ///
+    /// `/` on a running machine, and a directory laid out like one in a test.
+    /// A seam for the same reason [`Config::credential`] is: everything the
+    /// compositor knows about batteries, links, cards and adapters comes from
+    /// files under here, and a test that could not move the root would be
+    /// asserting about the developer's laptop — or, worse, turning the volume
+    /// on it up. Deliberately not a flag and not a file setting: which `/sys`
+    /// a session reads is not a preference anybody has.
+    pub system_root: PathBuf,
 }
 
 impl Default for Config {
@@ -148,6 +158,7 @@ impl Default for Config {
             // the keyboard shows the session to whoever is there.
             idle_lock: Some(Duration::from_secs(300)),
             idle_blank: Some(Duration::from_secs(600)),
+            system_root: PathBuf::from("/"),
         }
     }
 }
