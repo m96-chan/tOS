@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 use tos_term::{Palette, Rgb};
 
 use crate::chrome::Chrome;
-use crate::config::{parse_args, parse_args_over, parse_size, Backend, Config, ConfigSource};
+use crate::config::{
+    parse_args, parse_args_over, parse_interval, parse_size, Backend, Config, ConfigSource,
+};
 
 /// The file tOS looks for in each directory of the search path.
 pub const FILE_NAME: &str = "tos.conf";
@@ -203,6 +205,12 @@ fn set(config: &mut Config, section: &str, key: &str, value: &str) -> Result<(),
             }
             config.command = Some(words);
         }
+        // What the session does when nobody is touching it. A section of its
+        // own because the two settings are one subject and are read together:
+        // which comes first is the whole of what an idle machine does.
+        ("idle", "lock-after") => config.idle_lock = parse_interval(value)?,
+        ("idle", "blank-after") => config.idle_blank = parse_interval(value)?,
+        ("idle", other) => return Err(format!("unknown setting: [idle] {other}")),
         ("colors", key) => set_palette(&mut config.palette, key, value)?,
         ("chrome", key) => set_chrome(&mut config.chrome, key, value)?,
         ("", key) => return Err(format!("unknown setting: {key}")),
@@ -367,6 +375,34 @@ mod tests {
         assert!(problems[1].contains("unknown setting"), "{:?}", problems[1]);
         assert!(problems[2].starts_with("3: "), "{:?}", problems[2]);
         assert_eq!(config.scrollback, 42);
+    }
+
+    #[test]
+    fn the_idle_deadlines_come_from_the_file() {
+        let mut config = Config::default();
+        apply_to(
+            &mut config,
+            "[idle]\nlock-after = 90\nblank-after = never\n",
+        );
+        assert_eq!(config.idle_lock, Some(std::time::Duration::from_secs(90)));
+        assert_eq!(config.idle_blank, None);
+        let problems = apply(&mut config, "[idle]\nlock-after = soon\nsleep = 10\n");
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[1].contains("[idle] sleep"), "{:?}", problems[1]);
+    }
+
+    #[test]
+    fn an_idle_flag_wins_over_the_file() {
+        let path = scratch("idle", "[idle]\nlock-after = 90\nblank-after = 120\n");
+        let flags = args(&["--config", path.to_str().unwrap(), "--idle-lock", "never"]);
+        let startup = startup(&flags).expect("startup");
+        assert!(startup.problems.is_empty(), "{:?}", startup.problems);
+        assert_eq!(startup.config.idle_lock, None);
+        // And leaves alone what it did not mention.
+        assert_eq!(
+            startup.config.idle_blank,
+            Some(std::time::Duration::from_secs(120))
+        );
     }
 
     #[test]
