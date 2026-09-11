@@ -502,7 +502,7 @@ answered with an error, and frames carry the same raw formats images do.
 - [x] notifications
 - [ ] launcher
 - [x] power controls
-- [ ] network controls
+- [x] network controls
 - [ ] Bluetooth controls
 - [ ] audio controls
 
@@ -517,6 +517,15 @@ tOS may be PID 1 with no init to ask; suspend writes `mem` to
 `/sys/power/state`. All three sit behind a trait, so the tests assert what was
 asked for without the machine acting on it. There is no UI on any of this yet,
 and the syscall path itself is only exercised on a real Linux machine.
+
+The network is read out of `/sys/class/net` and `/proc/net` with no
+NetworkManager under it: every interface and what sort it is, link and carrier
+state, MAC, MTU, speed, byte counters, IPv4 and IPv6 addresses from
+`getifaddrs`, and which interface holds the default route. It can also bring a
+link administratively up or down, which is one `SIOCSIFFLAGS` ioctl. Joining a
+wireless network is not part of it: an associated interface's SSID and signal
+are reported, but scanning, WPA and DHCP need nl80211 and a supplicant, and
+those are a later item of their own.
 
 ### 0.1 — Portable tOS
 
