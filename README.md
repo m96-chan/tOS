@@ -462,12 +462,25 @@ wrapped lines rather than re-wrapping them.
 - [x] image surfaces
 - [ ] GPU-backed texture cache
 - [ ] image previews
-- [ ] video experiments
+- [x] video experiments
 
 Raw RGB and RGBA transmission work, including chunked transfers, placements
 and deletion. PNG payloads and zlib compression are parsed and answered with
 the protocol's error response rather than being silently dropped, so
 applications can fall back instead of hanging.
+
+Moving pictures reach a terminal as animation frames, and those play. An
+image can carry frames sent with `a=f`, each one a rectangle of new pixels
+composed over an earlier frame or over a flat background colour, blended or
+copied; `a=a` starts and stops the animation, sets the frame on screen, the
+loop count and each frame's gap. The compositor steps every pane's
+animations from its tick, wakes in time for the next frame rather than on
+its idle timer, and repaints only the rows the moving image covers.
+
+`cargo run --example graphics_animation -- /tmp/tos-animation` transmits a
+thirty frame animation into a real pane and saves ten pictures of it
+playing. Composing between two frames that already exist (`a=c`) is still
+answered with an error, and frames carry the same raw formats images do.
 
 ### 0.0.5 — System UI
 

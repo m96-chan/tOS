@@ -1,5 +1,7 @@
 //! Behavioural tests for the terminal: what a stream of bytes does to the grid.
 
+use std::time::{Duration, Instant};
+
 use tos_term::graphics::encode_base64;
 use tos_term::{Color, CursorShape, Flags, MouseTracking, TermEvent, Terminal, TerminalConfig};
 
@@ -514,4 +516,55 @@ fn resizing_on_the_primary_screen_still_keeps_the_newest_output() {
     t.resize(10, 2);
     assert_eq!(screen(&t)[0], "l3");
     assert_eq!(screen(&t)[1], "l4");
+}
+
+#[test]
+fn kitty_graphics_plays_an_animation_and_damages_the_rows_it_covers() {
+    let mut t = term(10, 4);
+    // An 8x16 image is one cell, placed on row zero.
+    let red = encode_base64(&[255, 0, 0, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=T,f=32,s=8,v=16,i=5;{red}\x1b\\").as_bytes());
+    let green = encode_base64(&[0, 255, 0, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=f,f=32,s=8,v=16,i=5,z=40;{green}\x1b\\").as_bytes());
+    t.advance(b"\x1b_Ga=a,i=5,r=1,z=40,s=3\x1b\\");
+    assert!(String::from_utf8(t.take_output()).unwrap().contains("OK"));
+
+    let start = Instant::now();
+    assert!(!t.advance_animations(start));
+    t.clear_damage();
+
+    assert!(!t.advance_animations(start + Duration::from_millis(20)));
+    assert!(!t.damage().is_row_dirty(0));
+
+    assert!(t.advance_animations(start + Duration::from_millis(40)));
+    assert!(t.damage().is_row_dirty(0));
+    assert!(!t.damage().is_row_dirty(2));
+    assert_eq!(t.graphics().image(5).unwrap().data[..4], [0, 255, 0, 255]);
+}
+
+#[test]
+fn kitty_graphics_rejects_frames_for_images_that_were_never_sent() {
+    let mut t = term(10, 4);
+    t.advance(b"\x1b_Ga=f,f=32,s=1,v=1,i=9;AAAAAA==\x1b\\");
+    let out = String::from_utf8(t.take_output()).unwrap();
+    assert!(out.contains("i=9"), "response should identify the image: {out}");
+    assert!(out.contains("ENOENT"), "response should be an error: {out}");
+}
+
+#[test]
+fn an_unplaced_animation_asks_for_no_repaint() {
+    let mut t = term(10, 4);
+    let pixels = encode_base64(&[0u8; 4]);
+    // a=t stores without placing, so nothing on screen shows these frames.
+    t.advance(format!("\x1b_Ga=t,f=32,s=1,v=1,i=6;{pixels}\x1b\\").as_bytes());
+    t.advance(format!("\x1b_Ga=f,f=32,s=1,v=1,i=6,z=40;{pixels}\x1b\\").as_bytes());
+    t.advance(b"\x1b_Ga=a,i=6,r=1,z=40,s=3\x1b\\");
+
+    let start = Instant::now();
+    t.advance_animations(start);
+    t.clear_damage();
+    assert!(!t.advance_animations(start + Duration::from_millis(40)));
+    assert!(!t.damage().is_dirty());
+    // The frame still moved on, so the next placement shows the right one.
+    assert_eq!(t.graphics().image(6).unwrap().current_frame(), 2);
 }

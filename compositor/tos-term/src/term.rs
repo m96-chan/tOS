@@ -4,6 +4,8 @@
 //! state and the scroll region, and implements [`Perform`] so the parser can
 //! drive it directly.
 
+use std::time::{Duration, Instant};
+
 use crate::cell::{Attrs, Cell, Flags, GraphicsRef, Underline};
 use crate::color::{Color, Palette, Rgb};
 use crate::graphics::{Action, GraphicsCommand, GraphicsStore};
@@ -1739,10 +1741,24 @@ impl Terminal {
                 // A query must not store anything; it only proves support.
                 self.graphics_response(&cmd, Ok(cmd.image_id));
             }
-            Action::Transmit | Action::TransmitAndDisplay => {
+            Action::Transmit | Action::TransmitAndDisplay | Action::TransmitFrame => {
                 let Some((full, payload)) = self.graphics.accumulate(&cmd) else {
                     return; // more chunks to come
                 };
+                // The continuation chunks of a transfer carry no action of
+                // their own, so what happens with the data is decided by the
+                // command that started it, not by the one that finished it.
+                if full.action == Action::TransmitFrame {
+                    match self.graphics.store_frame(&full, &payload) {
+                        Ok(id) => {
+                            // The frame just written may be the one on screen.
+                            self.damage_image(id);
+                            self.graphics_response(&full, Ok(id));
+                        }
+                        Err(err) => self.graphics_response(&full, Err(err)),
+                    }
+                    return;
+                }
                 match self.graphics.store(&full, &payload) {
                     Ok(id) => {
                         if full.action == Action::TransmitAndDisplay {
@@ -1768,8 +1784,57 @@ impl Terminal {
                     self.damage.mark_all();
                 }
             }
-            Action::Animate => self.graphics_response(&cmd, Err("ENOSUP:animation not supported")),
+            Action::AnimationControl => match self.graphics.control_animation(&cmd) {
+                Ok(changed) => {
+                    if changed {
+                        self.damage_image(cmd.image_id);
+                    }
+                    self.graphics_response(&cmd, Ok(cmd.image_id));
+                }
+                Err(err) => self.graphics_response(&cmd, Err(err)),
+            },
+            Action::ComposeFrames => {
+                self.graphics_response(&cmd, Err("ENOSUP:frame composition not supported"))
+            }
         }
+    }
+
+    /// Mark the rows every placement of an image covers. Returns true when the
+    /// image is on screen at all, which is the only case a repaint is needed.
+    fn damage_image(&mut self, image_id: u32) -> bool {
+        let offset = self.display_offset() as i64;
+        let rows: Vec<(i64, u16)> = self
+            .graphics
+            .placements()
+            .filter(|p| p.image_id == image_id)
+            .map(|p| (p.row as i64 - offset, p.rows))
+            .collect();
+        let on_screen = !rows.is_empty();
+        for (row, count) in rows {
+            let from = row.max(0) as usize;
+            let to = (row + count as i64).max(0) as usize;
+            self.damage.mark_range(from, to);
+        }
+        on_screen
+    }
+
+    /// Move animated images on to the frame `now` selects, and damage the rows
+    /// they are placed on. Returns true when the picture changed.
+    ///
+    /// The time is the caller's, because a terminal that read the clock itself
+    /// could not be stepped frame by frame from a test.
+    pub fn advance_animations(&mut self, now: Instant) -> bool {
+        let mut dirty = false;
+        for id in self.graphics.advance_animations(now) {
+            dirty |= self.damage_image(id);
+        }
+        dirty
+    }
+
+    /// How long until an animation here wants its next frame, so the caller can
+    /// wake up in time instead of on its idle timer.
+    pub fn next_animation_delay(&self, now: Instant) -> Option<Duration> {
+        self.graphics.next_animation_delay(now)
     }
 
     fn place_at_cursor(&mut self, cmd: &GraphicsCommand, image_id: u32) {
