@@ -502,9 +502,18 @@ answered with an error, and frames carry the same raw formats images do.
 - [x] notifications
 - [ ] launcher
 - [ ] power controls
-- [ ] network controls
+- [x] network controls
 - [ ] Bluetooth controls
 - [ ] audio controls
+
+The network is read out of `/sys/class/net` and `/proc/net` with no
+NetworkManager under it: every interface and what sort it is, link and carrier
+state, MAC, MTU, speed, byte counters, IPv4 and IPv6 addresses from
+`getifaddrs`, and which interface holds the default route. It can also bring a
+link administratively up or down, which is one `SIOCSIFFLAGS` ioctl. Joining a
+wireless network is not part of it: an associated interface's SSID and signal
+are reported, but scanning, WPA and DHCP need nl80211 and a supplicant, and
+those are a later item of their own.
 
 ### 0.1 — Portable tOS
 
