@@ -200,13 +200,21 @@ impl VirtualTerminal {
     /// Stop the kernel switching away from this terminal at all.
     ///
     /// Stronger than refusing each switch: the console switch key stops
-    /// working rather than being answered, and no other process can call
-    /// `VT_ACTIVATE` either. It needs `CAP_SYS_TTY_CONFIG`.
+    /// working rather than being answered, and another process's
+    /// `VT_ACTIVATE` stops moving the console — it still returns success, the
+    /// switch simply does not happen. It needs `CAP_SYS_TTY_CONFIG`.
     ///
     /// It is also a single global kernel flag with no owner, which
     /// [`VirtualTerminal::restore`] is careful to clear for the same reason
     /// it puts the console back into text mode: a machine nobody can reach is
     /// a worse outcome than the one this prevents.
+    ///
+    /// The lock does not call this, and `docs/design/vt-lockswitch.md` says
+    /// why: the kernel does not clear the flag when the process that set it
+    /// dies, so taking it trades away the `VT_ACTIVATE` that recovers a
+    /// machine whose tOS was killed holding the screen. It stays here because
+    /// [`VirtualTerminal::unlock_switching`] is how such a machine is
+    /// rescued.
     pub fn lock_switching(&mut self) -> io::Result<()> {
         ioctl_value(self.fd, VT_LOCKSWITCH, 0)?;
         self.switch_locked = true;
@@ -228,6 +236,16 @@ impl VirtualTerminal {
     }
 
     /// Switch to another virtual terminal.
+    ///
+    /// Two things this cannot tell the caller, both measured in
+    /// `docs/design/vt-lockswitch.md`. `VT_ACTIVATE` returns zero whether or
+    /// not the console moved — the kernel throws away `set_console`'s result —
+    /// so success here means the ioctl was accepted and nothing more; reading
+    /// `VT_GETSTATE` afterwards is the only way to know. And `VT_WAITACTIVE`
+    /// never returns while `vt_dont_switch` is set, so this blocks for good on
+    /// a machine where something took `VT_LOCKSWITCH` and did not give it
+    /// back. Nothing in tOS calls this yet, and nothing should call it
+    /// without having cleared that flag first, which `tos` does at startup.
     pub fn activate(&self, number: u16) -> io::Result<()> {
         ioctl_value(self.fd, VT_ACTIVATE, number as libc::c_long)?;
         ioctl_value(self.fd, VT_WAITACTIVE, number as libc::c_long)

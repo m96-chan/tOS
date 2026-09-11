@@ -43,6 +43,22 @@ pub trait Display {
         Ok(())
     }
 
+    /// Stop putting anything on the screen, without giving up the display.
+    ///
+    /// Blanking is not releasing. A blanked display is still owned: tOS keeps
+    /// DRM master and keeps the VT, so nothing else can draw while the screen
+    /// is dark, and the session is one call away from being visible again.
+    /// That is the whole difference between a blanked session and one that
+    /// has been switched away from, and it is why this is its own method
+    /// rather than a use of [`Display::release`].
+    ///
+    /// Defaulted to doing nothing, because a backend that draws through
+    /// another terminal or into memory has no panel to put to sleep.
+    fn blank(&mut self, blank: bool) -> io::Result<()> {
+        let _ = blank;
+        Ok(())
+    }
+
     /// A human readable name, for logs.
     fn name(&self) -> String {
         "display".to_string()

@@ -164,6 +164,29 @@ impl Rect {
     }
 }
 
+/// Whether a field shows what was typed into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Echo {
+    /// Draw the value as it is.
+    Plain,
+    /// Draw a row of asterisks and never the value itself. The installer runs
+    /// in a pane on a screen someone else can be standing in front of, and
+    /// what a pane has drawn survives in whatever is looking at it afterwards.
+    Masked,
+}
+
+impl Echo {
+    /// What actually reaches the cells.
+    fn shown(self, value: &str) -> String {
+        match self {
+            Echo::Plain => value.to_string(),
+            // One asterisk per character rather than per column: the mask is
+            // not a rendering of the value, it is a count of keystrokes.
+            Echo::Masked => "*".repeat(value.chars().count()),
+        }
+    }
+}
+
 /// A cell buffer that knows what it last drew.
 pub struct Screen {
     cols: u16,
@@ -312,6 +335,19 @@ impl Screen {
             rect.x + (rect.width - width) / 2
         };
         self.text_clipped(x, y, rect.width, text, style);
+    }
+
+    /// Draw a single line input box, returning the column its cursor belongs
+    /// in. The caller decides whether that cursor is the one on screen.
+    ///
+    /// The box is painted before the value is written into it, so a field that
+    /// just lost a character does not leave that character behind.
+    pub fn input(&mut self, rect: Rect, value: &str, echo: Echo, style: Style) -> u16 {
+        self.fill(rect, ' ', style);
+        let shown = echo.shown(value);
+        self.text_clipped(rect.x, rect.y, rect.width, &shown, style);
+        let cursor = rect.x + tos_term::str_width(&shown) as u16;
+        cursor.min(rect.x + rect.width.saturating_sub(1))
     }
 
     /// Produce the escape sequences that turn the last frame into this one.
@@ -580,6 +616,62 @@ mod tests {
         assert_eq!(Rect::centred(outer, 10, 4), Rect::new(5, 3, 10, 4));
         // Insetting past the middle yields an empty rectangle, not a panic.
         assert!(Rect::new(0, 0, 2, 2).inset(4).is_empty());
+    }
+
+    #[test]
+    fn an_input_box_shows_what_was_typed() {
+        let mut screen = Screen::new(12, 1);
+        let cursor = screen.input(Rect::new(2, 0, 8, 1), "tos", Echo::Plain, Style::default());
+        assert_eq!(screen.to_text(), "  tos");
+        assert_eq!(cursor, 5);
+    }
+
+    #[test]
+    fn a_masked_box_never_draws_the_value() {
+        let mut screen = Screen::new(12, 1);
+        let cursor = screen.input(
+            Rect::new(0, 0, 10, 1),
+            "hunter2",
+            Echo::Masked,
+            Style::default(),
+        );
+        assert_eq!(screen.to_text(), "*******");
+        assert_eq!(cursor, 7);
+    }
+
+    #[test]
+    fn a_mask_counts_characters_not_columns() {
+        // A wide character is one keystroke and gets one asterisk, so the
+        // cursor stays where the next one will land.
+        let mut screen = Screen::new(12, 1);
+        let cursor = screen.input(
+            Rect::new(0, 0, 10, 1),
+            "\u{6f22}a",
+            Echo::Masked,
+            Style::default(),
+        );
+        assert_eq!(screen.to_text(), "**");
+        assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn an_input_box_is_repainted_before_it_is_written() {
+        let mut screen = Screen::new(12, 1);
+        screen.input(Rect::new(0, 0, 6, 1), "abcd", Echo::Plain, Style::default());
+        screen.input(Rect::new(0, 0, 6, 1), "ab", Echo::Plain, Style::default());
+        assert_eq!(screen.to_text(), "ab", "the old tail was left behind");
+    }
+
+    #[test]
+    fn a_cursor_cannot_leave_its_box() {
+        let mut screen = Screen::new(12, 1);
+        let cursor = screen.input(
+            Rect::new(0, 0, 4, 1),
+            "abcdefgh",
+            Echo::Masked,
+            Style::default(),
+        );
+        assert_eq!(cursor, 3);
     }
 
     #[test]

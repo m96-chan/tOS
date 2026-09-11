@@ -21,6 +21,7 @@ use tos_term::TermEvent;
 use crate::chrome::{self, Chrome, StatusItem};
 use crate::config::Config;
 use crate::launcher;
+use crate::lock::{self, LockOutcome, LockScreen};
 use crate::notify::{self, Chosen, Notifications};
 use crate::overlay::{Overlay, OverlayItem, OverlayOutcome};
 use crate::pane::Pane;
@@ -30,6 +31,16 @@ use crate::selection::{Selection, SelectionMode};
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 /// Longest a frame may wait when nothing is happening.
 const IDLE_TIMEOUT_MS: i32 = 100;
+/// Longest it may wait when the screen is dark.
+///
+/// Nothing on a blanked screen can need repainting, so the only thing worth
+/// coming back for is a deadline of its own, and those are folded into the
+/// wait below and win whenever they are nearer. This is what is left when
+/// there is none: a heartbeat rather than a poll loop. Not unbounded, because
+/// the loop is also where `main` looks at the flags its signal handlers set
+/// and where a pane that has gone is noticed, and a dark screen should never
+/// be the reason either of those takes a noticeable while.
+const BLANKED_TIMEOUT_MS: i32 = 60_000;
 /// How long to wait when a pane still has input queued for its child.
 const WRITE_RETRY_TIMEOUT_MS: i32 = 4;
 /// The most a program may put into one selection with OSC 52. The clipboard
@@ -94,6 +105,16 @@ pub struct Compositor {
     notifications: Notifications,
     /// The open menu, if any. While it is open it owns the keyboard.
     overlay: Option<(OverlayKind, Overlay)>,
+    /// The lock screen, if the session is locked. While it is up it owns the
+    /// input — every kind of it, not only the keys — and the screen shows
+    /// nothing of the session.
+    lock: Option<LockScreen>,
+    /// The last pane died while the screen was locked.
+    ///
+    /// Ending the session is a way out of a locked screen, so a locked one
+    /// cannot be allowed to take it. The session ends when the password is
+    /// accepted instead.
+    session_ended_while_locked: bool,
     needs_full_redraw: bool,
     running: bool,
     /// Pointer position in pixels, for mouse routing.
@@ -104,6 +125,22 @@ pub struct Compositor {
     last_click: Option<Click>,
     /// Some pane still has input queued, so the loop must not idle.
     pending_writes: bool,
+    /// When somebody last did anything. Input only: see [`Compositor::handle_input`].
+    last_activity: Instant,
+    /// Whether the display has been told to stop showing anything.
+    ///
+    /// What the display was last told, rather than what it is about to be
+    /// told, so that the keystroke which arrives at a panel that is still
+    /// physically dark is recognised as one.
+    blanked: bool,
+    /// Whether the lock deadline has already been acted on this idle period.
+    ///
+    /// A deadline fires once, not on every pass after it. Without this a
+    /// machine with no password would read the credential file and find it
+    /// missing a few times a second for as long as nobody touched it.
+    idle_lock_done: bool,
+    /// The display refused to go dark, so this idle period stops asking.
+    blank_refused: bool,
 }
 
 impl Compositor {
@@ -126,12 +163,18 @@ impl Compositor {
             last_blink: Instant::now(),
             notifications: Notifications::new(),
             overlay: None,
+            lock: None,
+            session_ended_while_locked: false,
             needs_full_redraw: true,
             running: true,
             pointer: (0, 0),
             mouse_grab: None,
             last_click: None,
             pending_writes: false,
+            last_activity: Instant::now(),
+            blanked: false,
+            idle_lock_done: false,
+            blank_refused: false,
             config,
         };
 
@@ -367,6 +410,43 @@ impl Compositor {
 
     /// Handle one input event. Returns true when something needs repainting.
     pub fn handle_input(&mut self, event: InputEvent) -> bool {
+        // Activity is input, and only input. A pane producing output is not a
+        // person being present: a `tail -f` on a log that turns over all night
+        // would hold the screen on and the lock off for as long as the machine
+        // kept running, and an idle timer that a program can hold open is not
+        // one. Every kind of input counts, because every kind of it is
+        // somebody doing something — a key, the mouse, a paste, and the host
+        // terminal saying its window has been switched to.
+        self.last_activity = Instant::now();
+        // The idle period ends here, so the deadlines in it are owed another
+        // turn — including the one the display refused, which may have been
+        // refusing for a reason that has since gone away.
+        self.idle_lock_done = false;
+        self.blank_refused = false;
+
+        // A dark screen takes the event that woke it and gives it to nobody.
+        // Whoever sent it could not see what they were aiming at, and the
+        // panel is still off at this moment — it comes back at the end of this
+        // pass — so every event that arrived while it was off was sent blind.
+        // A key let through would go to whatever program has the focus, where
+        // `q`, `space` and `enter` each mean something, and to the lock, where
+        // it would be the first character of a password the field is not
+        // showing yet. Swallowing costs a keystroke; letting it through costs
+        // whatever the keystroke did.
+        if self.blanked {
+            return true;
+        }
+        // The gate is here and not in `handle_key`, which is where an overlay
+        // puts its own. An overlay owns the keyboard; a lock has to own the
+        // input, and the two are not the same thing: `Mouse`, `Pointer` and
+        // `Paste` are routed below without ever passing through `handle_key`.
+        // A lock gated one level down would let a middle click paste the
+        // primary selection into a shell, let a drag select and copy what is
+        // on screen, and let the host terminal's bracketed paste type for the
+        // person who is not there.
+        if self.lock.is_some() {
+            return self.locked_input(event);
+        }
         match event {
             InputEvent::Key(key) => self.handle_key(key),
             // A host terminal reports cells; a device reports pixels. The two
@@ -397,6 +477,30 @@ impl Compositor {
             }
             InputEvent::FocusGained => self.forward_focus(true),
             InputEvent::FocusLost => self.forward_focus(false),
+        }
+    }
+
+    /// Everything that arrives while the screen is locked.
+    ///
+    /// One rule with no exceptions: a key goes to the lock, and nothing else
+    /// goes anywhere. Focus notifications are dropped along with the rest —
+    /// telling a pane it has the focus is still writing to a pane on behalf of
+    /// somebody who has not proved who they are, and an exception is how a
+    /// gate stops being one.
+    fn locked_input(&mut self, event: InputEvent) -> bool {
+        let InputEvent::Key(key) = event else {
+            return false;
+        };
+        let Some(lock) = &mut self.lock else {
+            return false;
+        };
+        match lock.handle_key(&key, Instant::now()) {
+            LockOutcome::Consumed => false,
+            LockOutcome::Changed => true,
+            LockOutcome::Unlocked => {
+                self.unlock();
+                true
+            }
         }
     }
 
@@ -849,11 +953,194 @@ impl Compositor {
                 self.needs_full_redraw = true;
                 true
             }
+            Action::Lock => self.lock_session(),
             Action::Quit => {
                 self.running = false;
                 true
             }
         }
+    }
+
+    // ---- the lock -------------------------------------------------------
+
+    /// Put the lock screen up, or say why there is no lock to put up.
+    ///
+    /// Public because the binding is not the only way in: an idle deadline
+    /// reaches the same state machine, and a test reaches it without
+    /// synthesising a keypress.
+    ///
+    /// The credential is read here rather than when a password is offered, so
+    /// that a machine with no password never gets a locked screen at all. That
+    /// one rule is the whole of what makes the live ISO behave: nothing in the
+    /// compositor knows what live media is, only that this machine was never
+    /// given a password to unlock with.
+    pub fn lock_session(&mut self) -> bool {
+        if self.lock.is_some() {
+            return false;
+        }
+        match lock::read_credential(&self.config.credential) {
+            Ok(hash) => {
+                self.engage_lock(hash);
+                true
+            }
+            Err(why) => {
+                self.notifications.status(format!("cannot lock: {why}"));
+                true
+            }
+        }
+    }
+
+    /// Put the lock up because a deadline came due rather than because
+    /// somebody asked.
+    ///
+    /// Identical to the binding except on a machine with no password, and
+    /// that difference is the point. The binding says so, because a person
+    /// pressed a key and is owed an answer. This says nothing: nobody asked,
+    /// nothing is wrong, and a live ISO would otherwise find "cannot lock"
+    /// waiting on the status bar every time its user walked away from it.
+    /// Such a session blanks and stays unlocked, which is "no credential, no
+    /// lock" arriving by the other road.
+    fn lock_on_idle(&mut self) -> bool {
+        match lock::read_credential(&self.config.credential) {
+            Ok(hash) => {
+                self.engage_lock(hash);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn engage_lock(&mut self, hash: String) {
+        // A half-pressed leader and a drag in progress both belong to the
+        // person who was here before; neither should still be going when the
+        // session comes back.
+        self.keymap.cancel_pending();
+        self.release_grab();
+        self.lock = Some(LockScreen::new(hash));
+        // An open overlay is left exactly as it was, under the lock rather
+        // than closed by it. Nothing of it is drawn while the lock is up, and
+        // the person who gets it back is the person who left it there.
+        self.needs_full_redraw = true;
+    }
+
+    /// Whether the session is locked, which the DRM loop asks before it agrees
+    /// to a VT switch and before it lets go of the display.
+    pub fn is_locked(&self) -> bool {
+        self.lock.is_some()
+    }
+
+    pub fn lock_screen(&self) -> Option<&LockScreen> {
+        self.lock.as_ref()
+    }
+
+    /// The one way out, and there is no other.
+    fn unlock(&mut self) {
+        self.lock = None;
+        // Nothing under the lock was drawn while it was up, and the damage
+        // that would have said what to repaint was thrown away with each
+        // locked frame. The whole screen is the only honest answer.
+        self.needs_full_redraw = true;
+        // A pane that died while the screen was locked could not be allowed to
+        // end the session then. It ends it now.
+        if self.session_ended_while_locked {
+            self.running = false;
+        }
+    }
+
+    // ---- idle -----------------------------------------------------------
+
+    /// Whether the screen is dark because nobody has been here.
+    pub fn is_blanked(&self) -> bool {
+        self.blanked
+    }
+
+    /// Act on the idle deadlines, and bring the screen back the moment
+    /// somebody is here again. Returns true when a frame is needed.
+    ///
+    /// Nothing here can fail in a way that ends a session. A display that
+    /// will not blank leaves one lit, which is a thing to say rather than a
+    /// thing to stop for.
+    ///
+    /// The time arrives as an argument for the reason the lock's does: five
+    /// minutes from now has to be somewhere a test can stand without spending
+    /// five minutes getting there.
+    pub fn apply_idle(&mut self, now: Instant, display: &mut dyn Display) -> bool {
+        let idle = now.saturating_duration_since(self.last_activity);
+        let mut changed = false;
+
+        // The lock is looked at before the blank, and the order is load
+        // bearing on the pass where both are due — because they were given the
+        // same interval, or because the loop was away while another VT had the
+        // screen. Unblanking puts back the last frame that was drawn, so the
+        // last frame drawn before the screen goes dark must never be the
+        // session of somebody who is not here.
+        if !self.idle_lock_done
+            && self.lock.is_none()
+            && self.config.idle_lock.is_some_and(|after| idle >= after)
+        {
+            self.idle_lock_done = true;
+            changed |= self.lock_on_idle();
+        }
+
+        let dark = !self.blank_refused && self.config.idle_blank.is_some_and(|after| idle >= after);
+        if dark != self.blanked {
+            match display.blank(dark) {
+                // Remembered only once the display agrees. A screen that
+                // could not be put to sleep is still lit, and one remembered
+                // as dark would swallow the next keystroke to wake a panel
+                // that was never off.
+                Ok(()) => {
+                    self.blanked = dark;
+                    if !dark {
+                        // A backend that put the panel to sleep decides for
+                        // itself what is on it when it wakes, and painting all
+                        // of it is the only thing the session can do about
+                        // that.
+                        self.needs_full_redraw = true;
+                        // The cursor comes back lit. Where the caret is, is
+                        // the first thing anyone looks for on a screen they
+                        // have just woken.
+                        self.blink_visible = true;
+                        self.last_blink = now;
+                        changed = true;
+                    }
+                }
+                Err(e) => {
+                    // A screen that will not go out is not a reason to end
+                    // somebody's session, which is what letting this error
+                    // reach the loop would do. Say so, and stop asking: a
+                    // display that has refused once will refuse again, and
+                    // asking it on every pass is how a machine nobody is
+                    // using becomes a machine that is busy all night.
+                    self.report_error("blanking the display", e);
+                    self.blank_refused = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// How long until the next idle deadline, when one is still to come.
+    ///
+    /// A deadline that has already been acted on is not waited for. The blank
+    /// is level triggered off `blanked`, so it drops out once the screen is
+    /// dark; the lock fires once per idle period, so a machine with no
+    /// password does not spend the night rediscovering that it has none.
+    fn next_idle_deadline(&self, now: Instant) -> Option<Duration> {
+        let idle = now.saturating_duration_since(self.last_activity);
+        let blank = self
+            .config
+            .idle_blank
+            .filter(|_| !self.blanked && !self.blank_refused);
+        let lock = self
+            .config
+            .idle_lock
+            .filter(|_| self.lock.is_none() && !self.idle_lock_done);
+        [blank, lock]
+            .into_iter()
+            .flatten()
+            .map(|after| after.saturating_sub(idle))
+            .min()
     }
 
     // ---- overlays -------------------------------------------------------
@@ -1042,7 +1329,16 @@ impl Compositor {
         if closed.is_empty() {
             // The session refused, which means this was the final pane.
             self.panes.remove(&id);
-            self.running = false;
+            // Quitting is a way out of a locked screen, and a program exiting
+            // is a way to quit that does not go through a binding: a shell
+            // that reaches its end of file while nobody is there would
+            // otherwise hand the machine back. The session is over, but it
+            // does not end until somebody says who they are.
+            if self.lock.is_some() {
+                self.session_ended_while_locked = true;
+            } else {
+                self.running = false;
+            }
             return;
         }
         for pane in closed {
@@ -1074,7 +1370,11 @@ impl Compositor {
                 changed = true;
             }
         }
-        if self.last_blink.elapsed() >= BLINK_INTERVAL {
+        // The blink phase stands still while the screen is dark, for the
+        // reason the queue below does: a cursor nobody can see does not need
+        // to be somewhere in particular, and flipping it would repaint the
+        // whole session behind the blank twice a second.
+        if !self.blanked && self.last_blink.elapsed() >= BLINK_INTERVAL {
             self.blink_visible = !self.blink_visible;
             self.last_blink = Instant::now();
             changed = true;
@@ -1082,7 +1382,17 @@ impl Compositor {
         // A notification only spends its time on screen while it is on screen:
         // the leader indicator has the slot while the leader is armed, and one
         // shown there instead would be one nobody read.
-        if !self.keymap.is_pending() && self.notifications.advance(now) {
+        // A locked screen draws no status bar and no banner, so a message
+        // that spent its time there would have spent it unread. The queue
+        // stands still until the session comes back, which is the same reason
+        // the leader indicator holds it: time on screen means on screen. A
+        // blanked screen is the same case again — there is nothing on it, and
+        // it does not matter whose decision that was.
+        if self.lock.is_none()
+            && !self.blanked
+            && !self.keymap.is_pending()
+            && self.notifications.advance(now)
+        {
             // Without a status bar the notification is a banner over the panes,
             // and the cells it covered are only repainted on damage they have
             // not got. Retiring it has to uncover them.
@@ -1103,6 +1413,10 @@ impl Compositor {
 
     /// Paint a frame.
     pub fn render_frame(&mut self, surface: &mut Surface<'_>, retained: bool) {
+        if self.lock.is_some() {
+            self.render_locked(surface);
+            return;
+        }
         let force = self.needs_full_redraw || !retained;
         let (cw, ch) = self.cell_size();
         let area = self.grid_area();
@@ -1219,6 +1533,35 @@ impl Compositor {
         self.needs_full_redraw = false;
     }
 
+    /// Paint a locked frame: the lock, and nothing else at all.
+    ///
+    /// The panes, the dividers, the status bar, the notification banner and
+    /// any open menu are all skipped rather than painted over. Painting over
+    /// is not erasing: a frame that is not a full redraw only repaints the
+    /// cells a pane marked as damaged, so a box drawn on top of a session
+    /// leaves every undamaged cell of that session exactly where it was, and
+    /// the status bar underneath it goes on saying what the panes are called.
+    ///
+    /// The clear happens on every locked frame and not only the first, because
+    /// a display with two buffers hands out the other one next time and a
+    /// clear that ran once cleared one of them.
+    fn render_locked(&mut self, surface: &mut Surface<'_>) {
+        surface.clear(self.chrome.background);
+        let area = PixelRect::new(0, 0, self.size.0, self.size.1);
+        if let Some(lock) = &self.lock {
+            lock.draw(surface, &mut self.fonts, area, &self.chrome, Instant::now());
+        }
+        // The panes are still running and still marking damage nobody is
+        // drawing. Dropping it is what lets the loop idle instead of finding
+        // work outstanding on every pass, and nothing is lost by it: unlocking
+        // asks for a full redraw, which repaints every cell whatever the
+        // damage says.
+        for pane in self.panes.values_mut() {
+            pane.terminal.clear_damage();
+        }
+        self.needs_full_redraw = false;
+    }
+
     /// What the left of the status bar says: every workspace's name, in
     /// position order, with the active one marked.
     ///
@@ -1282,17 +1625,37 @@ impl Compositor {
 
     /// How long the loop may wait for something to happen. An animation with a
     /// frame due sooner than the idle timeout pulls the wait in, so playback
-    /// keeps its own pace instead of the poll timer's.
+    /// keeps its own pace instead of the poll timer's, and the idle deadlines
+    /// pull it in the same way, so that a session a minute from locking locks
+    /// on the minute rather than up to a tenth of a second later.
     fn frame_timeout_ms(&self) -> i32 {
-        let now = Instant::now();
-        let soonest = self
+        self.frame_timeout_ms_at(Instant::now())
+    }
+
+    fn frame_timeout_ms_at(&self, now: Instant) -> i32 {
+        // The wait when nothing at all is due, which is longer while the
+        // screen is dark: a blanked session has no blink phase to flip, no
+        // notification counting down its time on screen, and no animation
+        // frame anybody could see, so the only reason left to come back is a
+        // deadline, and those are folded in below.
+        let longest = if self.blanked {
+            BLANKED_TIMEOUT_MS
+        } else {
+            IDLE_TIMEOUT_MS
+        };
+        let animation = self
             .panes
             .values()
             .filter_map(|pane| pane.terminal.next_animation_delay(now))
+            .min()
+            .filter(|_| !self.blanked);
+        let soonest = [animation, self.next_idle_deadline(now)]
+            .into_iter()
+            .flatten()
             .min();
         match soonest {
-            Some(delay) => delay.as_millis().clamp(1, IDLE_TIMEOUT_MS as u128) as i32,
-            None => IDLE_TIMEOUT_MS,
+            Some(delay) => delay.as_millis().clamp(1, longest as u128) as i32,
+            None => longest,
         }
     }
 
@@ -1325,6 +1688,11 @@ impl Compositor {
         }
         dirty |= self.pump_panes();
         dirty |= self.tick();
+        // After the input, so that the event which arrived at a dark screen is
+        // swallowed by the screen still being dark, and before the frame, so
+        // that the frame this pass paints is the one a blanked display shows
+        // when it comes back.
+        dirty |= self.apply_idle(Instant::now(), display);
 
         if dirty || self.needs_render() {
             let retained = display.retains_contents();
@@ -2163,6 +2531,653 @@ mod tests {
             .terminal
             .advance_animations(due));
         assert!(compositor.needs_render());
+    }
+
+    // ---- the lock -------------------------------------------------------
+
+    /// A credential file of this test's own making, so that nothing here
+    /// depends on whether the machine running it has a password of its own.
+    /// The password is always "tos"; what varies is whether the file is there.
+    fn credential(name: &str, password: Option<&str>) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tos-lock-compositor-{}-{name}", std::process::id()));
+        match password {
+            Some(password) => {
+                let hash = tos_crypt::sha512crypt::hash(password.as_bytes(), b"tOScompositor");
+                std::fs::write(&path, format!("{hash}\n")).expect("credential file");
+            }
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        path
+    }
+
+    fn compositor_with_password(name: &str) -> Compositor {
+        compositor_with(Config {
+            credential: credential(name, Some("tos")),
+            ..Config::default()
+        })
+    }
+
+    /// Type a password into the lock and press enter.
+    fn answer(compositor: &mut Compositor, password: &str) {
+        type_into_overlay(compositor, password);
+        press_key(compositor, KeyCode::Enter, tos_input::Modifiers::NONE);
+    }
+
+    fn lock_binding(compositor: &mut Compositor) -> bool {
+        press_key(
+            compositor,
+            KeyCode::Char('l'),
+            tos_input::Modifiers::SUPER.union(tos_input::Modifiers::SHIFT),
+        )
+    }
+
+    #[test]
+    fn the_binding_locks_and_the_password_unlocks() {
+        let mut compositor = compositor_with_password("roundtrip");
+        assert!(lock_binding(&mut compositor));
+        assert!(compositor.is_locked());
+        answer(&mut compositor, "tos");
+        assert!(!compositor.is_locked());
+        assert!(compositor.is_running(), "unlocking is not quitting");
+    }
+
+    #[test]
+    fn a_wrong_password_leaves_the_screen_locked() {
+        let mut compositor = compositor_with_password("wrong");
+        compositor.lock_session();
+        answer(&mut compositor, "not it");
+        assert!(compositor.is_locked());
+        assert_eq!(compositor.lock_screen().unwrap().attempts(), 1);
+        // And the field is empty again, ready to be retyped.
+        assert_eq!(compositor.lock_screen().unwrap().typed_len(), 0);
+    }
+
+    #[test]
+    fn with_no_credential_the_lock_refuses_and_says_why() {
+        // The live ISO, and an installed machine whose owner declined a
+        // password. The compositor never asks what kind of machine it is on.
+        let mut compositor = compositor_with(Config {
+            credential: credential("none", None),
+            ..Config::default()
+        });
+        assert!(lock_binding(&mut compositor));
+        assert!(
+            !compositor.is_locked(),
+            "locked with nothing to unlock with"
+        );
+        let said = compositor.notifications.status_line().unwrap_or_default();
+        assert!(
+            said.starts_with("cannot lock: no password is set"),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_credential_that_does_not_parse_is_not_a_wrong_password() {
+        // It is a refusal to engage. Treating it as a wrong password would
+        // put up a screen that could never be opened.
+        let path = credential("yescrypt", None);
+        std::fs::write(&path, "$y$j9T$salt$digest\n").expect("credential file");
+        let mut compositor = compositor_with(Config {
+            credential: path,
+            ..Config::default()
+        });
+        compositor.lock_session();
+        assert!(!compositor.is_locked());
+        let said = compositor.notifications.status_line().unwrap_or_default();
+        assert!(said.contains("not a password tOS can check"), "{said:?}");
+    }
+
+    #[test]
+    fn no_binding_fires_while_the_screen_is_locked() {
+        let mut compositor = compositor_with_password("bindings");
+        compositor.lock_session();
+        for (code, modifiers) in [
+            (KeyCode::Char('d'), tos_input::Modifiers::SUPER),
+            (KeyCode::Char('q'), tos_input::Modifiers::SUPER),
+            (KeyCode::Char('x'), tos_input::Modifiers::SUPER),
+            (
+                KeyCode::Enter,
+                tos_input::Modifiers::CTRL.union(tos_input::Modifiers::SHIFT),
+            ),
+        ] {
+            press_key(&mut compositor, code, modifiers);
+        }
+        assert_eq!(compositor.panes.len(), 1, "a binding fired under the lock");
+        assert!(compositor.is_running(), "super+q quit a locked session");
+        assert!(compositor.is_locked());
+    }
+
+    #[test]
+    fn the_leader_cannot_reach_a_binding_while_locked() {
+        let mut compositor = compositor_with_password("leader");
+        compositor.lock_session();
+        press_key(
+            &mut compositor,
+            KeyCode::Char('a'),
+            tos_input::Modifiers::CTRL,
+        );
+        assert!(
+            !compositor.keymap.is_pending(),
+            "the leader armed under the lock"
+        );
+        press_key(
+            &mut compositor,
+            KeyCode::Char('q'),
+            tos_input::Modifiers::NONE,
+        );
+        assert!(compositor.is_running());
+    }
+
+    #[test]
+    fn nothing_typed_at_the_lock_reaches_a_pane() {
+        let mut compositor = compositor_with_password("typing");
+        compositor.lock_session();
+        type_into_overlay(&mut compositor, "tos");
+        let focus = compositor.session.focus();
+        assert_eq!(compositor.pane(focus).unwrap().pending_input(), 0);
+    }
+
+    /// The events `handle_key` would never have seen: routed straight through
+    /// `handle_input`, which is why the gate has to be there and not one level
+    /// further in.
+    #[test]
+    fn the_lock_gates_the_mouse_the_pointer_and_the_paste() {
+        let mut compositor = compositor_with_password("input");
+        compositor
+            .clipboard
+            .insert(PRIMARY, b"a command\n".to_vec());
+        compositor
+            .clipboard
+            .insert(CLIPBOARD, b"another command\n".to_vec());
+        compositor.lock_session();
+        let focus = compositor.session.focus();
+
+        // A middle click pastes primary into the focused pane when the screen
+        // is not locked, and it never passes through `handle_key` at all.
+        compositor.handle_input(InputEvent::Mouse(MouseEvent {
+            button: Some(MouseButton::Middle),
+            action: MouseAction::Press,
+            col: 2,
+            row: 2,
+            modifiers: tos_input::Modifiers::NONE,
+        }));
+        // A pointer press and drag, which is how the mouse selects and copies
+        // whatever is on the screen it is not supposed to be able to read.
+        for (action, y) in [(MouseAction::Press, 20.0), (MouseAction::Drag, 60.0)] {
+            compositor.handle_input(InputEvent::Pointer(tos_input::PointerEvent {
+                x: 20.0,
+                y,
+                button: Some(MouseButton::Left),
+                action,
+                modifiers: tos_input::Modifiers::NONE,
+            }));
+        }
+        // And a bracketed paste, which is how a host terminal types.
+        compositor.handle_input(InputEvent::Paste("a pasted command\n".into()));
+        // Focus notifications are input too.
+        compositor.handle_input(InputEvent::FocusGained);
+
+        assert!(compositor.is_locked());
+        let pane = compositor.pane(focus).unwrap();
+        assert_eq!(
+            pane.pending_input(),
+            0,
+            "input reached the pane under the lock"
+        );
+        assert!(
+            pane.selection.is_none(),
+            "the mouse selected under the lock"
+        );
+        assert!(!pane.selecting);
+        assert!(compositor.mouse_grab.is_none());
+    }
+
+    #[test]
+    fn the_last_pane_dying_while_locked_does_not_end_the_session() {
+        // A shell reaching its end of file is a way out of a locked screen
+        // that does not go through a binding at all.
+        let mut compositor = compositor_with_password("lastpane");
+        compositor.lock_session();
+        let focus = compositor.session.focus();
+        compositor.close_pane(focus);
+        assert!(compositor.is_running(), "the session ended under the lock");
+        assert!(compositor.is_locked());
+        // It ends when somebody has said who they are, and not before.
+        answer(&mut compositor, "tos");
+        assert!(!compositor.is_locked());
+        assert!(!compositor.is_running());
+    }
+
+    #[test]
+    fn resizing_the_display_while_locked_keeps_the_lock() {
+        let mut compositor = compositor_with_password("resize");
+        compositor.lock_session();
+        compositor.resize((320, 240));
+        assert!(compositor.is_locked());
+        // Even down to a display with no room to draw the box in, which is
+        // the one direction the lock is allowed to fail in: it stops being
+        // legible, and it does not stop being a lock.
+        compositor.resize((32, 24));
+        let mut framebuffer = tos_render::OwnedFramebuffer::new(32, 24);
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, false);
+        }
+        assert!(compositor.is_locked());
+        answer(&mut compositor, "tos");
+        assert!(!compositor.is_locked());
+    }
+
+    #[test]
+    fn a_notification_raised_while_locked_waits_instead_of_being_shown() {
+        let mut compositor = compositor_with_password("notify");
+        compositor.lock_session();
+        let focus = compositor.session.focus();
+        notify_from(&mut compositor, focus, "the build finished");
+        // Nothing is drawn, so nothing spends its time on screen: the queue
+        // stands still, and the message is still there afterwards.
+        for _ in 0..4 {
+            compositor.tick();
+        }
+        assert!(compositor.is_locked());
+        answer(&mut compositor, "tos");
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("pane 1: the build finished")
+        );
+    }
+
+    #[test]
+    fn unlocking_asks_for_the_whole_screen_back() {
+        let mut compositor = compositor_with_password("redraw");
+        compositor.lock_session();
+        let mut framebuffer = tos_render::OwnedFramebuffer::new(640, 360);
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, true);
+        }
+        assert!(
+            !compositor.needs_full_redraw,
+            "a locked frame leaves nothing outstanding"
+        );
+        answer(&mut compositor, "tos");
+        assert!(
+            compositor.needs_full_redraw,
+            "the session came back on damage that was thrown away"
+        );
+    }
+
+    // ---- idle -----------------------------------------------------------
+
+    /// A display that remembers what it was told about blanking.
+    ///
+    /// The DRM path cannot run here and the headless one has nothing to put
+    /// to sleep, so what a test can check is the one thing the compositor is
+    /// responsible for: that the display is told, once each way, at the right
+    /// moment.
+    struct Panel {
+        framebuffer: tos_render::OwnedFramebuffer,
+        told: Vec<bool>,
+        /// A display that cannot do what it is asked, which is a thing
+        /// hardware does.
+        refuses: bool,
+    }
+
+    impl Panel {
+        fn new() -> Panel {
+            Panel {
+                framebuffer: tos_render::OwnedFramebuffer::new(640, 360),
+                told: Vec::new(),
+                refuses: false,
+            }
+        }
+
+        fn refusing() -> Panel {
+            Panel {
+                refuses: true,
+                ..Panel::new()
+            }
+        }
+    }
+
+    impl Display for Panel {
+        fn size(&self) -> (u32, u32) {
+            (640, 360)
+        }
+
+        fn frame(&mut self, draw: &mut dyn FnMut(&mut Surface<'_>)) -> io::Result<()> {
+            draw(&mut self.framebuffer.surface());
+            Ok(())
+        }
+
+        fn blank(&mut self, blank: bool) -> io::Result<()> {
+            self.told.push(blank);
+            if self.refuses {
+                return Err(io::Error::other("the panel is welded on"));
+            }
+            Ok(())
+        }
+    }
+
+    /// A compositor whose deadlines are near enough to walk to, and the panel
+    /// it sits in front of.
+    fn idling(config: Config, lock_after: Option<u64>, blank_after: Option<u64>) -> Compositor {
+        compositor_with(Config {
+            idle_lock: lock_after.map(Duration::from_secs),
+            idle_blank: blank_after.map(Duration::from_secs),
+            ..config
+        })
+    }
+
+    /// Where the session's idle time is measured from.
+    fn started(compositor: &Compositor) -> Instant {
+        compositor.last_activity
+    }
+
+    #[test]
+    fn an_untouched_session_blanks_and_a_key_brings_it_back() {
+        let mut compositor = idling(
+            Config {
+                credential: credential("idle-blank", None),
+                ..Config::default()
+            },
+            None,
+            Some(60),
+        );
+        let start = started(&compositor);
+        let mut panel = Panel::new();
+
+        assert!(!compositor.apply_idle(start + Duration::from_secs(59), &mut panel));
+        assert!(!compositor.is_blanked(), "blanked a second early");
+
+        compositor.apply_idle(start + Duration::from_secs(60), &mut panel);
+        assert!(compositor.is_blanked());
+        assert_eq!(panel.told, vec![true]);
+        // Staying idle does not tell it again.
+        compositor.apply_idle(start + Duration::from_secs(600), &mut panel);
+        assert_eq!(panel.told, vec![true]);
+
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            tos_input::Modifiers::NONE,
+        )));
+        assert!(compositor.apply_idle(Instant::now(), &mut panel));
+        assert!(!compositor.is_blanked());
+        assert_eq!(panel.told, vec![true, false]);
+        assert!(
+            compositor.needs_full_redraw,
+            "the screen came back without being repainted"
+        );
+    }
+
+    #[test]
+    fn the_key_that_wakes_the_screen_is_swallowed() {
+        // super+space opens the launcher, which is a visible thing for a key
+        // to have done. Typed at a dark screen it must do nothing at all.
+        let mut compositor = idling(
+            Config {
+                credential: credential("idle-swallow", None),
+                ..Config::default()
+            },
+            None,
+            Some(60),
+        );
+        let start = started(&compositor);
+        let mut panel = Panel::new();
+        compositor.apply_idle(start + Duration::from_secs(60), &mut panel);
+
+        assert!(compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            tos_input::Modifiers::SUPER,
+        ))));
+        assert!(
+            compositor.overlay().is_none(),
+            "the key that woke the screen also ran a binding"
+        );
+    }
+
+    #[test]
+    fn a_key_at_a_dark_locked_screen_is_not_the_first_of_the_password() {
+        let mut compositor = idling(
+            Config {
+                credential: credential("idle-locked-dark", Some("tos")),
+                ..Config::default()
+            },
+            Some(60),
+            Some(120),
+        );
+        let start = started(&compositor);
+        let mut panel = Panel::new();
+        compositor.apply_idle(start + Duration::from_secs(120), &mut panel);
+        assert!(compositor.is_locked() && compositor.is_blanked());
+
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('t'),
+            tos_input::Modifiers::NONE,
+        )));
+        assert_eq!(
+            compositor.lock_screen().unwrap().typed_len(),
+            0,
+            "the key that woke the screen went into the password"
+        );
+        // The screen comes back, and the password typed at it works.
+        compositor.apply_idle(Instant::now(), &mut panel);
+        assert!(!compositor.is_blanked());
+        answer(&mut compositor, "tos");
+        assert!(!compositor.is_locked());
+    }
+
+    #[test]
+    fn the_lock_comes_before_the_blank_when_both_are_due_at_once() {
+        // Both deadlines land on the same pass, which is what happens when
+        // they are given the same interval and when the loop was away. The
+        // lock has to go up first: unblanking shows the last frame drawn, and
+        // that frame must not be the session.
+        let mut compositor = idling(
+            Config {
+                credential: credential("idle-together", Some("tos")),
+                ..Config::default()
+            },
+            Some(30),
+            Some(30),
+        );
+        let start = started(&compositor);
+        let mut panel = Panel::new();
+        compositor.apply_idle(start + Duration::from_secs(30), &mut panel);
+        assert!(compositor.is_locked(), "the screen went dark unlocked");
+        assert!(compositor.is_blanked());
+    }
+
+    #[test]
+    fn a_session_with_no_credential_blanks_and_does_not_lock() {
+        // The live ISO. The failure this guards against is the one the design
+        // refuses VT_LOCKSWITCH for: a machine that goes dark and then locks
+        // with nothing able to open it.
+        let mut compositor = idling(
+            Config {
+                credential: credential("idle-no-credential", None),
+                ..Config::default()
+            },
+            Some(30),
+            Some(60),
+        );
+        let start = started(&compositor);
+        let mut panel = Panel::new();
+        for seconds in [30, 60, 90, 600] {
+            compositor.apply_idle(start + Duration::from_secs(seconds), &mut panel);
+        }
+        assert!(!compositor.is_locked(), "locked with no way to unlock");
+        assert!(
+            compositor.is_blanked(),
+            "a session with no password is not a session nobody left"
+        );
+        // And it says nothing about it. The binding answers the person who
+        // pressed it; a deadline has nobody to answer.
+        assert_eq!(compositor.notifications.status_line(), None);
+        assert_eq!(panel.told, vec![true]);
+    }
+
+    #[test]
+    fn a_deadline_that_is_never_never_comes() {
+        let mut compositor = idling(
+            Config {
+                credential: credential("idle-off", Some("tos")),
+                ..Config::default()
+            },
+            None,
+            None,
+        );
+        let start = started(&compositor);
+        let mut panel = Panel::new();
+        compositor.apply_idle(start + Duration::from_secs(86_400), &mut panel);
+        assert!(!compositor.is_locked());
+        assert!(!compositor.is_blanked());
+        assert!(panel.told.is_empty());
+        assert_eq!(compositor.next_idle_deadline(start), None);
+    }
+
+    #[test]
+    fn the_wait_is_pulled_in_to_the_next_deadline() {
+        let mut compositor = idling(
+            Config {
+                credential: credential("idle-timeout", None),
+                ..Config::default()
+            },
+            None,
+            Some(10),
+        );
+        let start = started(&compositor);
+        // Far from the deadline the wait is what it always was: the blink
+        // phase still needs looking at.
+        assert_eq!(compositor.frame_timeout_ms_at(start), IDLE_TIMEOUT_MS);
+        // Near it, the deadline wins, so the screen goes dark on the ten
+        // seconds rather than up to a tenth of a second afterwards.
+        assert_eq!(
+            compositor.frame_timeout_ms_at(start + Duration::from_millis(9_960)),
+            40
+        );
+        // A deadline already past is not a wait of zero, which would be a
+        // spin.
+        assert_eq!(
+            compositor.frame_timeout_ms_at(start + Duration::from_secs(11)),
+            1
+        );
+        let mut panel = Panel::new();
+        compositor.apply_idle(start + Duration::from_secs(10), &mut panel);
+        // With the screen dark and nothing else to come, the loop stops
+        // waking up to look at a screen nobody can see.
+        assert_eq!(
+            compositor.frame_timeout_ms_at(start + Duration::from_secs(10)),
+            BLANKED_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn a_dark_screen_still_waits_for_the_lock_that_is_coming() {
+        let mut compositor = idling(
+            Config {
+                credential: credential("idle-dark-wait", Some("tos")),
+                ..Config::default()
+            },
+            Some(60),
+            Some(30),
+        );
+        let start = started(&compositor);
+        let mut panel = Panel::new();
+        compositor.apply_idle(start + Duration::from_secs(30), &mut panel);
+        assert!(compositor.is_blanked() && !compositor.is_locked());
+        assert_eq!(
+            compositor.frame_timeout_ms_at(start + Duration::from_secs(30)),
+            30_000,
+            "a blanked session forgot the lock it still owes"
+        );
+        compositor.apply_idle(start + Duration::from_secs(60), &mut panel);
+        assert!(
+            compositor.is_locked(),
+            "the lock deadline passed in the dark"
+        );
+        assert_eq!(panel.told, vec![true], "locking woke the screen up");
+    }
+
+    #[test]
+    fn the_loop_itself_acts_on_the_deadlines() {
+        // Every test above hands the clock in. This is the one that checks the
+        // loop is wired to the deadlines at all, and it needs no clock of its
+        // own: a millisecond has always gone by, because starting a pane takes
+        // longer than that.
+        let mut compositor = compositor_with(Config {
+            credential: credential("idle-loop", Some("tos")),
+            idle_lock: Some(Duration::from_millis(1)),
+            idle_blank: Some(Duration::from_millis(1)),
+            ..Config::default()
+        });
+        let mut panel = Panel::new();
+        compositor
+            .run_once(&mut panel, &[], |_| Vec::new())
+            .expect("a pass of the loop");
+        assert!(compositor.is_locked(), "the loop ignored the lock deadline");
+        assert!(
+            compositor.is_blanked(),
+            "the loop ignored the blank deadline"
+        );
+    }
+
+    #[test]
+    fn a_display_that_will_not_go_dark_is_said_and_not_died_of() {
+        let mut compositor = idling(
+            Config {
+                credential: credential("idle-refused", None),
+                ..Config::default()
+            },
+            None,
+            Some(60),
+        );
+        let start = started(&compositor);
+        let mut panel = Panel::refusing();
+        for seconds in [60, 61, 62, 600] {
+            compositor.apply_idle(start + Duration::from_secs(seconds), &mut panel);
+        }
+        assert!(!compositor.is_blanked(), "a lit screen remembered as dark");
+        assert!(compositor.is_running(), "a refused blank ended the session");
+        assert_eq!(panel.told, vec![true], "asked a display that said no again");
+        assert!(compositor
+            .notifications
+            .status_line()
+            .unwrap_or_default()
+            .contains("blanking the display"));
+        // And the loop goes back to its ordinary wait rather than spinning on
+        // a deadline that has passed and can never be met.
+        assert_eq!(
+            compositor.frame_timeout_ms_at(start + Duration::from_secs(600)),
+            IDLE_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn output_from_a_pane_is_not_somebody_being_there() {
+        // The `tail -f` case. A pane that goes on writing must not hold the
+        // screen on, so nothing in the pump touches the idle clock.
+        let mut compositor = idling(
+            Config {
+                credential: credential("idle-output", None),
+                ..Config::default()
+            },
+            None,
+            Some(60),
+        );
+        let start = started(&compositor);
+        compositor.inject(b"still here\r\n");
+        compositor.pump_panes();
+        compositor.tick();
+        assert_eq!(started(&compositor), start, "a pane moved the idle clock");
+
+        let mut panel = Panel::new();
+        compositor.apply_idle(start + Duration::from_secs(60), &mut panel);
+        assert!(compositor.is_blanked());
     }
 
     #[test]

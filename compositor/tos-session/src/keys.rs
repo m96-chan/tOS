@@ -54,6 +54,9 @@ pub enum Action {
     ShowNotifications,
     /// Show what the bindings are, read out of this keymap.
     ShowBindings,
+    /// Lock the screen: a password prompt that owns the session until it is
+    /// answered. Refuses to engage when the machine has no password set.
+    Lock,
     /// Leave the compositor.
     Quit,
     /// Redraw everything.
@@ -222,6 +225,9 @@ impl Keymap {
             // Shift and the slash key is the question mark, which is where
             // every other program with a leader key keeps its own help.
             (KeyCode::Char('/'), Modifiers::SHIFT, Action::ShowBindings),
+            // Shift and the l key, because l on its own moves focus right the
+            // way vim does, and because every other desktop locks with an L.
+            (KeyCode::Char('l'), Modifiers::SHIFT, Action::Lock),
             (KeyCode::Char('q'), Modifiers::NONE, Action::Quit),
         ];
         for (code, modifiers, action) in bindings {

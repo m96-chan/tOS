@@ -156,19 +156,44 @@ and no PAM, because there is nothing to gain: `tos` already runs as root, owns
 the framebuffer and holds an exclusive grab on every keyboard. A helper would
 be a boundary between the process and itself.
 
-### What is deliberately not decided here
+### An empty password is allowed, and means no file at all
 
-Whether the installer *requires* a password or allows an empty one. Requiring
-it makes every installed machine lockable; allowing it keeps a single-user
-machine from being nagged. The rule below ("no credential, no lock") works
-either way, so this can be decided when the installer screen is written.
+This was left open here and settled when the installer screen was written
+([#48](https://github.com/m96-chan/tOS/issues/48)): the password field may be
+left empty, and when it is, `tos-install` writes **no** `/etc/tos/shadow`.
+
+Three reasons, in order of how much they matter.
+
+The empty string hashes perfectly well. A `$6$` line for it is a valid
+credential that a lock would engage on and then open for a bare Enter, which
+is worse than no lock — it looks like one. Declining a password therefore has
+to mean *no credential*, not *a credential of nothing*, and the rule below
+already gives that case a defined, honest behaviour.
+
+Requiring one would not buy what it looks like it buys. Nothing on the machine
+gates a login — the console starts the compositor directly — so this password
+protects the screen lock and nothing else. An installer that refuses to finish
+without one teaches the person in front of it to type `a` and press Enter
+twice, which is a credential in name only and a worse outcome than the empty
+field they chose on purpose.
+
+And it is not a silent choice. The configuration screen says "With no
+password, the screen will never lock" under the empty field, and the
+confirmation screen — the one nobody gets past without typing the disk's name
+— carries `Password   none, so the screen will not lock` in the warning
+colour.
+
+`/etc/passwd` was fixed in the same change. It said `x` in the password field,
+which means "the hash is in `/etc/shadow`" — a file tOS does not write. It now
+says `*`: nothing logs in through that file, which is both true today and the
+safe thing for Debian's PAM to read after [#20](https://github.com/m96-chan/tOS/issues/20).
 
 ---
 
 ## VT switching and DRM master
 
 **Decision: the lock refuses the switch with `VT_RELDISP 0`. It does not take
-`VT_LOCKSWITCH`, at least not yet.**
+`VT_LOCKSWITCH`.**
 
 A lock that Ctrl+Alt+F2 walks around is not a lock. There are exactly two
 mechanisms in the kernel for stopping it, `vt.rs` can reach both, and they
@@ -206,48 +231,62 @@ hang. That is why refusal must be a branch on lock state rather than a
 standing policy — an unlocked session answers immediately, a locked one
 refuses immediately, and neither is silent.
 
-### `VT_LOCKSWITCH`, and why not yet
+### `VT_LOCKSWITCH`, and why not
 
 `VT_LOCKSWITCH` (`0x560B`) and `VT_UNLOCKSWITCH` (`0x560C`) set and clear the
 kernel's `vt_dont_switch`, which makes `set_console()` — the function behind
-the Ctrl+Alt+Fn keysym — refuse, and makes `VT_ACTIVATE` fail. It needs
+both the Ctrl+Alt+Fn keysym and `VT_ACTIVATE` — do nothing. It needs
 `CAP_SYS_TTY_CONFIG`, which tOS has. This is what an X server's
-`DontVTSwitch` uses, and it is a strictly stronger statement than refusing a
-switch one at a time.
+`DontVTSwitch` uses, and it reads as a strictly stronger statement than
+refusing a switch one at a time.
 
-It is also a single global kernel flag with no owner. Nothing clears it when
-the process that set it exits. If tOS is killed while locked, that machine can
-never switch virtual terminals again until it reboots.
+It is measured now, in [`vt-lockswitch.md`](vt-lockswitch.md), on Debian
+bookworm's 6.1.187 — the kernel the ISO boots — and on 7.2.4. Three results
+decide it:
 
-`vt.rs` is already careful about this exact class of failure — `Drop` restores
-the terminal because "leaving a VT in graphics mode with the keyboard off would
-make the machine look dead" — but `Drop` is not a guarantee here. The release
-profile sets `panic = "abort"`, so a panic does not unwind and no destructor
-runs, and `SIGKILL` never ran one to begin with. Today that exposure is
-"this VT looks dead". Taking `VT_LOCKSWITCH` widens it to "no VT can be
-reached".
+- **The flag outlives the process that set it.** The setting process was
+  `SIGKILL`ed and reaped, and switching stayed dead. `VT_UNLOCKSWITCH` from
+  any privileged process clears it, and a reboot clears it; nothing else in
+  the kernel touches it.
+- **It buys nothing the refusal does not.** `VT_RELDISP 0` refuses a switch
+  whoever asked for it, so another process's `VT_ACTIVATE` is already refused
+  while tOS is alive and locked. On hardware the keyboard path is gone before
+  either mechanism: `EVIOCGRAB` takes the keyboards away from the kernel's
+  input handler, and `K_OFF` makes the VT keyboard drop the `KT_CONS` keysym
+  that Ctrl+Alt+Fn is.
+- **It costs the only recovery there is.** When the process holding a VT under
+  `VT_PROCESS` dies, the kernel notices on the next switch, resets the
+  terminal out of `KD_GRAPHICS` and lets the switch through. A killed `tos`
+  leaves a dead screen and a dead console keyboard — `Drop` does not run under
+  `panic = "abort"` and never runs on `SIGKILL` — and one `VT_ACTIVATE` from
+  ssh or the serial line brings the machine back. `set_console` tests
+  `vt_dont_switch` first, so taking the flag discards that rescue too.
 
-That trade is probably still worth making, because the window is exactly the
-locked interval and the whole point of a locked interval is that the machine
-should be hard to get into. But it should be made after someone has answered
-the empirical question on real hardware — does the kernel clear
-`vt_dont_switch` when the process that set it dies, on the kernels tOS boots?
-— rather than by reasoning from the source. That is its own task, below.
+So the trade is not a stronger lock for a small risk. It adds no protection
+against anyone who is not already able to kill `tos`, and it removes the way a
+machine is recovered when `tos` dies holding the screen. `vt.rs` keeps the
+pair: `unlock_switching` is the rescue, and `tos` should call it once at
+startup so that a respawn clears the flag however it came to be set.
 
 ### What the lock does not stop
 
-Stating these is part of the design, not an omission from it.
+Stating these is part of the design, not an omission from it. The first two
+are now decided, door by door, in
+[`lock-other-doors.md`](lock-other-doors.md), which also finds the ones this
+list missed and says what a tOS lock is not for.
 
 - **SysRq.** `Alt+SysRq+r` takes the keyboard out of raw mode and undoes the
   grab; `Alt+SysRq+k` kills everything on the VT. SysRq is above every
-  mechanism here. The ISO's kernel command line sets nothing, so whatever the
-  Debian kernel's default mask is, is the policy. On a locked machine that is
-  a hole; on a project at this stage SysRq is also the debugging lifeline.
-  It needs a decision, not a default.
+  mechanism here. *Decided in `lock-other-doors.md`:* the installed system
+  boots `sysctl.kernel.sysrq=434`, the live image `438`. The grab turns out to
+  close more of this than it looked — a grabbed keyboard's SysRq never reaches
+  the kernel — and what is left is an ungrabbed keyboard and the serial line.
 - **The serial console.** `iso/mkiso.sh` boots with `console=ttyS0
   console=tty0`, and `/init` execs a shell on `/dev/console` if `tos` exits.
   A serial line is an unauthenticated root shell. On the live ISO that is the
-  point. On an installed system it is a decision nobody has made.
+  point. *Decided in `lock-other-doors.md`:* the installed system has no
+  serial console, and the emergency shell now needs `tos.rescue` on the kernel
+  command line, which only the live image's GRUB entries carry.
 - **The disk.** This is a screen lock. Anyone who can reboot the machine reads
   everything on it. Disk encryption is a different feature and is not implied
   by this one.
@@ -509,19 +548,17 @@ intervals belong in the configuration of #38; until that exists they are
 constants with a flag. A session with no credential blanks and does not lock.
 Labels: `enhancement`, `area:system-ui`.
 
-### #53 — Decide whether the lock takes VT_LOCKSWITCH
+### #53 — Decide whether the lock takes VT_LOCKSWITCH — settled
 
-Refusing each switch with `VT_RELDISP 0` stops Ctrl+Alt+F2 and dies with the
-process, which is the right failure. `VT_LOCKSWITCH` is stronger — it makes
-`set_console()` refuse outright, and it also blocks `VT_ACTIVATE` from any
-other process — but it sets a single global kernel flag with no owner, and the
-release profile builds with `panic = "abort"`, so no destructor runs on a
-panic and none ever runs on `SIGKILL`. If the kernel does not clear
-`vt_dont_switch` when the setting process dies, a crash while locked leaves a
-machine whose virtual terminals cannot be reached until it reboots. `vt.rs`
-has the ioctls and the bookkeeping; what it does not have is the answer, and
-the answer is an experiment on the kernels tOS actually boots, not a reading
-of the source. Labels: `experiment`, `area:platform`, `security`.
+Answered in [`vt-lockswitch.md`](vt-lockswitch.md). The kernel does not clear
+`vt_dont_switch` when the process that set it is killed, on 6.1.187 and on
+7.2.4; `VT_UNLOCKSWITCH` and a reboot are the only things that clear it. The
+lock refuses each switch with `VT_RELDISP 0` and does not take the flag,
+because the flag adds no protection the refusal does not already give and
+removes the `VT_ACTIVATE` that recovers a machine whose `tos` died holding the
+screen. `compositor/tos-platform/examples/vt_lockswitch.rs` is the reproducer;
+it has not been run on bare metal. Labels: `experiment`, `area:platform`,
+`security`.
 
 ### #54 — The unauthenticated ways past a locked screen
 
@@ -535,3 +572,178 @@ image, and a decision nobody has made for an installed one. Neither is a bug
 in the lock; both are the reason a lock needs its limits written down. Decide
 each for the installed system, leave the live image as it is, and record the
 result next to the design. Labels: `design`, `security`, `area:iso`.
+
+---
+
+## What building #50 settled
+
+The state machine and its screen landed on branch `lock-screen`. The shape is
+the one above; these are the questions the shape did not answer, recorded here
+because each of them is a decision rather than a detail.
+
+### The binding is `super+shift+l`
+
+One row in the table, which registers it as `super+shift+l` and as `leader`
+then `L` for free. Not `super+l`: `l` is already "move focus right", because
+that is what `l` does in vi, and taking it would be trading a key people use
+every minute for one they use twice a day. Shift and the `l` key keeps the L
+that every other desktop locks with.
+
+### The gate is at the top of `handle_input`, and it catches three things
+
+`handle_key` is where an overlay takes the keyboard, and it is the wrong place
+for a lock by three events: `Mouse`, `Pointer` and `Paste` are all routed in
+`handle_input` without ever passing through it. A lock gated one level further
+in would let a middle click paste the primary selection straight into the
+focused pane's shell, let a press and drag select and copy whatever is on the
+screen it is meant to be hiding, and let a host terminal's bracketed paste type
+for the person who is not there. `FocusGained` and `FocusLost` are gated with
+the rest rather than excepted: telling a pane it has the focus is still writing
+to a pane on behalf of somebody who has not said who they are, and an exception
+is how a gate stops being one.
+
+Two pieces of state are put down when the lock engages, because both belong to
+the person who was there before it: a half-armed leader key is cancelled, and a
+mouse grab in progress is released so that a drag cannot resume across the lock.
+
+### What the screen shows, and how it erases
+
+The locked frame draws the lock and nothing else. The panes, the dividers, the
+status bar, the notification banner and any open menu are skipped rather than
+painted over, for the reason the design gives: a frame where `force` is false
+repaints only the cells a pane marked as damaged, so a box painted on top of a
+session leaves the whole of the rest of that session where it was, status bar
+and pane titles included.
+
+The clear runs on **every** locked frame and not only on the first. A DRM
+display has two buffers and hands out the one it is not scanning out, so a
+clear that ran once cleared one of them and the next flip would put the session
+back on the screen. `tests/lock.rs` renders into two framebuffers in turn to
+say so.
+
+A screen too small to draw the box in is still locked; it simply has nowhere to
+say so. That is the one direction the drawing is allowed to fail in, and it is
+tested: legibility is not what makes a lock a lock.
+
+### A wrong password: what is shown, and what is waited
+
+The field clears, the box does not move, and the message line under it changes
+from "type your password and press enter" to "wrong password". The box keeps
+its height either way, so that getting it wrong cannot shift the field out from
+under the cursor at the worst possible moment.
+
+**Rejection is rate limited, and the limit is on checking rather than on
+typing.** A `$6$` verification is about five milliseconds, so an unthrottled
+prompt is a couple of hundred guesses a second at the keyboard of a machine
+somebody has walked up to. After a wrong password the lock will not look at
+another for a second, then two, then four, then eight, and no longer than
+eight. Doubling makes guessing expensive quickly; the cap is there because the
+person being kept waiting is overwhelmingly the owner who mistyped, and a
+punishment that grows without limit is one that has stopped being able to tell
+the two apart. The countdown is shown in whole seconds, and the frame that
+moves it is the blink phase the compositor already ticks twice a second — the
+lock keeps no clock of its own.
+
+Typing is never held up, only submitting: a field that stopped taking
+characters would read as a compositor that had stopped reading the keyboard,
+which is the one thing a lock must not look like. An enter that arrives during
+the wait is refused without extending it, because a held enter key would
+otherwise lock the owner out for as long as they leant on it.
+
+An empty line is submitted like any other. Whether an empty password is allowed
+is the installer's decision (#48), and a lock that refused to submit one would
+be a lock that machine could never open. The cost is that a stray enter spends
+a second, which is the same second a wrong password spends.
+
+### The panes keep running, and none of it reaches the screen
+
+A pane's program is not told anything. It runs, its output arrives, its
+terminal takes it, and the damage that would say which cells to repaint is
+discarded with each locked frame — which is what lets the loop idle instead of
+finding work outstanding on every pass. Nothing is lost by discarding it,
+because unlocking asks for a full redraw and a full redraw repaints every cell
+whatever the damage says.
+
+**A pane that exits while the screen is locked must not end the session**, and
+this is the route the design warned about: `Action::Quit` and `ClosePane` are
+unreachable, but the last pane's program reaching its end of file is a
+different way to the same place. The session is remembered as over and the
+compositor keeps running; `running` goes false when the password is accepted.
+Somebody who walks up to a locked machine and kills the shell gets a locked
+screen, not a shell.
+
+### Resize, the bell, and notifications
+
+A resize while locked is a resize: the panes are told their new size, because
+the programs in them should not be lied to about it, and the box re-centres on
+the next frame. The lock is untouched by it.
+
+A bell and an application notification are the same path, and while the screen
+is locked that path ends in the queue rather than on the screen. The status bar
+is not drawn and neither is the banner that stands in for it, so nothing can be
+shown; and the queue is not advanced either, so nothing spends its time on
+screen unread. Whatever was waiting is still waiting when the session comes
+back. Not even a count is shown on the lock screen: a count is still something
+about the session, and the lock's job is to show none of it.
+
+### The credential
+
+Read once, when the lock engages, and not per attempt. That is what makes "no
+credential, no lock" a decision taken before the screen goes up, and it means a
+credential file removed, renamed or made unreadable while the screen is locked
+cannot lock the owner out of their own session.
+
+A file that does not parse is a refusal to engage with a message, not a wrong
+password — a wrong password would be a screen nobody could ever open. A missing
+file, an unreadable file and a `$y$` yescrypt line from `/etc/shadow` all land
+there, each saying which it was.
+
+The mode of the file is not checked. It should be 0600 and the installer writes
+it that way, but refusing to lock because the hash is more readable than it
+ought to be would trade a lock that works for one that does not, over a file
+only root can reach in the first place.
+
+The path is a field on `Config` and deliberately not a command line flag or a
+configuration file setting. Which file holds the password is not a preference,
+and a session that could be told to unlock against a file of the user's
+choosing would be a lock with a spare key printed on it. Tests set the field.
+
+### `VT_UNLOCKSWITCH` at startup
+
+From the experiment in [`vt-lockswitch.md`](vt-lockswitch.md): `tos` now clears
+`vt_dont_switch` once, unconditionally, before it takes the terminal. tOS never
+sets the flag, so this is purely a rescue — the kernel does not clear it when
+the process that set it dies, and an installed system respawns `tos` from
+`/etc/inittab`, so one ioctl here turns a stuck flag from anything at all into
+something a restart undoes. `VirtualTerminal::activate` has gained the warning
+the experiment asked for: `VT_ACTIVATE` returns zero whether or not the console
+moved, and `VT_WAITACTIVE` never returns while the flag is set.
+
+### The `/run` marker is a follow-up, not this issue
+
+[#54](https://github.com/m96-chan/tOS/issues/54) observes that a crashed or
+restarted compositor comes back unlocked, and proposes a marker under `/run` —
+tmpfs, so a reboot clears it — as the shape of the fix. **That belongs in its
+own issue.** Three reasons:
+
+1. It defends a path that does not run yet. The only thing that restarts `tos`
+   automatically is `::respawn:` in `/etc/inittab`, and `lock-other-doors.md`
+   records that the installed system does not read that file yet. A marker
+   written today would be read by nothing.
+2. It changes the startup contract rather than adding to the lock. `tos` would
+   have to come up already locked, before the first frame and before any pane
+   exists, and that state has to be reachable and drawable before the things a
+   lock normally has behind it. None of the state machine here is shaped for
+   it, and none of the tests here would exercise it.
+3. It collides with the rule that makes the live ISO behave. A marker plus no
+   credential is a machine that starts locked with nothing to unlock it, which
+   is the "machine nobody can reach" failure this document refuses
+   `VT_LOCKSWITCH` for. Deciding what a marker means when there is no password
+   to check it against is the substance of that issue, and it is not a line of
+   code here.
+
+So: a compositor that is killed while locked comes back unlocked, today, and
+that is written down rather than fixed. It is worth saying plainly that this is
+the weakest joint in the chain — everything else here holds against somebody at
+the keyboard, and this one does not hold against somebody who can make the
+compositor die.

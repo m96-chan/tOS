@@ -36,11 +36,79 @@ impl Firmware {
     }
 }
 
+/// The password for the account the installer creates.
+///
+/// It is a type of its own rather than a `String` for one reason: `Settings`
+/// and `Plan` both derive `Debug`, and both get printed — by `--plan`, by a
+/// failing test, by anything that ever decides to log what it is about to do.
+/// Nothing outside the field it is typed into and the hash it becomes has any
+/// business with the value, so this cannot be printed, only hashed.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Password(String);
+
+impl std::fmt::Debug for Password {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_empty() {
+            "Password(none)"
+        } else {
+            "Password(set)"
+        })
+    }
+}
+
+impl Password {
+    /// The most characters the field accepts. SHA-512 crypt has no limit of
+    /// its own; this one only stops a key held down from growing a value the
+    /// box can no longer show.
+    pub const MAX_CHARS: usize = 128;
+
+    /// Whether no password was given at all. The installer writes no
+    /// credential then, and the lock refuses to engage — which is the whole
+    /// of what declining one means.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Append a typed character, unless the field is already full.
+    pub fn push(&mut self, ch: char) {
+        if self.0.chars().count() < Password::MAX_CHARS {
+            self.0.push(ch);
+        }
+    }
+
+    pub fn pop(&mut self) {
+        self.0.pop();
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// What gets hashed.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    /// What the masked field counts. The drawing code replaces every
+    /// character of it with an asterisk before a cell is touched.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for Password {
+    fn from(value: &str) -> Password {
+        Password(value.to_string())
+    }
+}
+
 /// What the user chose on the configuration screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub hostname: String,
     pub username: String,
+    /// The password for that user, empty when they declined one.
+    pub password: Password,
 }
 
 impl Default for Settings {
@@ -48,6 +116,7 @@ impl Default for Settings {
         Settings {
             hostname: "tos".to_string(),
             username: "tos".to_string(),
+            password: Password::default(),
         }
     }
 }
@@ -69,6 +138,19 @@ impl Settings {
 
     pub fn is_valid(&self) -> bool {
         self.problem().is_none()
+    }
+
+    /// How the password reads on the last screen before the disk is erased.
+    ///
+    /// An empty one is allowed, so it has to be said out loud somewhere the
+    /// user cannot walk past it: a machine that will never lock is a choice,
+    /// and this is where it stops being a silent one.
+    pub fn password_summary(&self) -> &'static str {
+        if self.password.is_empty() {
+            "none, so the screen will not lock"
+        } else {
+            "set"
+        }
     }
 }
 
@@ -248,6 +330,7 @@ impl Plan {
             format!("Firmware   {}", self.firmware.label()),
             format!("Host name  {}", self.settings.hostname),
             format!("User       {}", self.settings.username),
+            format!("Password   {}", self.settings.password_summary()),
             String::new(),
             "New partition table (GPT), replacing everything on the disk:".to_string(),
             format!("  {boot}"),
@@ -387,6 +470,7 @@ mod tests {
             Settings {
                 hostname: hostname.into(),
                 username: username.into(),
+                ..Settings::default()
             }
             .problem()
         };
@@ -407,7 +491,55 @@ mod tests {
         let settings = Settings {
             hostname: "tos".into(),
             username: "Root".into(),
+            ..Settings::default()
         };
         assert!(settings.problem().unwrap().starts_with("User name"));
+    }
+
+    #[test]
+    fn a_password_never_prints_itself() {
+        // Everything that prints a plan prints this, so the one thing it must
+        // not say is what was typed.
+        let settings = Settings {
+            password: "hunter2".into(),
+            ..Settings::default()
+        };
+        let printed = format!("{:?}", Plan::new(disk(), Firmware::Uefi, settings));
+        assert!(!printed.contains("hunter2"), "{printed}");
+        assert!(printed.contains("Password(set)"), "{printed}");
+        assert!(format!("{:?}", Settings::default()).contains("Password(none)"));
+    }
+
+    #[test]
+    fn the_summary_says_whether_there_is_a_password() {
+        let without = plan(Firmware::Uefi).summary().join("\n");
+        assert!(
+            without.contains("Password   none, so the screen will not lock"),
+            "declining a password has to be visible: {without}"
+        );
+
+        let settings = Settings {
+            password: "hunter2".into(),
+            ..Settings::default()
+        };
+        let with = Plan::new(disk(), Firmware::Uefi, settings)
+            .summary()
+            .join("\n");
+        assert!(with.contains("Password   set"));
+        assert!(!with.contains("hunter2"), "the summary echoed it: {with}");
+    }
+
+    #[test]
+    fn a_password_field_fills_up_rather_than_growing() {
+        let mut password = Password::default();
+        assert!(password.is_empty());
+        for _ in 0..Password::MAX_CHARS + 10 {
+            password.push('a');
+        }
+        assert_eq!(password.as_bytes().len(), Password::MAX_CHARS);
+        password.pop();
+        assert_eq!(password.as_bytes().len(), Password::MAX_CHARS - 1);
+        password.clear();
+        assert!(password.is_empty());
     }
 }

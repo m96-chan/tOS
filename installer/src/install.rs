@@ -6,7 +6,21 @@
 //! about than one that carried on after `mkfs` failed.
 
 use crate::exec::{Backend, Output};
-use crate::plan::{Firmware, Plan, Step};
+use crate::plan::{Firmware, Plan, Settings, Step};
+
+/// Where tOS keeps its own files on an installed system.
+pub const CREDENTIAL_DIRECTORY: &str = "/etc/tos";
+
+/// The credential the screen lock reads: one `$6$` line, and deliberately not
+/// `/etc/shadow`. Writing a tOS password into Debian's file would silently
+/// make it the machine's login password too, and reading Debian's file back
+/// would mean verifying the yescrypt hashes it holds. The reasoning is in
+/// `docs/design/screen-lock.md`.
+pub const CREDENTIAL_FILE: &str = "/etc/tos/shadow";
+
+/// Root reads it, nobody else. A hash anyone can read is a hash anyone can
+/// attack offline, at their leisure, on a machine they took.
+pub const CREDENTIAL_MODE: u32 = 0o600;
 
 /// What happened to one step.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,10 +259,18 @@ impl<'a> Installer<'a> {
         // A minimal passwd and group, so the installed system has the user the
         // installer was told about. Login is not gated yet: the console starts
         // the compositor directly, exactly as the live image does.
+        //
+        // The password field is `*`, not `x`. `x` means "the hash is in
+        // /etc/shadow", and tOS writes no /etc/shadow — its credential is
+        // /etc/tos/shadow, which no login program reads. Promising a file that
+        // does not exist is how this line came to be a lie about an account
+        // with no credential at all. `*` says what is true, that nothing logs
+        // in through this file, and it stays true the day a Debian userland
+        // and its PAM arrive on the disk.
         self.write(
             &format!("{root}/etc/passwd"),
             &format!(
-                "root:x:0:0:root:/root:/bin/sh\n{user}:x:1000:1000:{user}:/home/{user}:/bin/sh\n",
+                "root:*:0:0:root:/root:/bin/sh\n{user}:*:1000:1000:{user}:/home/{user}:/bin/sh\n",
                 user = settings.username
             ),
         )?;
@@ -256,6 +278,7 @@ impl<'a> Installer<'a> {
             &format!("{root}/etc/group"),
             &format!("root:x:0:\n{user}:x:1000:\n", user = settings.username),
         )?;
+        self.write_credential(&root, &settings)?;
         let home = format!("{root}/home/{}", settings.username);
         self.backend
             .create_dir(&home)
@@ -273,6 +296,43 @@ impl<'a> Installer<'a> {
         let rc = format!("{root}/etc/rc");
         let _ = self.backend.run("chmod", &["755", &rc]);
         Ok(())
+    }
+
+    /// Write the credential the tOS lock unlocks with, if there is one.
+    ///
+    /// An empty password is allowed, and it produces no file rather than a
+    /// hash of nothing. The empty string hashes perfectly well, and a lock
+    /// that engaged and then opened for a bare Enter would be worse than no
+    /// lock at all; `docs/design/screen-lock.md` makes the missing file mean
+    /// "there is nothing to unlock with", which is exactly what is true of a
+    /// machine whose owner declined a password.
+    fn write_credential(&mut self, root: &str, settings: &Settings) -> Result<(), String> {
+        if settings.password.is_empty() {
+            self.progress
+                .note("   no password given: the screen lock will stay off");
+            return Ok(());
+        }
+
+        let directory = format!("{root}{CREDENTIAL_DIRECTORY}");
+        self.backend
+            .create_dir(&directory)
+            .map_err(|e| format!("cannot create {directory}: {e}"))?;
+
+        // Hashing is the installer's last chance to hold the password; after
+        // this only the hash exists anywhere on the disk.
+        let hash = tos_crypt::hash_password(settings.password.as_bytes())
+            .map_err(|e| format!("cannot hash the password: {e}"))?;
+
+        // One `$6$` line and a terminator, which is what a reader trims
+        // before it parses. Nothing names the user: this file is the
+        // session's credential, not a user database, and the machine has
+        // exactly one person at the keyboard.
+        let path = format!("{root}{CREDENTIAL_FILE}");
+        self.progress
+            .note(format!("   write {path} (mode {CREDENTIAL_MODE:04o})"));
+        self.backend
+            .write_file_with_mode(&path, &format!("{hash}\n"), Some(CREDENTIAL_MODE))
+            .map_err(|e| format!("cannot write {path}: {e}"))
     }
 
     /// The installed system's `/etc/fstab`, by label so that the disk can move.
@@ -340,21 +400,22 @@ impl<'a> Installer<'a> {
     /// Written directly rather than through `grub-mkconfig`, which needs a
     /// Debian userspace the live image does not have yet.
     fn grub_config(&self) -> String {
-        "set timeout=2\n\
+        format!(
+            "set timeout=2\n\
              set default=0\n\
              \n\
-             menuentry \"tOS\" {\n\
+             menuentry \"tOS\" {{\n\
              \tsearch --no-floppy --label --set=root tos-root\n\
-             \tlinux /boot/vmlinuz root=LABEL=tos-root rw console=tty0 quiet\n\
+             \tlinux /boot/vmlinuz {CMDLINE} quiet\n\
              \tinitrd /boot/initramfs.gz\n\
-             }\n\
+             }}\n\
              \n\
-             menuentry \"tOS (verbose)\" {\n\
+             menuentry \"tOS (verbose)\" {{\n\
              \tsearch --no-floppy --label --set=root tos-root\n\
-             \tlinux /boot/vmlinuz root=LABEL=tos-root rw console=tty0\n\
+             \tlinux /boot/vmlinuz {CMDLINE}\n\
              \tinitrd /boot/initramfs.gz\n\
-             }\n"
-        .to_string()
+             }}\n"
+        )
     }
 
     fn finish(&mut self) -> Result<(), String> {
@@ -463,6 +524,31 @@ pub const COPIED_DIRECTORIES: &[&str] = &["/bin", "/sbin", "/lib", "/etc", "/roo
 /// The files GRUB loads, taken from the live medium.
 pub const BOOT_FILES: &[&str] = &["vmlinuz", "initramfs.gz"];
 
+/// The kernel command line an installed tOS machine boots with.
+///
+/// Two of these four words are a security decision rather than a convenience,
+/// and a third decision is a word that is deliberately not here.
+/// `docs/design/lock-other-doors.md` argues all three.
+///
+/// `console=tty0` and no `console=ttyS0`: `/init` execs a shell on
+/// `/dev/console` when the compositor exits, so a serial console on an
+/// installed machine is an unauthenticated root shell on a wire. The live
+/// image wants one and says so in `iso/mkiso.sh`; a machine somebody leaves
+/// alone does not.
+///
+/// No `tos.rescue`, which is the word `/init` wants before it execs that
+/// shell at all. An installed machine that will not start its compositor is
+/// rescued by adding it at the GRUB prompt.
+///
+/// `sysctl.kernel.sysrq=434` is `0x1b2`: the Debian kernel's own default mask
+/// of `0x1b6` with `SYSRQ_ENABLE_KEYBOARD` (`0x4`) taken out. That bit carries
+/// `Alt+SysRq+k` and `Alt+SysRq+r`, the two SysRq functions that take a locked
+/// session away from the compositor; the sync, remount-read-only and reboot
+/// bits stay, so S-U-B still gets a wedged machine down without losing the
+/// filesystem. There is no `sysrq=` boot parameter — the mask is a sysctl, and
+/// `sysctl.*=` is the generic form the kernel applies just before `/init`.
+const CMDLINE: &str = "root=LABEL=tos-root rw console=tty0 sysctl.kernel.sysrq=434";
+
 /// A recorder primed to look like a live session with its medium mounted.
 ///
 /// This is what a dry run and `--plan` walk, so that what they print is the
@@ -534,6 +620,34 @@ mod tests {
     /// A recorder that looks like a live session with its medium mounted.
     fn live_backend() -> Recorder {
         planning_backend()
+    }
+
+    /// What was written to a path, and the mode it was asked for.
+    fn file(backend: &Recorder, path: &str) -> (String, Option<u32>) {
+        backend
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                crate::exec::Action::WriteFile {
+                    path: written,
+                    contents,
+                    mode,
+                } if written == path => Some((contents.clone(), *mode)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{path} was never written"))
+    }
+
+    /// What was written to a path, when only the contents matter.
+    fn written(backend: &Recorder, path: &str) -> String {
+        file(backend, path).0
+    }
+
+    /// Whether a path was written at all.
+    fn wrote(backend: &Recorder, path: &str) -> bool {
+        backend.actions.iter().any(|action| {
+            matches!(action, crate::exec::Action::WriteFile { path: written, .. } if written == path)
+        })
     }
 
     #[test]
@@ -678,31 +792,118 @@ mod tests {
         let settings = Settings {
             hostname: "workshop".into(),
             username: "yusuke".into(),
+            ..Settings::default()
         };
         let mut installer =
             Installer::new(Plan::new(disk(), Firmware::Uefi, settings), &mut backend);
         installer.run();
 
-        let written = |path: &str| {
-            backend
-                .actions
-                .iter()
-                .find_map(|action| match action {
-                    crate::exec::Action::WriteFile { path: p, contents } if p == path => {
-                        Some(contents.clone())
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| panic!("{path} was never written"))
-        };
-
-        assert_eq!(written("/mnt/target/etc/hostname"), "workshop\n");
-        assert!(written("/mnt/target/etc/hosts").contains("workshop"));
-        let passwd = written("/mnt/target/etc/passwd");
-        assert!(passwd.contains("yusuke:x:1000:1000"));
-        assert!(passwd.starts_with("root:x:0:0"));
-        assert!(written("/mnt/target/etc/group").contains("yusuke:x:1000:"));
+        assert_eq!(written(&backend, "/mnt/target/etc/hostname"), "workshop\n");
+        assert!(written(&backend, "/mnt/target/etc/hosts").contains("workshop"));
+        let passwd = written(&backend, "/mnt/target/etc/passwd");
+        assert!(passwd.contains("yusuke:*:1000:1000"));
+        assert!(passwd.starts_with("root:*:0:0"));
+        assert!(written(&backend, "/mnt/target/etc/group").contains("yusuke:x:1000:"));
         assert!(backend.did("mkdir -p /mnt/target/home/yusuke"));
+    }
+
+    #[test]
+    fn the_passwd_file_does_not_promise_a_shadow_file() {
+        // `x` means "the hash is in /etc/shadow", and there is no /etc/shadow:
+        // the tOS credential is /etc/tos/shadow, which nothing that reads
+        // passwd knows about. `*` is the true statement.
+        let backend = install(Firmware::Uefi);
+        let passwd = written(&backend, "/mnt/target/etc/passwd");
+        assert!(
+            !passwd.contains(":x:"),
+            "still promising a shadow: {passwd}"
+        );
+        assert!(passwd.contains("root:*:0:0"), "{passwd}");
+        assert!(passwd.contains("tos:*:1000:1000"), "{passwd}");
+        assert!(!wrote(&backend, "/mnt/target/etc/shadow"));
+    }
+
+    #[test]
+    fn a_password_is_hashed_into_the_file_the_lock_reads() {
+        let mut backend = live_backend();
+        let settings = Settings {
+            username: "yusuke".into(),
+            password: "correct horse battery staple".into(),
+            ..Settings::default()
+        };
+        let mut installer =
+            Installer::new(Plan::new(disk(), Firmware::Uefi, settings), &mut backend);
+        let progress = installer.run();
+        assert!(progress.failure().is_none());
+
+        let (contents, mode) = file(&backend, "/mnt/target/etc/tos/shadow");
+        assert_eq!(mode, Some(0o600), "the hash must not be readable: {mode:?}");
+        assert!(backend.did("mkdir -p /mnt/target/etc/tos"));
+
+        // One line, and a terminator a reader trims before it parses.
+        assert_eq!(contents.lines().count(), 1);
+        assert!(contents.ends_with('\n'));
+        let hash = contents.trim_end();
+        assert!(hash.starts_with("$6$"), "not a SHA-512 crypt line: {hash}");
+
+        // The point of the whole issue: what was typed opens this.
+        assert_eq!(
+            tos_crypt::verify_password(b"correct horse battery staple", hash),
+            Ok(true)
+        );
+        assert_eq!(tos_crypt::verify_password(b"", hash), Ok(false));
+        assert_eq!(
+            tos_crypt::verify_password(b"correct horse battery stapl", hash),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn the_password_itself_is_never_recorded_anywhere() {
+        let mut backend = live_backend();
+        let settings = Settings {
+            password: "hunter2".into(),
+            ..Settings::default()
+        };
+        let mut installer =
+            Installer::new(Plan::new(disk(), Firmware::Uefi, settings), &mut backend);
+        let log = installer.run().log.join("\n");
+
+        let transcript = format!("{:?}", backend.actions);
+        assert!(!transcript.contains("hunter2"), "{transcript}");
+        assert!(!log.contains("hunter2"), "{log}");
+        // Nor does the log carry the hash, which is a thing to attack.
+        assert!(!log.contains("$6$"), "{log}");
+    }
+
+    #[test]
+    fn two_installations_of_the_same_password_get_different_hashes() {
+        // A fresh salt each time, so two machines with one password do not
+        // give each other away.
+        let hashes: Vec<String> = (0..2)
+            .map(|_| {
+                let mut backend = live_backend();
+                let settings = Settings {
+                    password: "hunter2".into(),
+                    ..Settings::default()
+                };
+                Installer::new(Plan::new(disk(), Firmware::Uefi, settings), &mut backend).run();
+                written(&backend, "/mnt/target/etc/tos/shadow")
+            })
+            .collect();
+        assert_ne!(hashes[0], hashes[1]);
+    }
+
+    #[test]
+    fn no_password_means_no_credential_rather_than_a_hash_of_nothing() {
+        // An empty password hashes perfectly well, and a lock that opened for
+        // a bare Enter would be worse than one that refuses to engage.
+        let backend = install(Firmware::Uefi);
+        assert!(
+            !wrote(&backend, "/mnt/target/etc/tos/shadow"),
+            "an empty password must leave no credential: {:?}",
+            backend.transcript()
+        );
     }
 
     #[test]
@@ -712,7 +913,7 @@ mod tests {
             .actions
             .iter()
             .find_map(|action| match action {
-                crate::exec::Action::WriteFile { path, contents }
+                crate::exec::Action::WriteFile { path, contents, .. }
                     if path.ends_with("/etc/inittab") =>
                 {
                     Some(contents.clone())
@@ -735,7 +936,7 @@ mod tests {
             .actions
             .iter()
             .find_map(|action| match action {
-                crate::exec::Action::WriteFile { path, contents }
+                crate::exec::Action::WriteFile { path, contents, .. }
                     if path.ends_with("/etc/fstab") =>
                 {
                     Some(contents.clone())
@@ -758,7 +959,7 @@ mod tests {
             .actions
             .iter()
             .find_map(|action| match action {
-                crate::exec::Action::WriteFile { path, contents }
+                crate::exec::Action::WriteFile { path, contents, .. }
                     if path.ends_with("/etc/fstab") =>
                 {
                     Some(contents.clone())
@@ -793,7 +994,9 @@ mod tests {
             .actions
             .iter()
             .find_map(|action| match action {
-                crate::exec::Action::WriteFile { path, contents } if path.ends_with("grub.cfg") => {
+                crate::exec::Action::WriteFile { path, contents, .. }
+                    if path.ends_with("grub.cfg") =>
+                {
                     Some(contents.clone())
                 }
                 _ => None,
@@ -802,6 +1005,46 @@ mod tests {
         assert!(config.contains("--label --set=root tos-root"));
         assert!(config.contains("root=LABEL=tos-root"));
         assert!(config.contains("menuentry \"tOS\""));
+    }
+
+    /// The doors a screen lock cannot close on its own, closed on the command
+    /// line instead. See `docs/design/lock-other-doors.md`.
+    #[test]
+    fn the_installed_command_line_shuts_the_doors_the_lock_cannot() {
+        let backend = install(Firmware::Uefi);
+        let config = backend
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                crate::exec::Action::WriteFile { path, contents, .. }
+                    if path.ends_with("grub.cfg") =>
+                {
+                    Some(contents.clone())
+                }
+                _ => None,
+            })
+            .expect("no grub.cfg");
+
+        // 0x1b2: Debian's own 0x1b6 without SYSRQ_ENABLE_KEYBOARD (0x4).
+        // Alt+SysRq+k and Alt+SysRq+r are what that bit carries, and both take
+        // a locked session away from the compositor.
+        assert!(
+            config.contains("sysctl.kernel.sysrq=434"),
+            "SysRq policy must be stated, not inherited: {config}"
+        );
+        // /init execs a shell on /dev/console when the compositor exits, so a
+        // serial console here would be an unauthenticated root shell.
+        assert!(
+            !config.contains("ttyS0"),
+            "an installed machine gets no serial console: {config}"
+        );
+        // And the shell itself is not asked for. Only the live image asks.
+        assert!(
+            !config.contains("tos.rescue"),
+            "the emergency shell is not a boot menu entry: {config}"
+        );
+        // Both entries, not just the quiet one.
+        assert_eq!(config.matches("sysctl.kernel.sysrq=434").count(), 2);
     }
 
     #[test]

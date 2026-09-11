@@ -37,6 +37,7 @@ name = "tos-compositor"
 version = "0.0.4"
 dependencies = [
  "libc",
+ "tos-crypt",
  "tos-font",
  "tos-input",
  "tos-platform",
@@ -45,6 +46,10 @@ dependencies = [
  "tos-session",
  "tos-term",
 ]
+
+[[package]]
+name = "tos-crypt"
+version = "0.0.4"
 
 [[package]]
 name = "tos-font"
@@ -66,6 +71,7 @@ name = "tos-install"
 version = "0.0.4"
 dependencies = [
  "libc",
+ "tos-crypt",
  "tos-input",
  "tos-platform",
  "tos-pty",

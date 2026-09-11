@@ -563,7 +563,10 @@ fn clip_end(text: &str, cols: usize) -> String {
 }
 
 /// Extend `text` with `fill` until it is `cols` cells wide.
-fn pad_to(text: &mut String, cols: usize, fill: char) {
+///
+/// Visible to the crate so that the lock screen beside this one draws its box
+/// out of the same cells rather than out of its own copy of this.
+pub(crate) fn pad_to(text: &mut String, cols: usize, fill: char) {
     let mut used = width_of(text);
     let step = tos_term::char_width(fill).max(1) as usize;
     while used + step <= cols {

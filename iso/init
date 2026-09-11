@@ -78,7 +78,34 @@ export TOS=1
 # of the day reaches each pane the compositor opens.
 export ENV=/etc/profile
 
+# The emergency shell is a rescue tool, and a rescue tool on a machine that
+# somebody else is standing at is an unauthenticated root shell on the screen
+# they were locked out of. An installed system and the live image run this
+# same script — nothing pivots to the installed root yet — so the command
+# line is the only thing that can tell them apart. The live image asks for the
+# shell by name; an installed machine that needs one adds the word at the GRUB
+# prompt. See docs/design/lock-other-doors.md.
+rescue=
+if [ -r /proc/cmdline ]; then
+    read -r cmdline </proc/cmdline
+    case " $cmdline " in
+    *" tos.rescue "*) rescue=1 ;;
+    esac
+fi
+
 say "tOS: starting compositor"
-/sbin/tos
-say "tOS: compositor exited ($?), dropping to emergency shell"
-exec sh
+restarts=0
+while :; do
+    /sbin/tos
+    status=$?
+    if [ -n "$rescue" ]; then
+        say "tOS: compositor exited ($status), dropping to emergency shell"
+        exec sh
+    fi
+    if [ "$restarts" -eq 0 ]; then
+        say "tOS: add tos.rescue to the kernel command line for a shell"
+    fi
+    restarts=$((restarts + 1))
+    say "tOS: compositor exited ($status), restarting"
+    sleep 1
+done

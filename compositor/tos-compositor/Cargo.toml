@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 tos-term = { workspace = true }
+tos-crypt = { workspace = true }
 tos-font = { workspace = true }
 tos-render = { workspace = true }
 tos-pty = { workspace = true }

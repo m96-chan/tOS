@@ -16,6 +16,7 @@ name = "tos_install"
 path = "src/lib.rs"
 
 [dependencies]
+tos-crypt = { workspace = true }
 tos-input = { workspace = true }
 tos-platform = { workspace = true }
 tos-term = { workspace = true }

@@ -510,6 +510,7 @@ answered with an error, and frames carry the same raw formats images do.
 - [ ] Bluetooth controls
 - [x] audio controls
 - [x] configuration file
+- [ ] screen lock
 
 Sound is driven straight through the kernel's control interface. `tos-system`
 opens `/dev/snd/controlC<N>` and issues `SNDRV_CTL_IOCTL_CARD_INFO`,
@@ -616,6 +617,109 @@ for back: the workspace forgets it was ever named, so renumbering moves it
 along with the rest again when a workspace before it closes. A name belongs to
 the workspace rather than to the position, which is why a named workspace keeps
 its name while its neighbours are renumbered around it.
+
+`super+shift+l`, or `ctrl+a` then `L`, locks the screen. The lock is a password
+field, and it is its own type rather than another use of that box for exactly
+that reason: the box echoes what is typed, refilters a list on every keystroke
+and closes on escape, and a password field is the opposite of all three. This
+one masks, it always submits, and escape clears the line because there is
+nothing to close.
+
+The password is checked against `/etc/tos/shadow`: tOS's own file, one `$6$`
+crypt line, hashed and verified by `tos-crypt` in this tree rather than by
+`crypt(3)`, which the workspace cannot link and which could not read the
+yescrypt hashes Debian writes anyway. The file is read when the lock engages
+rather than when a password is offered, so a machine with no password does not
+lock — the binding says there is nothing to unlock with and the session carries
+on. That one rule is what makes the live ISO behave without the compositor ever
+being told what live media is, and it is the same rule on an installed machine
+whose owner declined a password.
+
+What the lock owns is the input, not merely the keyboard. The gate is at the top
+of `handle_input` and not in `handle_key`, because mouse, pointer and paste
+events never pass through `handle_key`: a lock one level further in would still
+let a middle click paste the primary selection into a shell and a drag select
+what is on the screen. What it draws is a frame with the panes, the dividers,
+the status bar and any open menu *skipped* rather than painted over — a frame
+that is not a full redraw only repaints the cells a pane marked as damaged, so
+a box drawn on top of a session leaves the rest of that session exactly where it
+was. The screen is cleared on every locked frame rather than the first, because
+a display with two buffers hands out the other one next time.
+
+Underneath it, everything goes on running. A pane's program is not told the
+screen is locked; its output arrives, its terminal takes it, and none of it is
+drawn until the password is accepted, at which point the whole screen is
+repainted rather than the damage replayed. Notifications queue and none is
+shown, so neither a bell nor a build finishing can put anything on a locked
+screen, and nothing is lost by it: the queue stands still and says its piece
+when the session comes back. A pane whose program exits cannot end the session
+either, because exiting is a way out of a locked screen — the last pane dying is
+remembered and acted on once somebody has said who they are. A wrong password
+clears the field and waits a second, then two, four and eight; the wait is on
+checking a guess rather than on typing one, since checking is what a guess
+costs.
+
+The screen also locks and goes dark on its own. Two deadlines run from the last
+piece of input — `lock-after`, five minutes by default, and `blank-after`, ten —
+and they are two deadlines over one state machine rather than one deadline with
+two effects: a dark screen has not necessarily been locked, and a locked screen
+goes dark later for the same reason an unlocked one does. Locking comes first on
+purpose. Blanking first would leave five minutes in which a tap on the keyboard
+shows the session to whoever is standing there; locking first means the screen a
+passer-by wakes is the password prompt. When both come due on the same pass the
+lock still goes up before the blank, because coming back from a blank shows the
+last frame that was drawn, and that frame must never be the session of somebody
+who is not there.
+
+What counts as being there is input, and only input. A pane producing output is
+not a person: a `tail -f` on a log that turns over all night would otherwise
+hold the screen on and the lock off for as long as the machine kept running, and
+an idle timer that any program can hold open is not one. Every kind of input
+counts — a key, the mouse, a paste, the host terminal saying its window has been
+switched to — because every kind of it is somebody doing something.
+
+The event that wakes a dark screen is taken and given to nobody. Whoever sent it
+could not see what they were aiming at, and a key let through would go to
+whatever program has the focus, where `q`, `space` and `enter` each mean
+something. It does not reach the lock either, so a password typed blind arrives
+missing its first character — the field shows how much it is holding, and that
+is the cheaper of the two mistakes. An open menu is left exactly as it was,
+under the lock rather than closed by it: the person who gets it back is the
+person who left it there.
+
+A machine with no password goes dark and stays unlocked. The deadline reads the
+credential the way the binding does, finds nothing and leaves the session alone;
+unlike the binding it says nothing about it, because nobody asked and a live
+session would otherwise find "cannot lock" waiting on the status bar every time
+its user walked away from it. That is "no credential, no lock" arriving by the
+other road, and it is exactly the failure the design refuses `VT_LOCKSWITCH`
+for: a machine that blanks and then locks with nothing able to open it.
+
+Both deadlines are folded into the poll timeout, beside the animation frame that
+was already folded in there. A session a minute from locking waits the minute
+out rather than waking ten times a second to find out that it is not a minute
+yet, and once the screen is dark the wait stretches further: there is no blink
+phase to flip behind a blank, no notification spending its time on a screen
+nobody can see and no animation frame anyone would watch, so the only reason
+left to come back is the next deadline. Nothing underneath stops. The panes go
+on running and the compositor goes on painting them into a buffer the display is
+not scanning out, which is why the screen comes back showing the session as it
+is now rather than as it was when it went dark.
+
+Only the DRM backend really goes dark, where blanking is disabling the CRTC and
+the panel loses its signal. Nested and headless have no panel to put to sleep,
+so they are given no blank deadline rather than a pretended one — a session that
+believed it was dark when it was not would swallow the keystroke that woke a
+screen its user could see all along. The lock deadline is untouched there:
+locking means the same thing everywhere. A display that refuses to blank is
+reported and then left alone; a screen that will not go out is not a reason to
+end somebody's session.
+
+One part of the design is not here yet, and the lock claims nothing it has not
+got: refusing a VT switch with `VT_RELDISP 0`
+([#47](https://github.com/m96-chan/tOS/issues/47)). Until that, the lock defends
+the session rather than the machine — which on the nested and headless backends
+is all there was ever going to be to defend.
 
 ### 0.1 — Portable tOS
 
@@ -746,6 +850,7 @@ tOS/
 ├── iso/                 bootable image and its initramfs
 └── compositor/
     ├── tos-term/        terminal model: cells, grid, VT parser, graphics
+    ├── tos-crypt/       SHA-512 and the $6$ crypt scheme, for passwords
     ├── tos-font/        glyph engine: bitmap face, box drawing, TrueType
     ├── tos-render/      CPU renderer: surfaces, grid painting
     ├── tos-pty/         pseudoterminals
@@ -794,8 +899,9 @@ To render a frame without a display at all:
 `ctrl+a`; on hardware the same bindings work directly with `super`. The two
 bindings that grow a session are also where most people expect them:
 `ctrl+shift+enter` splits the focused pane and `ctrl+shift+t` opens a new
-workspace. `super+space` opens the launcher, `super+m` opens the notifications
-and `super+,` names the workspace. From inside a session, `leader ?` puts the
+workspace. `super+space` opens the launcher, `super+m` opens the notifications,
+`super+,` names the workspace and `super+shift+l` locks the screen on a machine
+that has a password to unlock with. From inside a session, `leader ?` puts the
 binding list over the panes; both it and `--help` are generated from the keymap
 that is running, so neither can fall behind it.
 
@@ -840,6 +946,13 @@ status-bar = true
 inactive-fade = 40
 # The headless size, and the fallback when a backend cannot report one.
 size = 1280x720
+
+# What the session does when nobody touches it, in seconds. The screen locks
+# first and goes dark afterwards; 0, or never, switches a deadline off. A
+# machine with no password never locks, whatever this says.
+[idle]
+lock-after = 300
+blank-after = 600
 
 # What applications paint with. color0 to color255 set the palette itself.
 [colors]
