@@ -4,10 +4,11 @@
 //! This module parses them and owns the image/placement store that cells refer
 //! to through [`crate::cell::GraphicsRef`].
 //!
-//! Transmission of raw RGB and RGBA data is implemented. PNG payloads and
-//! zlib-compressed payloads are recognised and rejected with the protocol's
-//! error response rather than being silently dropped, so applications can fall
-//! back instead of hanging.
+//! Raw RGB and RGBA data, PNG (`f=100`) and zlib-compressed payloads (`o=z`)
+//! all transmit; PNG and zlib are decoded by [`crate::png`] and
+//! [`crate::inflate`]. Anything that cannot be decoded is answered with the
+//! protocol's error response rather than being silently dropped, so
+//! applications can fall back instead of hanging.
 //!
 //! Images may also be animations. The store keeps every frame but holds the
 //! one that is on screen in [`Image::data`], so the renderer asks for an image
@@ -17,6 +18,9 @@
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+use crate::inflate::{self, InflateError};
+use crate::png::{self, PngError};
 
 /// What a command asks the terminal to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -572,34 +576,10 @@ impl GraphicsStore {
     /// Store an image, converting the payload to RGBA. Returns an error string
     /// suitable for the protocol response.
     pub fn store(&mut self, cmd: &GraphicsCommand, payload: &[u8]) -> Result<u32, &'static str> {
-        if cmd.compressed {
-            return Err("EINVAL:compression not supported");
-        }
-        if cmd.format == Format::Png {
-            return Err("EINVAL:PNG not supported");
-        }
         if cmd.medium != Medium::Direct {
             return Err("EINVAL:only direct transmission supported");
         }
-        let (w, h) = (cmd.width, cmd.height);
-        if w == 0 || h == 0 {
-            return Err("EINVAL:missing dimensions");
-        }
-        let stride = match cmd.format {
-            Format::Rgb => 3,
-            Format::Rgba => 4,
-            Format::Png => unreachable!(),
-        };
-        let expected = (w as usize) * (h as usize) * stride;
-        if payload.len() < expected {
-            return Err("EINVAL:truncated payload");
-        }
-
-        let mut data = Vec::with_capacity((w as usize) * (h as usize) * 4);
-        for px in payload[..expected].chunks_exact(stride) {
-            data.extend_from_slice(&[px[0], px[1], px[2]]);
-            data.push(if stride == 4 { px[3] } else { 0xff });
-        }
+        let (w, h, data) = decode_payload(cmd, payload, self.budget)?;
 
         let id = if cmd.image_id != 0 {
             cmd.image_id
@@ -1073,6 +1053,89 @@ fn compose(
     }
 }
 
+/// Turn a transmitted payload into RGBA8 and the dimensions that belong to it.
+///
+/// `budget` is the store's whole byte allowance, used as the ceiling on
+/// anything that has to be decompressed. A payload that would expand past it
+/// could never be kept, so it is refused while it is still being decoded
+/// instead of after it has been materialised — which is the difference
+/// between rejecting a decompression bomb and being flattened by one.
+fn decode_payload(
+    cmd: &GraphicsCommand,
+    payload: &[u8],
+    budget: usize,
+) -> Result<(u32, u32, Vec<u8>), &'static str> {
+    match cmd.format {
+        Format::Png => {
+            // A PNG carries its own dimensions, so `s=`/`v=` are advisory and
+            // the file wins if they disagree.
+            let decompressed;
+            let bytes = if cmd.compressed {
+                decompressed = inflate::zlib_decompress(payload, budget).map_err(zlib_error)?;
+                &decompressed[..]
+            } else {
+                payload
+            };
+            let image = png::decode(bytes, budget).map_err(png_error)?;
+            Ok((image.width, image.height, image.rgba))
+        }
+        Format::Rgb | Format::Rgba => {
+            let stride = if cmd.format == Format::Rgb { 3 } else { 4 };
+            let (w, h) = (cmd.width, cmd.height);
+            if w == 0 || h == 0 {
+                return Err("EINVAL:missing dimensions");
+            }
+            let expected = (w as usize)
+                .checked_mul(h as usize)
+                .and_then(|pixels| pixels.checked_mul(stride))
+                .ok_or("EINVAL:image too large")?;
+
+            let decompressed;
+            let bytes = if cmd.compressed {
+                // Raw pixels decompress to exactly this many bytes, so the
+                // inflater can be told the answer in advance; an image that
+                // would not fit the budget is refused at the budget instead.
+                decompressed =
+                    inflate::zlib_decompress(payload, expected.min(budget)).map_err(zlib_error)?;
+                &decompressed[..]
+            } else {
+                payload
+            };
+            if bytes.len() < expected {
+                return Err("EINVAL:truncated payload");
+            }
+
+            let mut data = Vec::with_capacity((w as usize) * (h as usize) * 4);
+            for px in bytes[..expected].chunks_exact(stride) {
+                data.extend_from_slice(&[px[0], px[1], px[2]]);
+                data.push(if stride == 4 { px[3] } else { 0xff });
+            }
+            Ok((w, h, data))
+        }
+    }
+}
+
+/// Map a decompression failure onto a protocol error response. The one
+/// distinction worth keeping is "too big to hold" against "corrupt", because
+/// an application can do something useful about the first.
+fn zlib_error(err: InflateError) -> &'static str {
+    match err {
+        InflateError::TooLarge => "EINVAL:compressed payload exceeds the image budget",
+        _ => "EINVAL:corrupt zlib payload",
+    }
+}
+
+fn png_error(err: PngError) -> &'static str {
+    match err {
+        PngError::TooLarge | PngError::Deflate(InflateError::TooLarge) => {
+            "EINVAL:PNG exceeds the image budget"
+        }
+        PngError::BadSignature => "EINVAL:not a PNG",
+        PngError::Unsupported => "EINVAL:unsupported PNG variant",
+        _ => "EINVAL:corrupt PNG",
+    }
+}
+
 /// Decode base64, skipping whitespace. Invalid characters end the decode.
 pub fn decode_base64(input: &[u8]) -> Vec<u8> {
     const INVALID: u8 = 0xff;
@@ -1177,11 +1240,80 @@ mod tests {
         assert_eq!(img.data, vec![1, 2, 3, 255, 4, 5, 6, 255]);
     }
 
+    /// Build a transmit command carrying `data` as its base64 payload.
+    fn transmit(control: &str, data: &[u8]) -> GraphicsCommand {
+        let payload = encode_base64(data);
+        GraphicsCommand::parse(format!("{control};{payload}").as_bytes()).unwrap()
+    }
+
     #[test]
-    fn png_is_rejected_not_ignored() {
+    fn a_png_payload_is_decoded_to_rgba() {
         let mut store = GraphicsStore::new(1 << 20);
-        let cmd = GraphicsCommand::parse(b"a=t,f=100,s=1,v=1,i=1;AAAA").unwrap();
-        assert!(store.store(&cmd, &cmd.payload).is_err());
+        let pixels: Vec<u8> = (0..2 * 2 * 4).map(|i| i as u8).collect();
+        let cmd = transmit("a=t,f=100,i=1", &crate::png::tests::rgba_png(2, 2, &pixels));
+        let id = store.store(&cmd, &cmd.payload).unwrap();
+        let img = store.image(id).unwrap();
+        // The file's own dimensions are used, not the ones on the command.
+        assert_eq!((img.width, img.height), (2, 2));
+        assert_eq!(img.data, pixels);
+    }
+
+    #[test]
+    fn a_zlib_compressed_rgba_payload_is_decoded() {
+        let mut store = GraphicsStore::new(1 << 20);
+        let pixels = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let cmd = transmit(
+            "a=t,f=32,o=z,s=2,v=1,i=1",
+            &crate::inflate::tests::zlib_stored(&pixels),
+        );
+        let id = store.store(&cmd, &cmd.payload).unwrap();
+        assert_eq!(store.image(id).unwrap().data, pixels);
+    }
+
+    #[test]
+    fn a_zlib_compressed_png_payload_is_decoded() {
+        let mut store = GraphicsStore::new(1 << 20);
+        let pixels: Vec<u8> = (0..2 * 4).map(|i| (i * 3) as u8).collect();
+        let file = crate::png::tests::rgba_png(1, 2, &pixels);
+        let cmd = transmit("a=t,f=100,o=z,i=1", &crate::inflate::tests::zlib_stored(&file));
+        let id = store.store(&cmd, &cmd.payload).unwrap();
+        assert_eq!(store.image(id).unwrap().data, pixels);
+    }
+
+    #[test]
+    fn a_corrupt_png_is_an_error_not_a_panic() {
+        let mut store = GraphicsStore::new(1 << 20);
+        let full = crate::png::tests::rgba_png(2, 2, &[0x40; 2 * 2 * 4]);
+        for cut in 0..full.len() {
+            let cmd = transmit("a=t,f=100,i=1", &full[..cut]);
+            assert!(store.store(&cmd, &cmd.payload).is_err());
+        }
+        // And a payload that is not a PNG at all.
+        let cmd = transmit("a=t,f=100,i=1", b"not an image");
+        assert_eq!(store.store(&cmd, &cmd.payload), Err("EINVAL:not a PNG"));
+    }
+
+    #[test]
+    fn a_compressed_payload_that_would_burst_the_budget_is_refused() {
+        // 4 MiB of zeroes offered to a store that can only hold 1 KiB.
+        let mut store = GraphicsStore::new(1024);
+        let bomb = crate::inflate::tests::zlib_stored(&vec![0u8; 4 << 20]);
+        let cmd = transmit("a=t,f=32,o=z,s=1024,v=1024,i=1", &bomb);
+        assert_eq!(
+            store.store(&cmd, &cmd.payload),
+            Err("EINVAL:compressed payload exceeds the image budget")
+        );
+    }
+
+    #[test]
+    fn a_png_larger_than_the_budget_is_refused_from_its_header() {
+        let mut store = GraphicsStore::new(1024);
+        let file = crate::png::tests::rgba_png(64, 64, &[0; 64 * 64 * 4]);
+        let cmd = transmit("a=t,f=100,i=1", &file);
+        assert_eq!(
+            store.store(&cmd, &cmd.payload),
+            Err("EINVAL:PNG exceeds the image budget")
+        );
     }
 
     #[test]
