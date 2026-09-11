@@ -481,7 +481,11 @@ integration.
 Placements are scaled once and the result is kept, so a repeat frame costs a
 blend instead of a resample. The cache is a plain CPU one, bounded in bytes
 and evicted least-recently-used; there is no GPU pipeline under it to upload
-textures to, which is why the roadmap item no longer says there is.
+textures to, which is why the roadmap item no longer says there is. Handing an
+image to a DRM overlay plane, so the display engine scales and composites it
+during scanout and the CPU stops touching those pixels, is the part that was
+reaching for, and is tracked separately as
+[#31](https://github.com/m96-chan/tOS/issues/31).
 
 Moving pictures reach a terminal as animation frames, and those play. An
 image can carry frames sent with `a=f`, each one a rectangle of new pixels
