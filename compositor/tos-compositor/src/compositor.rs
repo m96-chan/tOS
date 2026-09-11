@@ -1140,6 +1140,26 @@ mod tests {
     }
 
     #[test]
+    fn the_ctrl_shift_bindings_win_over_the_encoder() {
+        // Ctrl+shift+enter is a key the kitty protocol can encode, so the
+        // keymap has to claim it before the encoder is ever asked.
+        let mut compositor = compositor();
+        let ctrl_shift = tos_input::Modifiers::CTRL.union(tos_input::Modifiers::SHIFT);
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(KeyCode::Enter, ctrl_shift)));
+        assert_eq!(compositor.panes.len(), 2, "ctrl+shift+enter should split");
+
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('t'),
+            ctrl_shift,
+        )));
+        assert_eq!(
+            compositor.session.workspace_count(),
+            2,
+            "ctrl+shift+t should open a workspace"
+        );
+    }
+
+    #[test]
     fn rendering_produces_pixels() {
         let mut compositor = compositor();
         compositor.inject(b"tOS");
