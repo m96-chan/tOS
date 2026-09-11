@@ -40,7 +40,7 @@ apt-get update
 apt-get install -y --no-install-recommends \
     musl-tools busybox-static cpio kmod \
     "$KERNEL_PKG" \
-    grub-common $GRUB_PKGS xorriso mtools \
+    grub-common grub2-common $GRUB_PKGS xorriso mtools \
     fdisk dosfstools e2fsprogs
 
 # Fully static binaries: they run as PID 1's children with no libc on disk.
@@ -73,19 +73,36 @@ cp iso/profile "$ROOT/etc/profile"
 # The tools the installer shells out to. Unlike the compositor these are
 # Debian binaries, so their libraries have to come along; the installer is
 # useless without them and finding that out mid-install is no good.
-INSTALL_TOOLS="sfdisk partx mkfs.ext4 mkfs.vfat mount umount sync"
-for tool in $INSTALL_TOOLS; do
-    path=$(command -v "$tool" 2>/dev/null) || {
-        echo "mkiso: $tool is missing from the build image" >&2
-        exit 1
-    }
-    cp "$path" "$ROOT/sbin/$(basename "$tool")"
-done
-# grub-install carries its own tree of modules and templates.
-cp "$(command -v grub-install)" "$ROOT/sbin/grub-install"
-for helper in grub-mkimage grub-bios-setup grub-probe grub-mkdevicemap grub-editenv; do
-    path=$(command -v "$helper" 2>/dev/null) && cp "$path" "$ROOT/sbin/$(basename "$helper")"
-done
+#
+# A tool is looked up once, through these two helpers, so that a missing one
+# stops the build with its name rather than turning into `cp ''` further down.
+need_tool() {
+    for tool in "$@"; do
+        path=$(command -v "$tool" 2>/dev/null) || path=""
+        if [ -z "$path" ]; then
+            echo "mkiso: $tool is missing from the build image" >&2
+            exit 1
+        fi
+        cp "$path" "$ROOT/sbin/$(basename "$tool")"
+    done
+}
+
+# Tools that improve things when present but are not required.
+maybe_tool() {
+    for tool in "$@"; do
+        path=$(command -v "$tool" 2>/dev/null) || path=""
+        [ -n "$path" ] && cp "$path" "$ROOT/sbin/$(basename "$tool")"
+    done
+    return 0
+}
+
+# grub-install is in grub2-common, not grub-common: grub-common carries the
+# grub-mkrescue this script already used, which is why it was enough before.
+need_tool sfdisk partx mkfs.ext4 mkfs.vfat mount umount sync grub-install
+maybe_tool grub-mkimage grub-bios-setup grub-probe grub-mkdevicemap \
+    grub-editenv grub-macbless blkid
+
+# grub-install reads its modules and templates out of these trees.
 mkdir -p "$ROOT/usr/lib/grub" "$ROOT/usr/share/grub"
 cp -a /usr/lib/grub/. "$ROOT/usr/lib/grub/" 2>/dev/null || true
 cp -a /usr/share/grub/. "$ROOT/usr/share/grub/" 2>/dev/null || true
