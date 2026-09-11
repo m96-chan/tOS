@@ -44,8 +44,6 @@ pub enum Action {
     ScrollToBottom,
     Copy,
     Paste,
-    /// Start a selection with the keyboard.
-    BeginSelection,
     /// Open the launcher: a filtered list of programs, one of which starts in
     /// a new pane.
     OpenLauncher,
@@ -61,6 +59,16 @@ pub enum Action {
     Quit,
     /// Redraw everything.
     Refresh,
+    /// Take the keyboard and drive a selection with it: motions move a copy
+    /// cursor through the pane and its history, `v` fixes one end of the
+    /// selection, `y` copies it and leaves.
+    ///
+    /// This replaced a `BeginSelection` that made a selection of exactly one
+    /// cell and had no way to make it any bigger, because there was no action
+    /// that could move either end of it. A mode is what that was missing: the
+    /// leader disarms after one key, so extending a selection through the
+    /// keymap would be one leader press per cell.
+    CopyMode,
 }
 
 /// A key combination.
@@ -209,7 +217,6 @@ impl Keymap {
             (KeyCode::Char(','), Modifiers::NONE, Action::RenameWorkspace),
             (KeyCode::PageUp, Modifiers::NONE, Action::ScrollPage(-1)),
             (KeyCode::PageDown, Modifiers::NONE, Action::ScrollPage(1)),
-            (KeyCode::Char('['), Modifiers::NONE, Action::BeginSelection),
             (KeyCode::Char(']'), Modifiers::NONE, Action::Paste),
             (KeyCode::Char('y'), Modifiers::NONE, Action::Copy),
             (KeyCode::Char('r'), Modifiers::NONE, Action::Refresh),
@@ -229,6 +236,9 @@ impl Keymap {
             // way vim does, and because every other desktop locks with an L.
             (KeyCode::Char('l'), Modifiers::SHIFT, Action::Lock),
             (KeyCode::Char('q'), Modifiers::NONE, Action::Quit),
+            // Where tmux keeps copy mode, and the key that used to start a
+            // selection nothing could extend.
+            (KeyCode::Char('['), Modifiers::NONE, Action::CopyMode),
         ];
         for (code, modifiers, action) in bindings {
             keymap.bind_after_leader(Binding::new(*code, *modifiers), action.clone());

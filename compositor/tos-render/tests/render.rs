@@ -227,6 +227,30 @@ fn unfocused_cursor_is_hollow() {
 }
 
 #[test]
+fn the_copy_cursor_outlines_a_cell_of_its_own() {
+    // Copy mode's cursor is not the terminal's: it is somewhere else, it is
+    // an outline rather than a block, and it is drawn whether or not the
+    // program's own cursor is.
+    let mut h = Harness::new(4, 2);
+    h.draw_with(&RenderOptions {
+        force: true,
+        draw_cursor: false,
+        copy_cursor: Some((2, 1)),
+        ..RenderOptions::default()
+    });
+    let copy = RenderOptions::default().copy_cursor_color.pack();
+    let background = h.term.palette().background.pack();
+    let metrics = h.fonts.metrics();
+    assert_eq!(h.cell_pixel(2, 1, 0, 0), copy, "no outline was drawn");
+    assert_eq!(
+        h.cell_pixel(2, 1, metrics.cell_width / 2, metrics.cell_height / 2),
+        background,
+        "the outline filled the cell"
+    );
+    assert_eq!(h.ink(1, 1), 0, "the cell beside it was painted");
+}
+
+#[test]
 fn hidden_cursor_draws_nothing() {
     let mut h = Harness::new(4, 1);
     h.feed(b"\x1b[?25l").draw_with(&RenderOptions {
