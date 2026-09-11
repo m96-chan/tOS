@@ -120,7 +120,22 @@ fn choose_backend(config: &Config) -> Backend {
     }
 }
 
+/// Take the blank deadline away from a backend that has no panel to put to
+/// sleep.
+///
+/// `Display::blank` is defaulted to doing nothing for exactly those backends,
+/// and a session that believed it was dark when it was not would be a session
+/// that swallows the keystroke waking a screen its user could see all along.
+/// The lock deadline is untouched: locking means the same thing everywhere.
+fn without_blanking(config: Config) -> Config {
+    Config {
+        idle_blank: None,
+        ..config
+    }
+}
+
 fn run_headless(config: Config) -> io::Result<()> {
+    let config = without_blanking(config);
     let (width, height) = config.size;
     let mut display = HeadlessDisplay::new(width, height);
     let screenshot = config.screenshot.clone();
@@ -156,6 +171,7 @@ fn run_headless(config: Config) -> io::Result<()> {
 }
 
 fn run_nested(config: Config) -> io::Result<()> {
+    let config = without_blanking(config);
     let mut display = NestedDisplay::acquire().map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -443,6 +459,16 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(choose_backend(&config), Backend::Headless);
+    }
+
+    #[test]
+    fn a_backend_with_no_panel_does_not_pretend_to_blank() {
+        let config = Config::default();
+        assert!(config.idle_blank.is_some(), "the default blanks");
+        let nested = without_blanking(config.clone());
+        assert_eq!(nested.idle_blank, None);
+        // Locking is not a property of the screen, so it survives.
+        assert_eq!(nested.idle_lock, config.idle_lock);
     }
 
     #[test]

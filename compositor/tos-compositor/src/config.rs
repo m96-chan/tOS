@@ -5,6 +5,7 @@
 //! first, so a flag always lands on top of what the file said.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tos_session::{describe, Keymap};
 use tos_term::Palette;
@@ -102,6 +103,22 @@ pub struct Config {
     /// unlock against a file of the user's choosing would be a lock with a
     /// spare key printed on it.
     pub credential: PathBuf,
+    /// How long the session goes untouched before it locks, or `None` for
+    /// never.
+    ///
+    /// A machine with no credential never locks whatever this says: there
+    /// would be nothing to unlock it with, which is the same rule the binding
+    /// obeys and the reason the live ISO needs no special case.
+    pub idle_lock: Option<Duration>,
+    /// How long the session goes untouched before the screen goes dark, or
+    /// `None` for never.
+    ///
+    /// Two deadlines over one state machine rather than one deadline with two
+    /// effects: a dark screen has not necessarily been locked, and a locked
+    /// screen goes dark later for the same reason an unlocked one does. The
+    /// default locks first and blanks afterwards, so that a passer-by who
+    /// wakes the screen finds the prompt rather than the session.
+    pub idle_blank: Option<Duration>,
 }
 
 impl Default for Config {
@@ -125,6 +142,12 @@ impl Default for Config {
             palette: Palette::new(),
             chrome: Chrome::default(),
             credential: PathBuf::from(crate::lock::CREDENTIAL_PATH),
+            // Five minutes, then five more. The order is the point: locking
+            // first means the screen that a passer-by wakes is the prompt,
+            // where blanking first would leave five minutes in which a tap on
+            // the keyboard shows the session to whoever is there.
+            idle_lock: Some(Duration::from_secs(300)),
+            idle_blank: Some(Duration::from_secs(600)),
         }
     }
 }
@@ -146,6 +169,8 @@ options:
   --screenshot <path.ppm>                render one frame, save it and exit
   --preload <text>                       feed text to the first pane first
   --no-status-bar                        hide the status bar
+  --idle-lock <seconds>                  lock when untouched this long (default: 300, 0: never)
+  --idle-blank <seconds>                 blank the screen likewise (default: 600, 0: never)
   --allow-clipboard-read                 let programs read the clipboard (OSC 52)
   --config <path>                        read this file instead of searching
   --no-config                            ignore the configuration file
@@ -259,6 +284,8 @@ pub fn parse_args_over(base: Config, args: &[String]) -> Result<Config, String> 
                 let text = value("--warmup")?;
                 config.warmup_frames = text.parse().map_err(|_| format!("not a number: {text}"))?;
             }
+            "--idle-lock" => config.idle_lock = parse_interval(&value("--idle-lock")?)?,
+            "--idle-blank" => config.idle_blank = parse_interval(&value("--idle-blank")?)?,
             "--no-status-bar" => config.status_bar = false,
             "--allow-clipboard-read" => config.allow_clipboard_read = true,
             "-e" | "--command" => {
@@ -275,6 +302,25 @@ pub fn parse_args_over(base: Config, args: &[String]) -> Result<Config, String> 
         index += 1;
     }
     Ok(config)
+}
+
+/// Parse an idle interval in seconds, which is spelled the same way on the
+/// command line and in the file.
+///
+/// `None` is a deadline that never comes. It is spelled `0`, because that is
+/// what anyone who wants to switch a timer off reaches for first, and also
+/// `never` and `off`, because `lock-after = 0` read on its own looks like a
+/// session that locks the instant it is left alone — the opposite of what it
+/// does. Both spellings mean the same thing so that neither reading can be
+/// the wrong one.
+pub fn parse_interval(text: &str) -> Result<Option<Duration>, String> {
+    if matches!(text, "never" | "off" | "no") {
+        return Ok(None);
+    }
+    let seconds: u64 = text
+        .parse()
+        .map_err(|_| format!("expected seconds, or never, got {text}"))?;
+    Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
 }
 
 /// Parse a `WxH` size, which is spelled the same way on the command line and
@@ -378,6 +424,34 @@ mod tests {
         assert!(!parse_args(&[]).unwrap().allow_clipboard_read);
         let config = parse_args(&args(&["--allow-clipboard-read"])).unwrap();
         assert!(config.allow_clipboard_read);
+    }
+
+    #[test]
+    fn the_idle_deadlines_have_defaults_and_lock_first() {
+        let config = parse_args(&[]).unwrap();
+        let lock = config.idle_lock.expect("an idle lock");
+        let blank = config.idle_blank.expect("an idle blank");
+        assert!(
+            lock < blank,
+            "blanking before locking leaves a window where a key shows the session"
+        );
+    }
+
+    #[test]
+    fn the_idle_deadlines_are_flags_too() {
+        let config = parse_args(&args(&["--idle-lock", "30", "--idle-blank", "45"])).unwrap();
+        assert_eq!(config.idle_lock, Some(Duration::from_secs(30)));
+        assert_eq!(config.idle_blank, Some(Duration::from_secs(45)));
+    }
+
+    #[test]
+    fn a_deadline_can_be_switched_off_in_either_spelling() {
+        for text in ["0", "never", "off", "no"] {
+            assert_eq!(parse_interval(text), Ok(None), "{text}");
+        }
+        assert_eq!(parse_interval("90"), Ok(Some(Duration::from_secs(90))));
+        assert!(parse_interval("a while").is_err());
+        assert!(parse_interval("-1").is_err());
     }
 
     #[test]
