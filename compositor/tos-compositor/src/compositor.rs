@@ -770,7 +770,9 @@ impl Compositor {
 
         let mut drawn: Vec<PaneId> = Vec::with_capacity(geometry.len());
         for (id, rect) in &geometry {
-            let Some(pane) = self.panes.get(id) else {
+            // Mutable because the pane owns its texture cache, which the
+            // renderer fills in as it draws.
+            let Some(pane) = self.panes.get_mut(id) else {
                 continue;
             };
             // A pane that is synchronising its output asked not to be drawn
@@ -794,7 +796,14 @@ impl Compositor {
                 force,
                 inactive_fade: self.config.inactive_fade,
             };
-            render(surface, pixel_rect, &pane.terminal, &mut self.fonts, &options);
+            render(
+                surface,
+                pixel_rect,
+                &pane.terminal,
+                &mut self.fonts,
+                &mut pane.textures,
+                &options,
+            );
         }
 
         if force {

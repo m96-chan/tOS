@@ -3,6 +3,7 @@
 use std::io;
 
 use tos_pty::{Pty, PtyConfig, Winsize};
+use tos_render::TextureCache;
 use tos_session::Rect;
 use tos_term::{Terminal, TerminalConfig};
 
@@ -17,6 +18,10 @@ pub struct Pane {
     pub exited: bool,
     /// A selection being dragged with the mouse, in displayed cells.
     pub selection: Option<tos_render::Selection>,
+    /// Scaled image textures kept between frames. Rendering is stateless, so
+    /// the cache has to live with the thing it belongs to, which is the pane
+    /// whose images they are.
+    pub textures: TextureCache,
     /// Whether the mouse button is still down on this pane.
     pub selecting: bool,
     /// Input the PTY could not take yet.
@@ -64,6 +69,7 @@ impl Pane {
             area,
             exited: false,
             selection: None,
+            textures: TextureCache::default(),
             selecting: false,
             pending_input: Vec::new(),
             input_overflowed: false,

@@ -7,8 +7,10 @@
 
 use tos_term::Rgb;
 
+use crate::texture::Texture;
+
 /// An axis aligned rectangle in pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
@@ -235,6 +237,38 @@ impl<'a> Surface<'a> {
                 }
                 let index = (py as u32 * self.stride + px as u32) as usize;
                 let color = Rgb::new(r, g, b);
+                self.pixels[index] = if a == 0xff {
+                    color.pack()
+                } else {
+                    blend_packed(self.pixels[index], color, a)
+                };
+            }
+        }
+    }
+
+    /// Composite an already-scaled texture with its top left corner at
+    /// `(x, y)`.
+    ///
+    /// This is the cached counterpart of [`Surface::blit_rgba_region`]: the
+    /// resampling has happened already, so all that is left is the blend, and
+    /// that blend has to behave exactly as the uncached path does.
+    pub fn blit_texture(&mut self, x: i32, y: i32, texture: &Texture) {
+        let dest = Rect::new(x, y, texture.width(), texture.height());
+        let clipped = dest.intersect(&self.clip);
+        if clipped.is_empty() {
+            return;
+        }
+        let pixels = texture.pixels();
+        for py in clipped.y..clipped.bottom() {
+            let row = (py - y) as u32 * texture.width();
+            for px in clipped.x..clipped.right() {
+                let sample = pixels[(row + (px - x) as u32) as usize];
+                let a = (sample >> 24) as u8;
+                if a == 0 {
+                    continue;
+                }
+                let index = (py as u32 * self.stride + px as u32) as usize;
+                let color = Rgb::new((sample >> 16) as u8, (sample >> 8) as u8, sample as u8);
                 self.pixels[index] = if a == 0xff {
                     color.pack()
                 } else {

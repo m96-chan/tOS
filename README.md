@@ -460,7 +460,7 @@ wrapped lines rather than re-wrapping them.
 
 - [x] Kitty Graphics Protocol
 - [x] image surfaces
-- [ ] GPU-backed texture cache
+- [x] scaled texture cache
 - [ ] image previews
 - [ ] video experiments
 
@@ -468,6 +468,11 @@ Raw RGB and RGBA transmission work, including chunked transfers, placements
 and deletion. PNG payloads and zlib compression are parsed and answered with
 the protocol's error response rather than being silently dropped, so
 applications can fall back instead of hanging.
+
+Placements are scaled once and the result is kept, so a repeat frame costs a
+blend instead of a resample. The cache is a plain CPU one, bounded in bytes
+and evicted least-recently-used; there is no GPU pipeline under it to upload
+textures to, which is why the roadmap item no longer says there is.
 
 ### 0.0.5 — System UI
 

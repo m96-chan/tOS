@@ -204,6 +204,11 @@ pub struct Image {
     pub id: u32,
     pub width: u32,
     pub height: u32,
+    /// Bumped every time an id's pixels are replaced. An application may
+    /// re-transmit under an id it has already used, which leaves everything
+    /// else about the image the same, so anything caching work derived from
+    /// the pixels needs this to know the work is stale.
+    pub version: u64,
     /// Always RGBA8, converted at transmission time.
     pub data: Vec<u8>,
 }
@@ -238,6 +243,8 @@ pub struct GraphicsStore {
     /// Total bytes of pixel data held, used to enforce the budget.
     bytes: usize,
     budget: usize,
+    /// Monotonic counter handed to each stored image as its version.
+    next_version: u64,
 }
 
 impl GraphicsStore {
@@ -316,12 +323,14 @@ impl GraphicsStore {
             self.bytes -= old.data.len();
         }
         self.bytes += data.len();
+        self.next_version += 1;
         self.images.insert(
             id,
             Image {
                 id,
                 width: w,
                 height: h,
+                version: self.next_version,
                 data,
             },
         );
