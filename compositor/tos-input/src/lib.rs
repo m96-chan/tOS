@@ -11,6 +11,6 @@ pub mod keymap;
 
 pub use encode::{encode_focus, encode_key, encode_mouse, encode_paste, EncodeContext};
 pub use event::{
-    InputEvent, KeyCode, KeyEvent, KeyState, Keypad, ModifierKey, Modifiers, MouseAction,
+    ImeKey, InputEvent, KeyCode, KeyEvent, KeyState, Keypad, ModifierKey, Modifiers, MouseAction,
     MouseButton, MouseEvent, PointerEvent,
 };

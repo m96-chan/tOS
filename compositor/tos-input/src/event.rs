@@ -147,8 +147,29 @@ pub enum KeyCode {
     Menu,
     /// A modifier pressed on its own.
     ModifierKey(ModifierKey),
+    /// A conversion key from a Japanese keyboard.
+    Ime(ImeKey),
     /// Recognised by the driver but not mapped to anything.
     Unknown(u32),
+}
+
+/// The conversion keys a JIS keyboard has and a US one does not.
+///
+/// These are neither characters nor modifiers: nothing about them makes sense
+/// as text, and holding one changes no other key. They get their own variant
+/// rather than [`KeyCode::Unknown`] because an input method has to match on
+/// them by meaning, and a scancode would tie that match to the driver. The
+/// names are the W3C UI Events ones rather than the labels printed on the
+/// keycaps, because that is the vocabulary an input method and a keybinding
+/// file are already written against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImeKey {
+    /// 変換 (henkan): convert what has been typed so far.
+    Convert,
+    /// 無変換 (muhenkan): take what has been typed so far unconverted.
+    NonConvert,
+    /// かな / カタカナひらがな (katakana-hiragana): switch the input mode.
+    KanaMode,
 }
 
 /// Which physical modifier key was pressed.
