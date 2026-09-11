@@ -262,13 +262,14 @@ fn kernel_release() -> String {
     if unsafe { libc::uname(&mut info) } < 0 {
         return "unknown".to_string();
     }
-    let bytes: Vec<u8> = info
-        .release
-        .iter()
-        .take_while(|&&c| c != 0)
-        .map(|&c| c as u8)
-        .collect();
-    String::from_utf8_lossy(&bytes).into_owned()
+    // Read the field as bytes rather than casting each element: `c_char` is
+    // signed on x86_64 and unsigned on aarch64, so a per-element `as u8` is a
+    // real conversion on one and a no-op the lint rejects on the other.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(info.release.as_ptr().cast::<u8>(), info.release.len())
+    };
+    let end = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 /// Clear the flag, from a process that is not the one that set it.
