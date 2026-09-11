@@ -1,0 +1,52 @@
+name: release
+
+# Tag push -> build the ISO, prove it boots, publish a GitHub Release
+# with the image attached.
+#
+#   git tag v0.0.3 && git push origin v0.0.3
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ISO
+        run: iso/build.sh
+      - name: Smoke-boot in QEMU
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86
+          # A release must boot: success = the compositor announces itself
+          # and the live medium is found, same gate as the iso workflow.
+          timeout 120 qemu-system-x86_64 \
+            -m 1024 -cdrom dist/tos-x86_64.iso \
+            -vga std -display none -serial file:serial.log &
+          qemu_pid=$!
+          for _ in $(seq 60); do
+            grep -q "tOS: starting compositor" serial.log 2>/dev/null && break
+            sleep 2
+          done
+          kill "$qemu_pid" 2>/dev/null || true
+          echo "--- serial log ---"
+          cat serial.log || true
+          grep -q "tOS: starting compositor" serial.log
+          grep -q "tOS: live medium is" serial.log
+      - name: Stamp the version into the artifacts
+        run: |
+          mv dist/tos-x86_64.iso "dist/tos-${GITHUB_REF_NAME}-x86_64.iso"
+          (cd dist && sha256sum ./*.iso > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "tOS $GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*.iso dist/SHA256SUMS
