@@ -515,6 +515,16 @@ mod tests {
     }
 
     #[test]
+    fn a_match_at_the_front_beats_the_same_match_further_in() {
+        // Same length, same tightness: where the match starts is the only
+        // thing between these two, and a name that begins with what was typed
+        // is the one that was meant.
+        let front = score("ab", "abzz").unwrap();
+        let back = score("ab", "zzab").unwrap();
+        assert!(front > back, "{front} should beat {back}");
+    }
+
+    #[test]
     fn backspace_widens_the_list_again() {
         let mut overlay = overlay(&["ls", "vim"]);
         type_text(&mut overlay, "vi");
