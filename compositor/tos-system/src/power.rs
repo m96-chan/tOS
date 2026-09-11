@@ -908,6 +908,21 @@ mod tests {
     }
 
     #[test]
+    fn two_batteries_with_nothing_to_weigh_fall_back_to_their_mean() {
+        // Weighting needs counters in a shared unit. A pair that only reports
+        // a percentage has nothing to weigh by, so the mean is the honest
+        // answer — and it has to be the mean of both, not whichever came
+        // first out of the directory listing.
+        let tree = Tree::new("mean");
+        tree.supply("BAT0", "Battery", &[("status", "Discharging"), ("capacity", "20")])
+            .supply("BAT1", "Battery", &[("status", "Discharging"), ("capacity", "80")]);
+
+        let state = tree.state();
+        assert_eq!(state.batteries.len(), 2);
+        assert_eq!(state.percent(), Some(50));
+    }
+
+    #[test]
     fn firmware_that_reports_past_full_is_clamped() {
         let tree = Tree::new("clamp");
         tree.supply(
