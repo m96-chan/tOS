@@ -8,6 +8,8 @@ use tos_render::TextureCache;
 use tos_session::Rect;
 use tos_term::{Terminal, TerminalConfig};
 
+use crate::selection::{Anchor, Selection};
+
 /// A running pane.
 pub struct Pane {
     pub terminal: Terminal,
@@ -21,8 +23,9 @@ pub struct Pane {
     pub area: Rect,
     /// Set once the child has exited and the terminal has drained.
     pub exited: bool,
-    /// A selection being dragged with the mouse, in displayed cells.
-    pub selection: Option<tos_render::Selection>,
+    /// The selected text, anchored to the lines it was made over rather than
+    /// to the rows those lines happened to be on.
+    pub selection: Option<Selection>,
     /// Scaled image textures kept between frames. Rendering is stateless, so
     /// the cache has to live with the thing it belongs to, which is the pane
     /// whose images they are.
@@ -90,6 +93,10 @@ impl Pane {
         if !resized {
             return;
         }
+        // Resizing moves text between the screen and history and, when the
+        // width changes, between columns; the anchors would survive but would
+        // no longer be over the text they were drawn around.
+        self.clear_selection();
         self.terminal
             .resize(area.width.max(1) as usize, area.height.max(1) as usize);
         // The child only learns about the new size through the PTY.
@@ -106,6 +113,13 @@ impl Pane {
                 }
                 Ok(n) => {
                     self.terminal.advance(&buf[..n]);
+                    // The program has drawn over the screen, so a selection
+                    // left on it is describing text that may no longer be
+                    // there. A drag in progress is the exception: the user
+                    // still has the button down and is watching it.
+                    if !self.selecting {
+                        self.clear_selection();
+                    }
                     // A short read means the PTY is drained for now.
                     if n < buf.len() {
                         return true;
@@ -198,35 +212,39 @@ impl Pane {
 
     /// The text covered by the current selection.
     pub fn selected_text(&self) -> Option<String> {
-        let selection = self.selection?;
+        self.selection?.text(self.terminal.grid())
+    }
+
+    /// Where a displayed cell is in the text, which is what a selection
+    /// remembers. The pointer is clamped into the pane, so a drag past an
+    /// edge still lands somewhere real.
+    pub fn anchor_at(&self, col: usize, row: usize) -> Anchor {
         let grid = self.terminal.grid();
-        let mut out = String::new();
-        let rows = grid.rows();
-        for y in 0..rows {
-            let row = grid.display_row(y);
-            let mut line = String::new();
-            for x in 0..row.len() {
-                if !selection.contains(x, y) {
-                    continue;
-                }
-                let cell = &row.cells()[x];
-                if cell.attrs.flags.contains(tos_term::Flags::WIDE_SPACER) {
-                    continue;
-                }
-                line.push(cell.ch);
-                if let Some(marks) = &cell.zerowidth {
-                    line.extend(marks.iter());
-                }
-            }
-            let trimmed = line.trim_end();
-            if !trimmed.is_empty() || !out.is_empty() {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(trimmed);
-            }
+        let row = row.min(grid.rows().saturating_sub(1));
+        let col = col.min(grid.cols().saturating_sub(1));
+        Anchor::new(grid.display_line(row), col)
+    }
+
+    /// Replace the selection, repainting the rows it covers.
+    ///
+    /// The highlight is the compositor's, not the terminal's, so nothing else
+    /// marks those rows as needing another look.
+    pub fn set_selection(&mut self, selection: Option<Selection>) {
+        if self.selection == selection {
+            return;
         }
-        (!out.is_empty()).then_some(out)
+        self.selection = selection;
+        self.terminal.damage_mut().mark_all();
+    }
+
+    /// Drop the selection, if there is one.
+    pub fn clear_selection(&mut self) {
+        self.set_selection(None);
+    }
+
+    /// The selection in the rows it is currently drawn on, for the renderer.
+    pub fn display_selection(&self) -> Option<tos_render::Selection> {
+        self.selection?.display(self.terminal.grid())
     }
 }
 
