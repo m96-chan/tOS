@@ -19,6 +19,15 @@ const VT_GETSTATE: u64 = 0x5603;
 const VT_ACTIVATE: u64 = 0x5606;
 const VT_WAITACTIVE: u64 = 0x5607;
 const VT_RELDISP: u64 = 0x5605;
+const VT_LOCKSWITCH: u64 = 0x560b;
+const VT_UNLOCKSWITCH: u64 = 0x560c;
+
+/// Arguments to `VT_RELDISP`. The kernel suspends a switch until the process
+/// that owns the terminal answers with one of these, and zero is the answer
+/// that makes the switch not happen.
+const RELDISP_REFUSE: libc::c_long = 0;
+const RELDISP_RELEASE: libc::c_long = 1;
+const RELDISP_ACQUIRE: libc::c_long = 2;
 
 const KD_TEXT: libc::c_long = 0x00;
 const KD_GRAPHICS: libc::c_long = 0x01;
@@ -71,6 +80,11 @@ pub struct VirtualTerminal {
     saved_kb_mode: libc::c_long,
     saved_vt_mode: VtMode,
     owned: bool,
+    /// Whether `VT_LOCKSWITCH` has been taken. The kernel flag behind it is
+    /// global and has no owner, so nothing but this process will ever clear
+    /// it; forgetting to would leave a machine whose terminals cannot be
+    /// switched at all.
+    switch_locked: bool,
 }
 
 impl VirtualTerminal {
@@ -109,6 +123,7 @@ impl VirtualTerminal {
             saved_kb_mode,
             saved_vt_mode,
             owned: false,
+            switch_locked: false,
         })
     }
 
@@ -158,12 +173,58 @@ impl VirtualTerminal {
 
     /// Agree to a VT switch away from tOS.
     pub fn allow_switch_away(&self) -> io::Result<()> {
-        ioctl_value(self.fd, VT_RELDISP, 1)
+        ioctl_value(self.fd, VT_RELDISP, RELDISP_RELEASE)
+    }
+
+    /// Refuse a VT switch away from tOS.
+    ///
+    /// `VT_PROCESS` mode is not advisory: the kernel sends the release signal
+    /// and then suspends the switch until this call answers. Answering zero
+    /// makes it abandon the switch, so the user stays here. That is what lets
+    /// a locked session keep the screen — and, because the display is only
+    /// given up in the same breath as agreeing to a switch, keep DRM master
+    /// with it.
+    ///
+    /// The kernel puts no timeout on this. A process that answers neither way
+    /// leaves the switch pending for good, so refusing must be a decision the
+    /// caller makes every time rather than a mode it leaves the terminal in.
+    pub fn refuse_switch_away(&self) -> io::Result<()> {
+        ioctl_value(self.fd, VT_RELDISP, RELDISP_REFUSE)
     }
 
     /// Acknowledge coming back.
     pub fn acknowledge_switch_back(&self) -> io::Result<()> {
-        ioctl_value(self.fd, VT_RELDISP, 2)
+        ioctl_value(self.fd, VT_RELDISP, RELDISP_ACQUIRE)
+    }
+
+    /// Stop the kernel switching away from this terminal at all.
+    ///
+    /// Stronger than refusing each switch: the console switch key stops
+    /// working rather than being answered, and no other process can call
+    /// `VT_ACTIVATE` either. It needs `CAP_SYS_TTY_CONFIG`.
+    ///
+    /// It is also a single global kernel flag with no owner, which
+    /// [`VirtualTerminal::restore`] is careful to clear for the same reason
+    /// it puts the console back into text mode: a machine nobody can reach is
+    /// a worse outcome than the one this prevents.
+    pub fn lock_switching(&mut self) -> io::Result<()> {
+        ioctl_value(self.fd, VT_LOCKSWITCH, 0)?;
+        self.switch_locked = true;
+        Ok(())
+    }
+
+    /// Allow switching again.
+    pub fn unlock_switching(&mut self) -> io::Result<()> {
+        // Clearing the flag first: a failure here has to leave the terminal
+        // claiming the lock is still taken, so that restoring tries again.
+        ioctl_value(self.fd, VT_UNLOCKSWITCH, 0)?;
+        self.switch_locked = false;
+        Ok(())
+    }
+
+    /// Whether switching away has been locked out.
+    pub fn switching_locked(&self) -> bool {
+        self.switch_locked
     }
 
     /// Switch to another virtual terminal.
@@ -174,6 +235,12 @@ impl VirtualTerminal {
 
     /// Hand the terminal back to the kernel.
     pub fn restore(&mut self) {
+        // Before the `owned` check, and before anything that can fail: this
+        // flag is global to the kernel, so leaving it set would take every
+        // virtual terminal on the machine with it, not just this one.
+        if self.switch_locked {
+            let _ = self.unlock_switching();
+        }
         if !self.owned {
             return;
         }
@@ -264,6 +331,38 @@ mod tests {
         assert_eq!(KDSKBMODE, 0x4b45);
         assert_eq!(VT_SETMODE, 0x5602);
         assert_eq!(VT_RELDISP, 0x5605);
+        assert_eq!(VT_LOCKSWITCH, 0x560b);
+        assert_eq!(VT_UNLOCKSWITCH, 0x560c);
+    }
+
+    #[test]
+    fn releasing_and_refusing_a_switch_are_different_answers() {
+        // Zero is the whole of what stops a Ctrl+Alt+F2. Getting it confused
+        // with the release value would turn a locked session into one that
+        // agrees to hand the screen over.
+        assert_eq!(RELDISP_REFUSE, 0);
+        assert_eq!(RELDISP_RELEASE, 1);
+        assert_eq!(RELDISP_ACQUIRE, 2);
+        assert_ne!(RELDISP_REFUSE, RELDISP_RELEASE);
+    }
+
+    #[test]
+    fn a_failed_lock_is_not_recorded_as_taken() {
+        // /dev/null is a character device that answers no VT ioctl, which is
+        // the shape of every way this can fail: no capability, not a console.
+        // Recording the lock anyway would make `restore` clear a global flag
+        // this process never set.
+        let mut vt = VirtualTerminal::open("/dev/null").expect("/dev/null opens");
+        assert!(vt.lock_switching().is_err());
+        assert!(!vt.switching_locked());
+    }
+
+    #[test]
+    fn a_terminal_that_was_never_taken_over_is_left_alone() {
+        let mut vt = VirtualTerminal::open("/dev/null").expect("/dev/null opens");
+        assert!(!vt.switching_locked());
+        vt.restore();
+        assert!(!vt.switching_locked());
     }
 
     #[test]
