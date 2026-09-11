@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use tos_pty::{Pty, PtyConfig, Winsize};
 use tos_render::TextureCache;
 use tos_session::Rect;
-use tos_term::{Terminal, TerminalConfig};
+use tos_term::{Palette, Terminal, TerminalConfig};
 
 /// A running pane.
 pub struct Pane {
@@ -45,6 +45,7 @@ impl Pane {
         area: Rect,
         cell_size: (u32, u32),
         scrollback: usize,
+        palette: &Palette,
         command: Option<&[String]>,
     ) -> io::Result<Pane> {
         let winsize = winsize_for(area, cell_size);
@@ -57,7 +58,7 @@ impl Pane {
         let program = config.program.clone();
         let pty = Pty::spawn(&config)?;
 
-        let terminal = Terminal::new(
+        let mut terminal = Terminal::new(
             area.width.max(1) as usize,
             area.height.max(1) as usize,
             TerminalConfig {
@@ -67,6 +68,7 @@ impl Pane {
                 ..TerminalConfig::default()
             },
         );
+        terminal.set_palette(palette.clone());
 
         Ok(Pane {
             terminal,

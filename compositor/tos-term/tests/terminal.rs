@@ -491,6 +491,22 @@ fn valid_color_specs_still_parse() {
 }
 
 #[test]
+fn a_configured_palette_survives_a_reset() {
+    let mut t = term(10, 2);
+    let mut palette = tos_term::Palette::new();
+    palette.background = tos_term::Rgb::new(0x10, 0x20, 0x30);
+    palette.set_index(1, tos_term::Rgb::new(0x40, 0x50, 0x60));
+    t.set_palette(palette);
+
+    // An application changes the colours and then puts them back. Back means
+    // what the machine was configured with, not what tOS ships with.
+    t.advance(b"\x1b]11;#ff0000\x07\x1b]4;1;#00ff00\x07");
+    t.advance(b"\x1b]111\x07\x1b]104;1\x07");
+    assert_eq!(t.palette().background, tos_term::Rgb::new(0x10, 0x20, 0x30));
+    assert_eq!(t.palette().index(1), tos_term::Rgb::new(0x40, 0x50, 0x60));
+}
+
+#[test]
 fn an_enormous_parameter_does_not_wrap_around() {
     let mut t = term(10, 5);
     // Saturating rather than wrapping keeps this a clamp to the last row.

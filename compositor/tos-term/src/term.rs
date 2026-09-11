@@ -305,6 +305,16 @@ impl Terminal {
         &self.palette
     }
 
+    /// Replace the palette, including the one a reset goes back to.
+    ///
+    /// Colours that came from configuration have to become this terminal's
+    /// idea of default as well, or the first `OSC 104` an application sends
+    /// would quietly put the built-in palette back.
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.default_palette = palette.clone();
+        self.palette = palette;
+    }
+
     pub fn mouse(&self) -> MouseState {
         self.mouse
     }
