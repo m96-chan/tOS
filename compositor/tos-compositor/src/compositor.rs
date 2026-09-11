@@ -26,6 +26,8 @@ use crate::pane::Pane;
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 /// Longest a frame may wait when nothing is happening.
 const IDLE_TIMEOUT_MS: i32 = 100;
+/// How long to wait when a pane still has input queued for its child.
+const WRITE_RETRY_TIMEOUT_MS: i32 = 4;
 /// How long a transient status message stays up.
 const MESSAGE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -50,6 +52,8 @@ pub struct Compositor {
     pointer: (u32, u32),
     /// The pane a mouse button went down on.
     mouse_grab: Option<PaneId>,
+    /// Some pane still has input queued, so the loop must not idle.
+    pending_writes: bool,
 }
 
 impl Compositor {
@@ -71,6 +75,7 @@ impl Compositor {
             running: true,
             pointer: (0, 0),
             mouse_grab: None,
+            pending_writes: false,
             config,
         };
 
@@ -184,6 +189,16 @@ impl Compositor {
             }
             if let Some(pane) = self.panes.get_mut(&id) {
                 pane.flush_responses();
+                // A large paste does not fit the PTY buffer in one write, so
+                // the remainder is retried until the child has read it.
+                if pane.flush_input() {
+                    self.pending_writes = true;
+                }
+                if pane.input_overflowed() {
+                    self.message =
+                        Some(("input dropped: pane is not reading".into(), Instant::now()));
+                    changed = true;
+                }
             }
         }
 
@@ -252,10 +267,27 @@ impl Compositor {
     pub fn handle_input(&mut self, event: InputEvent) -> bool {
         match event {
             InputEvent::Key(key) => self.handle_key(key),
-            InputEvent::Mouse(mouse) => self.handle_mouse(mouse),
-            InputEvent::PointerMotion { x, y } => {
-                self.pointer = (x.max(0.0) as u32, y.max(0.0) as u32);
-                false
+            // A host terminal reports cells; a device reports pixels. The two
+            // are separate types so the conversion can never be skipped.
+            InputEvent::Mouse(mouse) => self.route_mouse(
+                mouse.col as u32,
+                mouse.row as u32,
+                mouse.button,
+                mouse.action,
+                mouse.modifiers,
+            ),
+            InputEvent::Pointer(pointer) => {
+                let (cw, ch) = self.cell_size();
+                let x = pointer.x.max(0.0) as u32;
+                let y = pointer.y.max(0.0) as u32;
+                self.pointer = (x, y);
+                self.route_mouse(
+                    x / cw,
+                    y / ch,
+                    pointer.button,
+                    pointer.action,
+                    pointer.modifiers,
+                )
             }
             InputEvent::Paste(text) => {
                 self.paste_text(&text);
@@ -304,67 +336,86 @@ impl Compositor {
         }
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
-        // Mouse coordinates arrive in pixels from the device layer.
-        let (cw, ch) = self.cell_size();
-        let (px, py) = (mouse.col as u32, mouse.row as u32);
-        self.pointer = (px, py);
-        let (cell_x, cell_y) = (px / cw, py / ch);
-
+    /// Route a mouse event that is already in display cell coordinates.
+    fn route_mouse(
+        &mut self,
+        cell_x: u32,
+        cell_y: u32,
+        button: Option<MouseButton>,
+        action: MouseAction,
+        modifiers: tos_input::Modifiers,
+    ) -> bool {
         let area = self.grid_area();
-        let target = self
-            .session
-            .active()
-            .geometry(area)
-            .into_iter()
-            .find(|(_, rect)| rect.contains(cell_x, cell_y));
+        let geometry = self.session.active().geometry(area);
+
         // A drag that started in a pane keeps going there even once the
-        // pointer leaves it, which is what makes selection usable.
-        let (pane_id, rect) = match (target, self.mouse_grab) {
-            (Some(hit), None) => hit,
-            (_, Some(grabbed)) => {
-                let area = self
-                    .session
-                    .active()
-                    .geometry(area)
-                    .into_iter()
-                    .find(|(id, _)| *id == grabbed);
-                match area {
-                    Some(hit) => hit,
-                    None => return false,
+        // pointer leaves it, which is what makes selection usable. A grab on a
+        // pane that has since closed is dropped rather than wedging the mouse.
+        let grabbed = self.mouse_grab.and_then(|id| {
+            geometry
+                .iter()
+                .find(|(pane, _)| *pane == id)
+                .map(|(pane, rect)| (*pane, *rect))
+        });
+        if self.mouse_grab.is_some() && grabbed.is_none() {
+            self.mouse_grab = None;
+        }
+
+        let hit = geometry
+            .iter()
+            .find(|(_, rect)| rect.contains(cell_x, cell_y))
+            .map(|(pane, rect)| (*pane, *rect));
+
+        // A press always re-targets: it starts a new interaction, and the pane
+        // under the pointer is the one it belongs to. Everything else follows
+        // the grab, so a drag can leave the pane it started in.
+        let target = if action == MouseAction::Press {
+            if let Some((pane, _)) = hit {
+                if self.mouse_grab.is_some_and(|grabbed| grabbed != pane) {
+                    self.release_grab();
                 }
             }
-            (None, None) => return false,
+            hit.or(grabbed)
+        } else {
+            grabbed.or(hit)
         };
+        let Some((pane_id, rect)) = target else {
+            return false;
+        };
+        // A pane with no area cannot be interacted with, and clamping into it
+        // would be a division by an empty range.
+        if rect.is_empty() {
+            return false;
+        }
 
         let mut changed = false;
-        if mouse.action == MouseAction::Press && self.session.focus() != pane_id {
+        if action == MouseAction::Press && self.session.focus() != pane_id {
             self.session.set_focus(pane_id);
             self.needs_full_redraw = true;
             changed = true;
         }
 
         // Clamp into the pane so a drag past its edge still selects sensibly.
+        let local_col = cell_x.clamp(rect.x, rect.right() - 1) - rect.x;
+        let local_row = cell_y.clamp(rect.y, rect.bottom() - 1) - rect.y;
         let local = MouseEvent {
-            col: cell_x.clamp(rect.x, rect.right().saturating_sub(1)).saturating_sub(rect.x) as usize,
-            row: cell_y.clamp(rect.y, rect.bottom().saturating_sub(1)).saturating_sub(rect.y) as usize,
-            ..mouse
+            button,
+            action,
+            col: local_col as usize,
+            row: local_row as usize,
+            modifiers,
         };
 
-        let (tracking, alt_screen) = match self.panes.get(&pane_id) {
-            Some(pane) => (
-                pane.terminal.mouse(),
-                pane.terminal.modes.alt_screen,
-            ),
+        let tracking = match self.panes.get(&pane_id) {
+            Some(pane) => pane.terminal.mouse(),
             None => return changed,
         };
-        let _ = alt_screen;
 
         // Wheel events scroll the compositor's own scrollback unless the
         // program is tracking the mouse itself.
-        if let Some(button) = mouse.button {
+        if let Some(button) = button {
             if button.is_wheel() && !tracking.is_enabled() {
-                if mouse.action != MouseAction::Press {
+                if action != MouseAction::Press {
                     return changed;
                 }
                 return self.scroll_wheel(pane_id, button) || changed;
@@ -384,13 +435,13 @@ impl Compositor {
         let mut copied = None;
         let mut paste = false;
         if let Some(pane) = self.panes.get_mut(&pane_id) {
-            match mouse.action {
-                MouseAction::Press if mouse.button == Some(MouseButton::Left) => {
+            match action {
+                MouseAction::Press if button == Some(MouseButton::Left) => {
                     pane.selecting = true;
                     pane.selection = Some(Selection::new(
                         (local.col, local.row),
                         (local.col, local.row),
-                        mouse.modifiers.alt(),
+                        modifiers.alt(),
                     ));
                     self.mouse_grab = Some(pane_id);
                     changed = true;
@@ -407,7 +458,7 @@ impl Compositor {
                     copied = pane.selected_text();
                     changed = true;
                 }
-                MouseAction::Press if mouse.button == Some(MouseButton::Middle) => {
+                MouseAction::Press if button == Some(MouseButton::Middle) => {
                     paste = true;
                 }
                 _ => {}
@@ -425,6 +476,15 @@ impl Compositor {
             changed = true;
         }
         changed
+    }
+
+    /// Abandon an interaction that was still in progress in another pane.
+    fn release_grab(&mut self) {
+        if let Some(pane) = self.mouse_grab.take() {
+            if let Some(pane) = self.panes.get_mut(&pane) {
+                pane.selecting = false;
+            }
+        }
     }
 
     fn scroll_wheel(&mut self, id: PaneId, button: MouseButton) -> bool {
@@ -540,7 +600,7 @@ impl Compositor {
                 changed
             }
             Action::MovePaneToWorkspace(n) => {
-                let moved = self.session.move_focused_to_workspace(n);
+                let moved = self.session.move_focused_to_workspace(area, n);
                 if moved {
                     self.sync_layout();
                     self.needs_full_redraw = true;
@@ -612,19 +672,23 @@ impl Compositor {
     }
 
     fn split(&mut self, axis: Axis) -> bool {
-        let Some(new_id) = self.session.split_focused(axis) else {
-            return false;
+        let area = self.grid_area();
+        let Some(new_id) = self.session.split_focused(area, axis) else {
+            // Refusing is the right answer when the pane is too small; saying
+            // so beats silently creating a pane with nowhere to go.
+            self.message = Some(("no room to split".to_string(), Instant::now()));
+            return true;
         };
-        let area = self
+        let pane_area = self
             .session
             .active()
-            .geometry(self.grid_area())
+            .geometry(area)
             .into_iter()
             .find(|(id, _)| *id == new_id)
             .map(|(_, rect)| rect)
             .unwrap_or(Rect::new(0, 0, 80, 24));
 
-        match self.spawn_pane(area) {
+        match self.spawn_pane(pane_area) {
             Ok(pane) => {
                 self.panes.insert(new_id, pane);
                 self.sync_layout();
@@ -652,6 +716,9 @@ impl Compositor {
         }
         for pane in closed {
             self.panes.remove(&pane);
+            if self.mouse_grab == Some(pane) {
+                self.mouse_grab = None;
+            }
         }
         self.sync_layout();
         self.needs_full_redraw = true;
@@ -701,6 +768,7 @@ impl Compositor {
             surface.clear(self.chrome.background);
         }
 
+        let mut drawn: Vec<PaneId> = Vec::with_capacity(geometry.len());
         for (id, rect) in &geometry {
             let Some(pane) = self.panes.get(id) else {
                 continue;
@@ -710,6 +778,7 @@ impl Compositor {
             if pane.terminal.modes.synchronized_output && !force {
                 continue;
             }
+            drawn.push(*id);
             let pixel_rect = PixelRect::new(
                 (rect.x * cw) as i32,
                 (rect.y * ch) as i32,
@@ -771,8 +840,14 @@ impl Compositor {
             self.draw_status(surface, area, ch);
         }
 
-        for pane in self.panes.values_mut() {
-            pane.terminal.clear_damage();
+        for (id, pane) in self.panes.iter_mut() {
+            // A pane skipped for synchronized output was not painted, so its
+            // damage still describes work outstanding; clearing it here would
+            // lose the whole update.
+            let skipped = !drawn.contains(id);
+            if !skipped {
+                pane.terminal.clear_damage();
+            }
         }
         self.needs_full_redraw = false;
     }
@@ -836,7 +911,15 @@ impl Compositor {
     ) -> io::Result<()> {
         let mut fds = self.pty_fds();
         fds.extend_from_slice(input_fds);
-        let ready = tos_platform::tty::poll_readable(&fds, IDLE_TIMEOUT_MS)?;
+        // With input still queued the loop has to come back promptly to retry
+        // it, rather than waiting for something to read.
+        let timeout = if self.pending_writes {
+            WRITE_RETRY_TIMEOUT_MS
+        } else {
+            IDLE_TIMEOUT_MS
+        };
+        self.pending_writes = false;
+        let ready = tos_platform::tty::poll_readable(&fds, timeout)?;
 
         let mut dirty = false;
         for fd in &ready {

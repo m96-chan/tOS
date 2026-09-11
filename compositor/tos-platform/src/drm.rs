@@ -216,6 +216,9 @@ fn ioctl_num<T>(nr: u64) -> u64 {
 const DRM_IOCTL_SET_MASTER: u64 = io_only(0x1e);
 const DRM_IOCTL_DROP_MASTER: u64 = io_only(0x1f);
 const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
+/// How long to wait for a page flip to report back before falling back to a
+/// mode set. Two frames at 60Hz, so a slow panel is not given up on early.
+const FLIP_TIMEOUT_MS: u64 = 34;
 
 fn ioctl<T>(fd: RawFd, request: u64, arg: &mut T) -> io::Result<()> {
     let result = unsafe { libc::ioctl(fd, request as _, arg as *mut T) };
@@ -339,11 +342,22 @@ impl Card {
             return Ok(None);
         }
 
+        let allocated = (connector_ids.len(), crtc_ids.len());
         res.connector_id_ptr = connector_ids.as_mut_ptr() as u64;
         res.crtc_id_ptr = crtc_ids.as_mut_ptr() as u64;
         res.encoder_id_ptr = encoder_ids.as_mut_ptr() as u64;
         res.fb_id_ptr = fb_ids.as_mut_ptr() as u64;
         ioctl(self.fd, ioctl_num::<CardRes>(0xa0), &mut res)?;
+        // Same race as the connector query: a grown list means the arrays were
+        // not filled in, and acting on the zeros would fail confusingly.
+        if res.count_connectors as usize > allocated.0 || res.count_crtcs as usize > allocated.1 {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "the display configuration changed while it was being read",
+            ));
+        }
+        connector_ids.truncate(res.count_connectors as usize);
+        crtc_ids.truncate(res.count_crtcs as usize);
 
         for &connector_id in &connector_ids {
             let Some(output) = self.query_connector(connector_id, &crtc_ids)? else {
@@ -388,6 +402,12 @@ impl Card {
             ..GetConnector::default()
         };
         ioctl(self.fd, ioctl_num::<GetConnector>(0xa7), &mut conn)?;
+        // The kernel copies nothing and reports the larger count when the mode
+        // list grew between the two calls, so a count above what was allocated
+        // means the arrays were left untouched rather than filled.
+        if (conn.count_modes as usize) > modes.len() {
+            return Ok(None);
+        }
         modes.truncate(conn.count_modes as usize);
         if modes.is_empty() {
             return Ok(None);
@@ -450,7 +470,13 @@ impl Drop for Card {
 // ---------------------------------------------------------------------------
 
 /// A CPU addressable framebuffer owned by the kernel.
+///
+/// The device descriptor is kept so the buffer can release itself: leaving
+/// that to the caller meant every error path leaked a framebuffer, a GEM
+/// handle and a mapping, and a mapping still held keeps the memory alive even
+/// after the device is closed.
 struct DumbBuffer {
+    fd: RawFd,
     handle: u32,
     fb_id: u32,
     width: u32,
@@ -488,6 +514,19 @@ impl DumbBuffer {
             return Err(e);
         }
 
+        // From here on the buffer owns the framebuffer and the handle, so any
+        // later failure releases them through `Drop`.
+        let mut buffer = DumbBuffer {
+            fd,
+            handle: create.handle,
+            fb_id: fb.fb_id,
+            width,
+            height,
+            pitch: create.pitch,
+            size: create.size,
+            map: libc::MAP_FAILED,
+        };
+
         let mut map = MapDumb {
             handle: create.handle,
             ..MapDumb::default()
@@ -507,21 +546,13 @@ impl DumbBuffer {
         if ptr == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
+        buffer.map = ptr;
 
         // A freshly allocated buffer holds whatever was in memory before.
         unsafe {
             std::ptr::write_bytes(ptr as *mut u8, 0, create.size as usize);
         }
-
-        Ok(DumbBuffer {
-            handle: create.handle,
-            fb_id: fb.fb_id,
-            width,
-            height,
-            pitch: create.pitch,
-            size: create.size,
-            map: ptr,
-        })
+        Ok(buffer)
     }
 
     /// The buffer as a pixel slice.
@@ -537,14 +568,25 @@ impl DumbBuffer {
         self.pitch / 4
     }
 
-    fn destroy(&mut self, fd: RawFd) {
-        unsafe {
-            libc::munmap(self.map, self.size as usize);
+}
+
+impl Drop for DumbBuffer {
+    fn drop(&mut self) {
+        // Order matters: the mapping holds a reference to the object, so it
+        // has to go before the handle is destroyed or the memory stays live.
+        if self.map != libc::MAP_FAILED {
+            unsafe {
+                libc::munmap(self.map, self.size as usize);
+            }
+        }
+        if self.fb_id != 0 {
+            let mut fb_id = self.fb_id;
+            let _ = ioctl(self.fd, ioctl_num::<u32>(0xaf), &mut fb_id);
         }
         let mut destroy = DestroyDumb {
             handle: self.handle,
         };
-        let _ = ioctl(fd, ioctl_num::<DestroyDumb>(0xb4), &mut destroy);
+        let _ = ioctl(self.fd, ioctl_num::<DestroyDumb>(0xb4), &mut destroy);
     }
 }
 
@@ -704,17 +746,40 @@ impl DrmDisplay {
             events: libc::POLLIN,
             revents: 0,
         };
-        // A flip that never completes would hang the compositor; give up after
-        // a frame's worth of time and carry on.
-        let ready = unsafe { libc::poll(&mut poll, 1, 100) };
-        if ready > 0 {
+        // Waiting must not be open ended, but it also must not give up on the
+        // first interruption: drawing into a buffer the display is still
+        // scanning out shows a torn frame, and the next flip is then rejected.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(FLIP_TIMEOUT_MS);
+        while self.flip_pending {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let ready = unsafe { libc::poll(&mut poll, 1, remaining.as_millis() as libc::c_int) };
+            if ready < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if ready == 0 {
+                break;
+            }
             let mut buf = [0u8; 1024];
             let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n > 0 {
-                self.consume_events(&buf[..n as usize]);
+            if n <= 0 {
+                break;
             }
+            self.consume_events(&buf[..n as usize]);
         }
-        self.flip_pending = false;
+        // A flip that never reported back leaves the compositor unsure which
+        // buffer is live; the next frame falls back to a mode set, which is
+        // unambiguous.
+        if self.flip_pending {
+            self.flip_pending = false;
+            self.mode_set = false;
+        }
         Ok(())
     }
 
@@ -734,6 +799,8 @@ impl DrmDisplay {
                 let event: EventVblank =
                     unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const EventVblank) };
                 self.last_sequence = event.sequence;
+                // The buffer that was being scanned out is now free to draw on.
+                self.flip_pending = false;
             }
             bytes = &bytes[length..];
         }
@@ -835,10 +902,8 @@ impl Drop for DrmDisplay {
     fn drop(&mut self) {
         let _ = self.wait_for_flip();
         self.restore_crtc();
-        let fd = self.card.fd();
-        for buffer in &mut self.buffers {
-            buffer.destroy(fd);
-        }
+        // The buffers release themselves; they must do so before the device
+        // descriptor is closed, which the field order guarantees.
     }
 }
 

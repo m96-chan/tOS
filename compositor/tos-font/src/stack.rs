@@ -39,6 +39,9 @@ impl FontStack {
     /// Append a fallback, tried after every source already added.
     pub fn push_fallback(&mut self, source: Box<dyn GlyphSource>) {
         self.sources.push(source);
+        // Characters already resolved to the missing-glyph box might be
+        // covered by the new source, and a cached box would never be revisited.
+        self.cache.clear();
     }
 
     pub fn metrics(&self) -> FontMetrics {
@@ -214,6 +217,36 @@ mod tests {
         stack.push_fallback(Box::new(OnlyQ));
         let g = stack.glyph('漢', RasterStyle::REGULAR);
         assert_eq!(g.coverage, vec![0x7f]);
+    }
+
+    #[test]
+    fn adding_a_fallback_invalidates_the_cache() {
+        struct OnlyCjk;
+        impl GlyphSource for OnlyCjk {
+            fn metrics(&self) -> FontMetrics {
+                BitmapFont::new(2).metrics()
+            }
+            fn has_glyph(&self, c: char) -> bool {
+                c == '漢'
+            }
+            fn rasterize(&mut self, c: char, _style: RasterStyle) -> Option<Glyph> {
+                (c == '漢').then(|| Glyph {
+                    width: 1,
+                    height: 1,
+                    left: 0,
+                    top: 1,
+                    coverage: vec![0x5a],
+                })
+            }
+        }
+
+        let mut stack = stack();
+        // Resolved to the missing box while no source covers it.
+        let before = stack.glyph('漢', RasterStyle::REGULAR).coverage.clone();
+        stack.push_fallback(Box::new(OnlyCjk));
+        let after = stack.glyph('漢', RasterStyle::REGULAR).coverage.clone();
+        assert_ne!(before, after, "the stale box must not be cached forever");
+        assert_eq!(after, vec![0x5a]);
     }
 
     #[test]

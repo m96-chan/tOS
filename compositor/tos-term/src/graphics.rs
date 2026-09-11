@@ -360,7 +360,10 @@ impl GraphicsStore {
             cmd.image_number
         };
         match self.pending.take() {
-            Some((pending_key, first, mut buf)) if pending_key == key || cmd.image_id == 0 => {
+            // A continuation either names the same image or, as the protocol
+            // allows, names nothing at all. A command that names a *different*
+            // image starts a new transmission and supersedes this one.
+            Some((pending_key, first, mut buf)) if key == 0 || pending_key == key => {
                 buf.extend_from_slice(&cmd.payload);
                 if cmd.more {
                     self.pending = Some((pending_key, first, buf));
@@ -618,6 +621,21 @@ mod tests {
         let (cmd, payload) = store.accumulate(&last).unwrap();
         assert_eq!(cmd.image_id, 3);
         assert_eq!(payload.len(), 6);
+    }
+
+    #[test]
+    fn a_differently_identified_command_does_not_join_a_pending_transfer() {
+        let mut store = GraphicsStore::new(1 << 20);
+        let abandoned = GraphicsCommand::parse(b"a=t,f=32,s=1,v=1,i=1,m=1;AAAA").unwrap();
+        assert!(store.accumulate(&abandoned).is_none());
+
+        // A complete command that identifies itself by image number must be
+        // stored as itself, not appended to the stale buffer.
+        let fresh = GraphicsCommand::parse(b"a=t,f=32,s=1,v=1,I=7;BBBBBB").unwrap();
+        let (cmd, payload) = store.accumulate(&fresh).unwrap();
+        assert_eq!(cmd.image_number, 7);
+        assert_eq!(cmd.image_id, 0);
+        assert_eq!(payload, fresh.payload);
     }
 
     #[test]

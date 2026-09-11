@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use tos_input::{KeyCode, KeyEvent, Modifiers};
+use tos_input::{KeyCode, KeyEvent, KeyState, Modifiers};
 
 use crate::layout::{Axis, Direction};
 
@@ -208,9 +208,25 @@ impl Keymap {
         if !event.is_press() {
             return Resolution::Passthrough;
         }
-        // A modifier on its own never triggers or cancels anything.
-        if matches!(event.code, KeyCode::ModifierKey(_)) {
+        // Modifier and lock keys are not commands: pressing one must neither
+        // trigger a binding nor consume a leader that is waiting.
+        if matches!(
+            event.code,
+            KeyCode::ModifierKey(_)
+                | KeyCode::CapsLock
+                | KeyCode::NumLock
+                | KeyCode::ScrollLock
+        ) {
             return Resolution::Passthrough;
+        }
+        // Holding the leader down repeats it; that is one keypress, not two,
+        // so a repeat must not disarm what the first press armed.
+        if event.state == KeyState::Repeat && self.leader_armed {
+            if let Some(leader) = self.leader {
+                if leader.matches(event) {
+                    return Resolution::Pending;
+                }
+            }
         }
 
         let lookup = |table: &HashMap<Binding, Action>| {
@@ -259,7 +275,6 @@ impl Default for Keymap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tos_input::KeyState;
 
     fn press(code: KeyCode, modifiers: Modifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -334,6 +349,43 @@ mod tests {
         );
         assert_eq!(keymap.resolve(&shift), Resolution::Passthrough);
         assert!(keymap.is_pending(), "leader should still be armed");
+    }
+
+    #[test]
+    fn holding_the_leader_does_not_disarm_it() {
+        // Autorepeat is one keypress held down, not a second press.
+        let mut keymap = Keymap::default_bindings();
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL)),
+            Resolution::Pending
+        );
+        for _ in 0..5 {
+            let repeat =
+                press(KeyCode::Char('a'), Modifiers::CTRL).with_state(KeyState::Repeat);
+            assert_eq!(keymap.resolve(&repeat), Resolution::Pending);
+            assert!(keymap.is_pending());
+        }
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('d'), Modifiers::NONE)),
+            Resolution::Action(Action::Split(Axis::Columns))
+        );
+    }
+
+    #[test]
+    fn lock_keys_do_not_consume_an_armed_leader() {
+        let mut keymap = Keymap::default_bindings();
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        for lock in [KeyCode::CapsLock, KeyCode::NumLock, KeyCode::ScrollLock] {
+            assert_eq!(
+                keymap.resolve(&press(lock, Modifiers::NONE)),
+                Resolution::Passthrough
+            );
+            assert!(keymap.is_pending(), "{lock:?} ate the leader");
+        }
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('s'), Modifiers::NONE)),
+            Resolution::Action(Action::Split(Axis::Rows))
+        );
     }
 
     #[test]

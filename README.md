@@ -584,6 +584,11 @@ What has been exercised, and how:
 | Whole compositor | tests that run shells in split panes and inspect pixels |
 | DRM/KMS, evdev, VT ownership | compile for x86_64 and arm64 Linux; ioctl numbers and structure layouts are unit-tested against the kernel headers |
 
+Panes refuse to split once they are too small to divide, rather than creating
+a pane with nowhere to go, and a virtual terminal is only taken over once the
+VT switch signals have handlers, so switching away with Ctrl+Alt+F2 cannot
+leave the console in graphics mode with no keyboard.
+
 The last row is the honest gap: the kernel-facing backends have not yet been
 run on hardware. Everything above them has, through the nested and headless
 backends.

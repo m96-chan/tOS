@@ -407,3 +407,111 @@ fn scrollback_viewport_snaps_back_on_output() {
     t.advance(b"e");
     assert_eq!(t.display_offset(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Regressions found in review
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_malformed_color_spec_does_not_panic() {
+    // The spec arrives through `from_utf8_lossy`, so a stray byte becomes a
+    // multi-byte replacement character; slicing it by byte offset used to
+    // abort the whole compositor.
+    let mut t = term(10, 2);
+    t.advance(b"\x1b]11;#\xff\x07");
+    t.advance(b"\x1b]4;1;#\xff\x07");
+    t.advance("\x1b]11;#a\u{20ac}\x07".as_bytes());
+    t.advance(b"\x1b]10;#\x07");
+    // The terminal is still usable afterwards.
+    t.advance(b"ok");
+    assert_eq!(screen(&t)[0], "ok");
+}
+
+#[test]
+fn valid_color_specs_still_parse() {
+    let mut t = term(10, 2);
+    t.advance(b"\x1b]11;#ff0000\x07");
+    assert_eq!(t.palette().background, tos_term::Rgb::new(0xff, 0, 0));
+    t.advance(b"\x1b]11;rgb:00/ff/00\x07");
+    assert_eq!(t.palette().background, tos_term::Rgb::new(0, 0xff, 0));
+}
+
+#[test]
+fn an_enormous_parameter_does_not_wrap_around() {
+    let mut t = term(10, 5);
+    // Saturating rather than wrapping keeps this a clamp to the last row.
+    t.advance(b"\x1b[99999999999;1Hx");
+    assert_eq!(screen(&t)[4], "x");
+}
+
+#[test]
+fn newline_mode_does_not_swallow_a_line_after_a_full_row() {
+    let mut t = term(4, 4);
+    t.advance(b"\x1b[20h");
+    t.advance(b"abcd\ne");
+    assert_eq!(screen(&t)[0], "abcd");
+    assert_eq!(screen(&t)[1], "e", "the deferred wrap must be cleared");
+}
+
+#[test]
+fn vertical_position_absolute_respects_origin_mode() {
+    let mut t = term(10, 10);
+    t.advance(b"\x1b[4;8r\x1b[?6h");
+    t.advance(b"\x1b[1dX");
+    // Row 1 of the region is absolute row 3.
+    assert_eq!(screen(&t)[3], "X");
+    assert_eq!(t.cursor().y, 3);
+}
+
+#[test]
+fn a_scroll_region_past_the_last_row_is_clamped_not_ignored() {
+    let mut t = term(10, 10);
+    t.advance(b"\x1b[3;6r");
+    // A stale region from before a resize must not stick.
+    t.advance(b"\x1b[1;40r");
+    t.advance(b"\x1b[10;1Ha\n b");
+    // With the full screen region restored, the last line scrolls the screen.
+    assert_eq!(t.grid().scrollback_len(), 1);
+}
+
+#[test]
+fn del_and_c1_bytes_are_discarded() {
+    let mut t = term(10, 1);
+    t.advance(b"ab\x7f\x7f\x7f");
+    let cell = t.grid().cell(1, 0).unwrap();
+    assert_eq!(cell.ch, 'b');
+    assert!(cell.zerowidth.is_none(), "DEL must not become a combining mark");
+    assert_eq!(t.cursor().x, 2);
+}
+
+#[test]
+fn combining_marks_on_one_cell_are_bounded() {
+    let mut t = term(10, 1);
+    t.advance(b"a");
+    for _ in 0..1000 {
+        t.advance("\u{0301}".as_bytes());
+    }
+    let marks = t.grid().cell(0, 0).unwrap().zerowidth.clone().unwrap();
+    assert!(marks.len() <= tos_term::Cell::MAX_ZEROWIDTH);
+}
+
+#[test]
+fn resizing_on_the_alternate_screen_keeps_the_newest_primary_output() {
+    let mut t = term(10, 4);
+    t.advance(b"l1\r\nl2\r\nl3\r\nl4");
+    t.advance(b"\x1b[?1049h");
+    t.resize(10, 2);
+    t.advance(b"\x1b[?1049l");
+    // The shell's most recent output survives; the oldest is what goes.
+    assert_eq!(screen(&t)[0], "l3");
+    assert_eq!(screen(&t)[1], "l4");
+}
+
+#[test]
+fn resizing_on_the_primary_screen_still_keeps_the_newest_output() {
+    let mut t = term(10, 4);
+    t.advance(b"l1\r\nl2\r\nl3\r\nl4");
+    t.resize(10, 2);
+    assert_eq!(screen(&t)[0], "l3");
+    assert_eq!(screen(&t)[1], "l4");
+}

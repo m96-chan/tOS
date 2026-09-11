@@ -9,6 +9,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tos_input::host::HostInput;
+use tos_platform::tty::ReadOutcome;
 use tos_platform::{Display, HeadlessDisplay, NestedDisplay};
 
 use tos_compositor::config::{parse_args, Backend, Config, USAGE};
@@ -40,11 +41,17 @@ fn install_signal_handlers() {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "-h" || a == "--help") {
+    // Everything after `-e` belongs to the child, so `tos -e git --help` must
+    // run git's help rather than printing this one.
+    let own_args = match args.iter().position(|a| a == "-e" || a == "--command") {
+        Some(at) => &args[..at],
+        None => &args[..],
+    };
+    if own_args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{USAGE}");
         return ExitCode::SUCCESS;
     }
-    if args.iter().any(|a| a == "-V" || a == "--version") {
+    if own_args.iter().any(|a| a == "-V" || a == "--version") {
         println!("tOS {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
@@ -151,16 +158,26 @@ fn run_nested(config: Config) -> io::Result<()> {
 
     let mut decoder = HostInput::new();
     let mut buf = vec![0u8; 8192];
+    let mut input_ended = false;
 
-    while compositor.is_running() && !TERMINATE.load(Ordering::Relaxed) {
+    while compositor.is_running() && !TERMINATE.load(Ordering::Relaxed) && !input_ended {
         if RESIZED.swap(false, Ordering::Relaxed) && display.refresh_size()? {
             compositor.resize(display.size());
         }
         compositor.run_once(&mut display, &[input_fd], |fd| {
             match tos_platform::tty::read_available(fd, &mut buf) {
-                Ok(0) => Vec::new(),
-                Ok(n) => decoder.feed(&buf[..n]),
-                Err(_) => Vec::new(),
+                Ok(ReadOutcome::Data(n)) => decoder.feed(&buf[..n]),
+                Ok(ReadOutcome::WouldBlock) => Vec::new(),
+                // The host terminal hung up. `poll` would keep reporting the
+                // descriptor readable, so the loop has to end here.
+                Ok(ReadOutcome::Eof) => {
+                    input_ended = true;
+                    Vec::new()
+                }
+                Err(_) => {
+                    input_ended = true;
+                    Vec::new()
+                }
             }
         })?;
     }
@@ -185,9 +202,14 @@ fn run_drm(config: Config) -> io::Result<()> {
     eprintln!("tos: {}", display.name());
 
     // Take the virtual terminal so the kernel stops drawing and reading keys.
+    // The switch signals need handlers first: their default action is to
+    // terminate, which would leave the console in graphics mode with no
+    // keyboard and no chance to put it back.
     let mut vt = VirtualTerminal::current().ok();
     if let Some(vt) = vt.as_mut() {
-        if let Err(e) = vt.take_over(libc::SIGUSR1, libc::SIGUSR2) {
+        let armed = tos_platform::install_switch_handlers(libc::SIGUSR1, libc::SIGUSR2)
+            .and_then(|()| vt.take_over(libc::SIGUSR1, libc::SIGUSR2));
+        if let Err(e) = armed {
             eprintln!("tos: continuing without VT ownership: {e}");
         }
     }
@@ -205,7 +227,33 @@ fn run_drm(config: Config) -> io::Result<()> {
         compositor.inject(unescape(text).as_bytes());
     }
 
+    let mut suspended = false;
     while compositor.is_running() && !TERMINATE.load(Ordering::Relaxed) {
+        // A VT switch is acted on here rather than in the signal handler,
+        // where releasing the display would not be safe.
+        if tos_platform::take_switch_away() && !suspended {
+            let _ = display.release();
+            if let Some(vt) = vt.as_ref() {
+                let _ = vt.allow_switch_away();
+            }
+            suspended = true;
+        }
+        if tos_platform::take_switch_back() && suspended {
+            if let Some(vt) = vt.as_ref() {
+                let _ = vt.acknowledge_switch_back();
+            }
+            let _ = display.restore();
+            compositor.perform(tos_session::Action::Refresh);
+            suspended = false;
+        }
+        if suspended {
+            // Another VT owns the screen; stay out of its way but keep the
+            // panes running so their output is there on the way back.
+            compositor.pump_panes();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
+
         // Draining every device on the first ready descriptor is harmless:
         // later calls in the same iteration simply find nothing left.
         compositor.run_once(&mut display, &input_fds, |_fd| {
@@ -267,6 +315,26 @@ mod tests {
     fn unknown_escapes_are_left_alone() {
         assert_eq!(unescape("\\q"), "\\q");
         assert_eq!(unescape("trailing\\"), "trailing\\");
+    }
+
+    #[test]
+    fn help_flags_after_dash_e_belong_to_the_child() {
+        let args: Vec<String> = ["-e", "git", "--help"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let at = args.iter().position(|a| a == "-e" || a == "--command");
+        assert_eq!(at, Some(0));
+        let own = &args[..at.unwrap()];
+        assert!(!own.iter().any(|a| a == "--help"));
+    }
+
+    #[test]
+    fn help_flags_before_dash_e_are_ours() {
+        let args: Vec<String> = ["--help", "-e", "sh"].iter().map(|s| s.to_string()).collect();
+        let at = args.iter().position(|a| a == "-e" || a == "--command");
+        let own = &args[..at.unwrap()];
+        assert!(own.iter().any(|a| a == "--help"));
     }
 
     #[test]

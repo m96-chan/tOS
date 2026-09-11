@@ -167,3 +167,58 @@ fn which_resolves_programs_on_the_path() {
 fn libc_sigterm() -> i32 {
     15
 }
+
+// ---------------------------------------------------------------------------
+// Regressions found in review
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dropping_a_pty_leaves_no_zombie() {
+    // A compositor closes panes for its whole life; one zombie per pane would
+    // accumulate without bound.
+    let pids: Vec<i32> = (0..4)
+        .map(|_| {
+            let pty = Pty::spawn(&sh("sleep 30")).expect("spawn");
+            let pid = pty.pid();
+            drop(pty);
+            pid
+        })
+        .collect();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for pid in pids {
+        loop {
+            // `kill(pid, 0)` fails with ESRCH once the process is fully gone.
+            let alive = unsafe { libc_kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "process {pid} is still around after being dropped"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[test]
+fn a_non_utf8_environment_is_not_fatal() {
+    // The environment tOS inherits is not under its control.
+    std::env::set_var(
+        std::ffi::OsStr::from_bytes(b"TOS_TEST_BINARY"),
+        std::ffi::OsStr::from_bytes(b"\xff\xfe"),
+    );
+    let result = Pty::spawn(&sh("echo survived"));
+    std::env::remove_var("TOS_TEST_BINARY");
+    let mut pty = result.expect("spawning must not panic on a non-UTF-8 environment");
+    let output = read_until(&mut pty, "survived", Duration::from_secs(5));
+    assert!(output.contains("survived"), "got: {output:?}");
+}
+
+use std::os::unix::ffi::OsStrExt;
+
+extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
+}

@@ -122,15 +122,17 @@ fn resolve_colors(
         std::mem::swap(&mut fg_rgb, &mut bg_rgb);
     }
 
-    if attrs.flags.contains(Flags::HIDDEN) {
-        fg_rgb = bg_rgb;
-    }
-    if attrs.flags.contains(Flags::BLINK) && !options.blink_visible {
-        fg_rgb = bg_rgb;
-    }
-
     if selected {
         bg_rgb = options.selection_background;
+    }
+
+    // Concealing has to happen after the background is final: hiding against
+    // the old background would leave the text legible once it is selected,
+    // which for SGR 8 means an echoed password becomes readable.
+    if attrs.flags.contains(Flags::HIDDEN)
+        || (attrs.flags.contains(Flags::BLINK) && !options.blink_visible)
+    {
+        fg_rgb = bg_rgb;
     }
 
     if options.inactive_fade > 0 && !options.focused {
@@ -315,9 +317,11 @@ fn draw_cell(
         draw_underline(
             surface,
             px,
-            py + metrics.underline_position as i32,
+            py,
             span,
             thickness,
+            metrics.underline_position,
+            cell_height,
             cell.attrs.underline,
             colors.underline,
         );
@@ -331,18 +335,35 @@ fn draw_cell(
     if cell.attrs.flags.contains(Flags::OVERLINE) {
         surface.fill(Rect::new(px, py, span, thickness), colors.fg);
     }
-    let _ = cell_height;
 }
 
+/// Draw an underline inside the cell that starts at `cell_top`.
+///
+/// Styles that need more than one row are shifted up rather than allowed to
+/// spill into the row below, where they would be painted over by the next
+/// row's background or left behind as a stray bar.
+#[allow(clippy::too_many_arguments)]
 fn draw_underline(
     surface: &mut Surface<'_>,
     x: i32,
-    y: i32,
+    cell_top: i32,
     width: u32,
     thickness: u32,
+    position: u32,
+    cell_height: u32,
     style: Underline,
     color: Rgb,
 ) {
+    // Rows the style needs below its first stroke.
+    let extra = match style {
+        Underline::Double => thickness * 2,
+        Underline::Curly => thickness,
+        _ => 0,
+    };
+    let last = cell_height.saturating_sub(thickness);
+    let position = position.min(last.saturating_sub(extra));
+    let y = cell_top + position as i32;
+
     match style {
         Underline::None => {}
         Underline::Single => surface.fill(Rect::new(x, y, width, thickness), color),
@@ -354,19 +375,17 @@ fn draw_underline(
             );
         }
         Underline::Curly => {
-            // A small triangle wave, one period every four pixels.
+            // A triangle wave with one period every four pixels. The centre
+            // line sits one stroke below the top so the wave fits.
             let amplitude = thickness.max(1) as i32;
+            let centre = y + amplitude;
             for dx in 0..width as i32 {
-                let phase = dx % 4;
-                let offset = match phase {
+                let offset = match dx % 4 {
                     0 | 2 => 0,
                     1 => -amplitude,
                     _ => amplitude,
                 };
-                surface.fill(
-                    Rect::new(x + dx, y + offset, 1, thickness),
-                    color,
-                );
+                surface.fill(Rect::new(x + dx, centre + offset, 1, thickness), color);
             }
         }
         Underline::Dotted => {
@@ -400,24 +419,36 @@ fn draw_graphics(
     if store.is_empty() {
         return;
     }
-    // Placements are drawn back to front so z-index is respected.
+    // Placements are drawn back to front so z-index is respected. The
+    // placement id breaks ties, because the store is a hash map and its
+    // iteration order would otherwise change the stacking every frame.
     let mut placements: Vec<_> = store.placements().collect();
-    placements.sort_by_key(|p| p.z_index);
+    placements.sort_by_key(|p| (p.z_index, p.id));
+
+    // Images belong to screen rows, so scrolling back into history moves them
+    // up with the text rather than leaving them pinned to the display.
+    let offset = term.display_offset() as i64;
 
     for placement in placements {
         let Some(image) = store.image(placement.image_id) else {
             continue;
         };
+        let row = placement.row as i64 - offset;
+        if row + placement.rows as i64 <= 0 || row >= term.grid().rows() as i64 {
+            continue;
+        }
         let dest = Rect::new(
             area.x + (placement.col as u32 * cell_width) as i32,
-            area.y + (placement.row as u32 * cell_height) as i32,
+            area.y + (row * cell_height as i64) as i32,
             placement.cols as u32 * cell_width,
             placement.rows as u32 * cell_height,
         );
         // Repaint an image only when a row it covers was damaged.
         if !options.force {
-            let touched = (0..placement.rows as usize)
-                .any(|dy| term.damage().is_row_dirty(placement.row as usize + dy));
+            let touched = (0..placement.rows as i64).any(|dy| {
+                let y = row + dy;
+                y >= 0 && term.damage().is_row_dirty(y as usize)
+            });
             if !touched {
                 continue;
             }
@@ -464,11 +495,20 @@ fn draw_cursor(
     };
     let thickness = (ch / 8).max(1);
 
+    // A double width glyph needs a double width cursor, or half the character
+    // would be repainted in the cursor's text colour with no cursor under it,
+    // making it vanish.
+    let cell_under = term.grid().cell(cursor.x, cursor.y);
+    let span = match &cell_under {
+        Some(cell) if cell.attrs.flags.contains(Flags::WIDE) => cw * 2,
+        _ => cw,
+    };
+
     match shape {
         CursorShape::Block => {
-            surface.fill(Rect::new(px, py, cw, ch), color);
+            surface.fill(Rect::new(px, py, span, ch), color);
             // Redraw the character on top in the cursor's text color.
-            if let Some(cell) = term.grid().cell(cursor.x, cursor.y) {
+            if let Some(cell) = cell_under {
                 if cell.ch != ' ' {
                     let style = RasterStyle::new(
                         cell.attrs.flags.contains(Flags::BOLD),
@@ -488,16 +528,22 @@ fn draw_cursor(
         }
         CursorShape::Underline => {
             surface.fill(
-                Rect::new(px, py + (ch - thickness) as i32, cw, thickness),
+                Rect::new(px, py + (ch - thickness) as i32, span, thickness),
                 color,
             );
         }
         CursorShape::Beam => surface.fill(Rect::new(px, py, thickness, ch), color),
         CursorShape::Hollow => {
-            surface.fill(Rect::new(px, py, cw, thickness), color);
-            surface.fill(Rect::new(px, py + (ch - thickness) as i32, cw, thickness), color);
+            surface.fill(Rect::new(px, py, span, thickness), color);
+            surface.fill(
+                Rect::new(px, py + (ch - thickness) as i32, span, thickness),
+                color,
+            );
             surface.fill(Rect::new(px, py, thickness, ch), color);
-            surface.fill(Rect::new(px + (cw - thickness) as i32, py, thickness, ch), color);
+            surface.fill(
+                Rect::new(px + (span - thickness) as i32, py, thickness, ch),
+                color,
+            );
         }
     }
 }

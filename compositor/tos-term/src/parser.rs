@@ -482,7 +482,12 @@ impl Parser {
                     return;
                 }
                 self.param_started = true;
-                self.current_param = self.current_param.saturating_mul(10) + (byte - b'0') as u32;
+                // Both steps saturate: a parameter longer than a terminal
+                // could ever mean is clamped rather than wrapping round.
+                self.current_param = self
+                    .current_param
+                    .saturating_mul(10)
+                    .saturating_add((byte - b'0') as u32);
             }
             b';' => self.finish_param(false),
             b':' => self.finish_param(true),
@@ -529,6 +534,11 @@ impl Parser {
         match byte {
             0x07 => self.dispatch_osc(performer, true),
             b';' => {
+                // Separators count against the cap as well; otherwise a run
+                // of them is unbounded allocation driven by the PTY.
+                if self.osc_buf.len() >= MAX_OSC_LEN {
+                    return;
+                }
                 if self.osc_field_ends.len() < MAX_OSC_FIELDS {
                     self.osc_field_ends.push(self.osc_buf.len());
                 }
@@ -585,7 +595,12 @@ impl Parser {
                     return;
                 }
                 self.param_started = true;
-                self.current_param = self.current_param.saturating_mul(10) + (byte - b'0') as u32;
+                // Both steps saturate: a parameter longer than a terminal
+                // could ever mean is clamped rather than wrapping round.
+                self.current_param = self
+                    .current_param
+                    .saturating_mul(10)
+                    .saturating_add((byte - b'0') as u32);
             }
             b';' => self.finish_param(false),
             b':' => self.finish_param(true),
@@ -802,6 +817,23 @@ mod tests {
     #[test]
     fn charset_designation_has_intermediate() {
         assert_eq!(run(b"\x1b(0"), vec!["esc((,0)"]);
+    }
+
+    #[test]
+    fn huge_parameters_saturate_instead_of_overflowing() {
+        // `CSI 99999999999 H` must not wrap round to a small row number.
+        let events = run(b"\x1b[99999999999H");
+        assert_eq!(events, vec![format!("csi([{}],,H)", u16::MAX)]);
+    }
+
+    #[test]
+    fn osc_separators_are_capped() {
+        // A run of separators is still bounded allocation.
+        let mut parser = Parser::new();
+        let mut rec = Recorder::default();
+        parser.advance(&mut rec, b"\x1b]");
+        parser.advance(&mut rec, &vec![b';'; MAX_OSC_LEN * 2]);
+        assert!(parser.osc_buf.len() <= MAX_OSC_LEN);
     }
 
     #[test]

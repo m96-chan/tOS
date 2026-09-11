@@ -257,6 +257,9 @@ pub enum MouseButton {
 
 impl MouseButton {
     /// The button number used in terminal mouse reports.
+    ///
+    /// Buttons 8 and up occupy 128..131; the variant already carries the
+    /// button number, so the base has to be subtracted, not added to.
     pub fn report_code(self) -> u32 {
         match self {
             MouseButton::Left => 0,
@@ -266,8 +269,24 @@ impl MouseButton {
             MouseButton::WheelDown => 65,
             MouseButton::WheelLeft => 66,
             MouseButton::WheelRight => 67,
-            MouseButton::Other(n) => 128 + n as u32,
+            MouseButton::Other(n) => 128 + (n as u32).saturating_sub(8),
         }
+    }
+
+    /// The button a report code names, if any. `3` means "no button", which
+    /// the legacy encodings use for a release.
+    pub fn from_report_code(code: u32) -> Option<MouseButton> {
+        Some(match code {
+            0 => MouseButton::Left,
+            1 => MouseButton::Middle,
+            2 => MouseButton::Right,
+            64 => MouseButton::WheelUp,
+            65 => MouseButton::WheelDown,
+            66 => MouseButton::WheelLeft,
+            67 => MouseButton::WheelRight,
+            128..=131 => MouseButton::Other((code - 128 + 8) as u8),
+            _ => return None,
+        })
     }
 
     pub fn is_wheel(self) -> bool {
@@ -303,13 +322,30 @@ pub struct MouseEvent {
     pub modifiers: Modifiers,
 }
 
+/// A pointer event in display pixels, as a device reports it.
+///
+/// This is deliberately a different type from [`MouseEvent`]: a device knows
+/// pixels and nothing about cells, while the encoders need cells. Keeping the
+/// two apart means the conversion has to be written out, rather than being
+/// forgotten in one of the two input paths.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PointerEvent {
+    pub button: Option<MouseButton>,
+    pub action: MouseAction,
+    /// Absolute position on the display, in pixels.
+    pub x: f64,
+    pub y: f64,
+    pub modifiers: Modifiers,
+}
+
 /// Everything that can arrive from an input device.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputEvent {
     Key(KeyEvent),
+    /// A mouse event already in cell coordinates, as a host terminal reports it.
     Mouse(MouseEvent),
-    /// Absolute pointer position in pixels, before it is mapped to a pane.
-    PointerMotion { x: f64, y: f64 },
+    /// A pointer event in display pixels, as a device reports it.
+    Pointer(PointerEvent),
     /// Text that arrived as a unit, such as a paste.
     Paste(String),
     FocusGained,
@@ -344,6 +380,32 @@ mod tests {
         assert_eq!(MouseButton::WheelUp.report_code(), 64);
         assert!(MouseButton::WheelDown.is_wheel());
         assert!(!MouseButton::Left.is_wheel());
+    }
+
+    #[test]
+    fn extra_buttons_use_the_128_range() {
+        assert_eq!(MouseButton::Other(8).report_code(), 128);
+        assert_eq!(MouseButton::Other(11).report_code(), 131);
+    }
+
+    #[test]
+    fn report_codes_round_trip() {
+        for button in [
+            MouseButton::Left,
+            MouseButton::Middle,
+            MouseButton::Right,
+            MouseButton::WheelUp,
+            MouseButton::WheelDown,
+            MouseButton::Other(8),
+            MouseButton::Other(11),
+        ] {
+            assert_eq!(
+                MouseButton::from_report_code(button.report_code()),
+                Some(button)
+            );
+        }
+        // Three is the legacy "released, button unknown" code.
+        assert_eq!(MouseButton::from_report_code(3), None);
     }
 
     #[test]

@@ -19,7 +19,15 @@ pub struct Pane {
     pub selection: Option<tos_render::Selection>,
     /// Whether the mouse button is still down on this pane.
     pub selecting: bool,
+    /// Input the PTY could not take yet.
+    pending_input: Vec<u8>,
+    /// Set once queued input had to be dropped.
+    input_overflowed: bool,
 }
+
+/// Input queued for a child that is not reading. Beyond this, the pane is
+/// clearly not consuming anything and holding more would be a memory leak.
+const MAX_PENDING_INPUT: usize = 4 * 1024 * 1024;
 
 impl Pane {
     /// Start a child on a new PTY sized to `area`.
@@ -57,6 +65,8 @@ impl Pane {
             exited: false,
             selection: None,
             selecting: false,
+            pending_input: Vec::new(),
+            input_overflowed: false,
         })
     }
 
@@ -97,8 +107,59 @@ impl Pane {
         }
     }
 
-    /// Send bytes to the child, dropping them if the PTY is gone.
+    /// Queue bytes for the child.
+    ///
+    /// The PTY master is non-blocking and its input buffer is only a few
+    /// kilobytes, so a large paste cannot be written in one go. Anything that
+    /// does not fit is held and retried by [`Pane::flush_input`]; dropping it
+    /// would silently truncate the paste, taking the bracketed paste
+    /// terminator with it and leaving the application stuck in paste mode.
     pub fn write(&mut self, bytes: &[u8]) {
+        if self.pending_input.is_empty() {
+            let written = self.write_now(bytes);
+            if written < bytes.len() {
+                self.pending_input.extend_from_slice(&bytes[written..]);
+            }
+            return;
+        }
+        // Ordering matters: queued bytes go first.
+        if self.pending_input.len() + bytes.len() > MAX_PENDING_INPUT {
+            // The child is not reading at all. Dropping the oldest bytes is
+            // the only option left, and it is worth being loud about it.
+            self.input_overflowed = true;
+            return;
+        }
+        self.pending_input.extend_from_slice(bytes);
+    }
+
+    /// Retry whatever the PTY could not take earlier.
+    ///
+    /// Returns true while bytes are still queued, so the caller knows to keep
+    /// polling for writability.
+    pub fn flush_input(&mut self) -> bool {
+        if self.pending_input.is_empty() {
+            return false;
+        }
+        let pending = std::mem::take(&mut self.pending_input);
+        let written = self.write_now(&pending);
+        if written < pending.len() {
+            self.pending_input = pending[written..].to_vec();
+        }
+        !self.pending_input.is_empty()
+    }
+
+    /// Bytes waiting for the child to read them.
+    pub fn pending_input(&self) -> usize {
+        self.pending_input.len()
+    }
+
+    /// Whether input had to be discarded because the child stopped reading.
+    pub fn input_overflowed(&self) -> bool {
+        self.input_overflowed
+    }
+
+    /// Write as much as the PTY will take right now.
+    fn write_now(&mut self, bytes: &[u8]) -> usize {
         let mut written = 0;
         while written < bytes.len() {
             match self.pty.write(&bytes[written..]) {
@@ -111,6 +172,7 @@ impl Pane {
                 }
             }
         }
+        written
     }
 
     /// Flush any replies the terminal generated, such as cursor reports.

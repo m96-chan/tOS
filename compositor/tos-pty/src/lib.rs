@@ -7,9 +7,9 @@
 //! Only POSIX interfaces are used (`posix_openpt` rather than `openpty`), so
 //! the same code runs on the Linux target and on a developer machine.
 
-use std::ffi::{CStr, CString, OsStr};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -306,17 +306,47 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        // Hang up the terminal so the child notices, then let it go.
+        if self.exit_status.is_some() {
+            unsafe {
+                libc::close(self.master);
+            }
+            return;
+        }
+
+        // Hang up the terminal so the child notices it has no controlling
+        // terminal left, then close the master, which is what makes its reads
+        // and writes fail.
         let _ = self.signal(libc::SIGHUP);
         unsafe {
             libc::close(self.master);
         }
-        let mut status = 0;
-        unsafe {
-            libc::waitpid(self.pid, &mut status, libc::WNOHANG);
+
+        // A child that has only just been signalled has usually not been
+        // scheduled yet, so a single non-blocking wait leaves a zombie behind.
+        // The compositor is a long-lived session leader, and one zombie per
+        // closed pane would accumulate for its whole life.
+        for attempt in 0..MAX_REAP_ATTEMPTS {
+            match self.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(_) => return,
+            }
+            if attempt == MAX_REAP_ATTEMPTS / 2 {
+                // Still there: insist.
+                let _ = self.signal(libc::SIGKILL);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(REAP_INTERVAL_MS));
         }
+        // Out of patience. Detaching the child stops it becoming a zombie:
+        // it is reparented to init, which reaps it.
+        let _ = self.signal(libc::SIGKILL);
     }
 }
+
+/// How many times `Drop` looks for the child before giving up.
+const MAX_REAP_ATTEMPTS: u32 = 20;
+/// How long to wait between those attempts.
+const REAP_INTERVAL_MS: u64 = 5;
 
 /// Everything the child does between `fork` and `execve`.
 ///
@@ -358,15 +388,32 @@ unsafe fn child_setup(master: RawFd, slave: RawFd, cwd: Option<&CStr>) {
 }
 
 fn build_env(config: &PtyConfig) -> io::Result<Vec<CString>> {
-    let mut vars: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| !config.unset_env.contains(k))
+    // `env::vars` panics on a variable that is not UTF-8, and the environment
+    // tOS inherits is not under its control. The OS form is what execve wants
+    // anyway.
+    let mut vars: Vec<(OsString, OsString)> = std::env::vars_os()
+        .filter(|(k, _)| {
+            let key = k.to_string_lossy();
+            !config.unset_env.iter().any(|unset| *unset == key)
+        })
         .collect();
     for (key, value) in &config.env {
-        vars.retain(|(k, _)| k != key);
-        vars.push((key.clone(), value.clone()));
+        let key = OsString::from(key);
+        vars.retain(|(k, _)| *k != key);
+        vars.push((key, OsString::from(value)));
     }
     vars.iter()
-        .map(|(k, v)| cstring(OsStr::new(&format!("{k}={v}"))))
+        .map(|(k, v)| {
+            let mut entry = k.clone().into_vec();
+            entry.push(b'=');
+            entry.extend_from_slice(&v.clone().into_vec());
+            CString::new(entry).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "environment variable contains a nul byte",
+                )
+            })
+        })
         .collect()
 }
 

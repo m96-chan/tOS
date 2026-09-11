@@ -19,16 +19,19 @@ pub struct Workspace {
     focus: PaneId,
     /// A pane temporarily filling the whole workspace.
     zoomed: Option<PaneId>,
+    /// Set once the user names the workspace, so renumbering leaves it alone.
+    renamed: bool,
 }
 
 impl Workspace {
-    fn new(id: WorkspaceId, root: PaneId) -> Self {
+    fn new(id: WorkspaceId, position: usize, root: PaneId) -> Self {
         Workspace {
             id,
-            name: format!("{}", id.0 + 1),
+            name: format!("{}", position + 1),
             layout: Layout::new(root),
             focus: root,
             zoomed: None,
+            renamed: false,
         }
     }
 
@@ -57,7 +60,18 @@ impl Workspace {
             return false;
         }
         self.focus = pane;
+        // Focusing a pane that the zoom is hiding has to leave the zoom, or
+        // keystrokes would go to a pane that is never drawn.
+        if self.zoomed.is_some_and(|zoomed| zoomed != pane) {
+            self.zoomed = None;
+        }
         true
+    }
+
+    /// Give the workspace a name of the user's choosing.
+    pub fn rename(&mut self, name: impl Into<String>) {
+        self.name = name.into();
+        self.renamed = true;
     }
 }
 
@@ -66,6 +80,8 @@ impl Workspace {
 pub struct Session {
     workspaces: Vec<Workspace>,
     active: usize,
+    /// The pane the session was created with.
+    root: PaneId,
     next_pane: u32,
     next_workspace: u32,
 }
@@ -74,18 +90,19 @@ impl Session {
     /// A session with one workspace holding one pane.
     pub fn new() -> Self {
         let root = PaneId(0);
-        let workspace = Workspace::new(WorkspaceId(0), root);
+        let workspace = Workspace::new(WorkspaceId(0), 0, root);
         Session {
             workspaces: vec![workspace],
             active: 0,
+            root,
             next_pane: 1,
             next_workspace: 1,
         }
     }
 
-    /// The pane identifier the first workspace was created with.
+    /// The pane every session starts with.
     pub fn root_pane(&self) -> PaneId {
-        self.workspaces[0].focus
+        self.root
     }
 
     pub fn workspaces(&self) -> &[Workspace] {
@@ -129,19 +146,38 @@ impl Session {
             .map(|w| w.id)
     }
 
+    /// Give every workspace the label matching its position.
+    fn renumber(&mut self) {
+        for (position, workspace) in self.workspaces.iter_mut().enumerate() {
+            // A workspace that was renamed keeps its name.
+            if workspace.renamed {
+                continue;
+            }
+            workspace.name = format!("{}", position + 1);
+        }
+    }
+
     fn allocate_pane(&mut self) -> PaneId {
         let id = PaneId(self.next_pane);
         self.next_pane += 1;
         id
     }
 
-    /// Split the focused pane. Returns the new pane, which the caller must
-    /// back with a terminal and a PTY.
-    pub fn split_focused(&mut self, axis: Axis) -> Option<PaneId> {
+    /// Split the focused pane inside `area`. Returns the new pane, which the
+    /// caller must back with a terminal and a PTY, or `None` when the pane is
+    /// too small to divide.
+    pub fn split_focused(&mut self, area: Rect, axis: Axis) -> Option<PaneId> {
+        let workspace = self.active();
+        // A zoomed pane is laid out as the whole workspace, so that is the
+        // rectangle the split has to fit inside.
+        let target = workspace.focus;
+        if workspace.zoomed.is_none() && !workspace.layout.can_split(area, target, axis) {
+            return None;
+        }
         let new_pane = self.allocate_pane();
         let workspace = self.active_mut();
         let focus = workspace.focus;
-        if !workspace.layout.split(focus, axis, new_pane) {
+        if !workspace.layout.split(area, focus, axis, new_pane) {
             return None;
         }
         // Splitting always leaves a zoomed view, since the point of the split
@@ -195,6 +231,9 @@ impl Session {
         } else if index < self.active {
             self.active -= 1;
         }
+        // Selection is by position, so the labels have to follow; otherwise
+        // the number a user reads addresses a different workspace.
+        self.renumber();
         vec![pane]
     }
 
@@ -221,7 +260,7 @@ impl Session {
         let panes = workspace.layout.panes();
         let current = panes.iter().position(|&p| p == workspace.focus).unwrap_or(0);
         let next = panes[(current + 1) % panes.len()];
-        workspace.focus = next;
+        workspace.set_focus(next);
         next
     }
 
@@ -235,7 +274,7 @@ impl Session {
             return false;
         };
         self.active = index;
-        self.workspaces[index].focus = pane;
+        self.workspaces[index].set_focus(pane);
         true
     }
 
@@ -268,8 +307,9 @@ impl Session {
         let pane = self.allocate_pane();
         let id = WorkspaceId(self.next_workspace);
         self.next_workspace += 1;
-        self.workspaces.push(Workspace::new(id, pane));
-        self.active = self.workspaces.len() - 1;
+        let position = self.workspaces.len();
+        self.workspaces.push(Workspace::new(id, position, pane));
+        self.active = position;
         pane
     }
 
@@ -292,8 +332,8 @@ impl Session {
         true
     }
 
-    /// Move the focused pane to another workspace.
-    pub fn move_focused_to_workspace(&mut self, number: usize) -> bool {
+    /// Move the focused pane to another workspace, laid out in `area`.
+    pub fn move_focused_to_workspace(&mut self, area: Rect, number: usize) -> bool {
         if number == 0 || number > self.workspaces.len() {
             return false;
         }
@@ -322,7 +362,17 @@ impl Session {
 
         let destination = &mut self.workspaces[target];
         let focus = destination.focus;
-        destination.layout.split(focus, Axis::Columns, pane);
+        if !destination.layout.split(area, focus, Axis::Columns, pane) {
+            // Put the pane back rather than losing it to a workspace that has
+            // no room for it.
+            let source_workspace = &mut self.workspaces[source];
+            let source_focus = source_workspace.focus;
+            source_workspace
+                .layout
+                .split(area, source_focus, Axis::Columns, pane);
+            source_workspace.focus = pane;
+            return false;
+        }
         destination.focus = pane;
         destination.zoomed = None;
         true
@@ -354,7 +404,7 @@ mod tests {
     #[test]
     fn splitting_focuses_the_new_pane() {
         let mut session = Session::new();
-        let new_pane = session.split_focused(Axis::Columns).unwrap();
+        let new_pane = session.split_focused(area(), Axis::Columns).unwrap();
         assert_eq!(session.focus(), new_pane);
         assert_eq!(session.all_panes().len(), 2);
     }
@@ -362,16 +412,16 @@ mod tests {
     #[test]
     fn pane_identifiers_are_never_reused() {
         let mut session = Session::new();
-        let first = session.split_focused(Axis::Columns).unwrap();
+        let first = session.split_focused(area(), Axis::Columns).unwrap();
         session.close_pane(first);
-        let second = session.split_focused(Axis::Columns).unwrap();
+        let second = session.split_focused(area(), Axis::Columns).unwrap();
         assert_ne!(first, second);
     }
 
     #[test]
     fn closing_a_pane_moves_focus_to_a_survivor() {
         let mut session = Session::new();
-        let new_pane = session.split_focused(Axis::Columns).unwrap();
+        let new_pane = session.split_focused(area(), Axis::Columns).unwrap();
         let closed = session.close_pane(new_pane);
         assert_eq!(closed, vec![new_pane]);
         assert_eq!(session.focus(), PaneId(0));
@@ -398,7 +448,7 @@ mod tests {
     #[test]
     fn focus_moves_between_panes() {
         let mut session = Session::new();
-        let right = session.split_focused(Axis::Columns).unwrap();
+        let right = session.split_focused(area(), Axis::Columns).unwrap();
         assert!(session.focus_direction(area(), Direction::Left));
         assert_eq!(session.focus(), PaneId(0));
         assert!(session.focus_direction(area(), Direction::Right));
@@ -409,7 +459,7 @@ mod tests {
     #[test]
     fn focus_next_wraps_around() {
         let mut session = Session::new();
-        session.split_focused(Axis::Columns);
+        session.split_focused(area(), Axis::Columns);
         assert_eq!(session.focus_next(), PaneId(0));
         assert_eq!(session.focus_next(), PaneId(1));
     }
@@ -417,7 +467,7 @@ mod tests {
     #[test]
     fn zoom_hides_the_other_panes() {
         let mut session = Session::new();
-        let zoomed = session.split_focused(Axis::Columns).unwrap();
+        let zoomed = session.split_focused(area(), Axis::Columns).unwrap();
         assert!(session.toggle_zoom());
         let geometry = session.active().geometry(area());
         assert_eq!(geometry, vec![(zoomed, area())]);
@@ -434,9 +484,9 @@ mod tests {
     #[test]
     fn splitting_while_zoomed_shows_both_panes() {
         let mut session = Session::new();
-        session.split_focused(Axis::Columns);
+        session.split_focused(area(), Axis::Columns);
         session.toggle_zoom();
-        session.split_focused(Axis::Rows);
+        session.split_focused(area(), Axis::Rows);
         assert!(session.active().zoomed().is_none());
         assert_eq!(session.active().geometry(area()).len(), 3);
     }
@@ -444,7 +494,7 @@ mod tests {
     #[test]
     fn focus_cannot_leave_a_zoomed_pane() {
         let mut session = Session::new();
-        session.split_focused(Axis::Columns);
+        session.split_focused(area(), Axis::Columns);
         session.toggle_zoom();
         assert!(!session.focus_direction(area(), Direction::Left));
     }
@@ -475,12 +525,12 @@ mod tests {
     #[test]
     fn a_pane_can_move_to_another_workspace() {
         let mut session = Session::new();
-        let moving = session.split_focused(Axis::Columns).unwrap();
+        let moving = session.split_focused(area(), Axis::Columns).unwrap();
         session.new_workspace();
         session.select_workspace(1);
         session.set_focus(moving);
 
-        assert!(session.move_focused_to_workspace(2));
+        assert!(session.move_focused_to_workspace(area(), 2));
         assert_eq!(session.workspace_of(moving), Some(WorkspaceId(1)));
         assert_eq!(session.active_index(), 0, "the source workspace stays active");
         assert!(!session.workspaces()[0].layout.contains(moving));
@@ -492,7 +542,7 @@ mod tests {
         session.new_workspace();
         session.select_workspace(1);
         // Workspace 1 has a single pane, so its pane cannot leave.
-        assert!(!session.move_focused_to_workspace(2));
+        assert!(!session.move_focused_to_workspace(area(), 2));
     }
 
     #[test]
@@ -509,7 +559,7 @@ mod tests {
     fn resizing_the_focused_pane_changes_the_geometry() {
         let mut session = Session::new();
         session.active_mut().layout.gap = 0;
-        session.split_focused(Axis::Columns);
+        session.split_focused(area(), Axis::Columns);
         let before = session.active().geometry(area())[0].1.width;
         assert!(session.resize_focused(area(), Direction::Left, 6));
         let after = session.active().geometry(area())[0].1.width;

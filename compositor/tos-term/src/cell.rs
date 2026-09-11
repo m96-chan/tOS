@@ -167,8 +167,16 @@ impl Cell {
         self.ch == ' ' && self.zerowidth.is_none() && self.attrs.graphics.is_none()
     }
 
+    /// A cell holds at most this many combining marks. Beyond it the extras
+    /// are dropped, because a stream of marks at one position would otherwise
+    /// grow a single cell without bound.
+    pub const MAX_ZEROWIDTH: usize = 8;
+
     pub fn push_zerowidth(&mut self, c: char) {
-        self.zerowidth.get_or_insert_with(Default::default).push(c);
+        let marks = self.zerowidth.get_or_insert_with(Default::default);
+        if marks.len() < Cell::MAX_ZEROWIDTH {
+            marks.push(c);
+        }
     }
 
     /// Number of columns this cell occupies.
@@ -195,6 +203,15 @@ mod tests {
         f.set(Flags::BOLD, false);
         assert!(!f.contains(Flags::BOLD));
         assert!(f.contains(Flags::ITALIC));
+    }
+
+    #[test]
+    fn combining_marks_are_capped() {
+        let mut cell = Cell::new('a', Attrs::default());
+        for _ in 0..100 {
+            cell.push_zerowidth('\u{0301}');
+        }
+        assert_eq!(cell.zerowidth.unwrap().len(), Cell::MAX_ZEROWIDTH);
     }
 
     #[test]

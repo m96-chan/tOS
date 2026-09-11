@@ -186,7 +186,11 @@ impl HostInput {
             _ => {}
         }
 
-        let mods = modifiers_from_param(params.get(1).copied());
+        let mut mods = modifiers_from_param(params.get(1).copied());
+        // CSI Z is back tab: the shift is in the final byte, not a parameter.
+        if final_byte == b'Z' {
+            mods.insert(Modifiers::SHIFT);
+        }
         match csi_key(final_byte) {
             Some(code) => Step::Event(InputEvent::Key(KeyEvent::new(code, mods))),
             None => Step::Consumed,
@@ -224,11 +228,16 @@ fn decode_plain(buf: &[u8]) -> (Option<InputEvent>, usize) {
         }
         0x20..=0x7e => {
             let c = byte as char;
-            let mut event = KeyEvent::new(KeyCode::Char(c.to_ascii_lowercase()), Modifiers::NONE);
-            if c.is_ascii_uppercase() {
+            // The base key is what the layout produces unshifted; without it
+            // a binding on shift plus a digit could never match, because the
+            // host only ever sends the shifted character.
+            let base = unshift_us(c);
+            let mut event = KeyEvent::new(KeyCode::Char(base), Modifiers::NONE);
+            if base != c {
                 event.modifiers.insert(Modifiers::SHIFT);
             }
             event.text = Some(c);
+            event.base = Some(base);
             (Some(InputEvent::Key(event)), 1)
         }
         _ => {
@@ -247,6 +256,38 @@ fn decode_plain(buf: &[u8]) -> (Option<InputEvent>, usize) {
                 Err(_) => (None, 1),
             }
         }
+    }
+}
+
+/// The unshifted character a US layout key produces.
+///
+/// A host terminal reports only the resulting character, so the base key has
+/// to be inferred to tell shifted keys apart from unshifted ones.
+fn unshift_us(c: char) -> char {
+    match c {
+        'A'..='Z' => c.to_ascii_lowercase(),
+        '!' => '1',
+        '@' => '2',
+        '#' => '3',
+        '$' => '4',
+        '%' => '5',
+        '^' => '6',
+        '&' => '7',
+        '*' => '8',
+        '(' => '9',
+        ')' => '0',
+        '_' => '-',
+        '+' => '=',
+        '{' => '[',
+        '}' => ']',
+        '|' => '\\',
+        ':' => ';',
+        '"' => '\'',
+        '<' => ',',
+        '>' => '.',
+        '?' => '/',
+        '~' => '`',
+        other => other,
     }
 }
 
@@ -445,6 +486,34 @@ mod tests {
     }
 
     #[test]
+    fn shifted_punctuation_reports_the_base_key() {
+        // Compositor bindings are written against the unshifted key, so the
+        // decoder has to say which key was pressed, not just what it produced.
+        let events = events(b"!");
+        let (code, mods) = key_of(&events[0]);
+        assert_eq!(code, KeyCode::Char('1'));
+        assert!(mods.shift());
+        match &events[0] {
+            InputEvent::Key(k) => assert_eq!(k.text, Some('!')),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn unshifted_punctuation_has_no_modifier() {
+        let (code, mods) = key_of(&events(b"1")[0]);
+        assert_eq!(code, KeyCode::Char('1'));
+        assert!(!mods.shift());
+    }
+
+    #[test]
+    fn back_tab_keeps_its_shift() {
+        let (code, mods) = key_of(&events(b"\x1b[Z")[0]);
+        assert_eq!(code, KeyCode::Tab);
+        assert!(mods.shift(), "CSI Z is shift plus tab");
+    }
+
+    #[test]
     fn control_bytes_become_ctrl_keys() {
         let (code, mods) = key_of(&events(b"\x03")[0]);
         assert_eq!(code, KeyCode::Char('c'));
@@ -566,6 +635,19 @@ mod tests {
     }
 
     #[test]
+    fn shifted_text_round_trips_through_its_character() {
+        // The legacy encoding has no way to say "shift" for a text key, so
+        // the round trip goes through the character the key produced.
+        use crate::encode::{encode_key, EncodeContext};
+        let mut event = KeyEvent::new(KeyCode::Char('1'), Modifiers::SHIFT);
+        event.text = Some('!');
+        let encoded = encode_key(&event, &EncodeContext::default());
+        assert_eq!(encoded, b"!");
+        let decoded = events(&encoded);
+        assert_eq!(key_of(&decoded[0]), (KeyCode::Char('1'), Modifiers::SHIFT));
+    }
+
+    #[test]
     fn round_trips_with_the_encoder() {
         use crate::encode::{encode_key, EncodeContext};
         let ctx = EncodeContext::default();
@@ -578,6 +660,7 @@ mod tests {
             (KeyCode::Function(5), Modifiers::NONE),
             (KeyCode::Enter, Modifiers::NONE),
             (KeyCode::Tab, Modifiers::NONE),
+            (KeyCode::Tab, Modifiers::SHIFT),
         ] {
             let encoded = encode_key(&KeyEvent::new(code, mods), &ctx);
             let decoded = events(&encoded);

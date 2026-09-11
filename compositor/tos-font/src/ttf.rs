@@ -84,9 +84,15 @@ impl TtfFont {
     }
 
     /// Load whichever monospace font the system has.
+    ///
+    /// Every candidate is tried: a font file that exists but does not parse
+    /// should not cost the user the ones further down the list.
     pub fn system(px: f32) -> Option<Self> {
-        let path = TtfFont::find_system_font()?;
-        TtfFont::from_path(path, px).ok()
+        FONT_SEARCH_PATHS
+            .iter()
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .find_map(|path| TtfFont::from_path(path, px).ok())
     }
 
     pub fn pixel_size(&self) -> f32 {

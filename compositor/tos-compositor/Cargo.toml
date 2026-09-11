@@ -26,8 +26,3 @@ tos-platform = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-tos-term = { workspace = true }
-tos-pty = { workspace = true }
-tos-render = { workspace = true }
-tos-session = { workspace = true }
-tos-input = { workspace = true }

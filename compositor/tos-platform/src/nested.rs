@@ -42,8 +42,13 @@ impl NestedDisplay {
                 "the host terminal reported no size",
             ));
         }
+        // Deliberately not O_NONBLOCK: stdin, stdout and the parent shell's
+        // own descriptors usually share one open file description, and the
+        // flag lives on that description, so setting it here would leave the
+        // user's shell with a non-blocking terminal after tOS exits. Reads
+        // only happen once `poll` has said the descriptor is readable, and
+        // raw mode sets VMIN to 1, so they return promptly.
         let raw = RawMode::acquire(input)?;
-        crate::tty::set_nonblocking(input)?;
 
         let mut display = NestedDisplay {
             framebuffer: OwnedFramebuffer::new(size.cols as u32, size.rows as u32 * 2),
@@ -81,9 +86,20 @@ impl NestedDisplay {
             };
             if n < 0 {
                 let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted
-                    || err.kind() == io::ErrorKind::WouldBlock
-                {
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    // Someone else made this descriptor non-blocking. Wait for
+                    // it rather than spinning a core on a full terminal buffer.
+                    let mut poll = libc::pollfd {
+                        fd: self.output,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    unsafe {
+                        libc::poll(&mut poll, 1, 50);
+                    }
                     continue;
                 }
                 return Err(err);

@@ -373,30 +373,47 @@ fn encode_kitty(event: &KeyEvent, ctx: &EncodeContext) -> Vec<u8> {
     };
     let mods = event.modifiers.effective();
 
-    // Plain text keys still send plain text unless the application asked for
-    // everything to be escaped; this is what keeps ordinary typing fast.
     // Repeats and releases have to be escaped once the application asked to
-    // tell them apart, even for keys that would otherwise send plain text.
-    let plain_event = event.state == KeyState::Press
-        || !flags.contains(KeyboardFlags::REPORT_EVENT_TYPES);
-    let text_only = event.text.is_some()
-        && mods.without(Modifiers::SHIFT).is_empty()
-        && plain_event
-        && !flags.contains(KeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE);
-    if text_only {
-        if let Some(text) = event.text {
-            // Enter, tab and backspace keep their control byte meanings.
-            if !matches!(
-                event.code,
-                KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace | KeyCode::Escape
-            ) {
-                let mut buf = [0u8; 4];
-                return text.encode_utf8(&mut buf).as_bytes().to_vec();
-            }
+    // tell them apart, even for keys that would otherwise send plain bytes.
+    let plain_event =
+        event.state == KeyState::Press || !flags.contains(KeyboardFlags::REPORT_EVENT_TYPES);
+    let unmodified = mods.without(Modifiers::SHIFT).is_empty();
+    let escape_everything = flags.contains(KeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE);
+
+    // Below the escape-everything level the protocol requires the legacy
+    // bytes for keys that have them. Enter, tab, backspace and escape carry no
+    // `text`, so testing `event.text` here would skip them and send CSI-u,
+    // which an application at flag level 1 is not required to understand.
+    if unmodified && plain_event && !escape_everything {
+        if matches!(
+            event.code,
+            KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace | KeyCode::Escape
+        ) {
+            return encode_legacy(event, ctx);
         }
-    }
-    if text_only && matches!(event.code, KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace) {
-        return encode_legacy(event, ctx);
+        if let Some(text) = event.text {
+            let mut buf = [0u8; 4];
+            return text.encode_utf8(&mut buf).as_bytes().to_vec();
+        }
+        // Cursor, navigation and function keys keep their legacy forms too,
+        // so that application cursor key mode is still honoured.
+        if matches!(
+            event.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Insert
+                | KeyCode::Delete
+                | KeyCode::Function(_)
+                | KeyCode::Keypad(_)
+        ) {
+            return encode_legacy(event, ctx);
+        }
     }
 
     // CSI number [: shifted [: base]] [; modifiers [: event]] [; text] final
@@ -419,7 +436,9 @@ fn encode_kitty(event: &KeyEvent, ctx: &EncodeContext) -> Vec<u8> {
         }
     }
 
-    let modifier_param = mods.xterm_param();
+    // The Kitty protocol does report caps lock and num lock, unlike the
+    // legacy encoding, so the full modifier set is used for the parameter.
+    let modifier_param = event.modifiers.xterm_param();
     let report_event = flags.contains(KeyboardFlags::REPORT_EVENT_TYPES)
         && event.state != KeyState::Press;
     let mut modifier_field = String::new();
@@ -475,11 +494,16 @@ pub fn encode_mouse(event: &MouseEvent, mouse: MouseState) -> Option<Vec<u8>> {
         return None;
     }
 
-    let button = event.button.unwrap_or(MouseButton::Other(3));
+    // Three is the protocol's "no button" code, which is what bare motion and
+    // a legacy release both report. Inventing a button here made every drag
+    // from a real device carry an out of range button number.
+    const NO_BUTTON: u32 = 3;
     let mut code = match event.action {
-        // A release in the legacy encodings is reported as button 3.
-        MouseAction::Release if mouse.encoding != MouseEncoding::Sgr => 3,
-        _ => button.report_code(),
+        MouseAction::Release if mouse.encoding != MouseEncoding::Sgr => NO_BUTTON,
+        _ => match event.button {
+            Some(button) => button.report_code(),
+            None => NO_BUTTON,
+        },
     };
     if matches!(event.action, MouseAction::Drag | MouseAction::Motion) {
         code += 32;
@@ -912,5 +936,135 @@ mod tests {
     fn focus_events_are_distinct() {
         assert_eq!(encode_focus(true), b"\x1b[I");
         assert_eq!(encode_focus(false), b"\x1b[O");
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    use crate::event::{KeyEvent, Modifiers, MouseEvent};
+
+    fn kitty(flags: KeyboardFlags) -> EncodeContext {
+        EncodeContext {
+            kitty: flags,
+            ..EncodeContext::default()
+        }
+    }
+
+    fn text(bytes: Vec<u8>) -> String {
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn kitty_keeps_the_legacy_bytes_for_control_keys() {
+        // At flag level 1 an application is not required to parse CSI-u, so
+        // these keys must still send what they always did.
+        let ctx = kitty(KeyboardFlags::DISAMBIGUATE);
+        for (code, expected) in [
+            (KeyCode::Enter, "\r"),
+            (KeyCode::Tab, "\t"),
+            (KeyCode::Backspace, "\x7f"),
+            (KeyCode::Escape, "\x1b"),
+        ] {
+            let bytes = encode_key(&KeyEvent::new(code, Modifiers::NONE), &ctx);
+            assert_eq!(text(bytes), expected, "for {code:?}");
+        }
+    }
+
+    #[test]
+    fn kitty_still_escapes_control_keys_when_modified() {
+        let ctx = kitty(KeyboardFlags::DISAMBIGUATE);
+        let bytes = encode_key(&KeyEvent::new(KeyCode::Enter, Modifiers::CTRL), &ctx);
+        assert_eq!(text(bytes), "\x1b[13;5u");
+    }
+
+    #[test]
+    fn kitty_escapes_everything_when_asked() {
+        let ctx = kitty(KeyboardFlags(
+            KeyboardFlags::DISAMBIGUATE.0 | KeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE.0,
+        ));
+        let bytes = encode_key(&KeyEvent::new(KeyCode::Enter, Modifiers::NONE), &ctx);
+        assert_eq!(text(bytes), "\x1b[13u");
+    }
+
+    #[test]
+    fn kitty_honours_application_cursor_keys() {
+        let ctx = EncodeContext {
+            kitty: KeyboardFlags::DISAMBIGUATE,
+            cursor_keys_application: true,
+            ..EncodeContext::default()
+        };
+        let bytes = encode_key(&KeyEvent::new(KeyCode::Up, Modifiers::NONE), &ctx);
+        assert_eq!(text(bytes), "\x1bOA", "DECCKM must still apply");
+    }
+
+    #[test]
+    fn kitty_reports_the_lock_modifiers() {
+        // Caps lock is modifier bit 64, so the parameter is 1 + 64 + 4.
+        let ctx = kitty(KeyboardFlags::DISAMBIGUATE);
+        let event = KeyEvent::new(
+            KeyCode::Char('a'),
+            Modifiers::CTRL.union(Modifiers::CAPS_LOCK),
+        );
+        assert_eq!(text(encode_key(&event, &ctx)), "\x1b[97;69u");
+    }
+
+    #[test]
+    fn legacy_encoding_ignores_the_lock_modifiers() {
+        let ctx = EncodeContext::default();
+        let event = KeyEvent::new(
+            KeyCode::Char('c'),
+            Modifiers::CTRL.union(Modifiers::CAPS_LOCK),
+        );
+        assert_eq!(encode_key(&event, &ctx), b"\x03");
+    }
+
+    fn mouse_state(tracking: MouseTracking, encoding: MouseEncoding) -> MouseState {
+        MouseState {
+            tracking,
+            encoding,
+            alternate_scroll: false,
+        }
+    }
+
+    #[test]
+    fn button_less_motion_reports_the_no_button_code() {
+        // Devices report drags with no button; inventing one made every drag
+        // report an out of range button number.
+        let state = mouse_state(MouseTracking::AnyEvent, MouseEncoding::Sgr);
+        let event = MouseEvent {
+            button: None,
+            action: MouseAction::Motion,
+            col: 4,
+            row: 9,
+            modifiers: Modifiers::NONE,
+        };
+        assert_eq!(text(encode_mouse(&event, state).unwrap()), "\x1b[<35;5;10M");
+    }
+
+    #[test]
+    fn button_less_drag_reports_the_no_button_code() {
+        let state = mouse_state(MouseTracking::ButtonEvent, MouseEncoding::Sgr);
+        let event = MouseEvent {
+            button: None,
+            action: MouseAction::Drag,
+            col: 0,
+            row: 0,
+            modifiers: Modifiers::NONE,
+        };
+        assert_eq!(text(encode_mouse(&event, state).unwrap()), "\x1b[<35;1;1M");
+    }
+
+    #[test]
+    fn extra_buttons_report_in_the_128_range() {
+        let state = mouse_state(MouseTracking::Normal, MouseEncoding::Sgr);
+        let event = MouseEvent {
+            button: Some(MouseButton::Other(8)),
+            action: MouseAction::Press,
+            col: 0,
+            row: 0,
+            modifiers: Modifiers::NONE,
+        };
+        assert_eq!(text(encode_mouse(&event, state).unwrap()), "\x1b[<128;1;1M");
     }
 }

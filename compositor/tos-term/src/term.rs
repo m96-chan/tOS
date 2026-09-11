@@ -193,6 +193,9 @@ pub struct Terminal {
     cursor: Cursor,
     saved_cursor: SavedCursor,
     saved_cursor_alt: SavedCursor,
+    /// Row the cursor sat on in the buffer that is not displayed, so that
+    /// resizing trims the right end of it.
+    inactive_cursor_y: usize,
 
     scroll_region: Region,
     tabs: Vec<bool>,
@@ -241,6 +244,7 @@ impl Terminal {
             cursor: Cursor::default(),
             saved_cursor: SavedCursor::default(),
             saved_cursor_alt: SavedCursor::default(),
+            inactive_cursor_y: 0,
             scroll_region: Region::new(0, rows),
             tabs: default_tabs(cols),
             modes: Modes::default(),
@@ -388,7 +392,12 @@ impl Terminal {
 
         let attrs = self.cursor.attrs;
         let shift = self.screen.resize(cols, rows, self.cursor.y, &attrs);
-        self.inactive.resize(cols, rows, 0, &attrs);
+        // Passing zero here would make the hidden buffer shed rows from the
+        // bottom, destroying the newest output of whichever screen is not on
+        // display.
+        let inactive_y = self.inactive_cursor_y.min(self.inactive.rows() - 1);
+        let inactive_shift = self.inactive.resize(cols, rows, inactive_y, &attrs);
+        self.inactive_cursor_y = (inactive_y + inactive_shift).min(rows - 1);
 
         self.cursor.y = (self.cursor.y + shift).min(rows - 1);
         self.cursor.x = self.cursor.x.min(cols - 1);
@@ -683,6 +692,8 @@ impl Terminal {
         if to_alt == self.modes.alt_screen {
             return;
         }
+        // The row the cursor is leaving belongs to the buffer being hidden.
+        self.inactive_cursor_y = self.cursor.y;
         std::mem::swap(&mut self.screen, &mut self.inactive);
         self.modes.alt_screen = to_alt;
         if to_alt {
@@ -1177,6 +1188,11 @@ impl Perform for Terminal {
             Some(slot) => self.charsets[slot],
             None => self.charsets[self.gl],
         };
+        // DEL and the C1 range are not printable and must not be treated as
+        // combining marks; real terminals drop them.
+        if c == '\u{7f}' || ('\u{80}'..='\u{9f}').contains(&c) {
+            return;
+        }
         let c = charset.map(c);
         // Any output pins the viewport back to the live screen.
         self.reset_display_offset();
@@ -1192,7 +1208,10 @@ impl Perform for Terminal {
                 self.reset_display_offset();
                 self.linefeed();
                 if self.modes.linefeed_newline {
-                    self.cursor.x = 0;
+                    // A real carriage return, so the deferred wrap is cleared
+                    // too; setting x alone leaves `wrap_pending` armed and the
+                    // next character skips a line.
+                    self.carriage_return();
                 }
             }
             0x0d => self.carriage_return(),
@@ -1283,14 +1302,10 @@ impl Perform for Terminal {
             (None, b'I') => self.tab(arg(0)),
             (None, b'Z') => self.back_tab(arg(0)),
             (None, b'd') => {
+                // VPA is line addressing, so origin mode applies exactly as
+                // it does to CUP; only the column is left alone.
                 let x = self.cursor.x;
-                let (top, _) = self.bounds();
-                let _ = top;
-                self.mark_cursor_row();
-                self.cursor.y = (arg(0) - 1).min(self.rows() - 1);
-                self.cursor.x = x;
-                self.cursor.wrap_pending = false;
-                self.mark_cursor_row();
+                self.set_cursor(x, arg(0) - 1);
             }
 
             // ---- erasing and editing ----
@@ -1385,9 +1400,12 @@ impl Perform for Terminal {
             // ---- scroll region and saved cursor ----
             (None, b'r') => {
                 let rows = self.rows();
-                let top = params.get(0, 1) as usize - 1;
-                let bottom = params.get(1, rows as u16) as usize;
-                if top + 1 < bottom && bottom <= rows {
+                let top = (params.get(0, 1) as usize).saturating_sub(1);
+                // A bottom past the last row is clamped, not rejected: an
+                // application that sends a stale region after a resize must
+                // not stay stuck with the previous one.
+                let bottom = (params.get(1, rows as u16) as usize).min(rows);
+                if top + 1 < bottom {
                     self.scroll_region = Region::new(top, bottom);
                     self.set_cursor(0, 0);
                 }
@@ -1680,6 +1698,13 @@ fn parse_color_spec(spec: &str) -> Option<Rgb> {
         return Some(Rgb::new(r, g, b));
     }
     if let Some(rest) = spec.strip_prefix('#') {
+        // The spec reaches here through `from_utf8_lossy`, so it can contain
+        // multi-byte replacement characters; splitting by byte offset would
+        // panic on a char boundary. Hex digits are ASCII, so anything else
+        // makes the whole spec invalid.
+        if !rest.is_ascii() {
+            return None;
+        }
         let per = match rest.len() {
             3 | 6 | 12 => rest.len() / 3,
             _ => return None,

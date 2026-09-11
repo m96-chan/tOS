@@ -20,4 +20,4 @@ pub use nested::NestedDisplay;
 #[cfg(target_os = "linux")]
 pub use drm::DrmDisplay;
 #[cfg(target_os = "linux")]
-pub use vt::VirtualTerminal;
+pub use vt::{install_switch_handlers, take_switch_away, take_switch_back, VirtualTerminal};

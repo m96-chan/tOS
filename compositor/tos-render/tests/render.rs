@@ -366,3 +366,151 @@ fn a_pane_only_paints_inside_its_area() {
     assert_eq!(h.cell_pixel(5, 3, 0, 0), red, "inside the pane");
     assert_eq!(h.cell_pixel(1, 1, 0, 0), 0, "outside the pane untouched");
 }
+
+// ---------------------------------------------------------------------------
+// Regressions found in review
+// ---------------------------------------------------------------------------
+
+#[test]
+fn concealed_text_stays_concealed_when_selected() {
+    // SGR 8 is used to echo passwords; a selection must not reveal them.
+    let mut h = Harness::new(6, 1);
+    let options = RenderOptions {
+        force: true,
+        draw_cursor: false,
+        selection: Some(Selection::new((0, 0), (2, 0), false)),
+        ..RenderOptions::default()
+    };
+    h.feed(b"\x1b[8mabc").draw_with(&options);
+    let selection = options.selection_background.pack();
+    // Every pixel of the selected cells is the selection colour: no glyph.
+    let metrics = h.fonts.metrics();
+    for col in 0..3 {
+        for y in 0..metrics.cell_height {
+            for x in 0..metrics.cell_width {
+                assert_eq!(
+                    h.cell_pixel(col, 0, x, y),
+                    selection,
+                    "glyph visible at {col} {x},{y}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn blinking_text_stays_hidden_when_selected() {
+    let mut h = Harness::new(6, 1);
+    let options = RenderOptions {
+        force: true,
+        draw_cursor: false,
+        blink_visible: false,
+        selection: Some(Selection::new((0, 0), (0, 0), false)),
+        ..RenderOptions::default()
+    };
+    h.feed(b"\x1b[5mX").draw_with(&options);
+    let selection = options.selection_background.pack();
+    let metrics = h.fonts.metrics();
+    for y in 0..metrics.cell_height {
+        for x in 0..metrics.cell_width {
+            assert_eq!(h.cell_pixel(0, 0, x, y), selection);
+        }
+    }
+}
+
+/// Rows of the framebuffer that hold ink, relative to a cell's top edge.
+fn inked_rows(h: &Harness, col: usize, row: usize) -> Vec<u32> {
+    let metrics = h.fonts.metrics();
+    let background = h.term.palette().background.pack();
+    (0..metrics.cell_height)
+        .filter(|&y| (0..metrics.cell_width).any(|x| h.cell_pixel(col, row, x, y) != background))
+        .collect()
+}
+
+#[test]
+fn a_double_underline_stays_inside_its_cell() {
+    let mut h = Harness::new(4, 2);
+    h.feed(b"\x1b[21m ").draw_with(&RenderOptions {
+        force: true,
+        draw_cursor: false,
+        ..RenderOptions::default()
+    });
+    let metrics = h.fonts.metrics();
+    let rows = inked_rows(&h, 0, 0);
+    assert_eq!(rows.len(), 2, "a double underline has two strokes: {rows:?}");
+    assert!(
+        rows.iter().all(|&y| y < metrics.cell_height),
+        "strokes must stay in the cell: {rows:?}"
+    );
+    // And nothing leaked into the row below.
+    assert!(inked_rows(&h, 0, 1).is_empty(), "ink spilled into the next row");
+}
+
+#[test]
+fn a_curly_underline_stays_inside_its_cell() {
+    let mut h = Harness::new(4, 2);
+    h.feed(b"\x1b[4:3m ").draw_with(&RenderOptions {
+        force: true,
+        draw_cursor: false,
+        ..RenderOptions::default()
+    });
+    let metrics = h.fonts.metrics();
+    let rows = inked_rows(&h, 0, 0);
+    assert!(!rows.is_empty());
+    assert!(rows.iter().all(|&y| y < metrics.cell_height), "{rows:?}");
+    assert!(inked_rows(&h, 0, 1).is_empty(), "ink spilled into the next row");
+}
+
+#[test]
+fn a_single_underline_is_still_one_stroke() {
+    let mut h = Harness::new(4, 2);
+    h.feed(b"\x1b[4m ").draw_with(&RenderOptions {
+        force: true,
+        draw_cursor: false,
+        ..RenderOptions::default()
+    });
+    assert_eq!(inked_rows(&h, 0, 0).len(), 1);
+}
+
+#[test]
+fn the_block_cursor_covers_a_wide_glyph() {
+    let mut h = Harness::new(6, 1);
+    // Put the cursor back on the wide character after writing it.
+    h.feed("漢\x1b[1G".as_bytes()).draw_with(&RenderOptions {
+        force: true,
+        draw_cursor: true,
+        focused: true,
+        ..RenderOptions::default()
+    });
+    let cursor = h.term.palette().cursor.pack();
+    // Both halves of the glyph sit on the cursor block.
+    assert_eq!(h.cell_pixel(0, 0, 0, 0), cursor);
+    assert_eq!(h.cell_pixel(1, 0, 0, 0), cursor);
+    assert_ne!(h.cell_pixel(2, 0, 0, 0), cursor);
+}
+
+#[test]
+fn images_scroll_with_the_text_they_sit_on() {
+    let mut h = Harness::new(8, 4);
+    let metrics = h.fonts.metrics();
+    let (w, hgt) = (metrics.cell_width, metrics.cell_height);
+    let pixels: Vec<u8> = (0..w * hgt).flat_map(|_| [0u8, 0xff, 0, 0xff]).collect();
+    let payload = tos_term::graphics::encode_base64(&pixels);
+    h.feed(format!("\x1b_Ga=T,f=32,s={w},v={hgt},i=1;{payload}\x1b\\").as_bytes());
+
+    let options = RenderOptions {
+        force: true,
+        draw_cursor: false,
+        ..RenderOptions::default()
+    };
+    h.draw_with(&options);
+    assert_eq!(h.cell_pixel(0, 0, 1, 1), 0x00ff00, "image should be on row 0");
+
+    // Push the image off the top of the screen, then look at history.
+    h.feed(b"\r\n\r\n\r\n\r\n\r\n");
+    h.term.scroll_display(2);
+    h.draw_with(&options);
+    // Wherever it is now, it must not still be painted on screen row 0.
+    let top_row_is_image = h.cell_pixel(0, 0, 1, 1) == 0x00ff00;
+    assert!(!top_row_is_image, "the image stayed pinned to the display");
+}

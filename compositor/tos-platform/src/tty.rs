@@ -85,17 +85,34 @@ pub fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Read whatever is available without blocking.
-pub fn read_available(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+/// What a read produced.
+///
+/// End of file and "nothing right now" have to be told apart: `poll` reports a
+/// hung up terminal as readable forever, so treating the resulting zero byte
+/// read as "try again" spins at full speed with no way out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOutcome {
+    Data(usize),
+    WouldBlock,
+    Eof,
+}
+
+/// Read whatever is available.
+pub fn read_available(fd: RawFd, buf: &mut [u8]) -> io::Result<ReadOutcome> {
     let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
     if n < 0 {
         let err = io::Error::last_os_error();
-        if err.kind() == io::ErrorKind::WouldBlock {
-            return Ok(0);
-        }
-        return Err(err);
+        return match err.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(ReadOutcome::WouldBlock),
+            // A terminal whose other end has gone reports EIO, not end of file.
+            _ if err.raw_os_error() == Some(libc::EIO) => Ok(ReadOutcome::Eof),
+            _ => Err(err),
+        };
     }
-    Ok(n as usize)
+    if n == 0 {
+        return Ok(ReadOutcome::Eof);
+    }
+    Ok(ReadOutcome::Data(n as usize))
 }
 
 /// Wait until any of `fds` is readable, or until the timeout expires.
@@ -153,10 +170,29 @@ mod tests {
         assert_eq!(poll_readable(&[read_end], 100).unwrap(), vec![read_end]);
 
         let mut buf = [0u8; 4];
-        assert_eq!(read_available(read_end, &mut buf).unwrap(), 1);
+        assert_eq!(
+            read_available(read_end, &mut buf).unwrap(),
+            ReadOutcome::Data(1)
+        );
         unsafe {
             libc::close(read_end);
             libc::close(write_end);
+        }
+    }
+
+    #[test]
+    fn a_closed_writer_reports_end_of_file() {
+        // Distinct from "nothing to read": a hung up terminal must end the
+        // loop rather than being polled forever.
+        let mut fds = [0 as RawFd; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        unsafe {
+            libc::close(fds[1]);
+        }
+        let mut buf = [0u8; 4];
+        assert_eq!(read_available(fds[0], &mut buf).unwrap(), ReadOutcome::Eof);
+        unsafe {
+            libc::close(fds[0]);
         }
     }
 
@@ -166,7 +202,10 @@ mod tests {
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         set_nonblocking(fds[0]).unwrap();
         let mut buf = [0u8; 4];
-        assert_eq!(read_available(fds[0], &mut buf).unwrap(), 0);
+        assert_eq!(
+            read_available(fds[0], &mut buf).unwrap(),
+            ReadOutcome::WouldBlock
+        );
         unsafe {
             libc::close(fds[0]);
             libc::close(fds[1]);

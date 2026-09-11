@@ -12,7 +12,7 @@ use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 
 use crate::event::{
-    InputEvent, KeyEvent, KeyState, Modifiers, MouseAction, MouseButton, MouseEvent,
+    InputEvent, KeyEvent, KeyState, Modifiers, MouseAction, MouseButton, PointerEvent,
 };
 use crate::keymap;
 
@@ -94,7 +94,14 @@ impl Device {
         let path = path.as_ref().to_path_buf();
         let c_path = CString::new(path.as_os_str().to_string_lossy().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad device path"))?;
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        // Without O_CLOEXEC every process started in a pane would inherit a
+        // readable descriptor on every keyboard in the machine.
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -237,6 +244,9 @@ struct Pointer {
 pub struct InputBackend {
     devices: Vec<Device>,
     modifiers: Modifiers,
+    /// Which physical modifier keys are down, so releasing one of a pair does
+    /// not clear the modifier while the other is still held.
+    modifier_keys: Vec<crate::event::ModifierKey>,
     pointer: Pointer,
     bounds: (f64, f64),
     /// Buttons currently held, so motion can be reported as a drag.
@@ -277,6 +287,7 @@ impl InputBackend {
         Ok(InputBackend {
             devices,
             modifiers: Modifiers::NONE,
+            modifier_keys: Vec::new(),
             pointer: Pointer {
                 x: width as f64 / 2.0,
                 y: height as f64 / 2.0,
@@ -383,10 +394,6 @@ impl InputBackend {
                     self.pointer.y += self.motion.1;
                     self.clamp_pointer();
                     self.motion = (0.0, 0.0);
-                    out.push(InputEvent::PointerMotion {
-                        x: self.pointer.x,
-                        y: self.pointer.y,
-                    });
                     let action = if self.buttons_down > 0 {
                         MouseAction::Drag
                     } else {
@@ -424,8 +431,21 @@ impl InputBackend {
         // Modifier keys update the shared state and are still reported, so the
         // Kitty protocol can see them.
         if let crate::event::KeyCode::ModifierKey(key) = mapping.code {
-            self.modifiers
-                .set(key.modifier(), state != KeyState::Release);
+            if state == KeyState::Release {
+                self.modifier_keys.retain(|held| *held != key);
+            } else if !self.modifier_keys.contains(&key) {
+                self.modifier_keys.push(key);
+            }
+            // Rebuild from the keys actually held: left and right shift share
+            // one modifier bit, and releasing one must not clear it.
+            let mut modifiers = Modifiers::NONE;
+            for held in &self.modifier_keys {
+                modifiers.insert(held.modifier());
+            }
+            for lock in [Modifiers::CAPS_LOCK, Modifiers::NUM_LOCK] {
+                modifiers.set(lock, self.modifiers.contains(lock));
+            }
+            self.modifiers = modifiers;
         }
         if mapping.code == crate::event::KeyCode::CapsLock && state == KeyState::Press {
             let on = self.modifiers.contains(Modifiers::CAPS_LOCK);
@@ -436,27 +456,63 @@ impl InputBackend {
             self.modifiers.set(Modifiers::NUM_LOCK, !on);
         }
 
-        let text = mapping.character(
-            self.modifiers.contains(Modifiers::SHIFT),
-            self.modifiers.contains(Modifiers::CAPS_LOCK),
-        );
-        let mut event = KeyEvent::new(mapping.code, self.modifiers).with_state(state);
+        // With num lock off the keypad is a navigation cluster, which is what
+        // the labels on the keys say and what applications expect.
+        let code = match mapping.code {
+            crate::event::KeyCode::Keypad(key)
+                if !self.modifiers.contains(Modifiers::NUM_LOCK) =>
+            {
+                keypad_navigation(key).unwrap_or(mapping.code)
+            }
+            other => other,
+        };
+        let text = if code == mapping.code {
+            mapping.character(
+                self.modifiers.contains(Modifiers::SHIFT),
+                self.modifiers.contains(Modifiers::CAPS_LOCK),
+            )
+        } else {
+            // A navigation key produces no text.
+            None
+        };
+
+        let mut event = KeyEvent::new(code, self.modifiers).with_state(state);
         event.text = text;
         event.base = mapping.plain;
         out.push(InputEvent::Key(event));
     }
 
     fn mouse_event(&self, button: Option<MouseButton>, action: MouseAction) -> InputEvent {
-        // Coordinates are in pixels here; the compositor converts them to
-        // cells once it knows which pane the pointer is over.
-        InputEvent::Mouse(MouseEvent {
+        // A device knows pixels and nothing about cells, so this is a pointer
+        // event; the compositor converts it once it knows the font metrics.
+        InputEvent::Pointer(PointerEvent {
             button,
             action,
-            col: self.pointer.x as usize,
-            row: self.pointer.y as usize,
+            x: self.pointer.x,
+            y: self.pointer.y,
             modifiers: self.modifiers,
         })
     }
+}
+
+/// What a keypad key means when num lock is off.
+fn keypad_navigation(key: crate::event::Keypad) -> Option<crate::event::KeyCode> {
+    use crate::event::{Keypad, KeyCode as K};
+    Some(match key {
+        Keypad::Digit(0) => K::Insert,
+        Keypad::Digit(1) => K::End,
+        Keypad::Digit(2) => K::Down,
+        Keypad::Digit(3) => K::PageDown,
+        Keypad::Digit(4) => K::Left,
+        Keypad::Digit(6) => K::Right,
+        Keypad::Digit(7) => K::Home,
+        Keypad::Digit(8) => K::Up,
+        Keypad::Digit(9) => K::PageUp,
+        Keypad::Digit(5) => K::Keypad(Keypad::Begin),
+        Keypad::Decimal => K::Delete,
+        // The arithmetic keys and enter mean the same either way.
+        _ => return None,
+    })
 }
 
 fn mouse_button(code: u16) -> Option<MouseButton> {
@@ -489,6 +545,25 @@ mod tests {
             EVENT_SIZE,
             std::mem::size_of::<libc::time_t>() * 2 + 8
         );
+    }
+
+    #[test]
+    fn devices_are_opened_close_on_exec() {
+        // Not a runtime check, but the flag must stay in the open call: a
+        // child inheriting these descriptors could read every keystroke.
+        let source = include_str!("evdev.rs");
+        assert!(source.contains("libc::O_CLOEXEC"));
+    }
+
+    #[test]
+    fn the_keypad_is_a_navigation_cluster_without_num_lock() {
+        use crate::event::{KeyCode, Keypad};
+        assert_eq!(keypad_navigation(Keypad::Digit(8)), Some(KeyCode::Up));
+        assert_eq!(keypad_navigation(Keypad::Digit(1)), Some(KeyCode::End));
+        assert_eq!(keypad_navigation(Keypad::Decimal), Some(KeyCode::Delete));
+        // Arithmetic keys are the same either way.
+        assert_eq!(keypad_navigation(Keypad::Add), None);
+        assert_eq!(keypad_navigation(Keypad::Enter), None);
     }
 
     #[test]

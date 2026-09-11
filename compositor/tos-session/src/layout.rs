@@ -117,6 +117,22 @@ struct Node {
 /// The smallest a pane is allowed to become, in cells.
 const MIN_PANE: u32 = 2;
 
+/// Size of one child of a split.
+///
+/// The weighted share is floored at [`MIN_PANE`] so a pane never vanishes, but
+/// it is also capped so that the children still to come each keep at least
+/// that much: without the cap the floors can add up to more than the split
+/// has, and the last child ends up zero sized and positioned outside its
+/// parent.
+fn child_size(available: u32, used: u32, weight: f64, sum: f64, remaining: usize) -> u32 {
+    let ideal = (available as f64 * weight / sum).round() as u32;
+    // Room the children after this one need at the very least.
+    let reserved = MIN_PANE.saturating_mul(remaining.saturating_sub(1) as u32);
+    let left = available.saturating_sub(used);
+    let ceiling = left.saturating_sub(reserved);
+    ideal.max(MIN_PANE).min(ceiling).min(left)
+}
+
 /// A tree of panes.
 #[derive(Debug, Clone)]
 pub struct Layout {
@@ -204,15 +220,42 @@ impl Layout {
         }
     }
 
+    /// Whether `pane` is currently large enough to split along `axis`.
+    ///
+    /// Both halves have to clear [`MIN_PANE`], and the divider needs a cell of
+    /// its own. Without this check a split can be accepted that the area
+    /// cannot hold, and some pane ends up with no room at all.
+    pub fn can_split(&self, area: Rect, pane: PaneId, axis: Axis) -> bool {
+        let Some(rect) = self
+            .geometry(area)
+            .into_iter()
+            .find(|(p, _)| *p == pane)
+            .map(|(_, rect)| rect)
+        else {
+            return false;
+        };
+        let extent = match axis {
+            Axis::Columns => rect.width,
+            Axis::Rows => rect.height,
+        };
+        extent >= MIN_PANE * 2 + self.gap
+    }
+
     /// Split `pane` along `axis`, placing `new_pane` after it.
     ///
     /// Splitting again along the same axis extends the existing split rather
     /// than nesting, which is what keeps a row of panes evenly sized.
-    pub fn split(&mut self, pane: PaneId, axis: Axis, new_pane: PaneId) -> bool {
+    ///
+    /// Returns false when the pane is too small to divide; `area` is what the
+    /// tree is currently laid out in.
+    pub fn split(&mut self, area: Rect, pane: PaneId, axis: Axis, new_pane: PaneId) -> bool {
         let Some(&leaf) = self.leaves.get(&pane) else {
             return false;
         };
         if self.leaves.contains_key(&new_pane) {
+            return false;
+        }
+        if !self.can_split(area, pane, axis) {
             return false;
         }
 
@@ -359,14 +402,13 @@ impl Layout {
                 // `used` counts pane cells only; `offset` also counts gaps.
                 let mut used = 0u32;
                 let mut offset = 0u32;
+                let count = children.len();
                 for (i, (&child, &weight)) in children.iter().zip(weights).enumerate() {
-                    let is_last = i + 1 == children.len();
-                    // The last child absorbs the rounding error so the panes
-                    // always tile the area exactly.
+                    let is_last = i + 1 == count;
                     let size = if is_last {
                         available.saturating_sub(used)
                     } else {
-                        ((available as f64 * weight / sum).round() as u32).max(MIN_PANE.min(available))
+                        child_size(available, used, weight, sum, count - i)
                     };
                     let child_area = match axis {
                         Axis::Columns => Rect::new(area.x + offset, area.y, size, area.height),
@@ -407,12 +449,13 @@ impl Layout {
 
         let mut used = 0u32;
         let mut offset = 0u32;
+        let count = children.len();
         for (i, (&child, &weight)) in children.iter().zip(weights).enumerate() {
-            let is_last = i + 1 == children.len();
+            let is_last = i + 1 == count;
             let size = if is_last {
                 available.saturating_sub(used)
             } else {
-                ((available as f64 * weight / sum).round() as u32).max(MIN_PANE.min(available))
+                child_size(available, used, weight, sum, count - i)
             };
             let child_area = match axis {
                 Axis::Columns => Rect::new(area.x + offset, area.y, size, area.height),
@@ -495,6 +538,9 @@ impl Layout {
             return false;
         };
         let axis = direction.axis();
+        // Weights are relative to the split's own rectangle, so the cell delta
+        // has to be measured against that rather than the whole screen.
+        let extents = self.split_extents(area);
 
         // Walk up to the first split along the right axis that has room to
         // move on the side we want.
@@ -525,16 +571,60 @@ impl Layout {
                     None
                 };
                 if let Some(neighbour) = neighbour {
-                    let extent = match axis {
+                    let extent = extents.get(&parent).copied().unwrap_or(match axis {
                         Axis::Columns => area.width,
                         Axis::Rows => area.height,
-                    };
+                    });
                     return self.shift_weights(parent, index, neighbour, amount, extent);
                 }
             }
             node = parent;
         }
         false
+    }
+
+    /// The usable extent of every split, along its own axis, inside `area`.
+    fn split_extents(&self, area: Rect) -> HashMap<NodeId, u32> {
+        let mut out = HashMap::new();
+        self.collect_extents(self.root, area, &mut out);
+        out
+    }
+
+    fn collect_extents(&self, id: NodeId, area: Rect, out: &mut HashMap<NodeId, u32>) {
+        let NodeKind::Split {
+            axis,
+            children,
+            weights,
+        } = &self.node(id).kind
+        else {
+            return;
+        };
+        let count = children.len();
+        let total_gap = self.gap * count.saturating_sub(1) as u32;
+        let available = match axis {
+            Axis::Columns => area.width.saturating_sub(total_gap),
+            Axis::Rows => area.height.saturating_sub(total_gap),
+        };
+        out.insert(id, available);
+
+        let sum: f64 = weights.iter().sum();
+        let sum = if sum <= 0.0 { 1.0 } else { sum };
+        let mut used = 0u32;
+        let mut offset = 0u32;
+        for (i, (&child, &weight)) in children.iter().zip(weights).enumerate() {
+            let size = if i + 1 == count {
+                available.saturating_sub(used)
+            } else {
+                child_size(available, used, weight, sum, count - i)
+            };
+            let child_area = match axis {
+                Axis::Columns => Rect::new(area.x + offset, area.y, size, area.height),
+                Axis::Rows => Rect::new(area.x, area.y + offset, area.width, size),
+            };
+            self.collect_extents(child, child_area, out);
+            used += size;
+            offset += size + self.gap;
+        }
     }
 
     fn shift_weights(
@@ -603,7 +693,7 @@ mod tests {
     fn splitting_into_columns_divides_the_width() {
         let mut layout = Layout::new(PaneId(1));
         layout.gap = 0;
-        assert!(layout.split(PaneId(1), Axis::Columns, PaneId(2)));
+        assert!(layout.split(area(), PaneId(1), Axis::Columns, PaneId(2)));
         let geometry = layout.geometry(area());
         assert_eq!(layout_of(&geometry, PaneId(1)), Rect::new(0, 0, 40, 24));
         assert_eq!(layout_of(&geometry, PaneId(2)), Rect::new(40, 0, 40, 24));
@@ -613,7 +703,7 @@ mod tests {
     fn splitting_into_rows_divides_the_height() {
         let mut layout = Layout::new(PaneId(1));
         layout.gap = 0;
-        layout.split(PaneId(1), Axis::Rows, PaneId(2));
+        layout.split(area(), PaneId(1), Axis::Rows, PaneId(2));
         let geometry = layout.geometry(area());
         assert_eq!(layout_of(&geometry, PaneId(1)), Rect::new(0, 0, 80, 12));
         assert_eq!(layout_of(&geometry, PaneId(2)), Rect::new(0, 12, 80, 12));
@@ -623,7 +713,7 @@ mod tests {
     fn the_gap_leaves_room_for_a_divider() {
         let mut layout = Layout::new(PaneId(1));
         layout.gap = 1;
-        layout.split(PaneId(1), Axis::Columns, PaneId(2));
+        layout.split(area(), PaneId(1), Axis::Columns, PaneId(2));
         let geometry = layout.geometry(area());
         let left = layout_of(&geometry, PaneId(1));
         let right = layout_of(&geometry, PaneId(2));
@@ -639,8 +729,8 @@ mod tests {
     fn splitting_the_same_axis_extends_the_row() {
         let mut layout = Layout::new(PaneId(1));
         layout.gap = 0;
-        layout.split(PaneId(1), Axis::Columns, PaneId(2));
-        layout.split(PaneId(2), Axis::Columns, PaneId(3));
+        layout.split(area(), PaneId(1), Axis::Columns, PaneId(2));
+        layout.split(area(), PaneId(2), Axis::Columns, PaneId(3));
         let geometry = layout.geometry(area());
         assert_eq!(geometry.len(), 3);
         // Panes stay in left to right order.
@@ -659,8 +749,8 @@ mod tests {
     fn splitting_the_other_axis_nests() {
         let mut layout = Layout::new(PaneId(1));
         layout.gap = 0;
-        layout.split(PaneId(1), Axis::Columns, PaneId(2));
-        layout.split(PaneId(2), Axis::Rows, PaneId(3));
+        layout.split(area(), PaneId(1), Axis::Columns, PaneId(2));
+        layout.split(area(), PaneId(2), Axis::Rows, PaneId(3));
         let geometry = layout.geometry(area());
         let two = layout_of(&geometry, PaneId(2));
         let three = layout_of(&geometry, PaneId(3));
@@ -673,8 +763,8 @@ mod tests {
     fn panes_tile_the_area_exactly() {
         let mut layout = Layout::new(PaneId(1));
         layout.gap = 0;
-        layout.split(PaneId(1), Axis::Columns, PaneId(2));
-        layout.split(PaneId(2), Axis::Columns, PaneId(3));
+        layout.split(area(), PaneId(1), Axis::Columns, PaneId(2));
+        layout.split(area(), PaneId(2), Axis::Columns, PaneId(3));
         // An area that does not divide evenly by three.
         let area = Rect::new(0, 0, 100, 30);
         let geometry = layout.geometry(area);
@@ -689,7 +779,7 @@ mod tests {
     fn closing_a_pane_gives_its_space_to_a_neighbour() {
         let mut layout = Layout::new(PaneId(1));
         layout.gap = 0;
-        layout.split(PaneId(1), Axis::Columns, PaneId(2));
+        layout.split(area(), PaneId(1), Axis::Columns, PaneId(2));
         assert!(layout.close(PaneId(2)));
         assert_eq!(layout.len(), 1);
         assert_eq!(layout.geometry(area()), vec![(PaneId(1), area())]);
@@ -699,8 +789,8 @@ mod tests {
     fn closing_collapses_a_split_with_one_child_left() {
         let mut layout = Layout::new(PaneId(1));
         layout.gap = 0;
-        layout.split(PaneId(1), Axis::Columns, PaneId(2));
-        layout.split(PaneId(2), Axis::Rows, PaneId(3));
+        layout.split(area(), PaneId(1), Axis::Columns, PaneId(2));
+        layout.split(area(), PaneId(2), Axis::Rows, PaneId(3));
         layout.close(PaneId(3));
         let geometry = layout.geometry(area());
         // Pane 2 takes the whole right column back.
@@ -724,8 +814,8 @@ mod tests {
     fn focus_moves_to_the_neighbour_in_that_direction() {
         let mut layout = Layout::new(PaneId(1));
         layout.gap = 0;
-        layout.split(PaneId(1), Axis::Columns, PaneId(2));
-        layout.split(PaneId(2), Axis::Rows, PaneId(3));
+        layout.split(area(), PaneId(1), Axis::Columns, PaneId(2));
+        layout.split(area(), PaneId(2), Axis::Rows, PaneId(3));
 
         assert_eq!(
             layout.neighbour(area(), PaneId(1), Direction::Right),
@@ -748,7 +838,7 @@ mod tests {
     #[test]
     fn there_is_no_neighbour_at_the_edge() {
         let mut layout = Layout::new(PaneId(1));
-        layout.split(PaneId(1), Axis::Columns, PaneId(2));
+        layout.split(area(), PaneId(1), Axis::Columns, PaneId(2));
         assert_eq!(layout.neighbour(area(), PaneId(1), Direction::Left), None);
         assert_eq!(layout.neighbour(area(), PaneId(1), Direction::Up), None);
     }
@@ -759,8 +849,8 @@ mod tests {
         // right from the left pane should land on whichever lines up best.
         let mut layout = Layout::new(PaneId(1));
         layout.gap = 0;
-        layout.split(PaneId(1), Axis::Columns, PaneId(2));
-        layout.split(PaneId(2), Axis::Rows, PaneId(3));
+        layout.split(area(), PaneId(1), Axis::Columns, PaneId(2));
+        layout.split(area(), PaneId(2), Axis::Rows, PaneId(3));
         // Pane 1's centre is halfway down, as is the boundary between 2 and 3,
         // so either is defensible; what matters is that it is one of them.
         let target = layout.neighbour(area(), PaneId(1), Direction::Right);
@@ -771,7 +861,7 @@ mod tests {
     fn resizing_moves_the_divider() {
         let mut layout = Layout::new(PaneId(1));
         layout.gap = 0;
-        layout.split(PaneId(1), Axis::Columns, PaneId(2));
+        layout.split(area(), PaneId(1), Axis::Columns, PaneId(2));
         assert!(layout.resize(area(), PaneId(1), Direction::Right, 8));
         let geometry = layout.geometry(area());
         assert_eq!(layout_of(&geometry, PaneId(1)).width, 48);
@@ -782,7 +872,7 @@ mod tests {
     fn resizing_stops_at_the_minimum_size() {
         let mut layout = Layout::new(PaneId(1));
         layout.gap = 0;
-        layout.split(PaneId(1), Axis::Columns, PaneId(2));
+        layout.split(area(), PaneId(1), Axis::Columns, PaneId(2));
         assert!(!layout.resize(area(), PaneId(1), Direction::Right, 100));
         // The layout is untouched when the move is refused.
         let geometry = layout.geometry(area());
@@ -792,7 +882,7 @@ mod tests {
     #[test]
     fn resizing_at_the_edge_does_nothing() {
         let mut layout = Layout::new(PaneId(1));
-        layout.split(PaneId(1), Axis::Columns, PaneId(2));
+        layout.split(area(), PaneId(1), Axis::Columns, PaneId(2));
         assert!(!layout.resize(area(), PaneId(1), Direction::Left, 4));
     }
 
@@ -800,7 +890,7 @@ mod tests {
     fn balance_restores_equal_shares() {
         let mut layout = Layout::new(PaneId(1));
         layout.gap = 0;
-        layout.split(PaneId(1), Axis::Columns, PaneId(2));
+        layout.split(area(), PaneId(1), Axis::Columns, PaneId(2));
         layout.resize(area(), PaneId(1), Direction::Right, 20);
         layout.balance();
         let geometry = layout.geometry(area());
@@ -811,7 +901,7 @@ mod tests {
     fn pane_at_finds_the_pane_under_a_cell() {
         let mut layout = Layout::new(PaneId(1));
         layout.gap = 1;
-        layout.split(PaneId(1), Axis::Columns, PaneId(2));
+        layout.split(area(), PaneId(1), Axis::Columns, PaneId(2));
         let geometry = layout.geometry(area());
         let right = layout_of(&geometry, PaneId(2));
         assert_eq!(layout.pane_at(area(), 0, 0), Some(PaneId(1)));
@@ -824,21 +914,173 @@ mod tests {
     fn deep_trees_stay_consistent() {
         let mut layout = Layout::new(PaneId(0));
         layout.gap = 0;
+        // Each split halves the newest pane, so the area has to be large
+        // enough for eleven halvings along each axis.
+        let area = Rect::new(0, 0, 4096, 4096);
         for i in 1..12u32 {
             let axis = if i % 2 == 0 { Axis::Columns } else { Axis::Rows };
-            assert!(layout.split(PaneId(i - 1), axis, PaneId(i)));
+            assert!(layout.split(area, PaneId(i - 1), axis, PaneId(i)));
         }
         assert_eq!(layout.len(), 12);
-        let geometry = layout.geometry(Rect::new(0, 0, 200, 100));
+        let geometry = layout.geometry(area);
         assert_eq!(geometry.len(), 12);
         // Closing every pane but one must not corrupt the tree.
         for i in (1..12u32).rev() {
             assert!(layout.close(PaneId(i)), "failed to close {i}");
         }
         assert_eq!(layout.len(), 1);
-        assert_eq!(
-            layout.geometry(Rect::new(0, 0, 200, 100)),
-            vec![(PaneId(0), Rect::new(0, 0, 200, 100))]
-        );
+        assert_eq!(layout.geometry(area), vec![(PaneId(0), area)]);
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+
+    /// Every pane must be inside the area, non-empty, and not overlap.
+    fn assert_tiles(layout: &Layout, area: Rect) {
+        let geometry = layout.geometry(area);
+        for (pane, rect) in &geometry {
+            assert!(!rect.is_empty(), "{pane:?} has no area: {rect:?}");
+            assert!(
+                rect.x >= area.x
+                    && rect.y >= area.y
+                    && rect.right() <= area.right()
+                    && rect.bottom() <= area.bottom(),
+                "{pane:?} at {rect:?} escapes {area:?}"
+            );
+        }
+        for (i, (a_pane, a)) in geometry.iter().enumerate() {
+            for (b_pane, b) in geometry.iter().skip(i + 1) {
+                let overlap = a.x < b.right()
+                    && b.x < a.right()
+                    && a.y < b.bottom()
+                    && b.y < a.bottom();
+                assert!(!overlap, "{a_pane:?} {a:?} overlaps {b_pane:?} {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn many_splits_keep_every_pane_inside_the_area() {
+        // Repeatedly splitting the newest pane halves its weight each time, so
+        // the shares become very uneven; the minimum size must not then add up
+        // to more than the area holds.
+        for width in [40u32, 80, 120, 200] {
+            let mut layout = Layout::new(PaneId(0));
+            let area = Rect::new(0, 0, width, 40);
+            for i in 1..16u32 {
+                // A refused split is the correct answer once the pane is too
+                // small; what must never happen is a pane with no room.
+                layout.split(area, PaneId(i - 1), Axis::Columns, PaneId(i));
+                assert_tiles(&layout, area);
+            }
+        }
+    }
+
+    #[test]
+    fn many_splits_keep_every_pane_inside_a_narrow_area() {
+        let mut layout = Layout::new(PaneId(0));
+        let area = Rect::new(0, 0, 24, 8);
+        for i in 1..12u32 {
+            layout.split(area, PaneId(i - 1), Axis::Rows, PaneId(i));
+            assert_tiles(&layout, area);
+        }
+    }
+
+    #[test]
+    fn alternating_splits_stay_inside_the_area() {
+        let mut layout = Layout::new(PaneId(0));
+        let area = Rect::new(0, 0, 100, 30);
+        for i in 1..20u32 {
+            let axis = if i % 2 == 0 { Axis::Columns } else { Axis::Rows };
+            layout.split(area, PaneId(i - 1), axis, PaneId(i));
+            assert_tiles(&layout, area);
+        }
+    }
+
+    #[test]
+    fn dividers_stay_inside_the_area_too() {
+        let mut layout = Layout::new(PaneId(0));
+        let area = Rect::new(0, 0, 60, 20);
+        for i in 1..10u32 {
+            layout.split(area, PaneId(i - 1), Axis::Columns, PaneId(i));
+        }
+        for (_, divider) in layout.dividers(area) {
+            assert!(
+                divider.right() <= area.right() && divider.bottom() <= area.bottom(),
+                "divider {divider:?} escapes {area:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_pane_can_be_found_by_its_own_cells() {
+        let mut layout = Layout::new(PaneId(0));
+        layout.gap = 0;
+        let area = Rect::new(0, 0, 80, 24);
+        for i in 1..8u32 {
+            let axis = if i % 3 == 0 { Axis::Rows } else { Axis::Columns };
+            layout.split(area, PaneId(i - 1), axis, PaneId(i));
+        }
+        for (pane, rect) in layout.geometry(area) {
+            assert_eq!(
+                layout.pane_at(area, rect.x, rect.y),
+                Some(pane),
+                "{pane:?} at {rect:?} cannot be clicked"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pane_too_small_to_divide_is_not_split() {
+        let mut layout = Layout::new(PaneId(0));
+        layout.gap = 1;
+        // Four columns need two cells each plus three dividers.
+        let area = Rect::new(0, 0, 4, 4);
+        assert!(!layout.can_split(area, PaneId(0), Axis::Columns));
+        assert!(!layout.split(area, PaneId(0), Axis::Columns, PaneId(1)));
+        assert_eq!(layout.len(), 1, "a refused split must change nothing");
+
+        let roomy = Rect::new(0, 0, 5, 4);
+        assert!(layout.can_split(roomy, PaneId(0), Axis::Columns));
+        assert!(layout.split(roomy, PaneId(0), Axis::Columns, PaneId(1)));
+    }
+
+    #[test]
+    fn resizing_a_nested_split_moves_by_the_requested_amount() {
+        // The delta must be measured against the split's own rectangle, not
+        // the whole screen, or a nested divider moves by the wrong distance.
+        let mut layout = Layout::new(PaneId(0));
+        layout.gap = 0;
+        let area = Rect::new(0, 0, 200, 40);
+        layout.split(area, PaneId(0), Axis::Columns, PaneId(1));
+        layout.split(area, PaneId(0), Axis::Rows, PaneId(2));
+        layout.split(area, PaneId(2), Axis::Columns, PaneId(3));
+
+        let width_of = |layout: &Layout, pane: PaneId| {
+            layout
+                .geometry(area)
+                .into_iter()
+                .find(|(p, _)| *p == pane)
+                .unwrap()
+                .1
+                .width
+        };
+        let before = width_of(&layout, PaneId(2));
+        assert!(layout.resize(area, PaneId(2), Direction::Right, 10));
+        assert_eq!(width_of(&layout, PaneId(2)), before + 10);
+    }
+
+    #[test]
+    fn resizing_a_top_level_split_accounts_for_the_gap() {
+        let mut layout = Layout::new(PaneId(0));
+        layout.gap = 1;
+        let area = Rect::new(0, 0, 80, 24);
+        layout.split(area, PaneId(0), Axis::Columns, PaneId(1));
+        let width_of = |layout: &Layout| layout.geometry(area)[0].1.width;
+        let before = width_of(&layout);
+        assert!(layout.resize(area, PaneId(0), Direction::Right, 8));
+        assert_eq!(width_of(&layout), before + 8);
     }
 }

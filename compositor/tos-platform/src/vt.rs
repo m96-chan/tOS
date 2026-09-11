@@ -25,6 +25,8 @@ const KD_GRAPHICS: libc::c_long = 0x01;
 /// Raw scancodes with no translation; tOS reads evdev instead, so the console
 /// keyboard is simply switched off.
 const K_OFF: libc::c_long = 0x04;
+/// The mode a text console normally runs in.
+const K_XLATE: libc::c_long = 0x01;
 
 const VT_AUTO: u8 = 0x00;
 const VT_PROCESS: u8 = 0x01;
@@ -93,7 +95,9 @@ impl VirtualTerminal {
 
         let mut saved_kd_mode: libc::c_long = KD_TEXT;
         let _ = ioctl_ptr(fd, KDGETMODE, &mut saved_kd_mode);
-        let mut saved_kb_mode: libc::c_long = 0;
+        // Zero is K_RAW: if the query fails, restoring that would hand the
+        // user back a console whose keyboard produces raw scancodes.
+        let mut saved_kb_mode: libc::c_long = K_XLATE;
         let _ = ioctl_ptr(fd, KDGKBMODE, &mut saved_kb_mode);
         let mut saved_vt_mode = VtMode::default();
         let _ = ioctl_ptr(fd, VT_GETMODE, &mut saved_vt_mode);
@@ -119,8 +123,17 @@ impl VirtualTerminal {
     /// Stop the kernel drawing text and reading the keyboard on this VT.
     ///
     /// `release` and `acquire` are the signals the kernel will send when the
-    /// user switches away from and back to this terminal.
+    /// user switches away from and back to this terminal. Handlers for both
+    /// must already be installed: their default disposition is to terminate,
+    /// so the first VT switch would kill tOS and leave the console in graphics
+    /// mode with no keyboard. [`install_switch_handlers`] does this.
     pub fn take_over(&mut self, release: i32, acquire: i32) -> io::Result<()> {
+        if !handlers_installed(release) || !handlers_installed(acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "VT switch signals need handlers before the terminal is taken over",
+            ));
+        }
         ioctl_value(self.fd, KDSETMODE, KD_GRAPHICS)?;
         // Losing this leaves the console unusable, so failure is fatal here.
         if let Err(e) = ioctl_value(self.fd, KDSKBMODE, K_OFF) {
@@ -187,6 +200,61 @@ impl Drop for VirtualTerminal {
     }
 }
 
+/// Signals that have had a handler installed by [`install_switch_handlers`].
+static SWITCH_SIGNALS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether tOS has taken responsibility for a VT switch signal.
+fn handlers_installed(signal: i32) -> bool {
+    SWITCH_SIGNALS
+        .lock()
+        .map(|installed| installed.contains(&signal))
+        .unwrap_or(false)
+}
+
+/// Install handlers for the VT switch signals.
+///
+/// The handler only records that a switch was requested; the compositor acts
+/// on it from its own loop, where it can release the display in an orderly
+/// way. Anything more in a signal handler would not be async-signal-safe.
+pub fn install_switch_handlers(release: i32, acquire: i32) -> io::Result<()> {
+    extern "C" fn on_release(_: libc::c_int) {
+        SWITCH_AWAY.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    extern "C" fn on_acquire(_: libc::c_int) {
+        SWITCH_BACK.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    unsafe {
+        if libc::signal(release, on_release as *const () as libc::sighandler_t) == libc::SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::signal(acquire, on_acquire as *const () as libc::sighandler_t) == libc::SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let mut installed = SWITCH_SIGNALS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    installed.push(release);
+    installed.push(acquire);
+    Ok(())
+}
+
+/// Set when the kernel asks tOS to give up the terminal.
+static SWITCH_AWAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set when the terminal comes back.
+static SWITCH_BACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a switch away has been requested since this was last called.
+pub fn take_switch_away() -> bool {
+    SWITCH_AWAY.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the terminal has come back since this was last called.
+pub fn take_switch_back() -> bool {
+    SWITCH_BACK.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +265,27 @@ mod tests {
         assert_eq!(KDSKBMODE, 0x4b45);
         assert_eq!(VT_SETMODE, 0x5602);
         assert_eq!(VT_RELDISP, 0x5605);
+    }
+
+    #[test]
+    fn taking_over_without_handlers_is_refused() {
+        // Arming VT_PROCESS without handlers means the first Ctrl+Alt+F2 kills
+        // tOS and leaves the console unusable, so it must not be possible.
+        assert!(!handlers_installed(libc::SIGUSR1));
+    }
+
+    #[test]
+    fn switch_flags_are_edge_triggered() {
+        SWITCH_AWAY.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(take_switch_away());
+        assert!(!take_switch_away());
+    }
+
+    #[test]
+    fn the_saved_keyboard_mode_defaults_to_translated() {
+        // Zero would be K_RAW, which is not what a console runs in.
+        assert_eq!(K_XLATE, 0x01);
+        assert_ne!(K_XLATE, 0);
     }
 
     #[test]
