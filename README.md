@@ -606,6 +606,16 @@ the top right of the panes — a failure has to look like something, and it used
 to look like a dead key. Kitty's OSC 99, with its ids, urgency and dismissal
 from the application, is not implemented: it belongs on top of this queue
 rather than beside it.
+Take the list away and the same box is a prompt: a title and one line to type
+into. That is what `super+,`, or `ctrl+a` then `,`, uses to name a workspace —
+the comma is where tmux renames a window. The line opens holding the name the
+workspace has now, so correcting one is a few keys rather than retyping it;
+enter takes the line and the status bar says it in the next frame, and escape
+leaves the old name alone. Accepting an empty line is how the number is asked
+for back: the workspace forgets it was ever named, so renumbering moves it
+along with the rest again when a workspace before it closes. A name belongs to
+the workspace rather than to the position, which is why a named workspace keeps
+its name while its neighbours are renumbered around it.
 
 ### 0.1 — Portable tOS
 
@@ -784,8 +794,8 @@ To render a frame without a display at all:
 `ctrl+a`; on hardware the same bindings work directly with `super`. The two
 bindings that grow a session are also where most people expect them:
 `ctrl+shift+enter` splits the focused pane and `ctrl+shift+t` opens a new
-workspace. `super+space` opens the launcher, and `super+m` opens the
-notifications.
+workspace. `super+space` opens the launcher, `super+m` opens the notifications
+and `super+,` names the workspace.
 
 ## Configuration
 

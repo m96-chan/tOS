@@ -68,6 +68,8 @@ pub enum OverlayKind {
     Launcher,
     /// What has been said on the status bar, newest first.
     Notifications,
+    /// A line of text: the new name for the active workspace.
+    RenameWorkspace,
 }
 
 /// The running compositor.
@@ -762,6 +764,17 @@ impl Compositor {
                 }
                 moved
             }
+            Action::RenameWorkspace => {
+                // The prompt opens on the name the workspace has now, which is
+                // both the value to edit and the only place it is written
+                // down; clearing the line is how the number is asked back.
+                let name = self.session.active().name.clone();
+                self.open_overlay(
+                    OverlayKind::RenameWorkspace,
+                    Overlay::prompt("rename workspace", name),
+                );
+                true
+            }
             Action::Scroll(lines) => self.scroll_focused(lines as isize),
             Action::ScrollPage(pages) => {
                 let rows = self
@@ -865,33 +878,47 @@ impl Compositor {
             OverlayOutcome::Chosen(index) => {
                 let label = overlay.items()[index].label.clone();
                 self.close_overlay();
-                self.choose(kind, index, &label);
+                self.choose(kind, Some(index), &label);
+                true
+            }
+            OverlayOutcome::Accepted => {
+                let text = overlay.query().to_string();
+                self.close_overlay();
+                self.choose(kind, None, &text);
                 true
             }
         }
     }
 
-    /// Act on the row an overlay reported. One arm per menu.
+    /// Act on what an overlay reported: the row that was chosen, or the line
+    /// a prompt accepted. One arm per menu.
     ///
-    /// Both the row's position and its label are passed, because a menu built
+    /// Both the row's position and its text are passed, because a menu built
     /// out of names is answered by name and a menu built out of a list the
-    /// compositor already holds is answered by position.
-    fn choose(&mut self, kind: OverlayKind, index: usize, label: &str) {
+    /// compositor already holds is answered by position. A prompt has no row,
+    /// which is what `None` means.
+    fn choose(&mut self, kind: OverlayKind, row: Option<usize>, label: &str) {
         match kind {
             OverlayKind::Launcher => self.launch(label),
-            OverlayKind::Notifications => match self.notifications.choose(index) {
-                Chosen::Clear => self.notifications.clear_history(),
-                // Where a notification came from is the useful thing to do
-                // with it: a build that finished is a pane to go and look at,
-                // wherever that pane has ended up.
-                Chosen::Pane(pane) => {
-                    if self.session.set_focus(pane) {
-                        self.sync_layout();
-                        self.needs_full_redraw = true;
+            OverlayKind::Notifications => {
+                let Some(index) = row else { return };
+                match self.notifications.choose(index) {
+                    Chosen::Clear => self.notifications.clear_history(),
+                    // Where a notification came from is the useful thing to do
+                    // with it: a build that finished is a pane to go and look
+                    // at, wherever that pane has ended up.
+                    Chosen::Pane(pane) => {
+                        if self.session.set_focus(pane) {
+                            self.sync_layout();
+                            self.needs_full_redraw = true;
+                        }
                     }
+                    Chosen::Nowhere => {}
                 }
-                Chosen::Nowhere => {}
-            },
+            }
+            // Closing the overlay has already asked for the frame that puts
+            // the new name in the status bar.
+            OverlayKind::RenameWorkspace => self.session.rename_active(label),
         }
     }
 
@@ -1153,16 +1180,23 @@ impl Compositor {
         self.needs_full_redraw = false;
     }
 
-    fn draw_status(&mut self, surface: &mut Surface<'_>, area: Rect, cell_height: u32) {
+    /// What the left of the status bar says: every workspace's name, in
+    /// position order, with the active one marked.
+    ///
+    /// Separate from the drawing so that a test can read the bar's own words
+    /// rather than infer them from pixels.
+    fn status_items(&self) -> Vec<StatusItem> {
         let active = self.session.active_index();
-        let items: Vec<StatusItem> = (0..self.session.workspace_count())
-            .map(|i| {
-                StatusItem::new(
-                    self.session.workspaces()[i].name.clone(),
-                    i == active,
-                )
-            })
-            .collect();
+        self.session
+            .workspaces()
+            .iter()
+            .enumerate()
+            .map(|(i, workspace)| StatusItem::new(workspace.name.clone(), i == active))
+            .collect()
+    }
+
+    fn draw_status(&mut self, surface: &mut Surface<'_>, area: Rect, cell_height: u32) {
+        let items = self.status_items();
 
         let focus = self.session.focus();
         // The leader indicator comes first: it is the state of the keyboard
@@ -1877,6 +1911,116 @@ mod tests {
             framebuffer.pixels().contains(&accent),
             "the notification was not drawn"
         );
+    }
+
+    // ---- workspace rename -----------------------------------------------
+
+    fn press_key(
+        compositor: &mut Compositor,
+        code: KeyCode,
+        modifiers: tos_input::Modifiers,
+    ) -> bool {
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(code, modifiers)))
+    }
+
+    /// Open the rename prompt, clear the name it starts on and type `name`.
+    fn rename_to(compositor: &mut Compositor, name: &str) {
+        press_key(compositor, KeyCode::Char(','), tos_input::Modifiers::SUPER);
+        while !compositor.overlay().expect("the prompt").query().is_empty() {
+            press_key(compositor, KeyCode::Backspace, tos_input::Modifiers::NONE);
+        }
+        type_into_overlay(compositor, name);
+        press_key(compositor, KeyCode::Enter, tos_input::Modifiers::NONE);
+    }
+
+    #[test]
+    fn the_rename_binding_opens_a_prompt_holding_the_current_name() {
+        let mut compositor = compositor();
+        assert!(press_key(
+            &mut compositor,
+            KeyCode::Char(','),
+            tos_input::Modifiers::SUPER
+        ));
+        let overlay = compositor.overlay().expect("the prompt should be open");
+        assert_eq!(overlay.query(), "1");
+        assert!(overlay.items().is_empty(), "a prompt has no list");
+    }
+
+    #[test]
+    fn a_typed_name_reaches_the_status_bar() {
+        let mut compositor = compositor();
+        rename_to(&mut compositor, "build");
+        assert!(compositor.overlay().is_none(), "accepting should close it");
+        assert_eq!(compositor.session.active().name, "build");
+        let items = compositor.status_items();
+        assert_eq!(items[0].text, "build");
+        assert!(items[0].highlighted, "the active workspace is marked");
+    }
+
+    #[test]
+    fn a_renamed_workspace_is_wider_in_the_drawn_status_bar() {
+        // The bar is the one thing the name is for, so this asks the pixels
+        // rather than the items: a longer name highlights more of the row.
+        fn accent_in_the_bar(compositor: &mut Compositor) -> usize {
+            let mut framebuffer = tos_render::OwnedFramebuffer::new(640, 360);
+            {
+                let mut surface = framebuffer.surface();
+                compositor.render_frame(&mut surface, false);
+            }
+            let (_, ch) = compositor.cell_size();
+            let accent = compositor.chrome.accent.pack();
+            let above = (compositor.grid_area().height * ch * 640) as usize;
+            framebuffer
+                .pixels()
+                .iter()
+                .skip(above)
+                .filter(|&&px| px == accent)
+                .count()
+        }
+
+        let mut compositor = compositor();
+        let before = accent_in_the_bar(&mut compositor);
+        rename_to(&mut compositor, "development");
+        let after = accent_in_the_bar(&mut compositor);
+        assert!(after > before, "{after} should be more than {before}");
+    }
+
+    #[test]
+    fn cancelling_the_prompt_leaves_the_name_alone() {
+        let mut compositor = compositor();
+        compositor.perform(Action::RenameWorkspace);
+        type_into_overlay(&mut compositor, "half typed");
+        assert!(press_key(
+            &mut compositor,
+            KeyCode::Escape,
+            tos_input::Modifiers::NONE
+        ));
+        assert!(compositor.overlay().is_none());
+        assert_eq!(compositor.session.active().name, "1");
+    }
+
+    #[test]
+    fn an_emptied_prompt_gives_the_workspace_its_number_back() {
+        let mut compositor = compositor();
+        rename_to(&mut compositor, "build");
+        rename_to(&mut compositor, "");
+        assert_eq!(compositor.session.active().name, "1");
+        // And with the name forgotten the number follows the position again.
+        compositor.perform(Action::NewWorkspace);
+        compositor.perform(Action::SelectWorkspace(1));
+        compositor.perform(Action::ClosePane);
+        assert_eq!(compositor.status_items()[0].text, "1");
+    }
+
+    #[test]
+    fn the_prompt_takes_the_keys_the_pane_would_have_had() {
+        let mut compositor = compositor();
+        compositor.perform(Action::RenameWorkspace);
+        type_into_overlay(&mut compositor, "build");
+        press_key(&mut compositor, KeyCode::Char('d'), tos_input::Modifiers::SUPER);
+        assert_eq!(compositor.panes.len(), 1, "a binding fired under the prompt");
+        let focus = compositor.session.focus();
+        assert_eq!(compositor.pane(focus).unwrap().pending_input(), 0);
     }
 
     #[test]
