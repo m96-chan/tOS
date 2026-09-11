@@ -62,6 +62,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tos-install"
+version = "0.0.3"
+dependencies = [
+ "libc",
+ "tos-input",
+ "tos-platform",
+ "tos-pty",
+ "tos-term",
+]
+
+[[package]]
 name = "tos-platform"
 version = "0.0.3"
 dependencies = [

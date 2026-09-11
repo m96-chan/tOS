@@ -1,0 +1,113 @@
+name: ci
+
+# The ISO workflow proves the image boots. This one proves the code is
+# correct, which is a different question and needs to run on every change,
+# not only on the ones that touch the image.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The lint gate is pinned. A floating toolchain plus `-D warnings` means a
+  # Rust release can fail a build over code that did not change, on a version
+  # nobody can guess to reproduce locally. Bumping this is a deliberate change
+  # with its own fixes, which is the only way the gate stays worth having.
+  LINT_TOOLCHAIN: "1.98.1"
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Tests run on whatever stable is, so a compiler that genuinely breaks
+      # tOS is caught rather than pinned away from.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Test
+        # These fork real processes onto real pseudoterminals, but need no
+        # display: the compositor's headless and nested backends are what the
+        # tests drive.
+        run: cargo test --workspace
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+      - name: Clippy
+        # `-D warnings` goes after the separator so it applies to this
+        # workspace and not to its dependencies, whose warnings are not ours
+        # to fix and would otherwise break the build on a compiler upgrade.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  cross:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # The kernel-facing backends are Linux-only, and tOS targets PCs
+          # and arm64 boards alike, so both have to keep compiling even
+          # though only one of them is tested.
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          # The ISO links a fully static binary; musl is what that means, and
+          # its libc definitions differ enough to break code that builds
+          # everywhere else.
+          - x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Check
+        run: >-
+          cargo clippy --workspace --all-targets
+          --target ${{ matrix.target }} -- -D warnings
+
+  shell:
+    name: shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax
+        run: |
+          # The container and initramfs scripts are POSIX shell; build.sh and
+          # run.sh run on the host and are bash.
+          for script in iso/mkiso.sh iso/init iso/profile; do
+            sh -n "$script" || exit 1
+          done
+          for script in iso/build.sh iso/run.sh; do
+            bash -n "$script" || exit 1
+          done
+      - name: Shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+          # Each script's own shebang says which shell it is, except the
+          # profile, which is sourced and so has none.
+          shellcheck --severity=warning iso/build.sh iso/run.sh iso/mkiso.sh iso/init
+          shellcheck --shell=sh --severity=warning iso/profile

@@ -38,11 +38,16 @@ const BTN_EXTRA: u16 = 0x114;
 const BTN_TOUCH: u16 = 0x14a;
 
 /// The kernel's `struct input_event`.
+///
+/// The timestamp is a kernel `struct timeval`, whose fields are kernel longs.
+/// `libc::time_t` and `libc::suseconds_t` are deprecated on musl because
+/// musl's own definitions changed width; the kernel's did not, and it is the
+/// kernel that writes these bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 struct RawEvent {
-    tv_sec: libc::time_t,
-    tv_usec: libc::suseconds_t,
+    tv_sec: libc::c_long,
+    tv_usec: libc::c_long,
     kind: u16,
     code: u16,
     value: i32,
@@ -388,19 +393,19 @@ impl InputBackend {
                 ABS_Y => self.pointer.y = raw.value as f64,
                 _ => {}
             },
-            EV_SYN => {
-                if self.motion != (0.0, 0.0) {
-                    self.pointer.x += self.motion.0;
-                    self.pointer.y += self.motion.1;
-                    self.clamp_pointer();
-                    self.motion = (0.0, 0.0);
-                    let action = if self.buttons_down > 0 {
-                        MouseAction::Drag
-                    } else {
-                        MouseAction::Motion
-                    };
-                    out.push(self.mouse_event(None, action));
-                }
+            // A report is only complete at the sync, and only worth sending
+            // when the pointer actually moved.
+            EV_SYN if self.motion != (0.0, 0.0) => {
+                self.pointer.x += self.motion.0;
+                self.pointer.y += self.motion.1;
+                self.clamp_pointer();
+                self.motion = (0.0, 0.0);
+                let action = if self.buttons_down > 0 {
+                    MouseAction::Drag
+                } else {
+                    MouseAction::Motion
+                };
+                out.push(self.mouse_event(None, action));
             }
             _ => {}
         }
@@ -540,11 +545,11 @@ mod tests {
 
     #[test]
     fn event_struct_matches_the_kernel_size() {
-        // Two longs of timeval plus two u16 and an i32.
-        assert_eq!(
-            EVENT_SIZE,
-            std::mem::size_of::<libc::time_t>() * 2 + 8
-        );
+        // Two kernel longs of timeval plus two u16 and an i32.
+        assert_eq!(EVENT_SIZE, std::mem::size_of::<libc::c_long>() * 2 + 8);
+        // On the 64-bit targets tOS runs on, that is 24 bytes.
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(EVENT_SIZE, 24);
     }
 
     #[test]

@@ -42,6 +42,30 @@ impl HostInput {
         self.buf.len()
     }
 
+    /// Whether the only thing held back is a bare escape.
+    ///
+    /// A terminal sends the same byte for the escape key and for the start of
+    /// every escape sequence, so the two can only be told apart by waiting.
+    pub fn has_pending_escape(&self) -> bool {
+        self.buf == [0x1b]
+    }
+
+    /// Give up waiting for the rest of a sequence.
+    ///
+    /// Called when nothing has arrived for a while, this is what makes the
+    /// escape key work: without it a lone escape sits in the buffer until the
+    /// user happens to press something else.
+    pub fn flush(&mut self) -> Vec<InputEvent> {
+        if !self.has_pending_escape() {
+            return Vec::new();
+        }
+        self.buf.clear();
+        vec![InputEvent::Key(KeyEvent::new(
+            KeyCode::Escape,
+            Modifiers::NONE,
+        ))]
+    }
+
     fn step(&mut self) -> Step {
         if self.buf.is_empty() {
             return Step::NeedMore;
@@ -553,6 +577,36 @@ mod tests {
         let (code, mods) = key_of(&events(b"\x1bb")[0]);
         assert_eq!(code, KeyCode::Char('b'));
         assert!(mods.alt());
+    }
+
+    #[test]
+    fn a_lone_escape_is_reported_when_nothing_follows_it() {
+        // The escape key and the start of a sequence are the same byte, so a
+        // caller that waits and then flushes is the only way to get the key.
+        let mut input = HostInput::new();
+        assert!(input.feed(b"\x1b").is_empty());
+        assert!(input.has_pending_escape());
+        let events = input.flush();
+        assert_eq!(key_of(&events[0]).0, KeyCode::Escape);
+        assert!(!input.has_pending_escape());
+        assert_eq!(input.pending(), 0);
+    }
+
+    #[test]
+    fn flushing_a_partial_sequence_does_nothing() {
+        // Half of an arrow key is not an escape; it is a sequence still on
+        // its way, and throwing it away would lose the keypress.
+        let mut input = HostInput::new();
+        input.feed(b"\x1b[");
+        assert!(!input.has_pending_escape());
+        assert!(input.flush().is_empty());
+        let events = input.feed(b"A");
+        assert_eq!(key_of(&events[0]).0, KeyCode::Up);
+    }
+
+    #[test]
+    fn flushing_an_empty_decoder_does_nothing() {
+        assert!(HostInput::new().flush().is_empty());
     }
 
     #[test]

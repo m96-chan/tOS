@@ -69,6 +69,10 @@ impl Default for ModeInfo {
 
 impl ModeInfo {
     pub fn name(&self) -> String {
+        // `c_char` is signed on x86_64 and unsigned on arm64, so this cast is
+        // needed on one and a no-op on the other; clippy only sees whichever
+        // it is compiling for.
+        #[allow(clippy::unnecessary_cast)]
         let bytes: Vec<u8> = self
             .name
             .iter()

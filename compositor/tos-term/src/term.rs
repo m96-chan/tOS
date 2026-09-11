@@ -134,9 +134,7 @@ impl Damage {
 
     pub fn mark_all(&mut self) {
         self.full = true;
-        for row in &mut self.rows {
-            *row = true;
-        }
+        self.rows.fill(true);
     }
 
     pub fn is_row_dirty(&self, y: usize) -> bool {
@@ -153,9 +151,7 @@ impl Damage {
 
     pub fn clear(&mut self) {
         self.full = false;
-        for row in &mut self.rows {
-            *row = false;
-        }
+        self.rows.fill(false);
     }
 }
 
@@ -1204,7 +1200,7 @@ impl Perform for Terminal {
             0x07 => self.events.push(TermEvent::Bell),
             0x08 => self.backspace(),
             0x09 => self.tab(1),
-            0x0a | 0x0b | 0x0c => {
+            0x0a..=0x0c => {
                 self.reset_display_offset();
                 self.linefeed();
                 if self.modes.linefeed_newline {

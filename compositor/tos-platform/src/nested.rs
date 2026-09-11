@@ -37,8 +37,7 @@ impl NestedDisplay {
         let input = io::stdin().as_raw_fd();
         let size = terminal_size(output)?;
         if size.cols == 0 || size.rows == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "the host terminal reported no size",
             ));
         }

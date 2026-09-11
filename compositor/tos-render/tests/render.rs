@@ -333,7 +333,7 @@ fn rendering_a_scrolled_view_shows_history() {
     assert!(h.ink(0, 0) > 0);
     // And the cursor is suppressed while looking at history.
     let cursor = h.term.palette().cursor.pack();
-    assert!(!h.fb.pixels().iter().any(|&px| px == cursor));
+    assert!(!h.fb.pixels().contains(&cursor));
 }
 
 #[test]

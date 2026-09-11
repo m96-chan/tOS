@@ -453,7 +453,7 @@ impl Parser {
     fn csi_entry<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
             0x00..=0x17 | 0x19 | 0x1c..=0x1f => performer.execute(byte),
-            0x30..=0x39 | 0x3a | 0x3b => {
+            0x30..=0x3b => {
                 self.state = State::CsiParam;
                 self.csi_param(performer, byte);
             }

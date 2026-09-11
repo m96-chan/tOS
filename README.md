@@ -481,11 +481,16 @@ applications can fall back instead of hanging.
 
 ### 0.1 — Portable tOS
 
-- [ ] generic x86_64 image
+- [x] generic x86_64 image
 - [ ] generic arm64 image
 - [ ] Debian rootfs tooling
-- [ ] install / boot tooling
+- [x] install / boot tooling
 - [ ] hardware abstraction cleanup
+
+`iso/` builds a bootable x86_64 image, and `tos-install` puts it on a disk
+from inside a pane. What lands on the disk is still the busybox initramfs
+world rather than a Debian rootfs, so the two remaining userspace items are
+the same piece of work.
 
 ### Later — Android devices
 
@@ -583,6 +588,7 @@ What has been exercised, and how:
 | Layout, focus, workspaces, key bindings | unit tests |
 | Whole compositor | tests that run shells in split panes and inspect pixels |
 | DRM/KMS, evdev, VT ownership | compile for x86_64 and arm64 Linux; ioctl numbers and structure layouts are unit-tested against the kernel headers |
+| Installer | the whole sequence against a recorded backend, plus the real binary driven on a pseudoterminal with its output read back through tOS's own terminal emulator |
 
 Panes refuse to split once they are too small to divide, rather than creating
 a pane with nowhere to go, and a virtual terminal is only taken over once the
@@ -597,6 +603,8 @@ backends.
 
 ```text
 tOS/
+├── installer/           tos-install: put tOS on a disk from the live session
+├── iso/                 bootable image and its initramfs
 └── compositor/
     ├── tos-term/        terminal model: cells, grid, VT parser, graphics
     ├── tos-font/        glyph engine: bitmap face, box drawing, TrueType
@@ -645,6 +653,21 @@ To render a frame without a display at all:
 
 `tos --help` lists the options and the default key bindings. The leader key is
 `ctrl+a`; on hardware the same bindings work directly with `super`.
+
+## Installing
+
+`iso/build.sh` builds a bootable image. Booting it gives a live session whose
+every shell prints the banner from `.motd_art` and the one line that matters:
+
+```text
+  Type tos-install to install tOS on this machine.
+```
+
+`tos-install` is a TUI running in a pane — installing tOS is the first real
+use of the platform as a platform. It will not write to a disk until the
+disk's own name has been typed, and it refuses the medium it booted from.
+`tos-install --plan` prints every command it would run without running any.
+See [`iso/README.md`](iso/README.md).
 
 ## License
 

@@ -129,8 +129,7 @@ impl VirtualTerminal {
     /// mode with no keyboard. [`install_switch_handlers`] does this.
     pub fn take_over(&mut self, release: i32, acquire: i32) -> io::Result<()> {
         if !handlers_installed(release) || !handlers_installed(acquire) {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "VT switch signals need handlers before the terminal is taken over",
             ));
         }
