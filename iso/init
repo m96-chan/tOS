@@ -1,4 +1,5 @@
 #!/bin/busybox sh
+# shellcheck shell=dash
 # PID 1 inside the tOS initramfs: bring up /dev and drivers, then hand the
 # machine to the compositor.
 

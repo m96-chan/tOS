@@ -134,9 +134,7 @@ impl Damage {
 
     pub fn mark_all(&mut self) {
         self.full = true;
-        for row in &mut self.rows {
-            *row = true;
-        }
+        self.rows.fill(true);
     }
 
     pub fn is_row_dirty(&self, y: usize) -> bool {
@@ -153,9 +151,7 @@ impl Damage {
 
     pub fn clear(&mut self) {
         self.full = false;
-        for row in &mut self.rows {
-            *row = false;
-        }
+        self.rows.fill(false);
     }
 }
 

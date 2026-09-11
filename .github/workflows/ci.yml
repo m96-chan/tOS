@@ -15,8 +15,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # A warning that nobody sees becomes a warning that nobody fixes.
-  RUSTFLAGS: -D warnings
 
 jobs:
   test:
@@ -31,36 +29,45 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets
       - name: Test
-        # The PTY and installer tests fork real processes; they need a
-        # terminal-shaped environment but no display.
-        run: cargo test --workspace -- --nocapture --test-threads 4
+        # These fork real processes onto real pseudoterminals, but need no
+        # display: the compositor's headless and nested backends are what the
+        # tests drive.
+        run: cargo test --workspace
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        # `-D warnings` goes after the separator so it applies to this
+        # workspace and not to its dependencies, whose warnings are not ours
+        # to fix and would otherwise break the build on a compiler upgrade.
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   cross:
-    name: cross-compile ${{ matrix.target }}
+    name: ${{ matrix.target }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         target:
-          # The compositor's kernel-facing backends only exist on Linux, and
-          # tOS targets both PCs and arm64 boards, so both have to keep
-          # compiling even though only one of them is tested.
+          # The kernel-facing backends are Linux-only, and tOS targets PCs
+          # and arm64 boards alike, so both have to keep compiling even
+          # though only one of them is tested.
           - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-gnu
-          # The ISO links a fully static binary; musl is what that means.
+          # The ISO links a fully static binary; musl is what that means, and
+          # its libc definitions differ enough to break code that builds
+          # everywhere else.
           - x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
       - name: Check
-        run: cargo check --workspace --all-targets --target ${{ matrix.target }}
+        run: >-
+          cargo clippy --workspace --all-targets
+          --target ${{ matrix.target }} -- -D warnings
 
   shell:
     name: shell scripts
