@@ -461,13 +461,22 @@ wrapped lines rather than re-wrapping them.
 - [x] Kitty Graphics Protocol
 - [x] image surfaces
 - [ ] GPU-backed texture cache
-- [ ] image previews
+- [x] image previews
 - [ ] video experiments
 
 Raw RGB and RGBA transmission work, including chunked transfers, placements
-and deletion. PNG payloads and zlib compression are parsed and answered with
-the protocol's error response rather than being silently dropped, so
-applications can fall back instead of hanging.
+and deletion. PNG payloads (`f=100`) and zlib-compressed payloads (`o=z`) are
+decoded in-tree by a hand-written DEFLATE and a PNG reader covering every
+colour type, bit depths 1 through 16, all five scanline filters and Adam7
+interlacing, which is the shape an image preview arrives in. A payload that
+cannot be decoded is still answered with the protocol's error response rather
+than being silently dropped, so applications can fall back instead of hanging.
+
+Only inline transmission is read, though. `t=f` and `t=t`, where the
+application hands over a path instead of the bytes, are still refused, and
+that is the route some file managers take for a large image. No preview tool
+has been run against tOS yet, so what is verified is the decoding, not the
+integration.
 
 ### 0.0.5 — System UI
 

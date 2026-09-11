@@ -378,13 +378,65 @@ fn kitty_graphics_places_an_image_and_tags_cells() {
     assert_eq!(t.take_output(), b"\x1b_Gi=5;OK\x1b\\".to_vec());
 }
 
+/// A 2x2 RGBA PNG: red, green on the top row, blue and half-transparent
+/// white on the bottom. Written by CPython's zlib rather than by anything in
+/// this repository, so the decoder is checked against a real encoder's
+/// output: `IDAT` here is a genuine compressed deflate block, not stored
+/// bytes. IHDR says 8-bit colour type 6, no interlacing.
+const PNG_2X2: [u8; 76] = [
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x72, 0xb6, 0x0d,
+    0x24, 0x00, 0x00, 0x00, 0x13, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xf8, 0xcf, 0xc0, 0xf0,
+    0x1f, 0x0c, 0x81, 0x34, 0x08, 0x34, 0x00, 0x00, 0x49, 0x49, 0x09, 0x78, 0x9c, 0x51, 0x17, 0x92,
+    0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
 #[test]
-fn kitty_graphics_reports_unsupported_formats() {
+fn kitty_graphics_transmits_a_png() {
+    let mut t = term(10, 4);
+    let payload = encode_base64(&PNG_2X2);
+    t.advance(format!("\x1b_Ga=t,f=100,i=9;{payload}\x1b\\").as_bytes());
+
+    let image = t.graphics().image(9).expect("the PNG should be stored");
+    assert_eq!((image.width, image.height), (2, 2));
+    assert_eq!(
+        image.data,
+        vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 128]
+    );
+    assert_eq!(t.take_output(), b"\x1b_Gi=9;OK\x1b\\".to_vec());
+}
+
+#[test]
+fn kitty_graphics_transmits_a_zlib_compressed_image() {
+    let mut t = term(10, 4);
+    // A PNG is already deflated, so `o=z` on top of it is the doubly
+    // compressed shape a file manager can send. Deflate is content-agnostic,
+    // so a stored block is a legitimate stream to send here.
+    let mut compressed = vec![0x78u8, 0x01, 0x01];
+    compressed.extend_from_slice(&(PNG_2X2.len() as u16).to_le_bytes());
+    compressed.extend_from_slice(&(!(PNG_2X2.len() as u16)).to_le_bytes());
+    compressed.extend_from_slice(&PNG_2X2);
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in PNG_2X2.iter() {
+        a = (a + byte as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    compressed.extend_from_slice(&(((b << 16) | a).to_be_bytes()));
+
+    let payload = encode_base64(&compressed);
+    t.advance(format!("\x1b_Ga=t,f=100,o=z,i=11;{payload}\x1b\\").as_bytes());
+    assert_eq!(t.graphics().image(11).unwrap().data.len(), 2 * 2 * 4);
+    assert_eq!(t.take_output(), b"\x1b_Gi=11;OK\x1b\\".to_vec());
+}
+
+#[test]
+fn kitty_graphics_reports_undecodable_payloads() {
     let mut t = term(10, 4);
     t.advance(b"\x1b_Ga=T,f=100,s=1,v=1,i=9;AAAA\x1b\\");
     let out = String::from_utf8(t.take_output()).unwrap();
     assert!(out.contains("i=9"), "response should identify the image: {out}");
     assert!(out.contains("EINVAL"), "response should be an error: {out}");
+    assert!(t.graphics().image(9).is_none());
 }
 
 #[test]
