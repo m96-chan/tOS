@@ -35,6 +35,15 @@ use std::os::unix::io::AsRawFd;
 /// thing in these structures whose width follows the architecture. Every
 /// array length that depends on it is written in terms of this, so the
 /// layouts stay right on a 32 bit kernel even though tOS does not ship one.
+// Every layout below was worked out for a 64 bit kernel, and the size
+// assertions that guard them only run there. A 32 bit one lays
+// `snd_ctl_elem_value` out differently: the union is eight byte aligned either
+// way, because of `long long`, but `long value[128]` is half the size. Rather
+// than hand the kernel a structure of the wrong size and find out through
+// ENOTTY, refuse to build.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("the ALSA structure layouts here are worked out for 64 bit kernels only");
+
 const LONG: usize = std::mem::size_of::<libc::c_long>();
 
 /// `snd_ctl_elem_value`'s union holds this many `long`s, so a control with
@@ -353,6 +362,14 @@ impl ElemInfo {
         info
     }
 
+    /// The same element with its read access taken away. Rarer than read only,
+    /// but drivers do publish write only controls, and picking one as the mute
+    /// switch would break every reading of the volume.
+    pub fn write_only(mut self) -> ElemInfo {
+        self.access &= !ACCESS_READ;
+        self
+    }
+
     /// The same element with its write access taken away. Drivers do publish
     /// controls a program may read and not change, and a fake has to be able
     /// to be one.
@@ -424,8 +441,10 @@ impl ElemInfo {
 pub struct ElemValue {
     id: ElemId,
     indirect: u32,
-    /// The union that follows is `long` aligned, so C pads to it here. On a
-    /// 32 bit kernel there is nothing to pad and this is empty.
+    /// The union that follows holds `long long`, so it is eight byte aligned
+    /// on every target this could run on, including a 32 bit one, and C pads
+    /// to it here. The size assertions below only run on 64 bit, so this line
+    /// is the only thing keeping a 32 bit build honest.
     _pad: [u8; LONG - 4],
     value: [u8; MAX_VALUES * LONG],
     _reserved: [u8; 128],
@@ -1010,7 +1029,10 @@ fn find_switch(
         };
         let mut info = ElemInfo::about(*id);
         control.elem_info(&mut info)?;
-        if info.kind() != ElemType::Boolean || !info.is_writable() {
+        // Readable as well as writable: `volume()` reads the switch on every
+        // call, so a write-only one would not be a mute button, it would be
+        // the whole mixer failing with EACCES from then on.
+        if info.kind() != ElemType::Boolean || !info.is_writable() || !info.is_readable() {
             continue;
         }
         return Ok(Some((*id, info.channels()?)));
@@ -1150,14 +1172,37 @@ impl<C: Control> Mixer<C> {
 
     /// Raise the level by `step` percentage points, stopping at the top.
     pub fn raise(&self, step: u8) -> io::Result<Volume> {
-        let now = self.volume()?.percent;
-        self.set_volume(now.saturating_add(step).min(100))
+        self.nudge(step as i16)
     }
 
     /// Lower the level by `step` percentage points, stopping at the bottom.
     pub fn lower(&self, step: u8) -> io::Result<Volume> {
-        let now = self.volume()?.percent;
-        self.set_volume(now.saturating_sub(step))
+        self.nudge(-(step as i16))
+    }
+
+    /// Move the level by `step` percentage points, but never by nothing.
+    ///
+    /// A percentage is a lossy way to name a level: a control whose whole
+    /// range is `0..=1` has one point between silence and full, and five
+    /// percent of it rounds back to where it started. Asking for that in
+    /// percent alone leaves the volume key doing nothing at all, for ever, so
+    /// a move that would not move goes one raw value instead — which on such a
+    /// control is the only move there is.
+    fn nudge(&self, step: i16) -> io::Result<Volume> {
+        let from = self.loudest()?;
+        let wanted = (self.range.percent_of(from) as i16 + step).clamp(0, 100) as u8;
+        let mut raw = self.range.raw_for(wanted);
+        if raw == from && step != 0 {
+            let by = self.range.step.max(1);
+            raw = if step > 0 {
+                from.saturating_add(by).min(self.range.max)
+            } else {
+                from.saturating_sub(by).max(self.range.min)
+            };
+        }
+        self.write_all(&self.volume, self.channels, raw)?;
+        self.before_mute.set(None);
+        self.volume()
     }
 
     /// Mute or unmute.
@@ -1754,6 +1799,57 @@ mod tests {
         let start = mixer.set_volume(40).unwrap().percent;
         mixer.volume_up().unwrap();
         assert_eq!(mixer.volume_down().unwrap().percent, start);
+    }
+
+    #[test]
+    fn a_write_only_switch_is_not_taken_as_the_mute_button() {
+        // `volume()` reads the switch every time it is called, so adopting one
+        // that cannot be read would not cost a mute button, it would cost
+        // every reading of the volume from then on.
+        let card = FakeCard::new("Odd")
+            .volume("Master Playback Volume", Range::new(0, 87, 0), &[43])
+            .element(
+                "Master Playback Switch",
+                |id| ElemInfo::boolean(id, 1).write_only(),
+                &[1],
+            );
+        let mixer = Mixer::attach(card).unwrap();
+        assert!(!mixer.has_mute_switch(), "a write only switch was adopted");
+        // The point of refusing it: the level still reads.
+        assert_eq!(mixer.volume().unwrap().percent, 49);
+    }
+
+    #[test]
+    fn the_volume_key_moves_a_control_too_coarse_for_percentages() {
+        // A switch-like control has one raw value between silence and full, so
+        // five percent of it rounds back to where it started. Stepping in
+        // percent alone would leave the volume key doing nothing for ever.
+        for range in [Range::new(0, 1, 0), Range::new(0, 3, 0), Range::new(0, 7, 0)] {
+            let card = FakeCard::new("Coarse").volume("Master Playback Volume", range, &[0]);
+            let mixer = Mixer::attach(card).unwrap();
+            let before = mixer.volume().unwrap().percent;
+            let after = mixer.volume_up().unwrap().percent;
+            assert!(
+                after > before,
+                "{range:?} stuck at {before}% after a step up"
+            );
+            assert_eq!(
+                mixer.volume_down().unwrap().percent,
+                before,
+                "{range:?} did not come back down"
+            );
+        }
+    }
+
+    #[test]
+    fn a_step_coarser_than_the_key_still_moves_by_one_step() {
+        // The driver insists on multiples of 32, which is more than the five
+        // percent the key asks for, so the move snaps back to where it was.
+        let card = FakeCard::new("Chunky")
+            .volume("Master Playback Volume", Range::new(0, 100, 32), &[0]);
+        let mixer = Mixer::attach(card).unwrap();
+        let after = mixer.volume_up().unwrap().percent;
+        assert!(after > 0, "stuck at {after}% with a step of 32");
     }
 
     // -----------------------------------------------------------------------
