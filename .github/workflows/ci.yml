@@ -15,6 +15,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The lint gate is pinned. A floating toolchain plus `-D warnings` means a
+  # Rust release can fail a build over code that did not change, on a version
+  # nobody can guess to reproduce locally. Bumping this is a deliberate change
+  # with its own fixes, which is the only way the gate stays worth having.
+  LINT_TOOLCHAIN: "1.98.1"
 
 jobs:
   test:
@@ -22,9 +27,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Tests run on whatever stable is, so a compiler that genuinely breaks
+      # tOS is caught rather than pinned away from.
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --workspace --all-targets
@@ -33,6 +38,19 @@ jobs:
         # display: the compositor's headless and nested backends are what the
         # tests drive.
         run: cargo test --workspace
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
       - name: Clippy
         # `-D warnings` goes after the separator so it applies to this
         # workspace and not to its dependencies, whose warnings are not ours
@@ -57,8 +75,9 @@ jobs:
           - x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
           targets: ${{ matrix.target }}
           components: clippy
       - uses: Swatinem/rust-cache@v2

@@ -393,19 +393,19 @@ impl InputBackend {
                 ABS_Y => self.pointer.y = raw.value as f64,
                 _ => {}
             },
-            EV_SYN => {
-                if self.motion != (0.0, 0.0) {
-                    self.pointer.x += self.motion.0;
-                    self.pointer.y += self.motion.1;
-                    self.clamp_pointer();
-                    self.motion = (0.0, 0.0);
-                    let action = if self.buttons_down > 0 {
-                        MouseAction::Drag
-                    } else {
-                        MouseAction::Motion
-                    };
-                    out.push(self.mouse_event(None, action));
-                }
+            // A report is only complete at the sync, and only worth sending
+            // when the pointer actually moved.
+            EV_SYN if self.motion != (0.0, 0.0) => {
+                self.pointer.x += self.motion.0;
+                self.pointer.y += self.motion.1;
+                self.clamp_pointer();
+                self.motion = (0.0, 0.0);
+                let action = if self.buttons_down > 0 {
+                    MouseAction::Drag
+                } else {
+                    MouseAction::Motion
+                };
+                out.push(self.mouse_event(None, action));
             }
             _ => {}
         }
