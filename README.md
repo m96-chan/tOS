@@ -504,7 +504,20 @@ answered with an error, and frames carry the same raw formats images do.
 - [ ] power controls
 - [ ] network controls
 - [ ] Bluetooth controls
-- [ ] audio controls
+- [x] audio controls
+
+Sound is driven straight through the kernel's control interface. `tos-system`
+opens `/dev/snd/controlC<N>` and issues `SNDRV_CTL_IOCTL_CARD_INFO`,
+`ELEM_LIST`, `ELEM_INFO`, `ELEM_READ` and `ELEM_WRITE` against structures
+declared by hand from `asound.h`, so there is no libasound and no sound
+daemon. It takes the first card that can actually play, then whichever of
+`Master`, `PCM`, `Speaker` or `Headphone` playback volume that hardware
+happens to expose, converts between that control's own range — rarely
+`0..=100` — and a percentage, steps up and down within it, and mutes with the
+card's switch or, on a card that has none, by turning the level down and
+remembering where it was. Every ioctl goes through a trait, so all of it is
+tested against a card built out of structures in a test; none of it has been
+run against real hardware yet, and no part of the interface calls it so far.
 
 ### 0.1 — Portable tOS
 
