@@ -103,6 +103,7 @@ key bindings (leader is ctrl+a; super works without the leader):
   leader x          close the focused pane
   leader c / n / p  new / next / previous workspace
   leader 1..9       select a workspace
+  leader space      launcher: run a program in a new pane
   leader q          quit
   shift+pageup      scroll back
 ";

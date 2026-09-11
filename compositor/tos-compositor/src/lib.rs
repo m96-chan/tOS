@@ -7,8 +7,11 @@
 pub mod chrome;
 pub mod compositor;
 pub mod config;
+pub mod launcher;
+pub mod overlay;
 pub mod pane;
 
-pub use compositor::Compositor;
+pub use compositor::{Compositor, OverlayKind};
 pub use config::{parse_args, Backend, Config, USAGE};
+pub use overlay::{Overlay, OverlayItem, OverlayOutcome};
 pub use pane::Pane;
