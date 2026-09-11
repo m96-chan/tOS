@@ -572,6 +572,33 @@ which is exactly the shape the four remaining items need. Power, network,
 Bluetooth and audio are the same overlay over a different list, and none of
 them exists yet: there is no system layer behind them to list.
 
+Notifications are a queue rather than a slot. The status bar shows one at a
+time — three seconds each, or one second while others are waiting, so a burst
+drains at a pace that can be read instead of one that has to be waited out —
+and `super+m` opens the list of what has been raised, newest first, saying what
+each one said, which pane said it and how long ago. Choosing one goes to the
+pane that raised it, wherever that pane has since ended up; the first row of
+the list clears it. Applications raise them with `OSC 9;body` or
+`OSC 777;notify;title;body`, and a bell becomes one too, because a display
+server with no audio stack has nothing to ring. The compositor's own messages —
+copied, no room to split, a split that failed and what the kernel said about it
+— queue and are kept the same way, and the leader indicator is not one of them:
+it is drawn from the keymap, so arming the leader no longer wipes whatever was
+on the bar.
+
+The body is whatever was on the other end of a pipe, so it is read only as far
+as it could possibly matter, stripped of control characters and of combining
+marks that have no base to attach to in a cell grid, collapsed at every run of
+whitespace into a single space, and cut to two hundred cells with an ellipsis.
+What is still too long for the bar is clipped there rather than dropped, which
+is what used to happen: a message that did not fit was not drawn at all, and
+the messages that do not fit are the ones carrying an `io::Error`. With
+`--no-status-bar` there is no bar to clip into, so the same line is drawn over
+the top right of the panes — a failure has to look like something, and it used
+to look like a dead key. Kitty's OSC 99, with its ids, urgency and dismissal
+from the application, is not implemented: it belongs on top of this queue
+rather than beside it.
+
 ### 0.1 — Portable tOS
 
 - [x] generic x86_64 image
@@ -748,7 +775,8 @@ To render a frame without a display at all:
 `ctrl+a`; on hardware the same bindings work directly with `super`. The two
 bindings that grow a session are also where most people expect them:
 `ctrl+shift+enter` splits the focused pane and `ctrl+shift+t` opens a new
-workspace. `super+space` opens the launcher.
+workspace. `super+space` opens the launcher, and `super+m` opens the
+notifications.
 
 ## Installing
 

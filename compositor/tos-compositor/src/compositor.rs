@@ -21,6 +21,7 @@ use tos_term::TermEvent;
 use crate::chrome::{self, Chrome, StatusItem};
 use crate::config::Config;
 use crate::launcher;
+use crate::notify::{self, Chosen, Notifications};
 use crate::overlay::{Overlay, OverlayOutcome};
 use crate::pane::Pane;
 
@@ -30,8 +31,6 @@ const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const IDLE_TIMEOUT_MS: i32 = 100;
 /// How long to wait when a pane still has input queued for its child.
 const WRITE_RETRY_TIMEOUT_MS: i32 = 4;
-/// How long a transient status message stays up.
-const MESSAGE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Which menu an open overlay is, and so what choosing a row means.
 ///
@@ -42,6 +41,8 @@ const MESSAGE_TIMEOUT: Duration = Duration::from_secs(3);
 pub enum OverlayKind {
     /// A program from `$PATH`, which starts in a new pane.
     Launcher,
+    /// What has been said on the status bar, newest first.
+    Notifications,
 }
 
 /// The running compositor.
@@ -58,7 +59,9 @@ pub struct Compositor {
     clipboard: HashMap<char, Vec<u8>>,
     blink_visible: bool,
     last_blink: Instant,
-    message: Option<(String, Instant)>,
+    /// Everything the compositor and its panes have had to say, queued for the
+    /// status bar and kept for the history list.
+    notifications: Notifications,
     /// The open menu, if any. While it is open it owns the keyboard.
     overlay: Option<(OverlayKind, Overlay)>,
     needs_full_redraw: bool,
@@ -85,7 +88,7 @@ impl Compositor {
             clipboard: HashMap::new(),
             blink_visible: true,
             last_blink: Instant::now(),
-            message: None,
+            notifications: Notifications::new(),
             overlay: None,
             needs_full_redraw: true,
             running: true,
@@ -153,6 +156,10 @@ impl Compositor {
         self.clipboard.get(&selector).map(|v| v.as_slice())
     }
 
+    pub fn notifications(&self) -> &Notifications {
+        &self.notifications
+    }
+
     /// File descriptors that should be polled for readiness.
     pub fn pty_fds(&self) -> Vec<std::os::unix::io::RawFd> {
         self.panes.values().map(|p| p.pty.fd()).collect()
@@ -211,8 +218,8 @@ impl Compositor {
                     self.pending_writes = true;
                 }
                 if pane.input_overflowed() {
-                    self.message =
-                        Some(("input dropped: pane is not reading".into(), Instant::now()));
+                    self.notifications
+                        .status("input dropped: pane is not reading");
                     changed = true;
                 }
             }
@@ -249,16 +256,14 @@ impl Compositor {
                 TermEvent::Bell => {
                     // A visible bell is the only kind a display server with no
                     // audio stack can offer.
-                    self.message = Some((format!("bell in pane {}", id.0 + 1), Instant::now()));
+                    self.notifications.from_pane(id, "", "bell");
                     changed = true;
                 }
                 TermEvent::Notify { title, body } => {
-                    let text = if title.is_empty() {
-                        body
-                    } else {
-                        format!("{title}: {body}")
-                    };
-                    self.message = Some((text, Instant::now()));
+                    // Which pane asked is part of the notification: it is the
+                    // one thing the application cannot say for itself, and the
+                    // history list uses it to take you there.
+                    self.notifications.from_pane(id, title, body);
                     changed = true;
                 }
                 TermEvent::ClipboardStore { selection, data } => {
@@ -331,12 +336,15 @@ impl Compositor {
         if self.overlay.is_some() {
             return self.overlay_key(&key);
         }
-        match self.keymap.resolve(&key) {
+        // The leader indicator is drawn from the keymap rather than queued as
+        // a notification: arming the leader is not news, and a message that
+        // says so would cost whatever is in the queue its turn on screen. The
+        // keypress that disarms it still needs a frame, though, even when the
+        // action it ran changed nothing else.
+        let was_armed = self.keymap.is_pending();
+        let changed = match self.keymap.resolve(&key) {
             Resolution::Action(action) => self.perform(action),
-            Resolution::Pending => {
-                self.message = Some(("leader".to_string(), Instant::now()));
-                true
-            }
+            Resolution::Pending => true,
             Resolution::Passthrough => {
                 let focus = self.session.focus();
                 let Some(pane) = self.panes.get_mut(&focus) else {
@@ -354,7 +362,8 @@ impl Compositor {
                 pane.write(&bytes);
                 scrolled
             }
-        }
+        };
+        changed || was_armed != self.keymap.is_pending()
     }
 
     /// Route a mouse event that is already in display cell coordinates.
@@ -488,7 +497,7 @@ impl Compositor {
 
         if let Some(text) = copied {
             self.clipboard.insert('c', text.into_bytes());
-            self.message = Some(("copied".to_string(), Instant::now()));
+            self.notifications.status("copied");
         }
         if paste {
             let data = self.clipboard.get(&'c').cloned().unwrap_or_default();
@@ -651,7 +660,7 @@ impl Compositor {
                 let focus = self.session.focus();
                 if let Some(text) = self.panes.get(&focus).and_then(|p| p.selected_text()) {
                     self.clipboard.insert('c', text.into_bytes());
-                    self.message = Some(("copied".to_string(), Instant::now()));
+                    self.notifications.status("copied");
                     return true;
                 }
                 false
@@ -676,6 +685,12 @@ impl Compositor {
                 // The scan happens here, once, rather than per keystroke.
                 let overlay = Overlay::new("run a program", launcher::programs_on_path());
                 self.open_overlay(OverlayKind::Launcher, overlay);
+                true
+            }
+            Action::ShowNotifications => {
+                let items = self.notifications.open_history(Instant::now());
+                let overlay = Overlay::new("notifications", items);
+                self.open_overlay(OverlayKind::Notifications, overlay);
                 true
             }
             Action::Refresh => {
@@ -725,16 +740,33 @@ impl Compositor {
             OverlayOutcome::Chosen(index) => {
                 let label = overlay.items()[index].label.clone();
                 self.close_overlay();
-                self.choose(kind, &label);
+                self.choose(kind, index, &label);
                 true
             }
         }
     }
 
     /// Act on the row an overlay reported. One arm per menu.
-    fn choose(&mut self, kind: OverlayKind, label: &str) {
+    ///
+    /// Both the row's position and its label are passed, because a menu built
+    /// out of names is answered by name and a menu built out of a list the
+    /// compositor already holds is answered by position.
+    fn choose(&mut self, kind: OverlayKind, index: usize, label: &str) {
         match kind {
             OverlayKind::Launcher => self.launch(label),
+            OverlayKind::Notifications => match self.notifications.choose(index) {
+                Chosen::Clear => self.notifications.clear_history(),
+                // Where a notification came from is the useful thing to do
+                // with it: a build that finished is a pane to go and look at,
+                // wherever that pane has ended up.
+                Chosen::Pane(pane) => {
+                    if self.session.set_focus(pane) {
+                        self.sync_layout();
+                        self.needs_full_redraw = true;
+                    }
+                }
+                Chosen::Nowhere => {}
+            },
         }
     }
 
@@ -743,7 +775,7 @@ impl Compositor {
         if tos_pty::which(program).is_none() {
             // The list came from $PATH, so this means it went away in between;
             // spawning would leave a pane that dies on its own.
-            self.message = Some((format!("not found: {program}"), Instant::now()));
+            self.notifications.status(format!("not found: {program}"));
             return;
         }
         let command = vec![program.to_string()];
@@ -780,7 +812,7 @@ impl Compositor {
         let Some(new_id) = self.session.split_focused(area, axis) else {
             // Refusing is the right answer when the pane is too small; saying
             // so beats silently creating a pane with nowhere to go.
-            self.message = Some(("no room to split".to_string(), Instant::now()));
+            self.notifications.status("no room to split");
             return None;
         };
         let pane_area = self
@@ -833,7 +865,7 @@ impl Compositor {
     }
 
     fn report_error(&mut self, what: &str, error: io::Error) {
-        self.message = Some((format!("{what} failed: {error}"), Instant::now()));
+        self.notifications.status(format!("{what} failed: {error}"));
     }
 
     // ---- rendering ------------------------------------------------------
@@ -856,11 +888,15 @@ impl Compositor {
             self.last_blink = Instant::now();
             changed = true;
         }
-        if let Some((_, at)) = &self.message {
-            if at.elapsed() >= MESSAGE_TIMEOUT {
-                self.message = None;
-                changed = true;
-            }
+        // A notification only spends its time on screen while it is on screen:
+        // the leader indicator has the slot while the leader is armed, and one
+        // shown there instead would be one nobody read.
+        if !self.keymap.is_pending() && self.notifications.advance(now) {
+            // Without a status bar the notification is a banner over the panes,
+            // and the cells it covered are only repainted on damage they have
+            // not got. Retiring it has to uncover them.
+            self.needs_full_redraw |= !self.config.status_bar;
+            changed = true;
         }
         changed
     }
@@ -965,6 +1001,12 @@ impl Compositor {
 
         if self.config.status_bar {
             self.draw_status(surface, area, ch);
+        } else if let Some(text) = self.notifications.status_line() {
+            // With no bar there is nowhere for a message to live, and going
+            // quiet is the one thing it must not do: this used to be why
+            // `--no-status-bar` made a failed split look like a dead key.
+            let over = PixelRect::new(0, 0, area.width * cw, ch);
+            notify::draw_banner(surface, &mut self.fonts, over, &self.chrome, &text);
         }
 
         // Last, and over everything: the overlay is modal, and the panes below
@@ -998,23 +1040,27 @@ impl Compositor {
             .collect();
 
         let focus = self.session.focus();
-        let right = match &self.message {
-            Some((text, _)) => text.clone(),
-            None => {
-                let panes = self.session.active().panes();
-                let index = panes.iter().position(|p| *p == focus).unwrap_or(0);
-                match self.panes.get(&focus) {
-                    Some(pane) => {
-                        let scrolled = pane.terminal.display_offset();
-                        let label = chrome::pane_label(index, &pane.terminal, &pane.title);
-                        if scrolled > 0 {
-                            format!("{label}  [scrollback {scrolled}]")
-                        } else {
-                            label
-                        }
+        // The leader indicator comes first: it is the state of the keyboard
+        // right now and it lasts only until the next key. Then the queue, and
+        // when it is empty, what the focused pane is.
+        let right = if self.keymap.is_pending() {
+            "leader".to_string()
+        } else if let Some(line) = self.notifications.status_line() {
+            line
+        } else {
+            let panes = self.session.active().panes();
+            let index = panes.iter().position(|p| *p == focus).unwrap_or(0);
+            match self.panes.get(&focus) {
+                Some(pane) => {
+                    let scrolled = pane.terminal.display_offset();
+                    let label = chrome::pane_label(index, &pane.terminal, &pane.title);
+                    if scrolled > 0 {
+                        format!("{label}  [scrollback {scrolled}]")
+                    } else {
+                        label
                     }
-                    None => String::new(),
                 }
+                None => String::new(),
             }
         };
 
@@ -1128,10 +1174,15 @@ mod tests {
     use tos_input::KeyCode;
 
     fn compositor() -> Compositor {
+        compositor_with(true)
+    }
+
+    fn compositor_with(status_bar: bool) -> Compositor {
         let config = Config {
             command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()]),
             bitmap_scale: Some(1),
             font: Some("/nonexistent-so-the-bitmap-font-is-used".into()),
+            status_bar,
             ..Config::default()
         };
         Compositor::new(config, (640, 360), None).expect("compositor")
@@ -1413,10 +1464,153 @@ mod tests {
             tos_input::Modifiers::NONE,
         )));
         assert_eq!(compositor.panes.len(), 1);
-        let message = compositor.message.as_ref().map(|(text, _)| text.clone());
         assert_eq!(
-            message.as_deref(),
+            compositor.notifications.status_line().as_deref(),
             Some("not found: definitely-not-a-program-1a2b3c")
+        );
+    }
+
+    // ---- notifications --------------------------------------------------
+
+    /// Raise an application notification in a pane, the way OSC 9 does.
+    fn notify_from(compositor: &mut Compositor, id: PaneId, body: &str) {
+        compositor
+            .pane_mut(id)
+            .unwrap()
+            .terminal
+            .advance(format!("\x1b]9;{body}\x07").as_bytes());
+        compositor.handle_terminal_events(id);
+    }
+
+    #[test]
+    fn an_application_notification_is_attributed_to_its_pane() {
+        let mut compositor = compositor();
+        let focus = compositor.session.focus();
+        notify_from(&mut compositor, focus, "build finished");
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("pane 1: build finished")
+        );
+    }
+
+    #[test]
+    fn a_bell_says_which_pane_rang() {
+        let mut compositor = compositor();
+        let focus = compositor.session.focus();
+        compositor.pane_mut(focus).unwrap().terminal.advance(b"\x07");
+        compositor.handle_terminal_events(focus);
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("pane 1: bell")
+        );
+    }
+
+    #[test]
+    fn a_second_notification_waits_instead_of_replacing_the_first() {
+        let mut compositor = compositor();
+        let focus = compositor.session.focus();
+        notify_from(&mut compositor, focus, "first");
+        notify_from(&mut compositor, focus, "second");
+        // The first is still the one on screen, and the bar says something is
+        // behind it rather than the first having never existed.
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("pane 1: first (+1)")
+        );
+    }
+
+    #[test]
+    fn the_leader_key_does_not_wipe_a_notification() {
+        let mut compositor = compositor();
+        let focus = compositor.session.focus();
+        notify_from(&mut compositor, focus, "still here");
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            tos_input::Modifiers::CTRL,
+        )));
+        assert!(compositor.keymap.is_pending());
+        // The indicator is drawn from the keymap rather than queued, so the
+        // notification is untouched and has not spent its time behind it.
+        compositor.tick();
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("pane 1: still here")
+        );
+    }
+
+    #[test]
+    fn the_history_list_holds_what_went_past() {
+        let mut compositor = compositor();
+        let focus = compositor.session.focus();
+        notify_from(&mut compositor, focus, "one");
+        notify_from(&mut compositor, focus, "two");
+        assert!(compositor.perform(Action::ShowNotifications));
+        let overlay = compositor.overlay().expect("the list should be open");
+        let labels: Vec<&str> = overlay.items().iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["clear", "pane 1: two", "pane 1: one"]);
+        // Reading the list is seeing them, so the bar goes quiet.
+        assert!(compositor.notifications.status_line().is_none());
+    }
+
+    #[test]
+    fn choosing_a_notification_goes_to_the_pane_that_raised_it() {
+        let mut compositor = compositor();
+        let first = compositor.session.focus();
+        compositor.perform(Action::Split(Axis::Columns));
+        let second = compositor.session.focus();
+        assert_ne!(first, second);
+        notify_from(&mut compositor, first, "over here");
+
+        compositor.perform(Action::ShowNotifications);
+        // The first row clears the list; the second is the notification.
+        for code in [KeyCode::Down, KeyCode::Enter] {
+            compositor.handle_input(InputEvent::Key(KeyEvent::new(
+                code,
+                tos_input::Modifiers::NONE,
+            )));
+        }
+        assert!(compositor.overlay().is_none());
+        assert_eq!(compositor.session.focus(), first);
+    }
+
+    #[test]
+    fn the_first_row_of_the_list_clears_it() {
+        let mut compositor = compositor();
+        let focus = compositor.session.focus();
+        notify_from(&mut compositor, focus, "gone soon");
+        compositor.perform(Action::ShowNotifications);
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            tos_input::Modifiers::NONE,
+        )));
+        assert_eq!(compositor.notifications.history().count(), 0);
+    }
+
+    #[test]
+    fn without_a_status_bar_a_notification_is_drawn_over_the_panes() {
+        // The bar is where messages live, so with no bar they have to live
+        // somewhere else: a failure nobody sees looks like a dead key.
+        let mut compositor = compositor_with(false);
+        let mut framebuffer = tos_render::OwnedFramebuffer::new(640, 360);
+        let accent = compositor.chrome.accent.pack();
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, false);
+        }
+        assert!(
+            !framebuffer.pixels().contains(&accent),
+            "nothing should be in the accent colour yet"
+        );
+
+        let focus = compositor.session.focus();
+        notify_from(&mut compositor, focus, "split failed");
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, false);
+        }
+        assert!(
+            framebuffer.pixels().contains(&accent),
+            "the notification was not drawn"
         );
     }
 

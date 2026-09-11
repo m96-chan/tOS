@@ -153,22 +153,59 @@ pub fn draw_status_bar(
     if right.is_empty() {
         return;
     }
-    // Right aligned, clipped if the bar is too narrow.
+    // Right aligned, with a cell of margin, in whatever the workspace items
+    // left. Text that does not fit is cut rather than dropped: the messages
+    // too long for the bar are exactly the ones worth reading, because a
+    // failure carries an `io::Error` and those are long.
     let metrics = fonts.metrics();
-    let width = tos_term::str_width(right) as u32 * metrics.cell_width;
-    let start = area.right() - width as i32 - metrics.cell_width as i32;
-    if start > x {
-        draw_text(
-            surface,
-            fonts,
-            start,
-            area.y,
-            right,
-            chrome.dim,
-            Some(chrome.background),
-            false,
-        );
+    let cw = metrics.cell_width.max(1);
+    let room = (((area.right() - x).max(0) as u32) / cw).saturating_sub(1) as usize;
+    if room == 0 {
+        return;
     }
+    let text = clip_marked(right, room);
+    let width = tos_term::str_width(&text) as u32 * cw;
+    let start = area.right() - width as i32 - cw as i32;
+    draw_text(
+        surface,
+        fonts,
+        start,
+        area.y,
+        &text,
+        chrome.dim,
+        Some(chrome.background),
+        false,
+    );
+}
+
+/// Cut text to `cols` cells, never slicing a double width character in half.
+pub fn clip(text: &str, cols: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = tos_term::char_width(c).max(1) as usize;
+        if used + w > cols {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out
+}
+
+/// Like [`clip`], but says so. The last cell of a string that was cut is an
+/// ellipsis, so a truncated message reads as truncated rather than as a
+/// shorter message somebody meant to send.
+pub fn clip_marked(text: &str, cols: usize) -> String {
+    if tos_term::str_width(text) <= cols {
+        return text.to_string();
+    }
+    if cols == 0 {
+        return String::new();
+    }
+    let mut out = clip(text, cols - 1);
+    out.push('…');
+    out
 }
 
 /// The label a pane shows in the status bar.
@@ -292,6 +329,54 @@ mod tests {
         assert!(fb.pixels().iter().any(|&px| px == chrome.accent.pack()));
         // And nothing is left transparent.
         assert!(!fb.pixels().iter().all(|&px| px == 0));
+    }
+
+    /// Draw a bar of `cols` cells with one highlighted workspace and this
+    /// message, and say whether any of the message reached the surface. The
+    /// workspace is highlighted so the only dim ink can be the message.
+    fn bar_with_message(cols: u32, message: &str) -> bool {
+        let mut fonts = fonts();
+        let chrome = Chrome::default();
+        let metrics = fonts.metrics();
+        let (w, h) = (metrics.cell_width * cols, metrics.cell_height);
+        let mut fb = OwnedFramebuffer::new(w, h);
+        {
+            let mut surface = fb.surface();
+            draw_status_bar(
+                &mut surface,
+                &mut fonts,
+                Rect::new(0, 0, w, h),
+                &chrome,
+                &[StatusItem::new("1", true)],
+                message,
+            );
+        }
+        fb.pixels().iter().any(|&px| px == chrome.dim.pack())
+    }
+
+    #[test]
+    fn a_message_too_long_for_the_bar_is_clipped_rather_than_dropped() {
+        // The message that does not fit is the one worth reading: this is
+        // what an `io::Error` from a failed split looks like on a narrow bar.
+        let long = "split failed: no such file or directory (os error 2)";
+        assert!(bar_with_message(20, long), "the message was not drawn");
+        assert!(bar_with_message(80, long));
+        // Down to a bar with no room at all for it, which draws nothing and
+        // does not panic working out where the text would start.
+        assert!(!bar_with_message(3, long));
+    }
+
+    #[test]
+    fn clipping_marks_what_it_cut_and_leaves_what_fits_alone() {
+        assert_eq!(clip_marked("hello", 10), "hello");
+        assert_eq!(clip_marked("hello", 5), "hello");
+        assert_eq!(clip_marked("hello", 4), "hel…");
+        assert_eq!(clip_marked("hello", 1), "…");
+        assert_eq!(clip_marked("hello", 0), "");
+        // A double width character is never cut in half, so the result can
+        // come out a cell narrower than it was allowed.
+        assert_eq!(clip_marked("漢字です", 4), "漢…");
+        assert_eq!(clip("漢字", 3), "漢");
     }
 
     #[test]

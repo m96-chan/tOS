@@ -104,6 +104,7 @@ key bindings (leader is ctrl+a; super works without the leader):
   leader c / n / p  new / next / previous workspace
   leader 1..9       select a workspace
   leader space      launcher: run a program in a new pane
+  leader m          notifications, including the ones already gone
   leader q          quit
   shift+pageup      scroll back
 ";

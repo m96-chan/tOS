@@ -334,6 +334,33 @@ fn a_program_can_set_the_pane_title() {
 }
 
 #[test]
+fn a_program_can_raise_a_notification_and_it_is_kept() {
+    // Two of them, close together, which is what used to lose the first: the
+    // status bar had one slot and the second overwrote it inside the three
+    // seconds nobody had read it in.
+    let mut c = compositor(&[
+        "/bin/sh",
+        "-c",
+        "printf '\\033]9;first\\007\\033]777;notify;build;finished\\007'; sleep 5",
+    ]);
+    assert!(wait_for(&mut c, Duration::from_secs(5), |c| {
+        c.notifications().waiting() > 0
+    }));
+    // The first is on the bar with the second behind it, and both name the
+    // pane that raised them.
+    assert_eq!(
+        c.notifications().status_line().as_deref(),
+        Some("pane 1: first (+1)")
+    );
+    let kept: Vec<String> = c
+        .notifications()
+        .history()
+        .map(|notification| notification.status_text())
+        .collect();
+    assert_eq!(kept, ["pane 1: build: finished", "pane 1: first"]);
+}
+
+#[test]
 fn a_program_can_query_the_terminal_and_get_an_answer() {
     // The child asks where the cursor is and reads the six byte reply back.
     // Echo is turned off first, so a reply that never left the compositor
