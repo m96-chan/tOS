@@ -500,7 +500,7 @@ answered with an error, and frames carry the same raw formats images do.
 
 - [x] status interface
 - [x] notifications
-- [ ] launcher
+- [x] launcher
 - [x] power controls
 - [x] network controls
 - [ ] Bluetooth controls
@@ -551,6 +551,22 @@ an inquiry for devices in range. Pairing and connecting are not there, and the
 box stays unticked for that reason: both are BlueZ, BlueZ is D-Bus, and doing
 them here instead means implementing SMP and an agent to answer for the user,
 which is a piece of work in its own right rather than a missing function.
+
+`super+space`, or `ctrl+a` then space, opens the launcher: a bordered box over
+the panes with a query line and a list of every executable on `$PATH`. Typing
+filters it by subsequence, so "gi" finds `git` and `gifbuild`, with shorter and
+earlier matches first; the arrows or `ctrl+p` / `ctrl+n` move, enter runs the
+selected program in a new pane, and escape closes the box without touching
+anything. While it is up it owns the keyboard, so neither the pane underneath
+nor the other bindings see a key. `$PATH` is read once when it opens, and a
+directory that is missing, unreadable or enormous costs the launcher nothing
+worse than the names it would have contributed.
+
+The box itself is not the launcher. It is a list-and-filter surface that takes
+a title, a list of labels and their details, and reports which one was chosen —
+which is exactly the shape the four remaining items need. Power, network,
+Bluetooth and audio are the same overlay over a different list, and none of
+them exists yet: there is no system layer behind them to list.
 
 ### 0.1 — Portable tOS
 
@@ -728,7 +744,7 @@ To render a frame without a display at all:
 `ctrl+a`; on hardware the same bindings work directly with `super`. The two
 bindings that grow a session are also where most people expect them:
 `ctrl+shift+enter` splits the focused pane and `ctrl+shift+t` opens a new
-workspace.
+workspace. `super+space` opens the launcher.
 
 ## Installing
 
