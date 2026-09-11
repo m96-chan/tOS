@@ -71,6 +71,7 @@ name = "tos-install"
 version = "0.0.4"
 dependencies = [
  "libc",
+ "tos-crypt",
  "tos-input",
  "tos-platform",
  "tos-pty",
