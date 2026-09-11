@@ -190,8 +190,12 @@ impl Selection {
 }
 
 /// What a character counts as when a double click grows to a word.
+///
+/// Visible to the crate because [`crate::copymode`]'s `w`, `b` and `e` have
+/// to agree with what a double click takes; two answers to "where does this
+/// word end" is one more than a terminal can have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Class {
+pub(crate) enum Class {
     Blank,
     Word,
     Separator,
@@ -216,7 +220,7 @@ fn class(ch: char) -> Class {
 /// The class of a cell, which for the trailing half of a double width glyph
 /// is the class of the glyph itself: the two cells are one character, and a
 /// word made of them must not be cut in half.
-fn class_at(cells: &[tos_term::Cell], x: usize) -> Class {
+pub(crate) fn class_at(cells: &[tos_term::Cell], x: usize) -> Class {
     if cells[x].attrs.flags.contains(Flags::WIDE_SPACER) && x > 0 {
         return class(cells[x - 1].ch);
     }

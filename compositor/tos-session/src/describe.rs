@@ -124,7 +124,6 @@ pub fn describe(action: &Action) -> String {
         Action::ScrollPage(pages) if *pages < 0 => "scroll back a page".into(),
         Action::ScrollPage(_) => "scroll forward a page".into(),
         Action::ScrollToBottom => "jump to the live screen".into(),
-        Action::BeginSelection => "start a selection".into(),
         Action::Copy => "copy the selection".into(),
         Action::Paste => "paste the clipboard".into(),
         Action::OpenLauncher => "open the launcher".into(),
@@ -133,6 +132,7 @@ pub fn describe(action: &Action) -> String {
         Action::ShowBindings => "show these bindings".into(),
         Action::Refresh => "redraw the screen".into(),
         Action::Lock => "lock the screen".into(),
+        Action::CopyMode => "select with the keyboard".into(),
         Action::Quit => "quit tOS".into(),
     }
 }
@@ -240,7 +240,6 @@ fn rank(action: &Action) -> (u16, u16) {
         Action::ScrollPage(pages) if *pages < 0 => (6, 2),
         Action::ScrollPage(_) => (6, 3),
         Action::ScrollToBottom => (6, 4),
-        Action::BeginSelection => (7, 0),
         Action::Copy => (7, 1),
         Action::Paste => (7, 2),
         Action::OpenLauncher => (8, 0),
@@ -249,6 +248,7 @@ fn rank(action: &Action) -> (u16, u16) {
         Action::ShowBindings => (8, 2),
         Action::Refresh => (9, 0),
         Action::Lock => (9, 1),
+        Action::CopyMode => (7, 0),
         Action::Quit => (9, 2),
     }
 }

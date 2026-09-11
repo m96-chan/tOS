@@ -901,7 +901,12 @@ bindings that grow a session are also where most people expect them:
 `ctrl+shift+enter` splits the focused pane and `ctrl+shift+t` opens a new
 workspace. `super+space` opens the launcher, `super+m` opens the notifications,
 `super+,` names the workspace and `super+shift+l` locks the screen on a machine
-that has a password to unlock with. From inside a session, `leader ?` puts the
+that has a password to unlock with. `super+[` takes the keyboard into copy
+mode, where vi's motions — `h j k l`, `w b e`, `0 $`, `g G` and a screenful on
+`ctrl+f` and `ctrl+b` — move a copy cursor through the pane and its history,
+`v` fixes one end of the selection and `y` copies it and leaves; the arrow,
+home, end and page keys do the same for anyone who does not think in vi. From
+inside a session, `leader ?` puts the
 binding list over the panes; both it and `--help` are generated from the keymap
 that is running, so neither can fall behind it.
 

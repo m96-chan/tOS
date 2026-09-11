@@ -21,6 +21,7 @@ use tos_term::TermEvent;
 
 use crate::chrome::{self, Chrome, StatusItem};
 use crate::config::Config;
+use crate::copymode::{CopyMode, CopyOutcome};
 use crate::launcher;
 use crate::lock::{self, LockOutcome, LockScreen};
 use crate::notify::{self, Chosen, Notifications};
@@ -111,6 +112,15 @@ pub struct Compositor {
     /// input — every kind of it, not only the keys — and the screen shows
     /// nothing of the session.
     lock: Option<LockScreen>,
+    /// Copy mode, and the pane it is selecting in. While it is up it owns the
+    /// keyboard: no key reaches the pane and no binding fires.
+    ///
+    /// The pane is remembered rather than looked up from the focus each time,
+    /// because a selection belongs to the text it was drawn over. Nothing can
+    /// move the focus while copy mode has the keyboard, but a pane can still
+    /// die under it, and a copy mode that followed the focus would come back
+    /// pointing at lines it never saw.
+    copy: Option<(PaneId, CopyMode)>,
     /// The last pane died while the screen was locked.
     ///
     /// Ending the session is a way out of a locked screen, so a locked one
@@ -170,6 +180,7 @@ impl Compositor {
             notifications: Notifications::new(),
             overlay: None,
             lock: None,
+            copy: None,
             session_ended_while_locked: false,
             needs_full_redraw: true,
             running: true,
@@ -538,6 +549,14 @@ impl Compositor {
         if self.overlay.is_some() {
             return self.overlay_key(&key);
         }
+        // Copy mode owns it in the same way, and for the same reason: its
+        // whole keymap is single letters that the pane would otherwise get.
+        // It is gated here rather than in `handle_input` because, unlike the
+        // lock, it claims only the keyboard — the mouse still selects, and a
+        // press on it is what ends the mode.
+        if self.copy.is_some() {
+            return self.copy_key(&key);
+        }
         // The leader indicator is drawn from the keymap rather than queued as
         // a notification: arming the leader is not news, and a message that
         // says so would cost whatever is in the queue its turn on screen. The
@@ -621,6 +640,13 @@ impl Compositor {
         }
 
         let mut changed = false;
+        // One selection cannot have two owners. Whoever reached for the mouse
+        // has stopped using the keyboard to select, and the press below is
+        // about to start a selection of its own.
+        if action == MouseAction::Press && self.copy.is_some() {
+            self.leave_copy_mode();
+            changed = true;
+        }
         if action == MouseAction::Press && self.session.focus() != pane_id {
             let previous = self.session.focus();
             self.session.set_focus(pane_id);
@@ -940,16 +966,6 @@ impl Compositor {
                 self.paste_text(&text);
                 true
             }
-            Action::BeginSelection => {
-                let focus = self.session.focus();
-                if let Some(pane) = self.panes.get_mut(&focus) {
-                    let cursor = pane.terminal.cursor();
-                    let at = pane.anchor_at(cursor.x, cursor.y);
-                    pane.set_selection(Some(Selection::new(at, false, SelectionMode::Cell)));
-                    return true;
-                }
-                false
-            }
             Action::OpenLauncher => {
                 // The scan happens here, once, rather than per keystroke.
                 let overlay = Overlay::new("run a program", launcher::programs_on_path());
@@ -971,11 +987,121 @@ impl Compositor {
                 true
             }
             Action::Lock => self.lock_session(),
+            Action::CopyMode => self.enter_copy_mode(),
             Action::Quit => {
                 self.running = false;
                 true
             }
         }
+    }
+
+    // ---- copy mode ------------------------------------------------------
+
+    /// Take the keyboard and start moving a selection with it.
+    ///
+    /// The mode starts where the terminal's cursor is drawn rather than where
+    /// the program thinks it is. The two differ only when the viewport has
+    /// been scrolled back, and there the program's cursor is off screen
+    /// entirely: entering copy mode at a point nobody can see, and then
+    /// yanking the viewport back to it on the first motion, would undo the
+    /// scrolling the user did to find what they wanted to copy.
+    fn enter_copy_mode(&mut self) -> bool {
+        let focus = self.session.focus();
+        let Some(pane) = self.panes.get_mut(&focus) else {
+            return false;
+        };
+        let cursor = pane.terminal.cursor();
+        let copy = CopyMode::new(pane.anchor_at(cursor.x, cursor.y));
+        // The same flag a mouse drag sets, and for the same reason: it says a
+        // selection belongs to an interaction that is still happening, so a
+        // program writing to the pane does not clear it out from under it.
+        pane.selecting = true;
+        pane.set_selection(copy.selection());
+        pane.terminal.damage_mut().mark_all();
+        self.copy = Some((focus, copy));
+        true
+    }
+
+    /// Give the pane back its keyboard and its selection.
+    ///
+    /// The highlight goes with the mode. What was copied is in the clipboard
+    /// by then, and a highlight left behind is the stale selection #36 was
+    /// about: the text under it moves on, and the highlight stops describing
+    /// anything.
+    fn leave_copy_mode(&mut self) {
+        let Some((id, _)) = self.copy.take() else {
+            return;
+        };
+        if let Some(pane) = self.panes.get_mut(&id) {
+            pane.selecting = false;
+            pane.clear_selection();
+            pane.terminal.damage_mut().mark_all();
+        }
+    }
+
+    /// Hand a key to copy mode, and act on what it says.
+    ///
+    /// The mode is taken out of the compositor and put back rather than
+    /// borrowed where it lies, because every outcome but one reaches for a
+    /// second piece of the compositor: the pane for its grid and its
+    /// viewport, and a yank for the clipboard and the status queue as well.
+    fn copy_key(&mut self, key: &KeyEvent) -> bool {
+        let Some((id, mut copy)) = self.copy.take() else {
+            return false;
+        };
+        let Some(pane) = self.panes.get_mut(&id) else {
+            // The pane died under the mode. There is nothing left to select
+            // in, and `self.copy` is already None.
+            return true;
+        };
+        match copy.handle_key(key, pane.terminal.grid()) {
+            CopyOutcome::Consumed => {
+                self.copy = Some((id, copy));
+                false
+            }
+            CopyOutcome::Changed => {
+                // The viewport follows the cursor rather than the cursor
+                // being held inside the viewport, which is what lets a `k` on
+                // the top row scroll into history instead of doing nothing.
+                let delta = copy.scroll_to_show(pane.terminal.grid());
+                if delta != 0 {
+                    pane.terminal.scroll_display(delta);
+                }
+                pane.set_selection(copy.selection());
+                // The copy cursor is drawn by the compositor over cells the
+                // terminal has no reason to think have changed, so moving it
+                // has to ask for the repaint itself.
+                pane.terminal.damage_mut().mark_all();
+                self.copy = Some((id, copy));
+                true
+            }
+            CopyOutcome::Copied => {
+                let text = copy.yanked().text(pane.terminal.grid());
+                self.copy = Some((id, copy));
+                self.leave_copy_mode();
+                // An explicit copy writes the clipboard, not primary: this is
+                // somebody deciding to keep something, which is exactly what
+                // a drag over a word must not be allowed to overwrite.
+                match text {
+                    Some(text) => {
+                        self.clipboard.insert(CLIPBOARD, text.into_bytes());
+                        self.notifications.status("copied");
+                    }
+                    None => self.notifications.status("nothing to copy"),
+                }
+                true
+            }
+            CopyOutcome::Left => {
+                self.copy = Some((id, copy));
+                self.leave_copy_mode();
+                true
+            }
+        }
+    }
+
+    /// The copy mode that is up, if any.
+    pub fn copy_mode(&self) -> Option<&CopyMode> {
+        self.copy.as_ref().map(|(_, copy)| copy)
     }
 
     // ---- the lock -------------------------------------------------------
@@ -1363,6 +1489,12 @@ impl Compositor {
             if self.mouse_grab == Some(pane) {
                 self.mouse_grab = None;
             }
+            // A copy mode whose pane has gone has nothing left to select in,
+            // and leaving it up would swallow the keyboard on behalf of text
+            // that no longer exists.
+            if self.copy.as_ref().is_some_and(|(id, _)| *id == pane) {
+                self.copy = None;
+            }
         }
         self.sync_layout();
         self.needs_full_redraw = true;
@@ -1476,6 +1608,16 @@ impl Compositor {
                 draw_cursor: true,
                 selection: pane.display_selection(),
                 selection_background: self.chrome.accent,
+                copy_cursor: self
+                    .copy
+                    .as_ref()
+                    .filter(|(copying, _)| copying == id)
+                    .and_then(|(_, copy)| copy.display_cursor(pane.terminal.grid())),
+                // The chrome's foreground rather than the accent the
+                // selection is painted in: the copy cursor spends most of its
+                // life sitting on one end of that highlight, and an outline
+                // in the colour of the thing under it is no outline at all.
+                copy_cursor_color: self.chrome.foreground,
                 force,
                 inactive_fade: self.config.inactive_fade,
             };
@@ -1606,10 +1748,15 @@ impl Compositor {
 
         let focus = self.session.focus();
         // The leader indicator comes first: it is the state of the keyboard
-        // right now and it lasts only until the next key. Then the queue, and
-        // when it is empty, what the focused pane is.
+        // right now and it lasts only until the next key. Copy mode is the
+        // same kind of thing and comes next, because a message that hid which
+        // mode the keyboard is in would be a message about a key that has
+        // stopped doing what it says. Then the queue, and when it is empty,
+        // what the focused pane is.
         let right = if self.keymap.is_pending() {
             "leader".to_string()
+        } else if let Some(copy) = self.copy_mode() {
+            copy.status().to_string()
         } else if let Some(line) = self.notifications.status_line() {
             line
         } else {
@@ -2565,6 +2712,175 @@ mod tests {
             .terminal
             .advance_animations(due));
         assert!(compositor.needs_render());
+    }
+
+    // ---- copy mode ------------------------------------------------------
+
+    /// Open copy mode the way a person does, on the binding.
+    fn copy_mode(compositor: &mut Compositor) {
+        press_key(compositor, KeyCode::Char('['), tos_input::Modifiers::SUPER);
+    }
+
+    /// Press a run of characters at whatever owns the keyboard.
+    fn type_keys(compositor: &mut Compositor, keys: &str) {
+        for ch in keys.chars() {
+            press_key(compositor, KeyCode::Char(ch), tos_input::Modifiers::NONE);
+        }
+    }
+
+    #[test]
+    fn the_binding_opens_copy_mode_and_the_bindings_stop_firing() {
+        let mut compositor = compositor();
+        copy_mode(&mut compositor);
+        assert!(compositor.copy_mode().is_some(), "the binding did nothing");
+        // Every key belongs to the mode now, including the ones that would
+        // otherwise split a pane.
+        press_key(
+            &mut compositor,
+            KeyCode::Char('d'),
+            tos_input::Modifiers::SUPER,
+        );
+        assert_eq!(compositor.panes.len(), 1, "a binding fired in copy mode");
+        assert!(compositor.is_running());
+        assert!(compositor.copy_mode().is_some());
+    }
+
+    #[test]
+    fn the_motions_move_the_copy_cursor_rather_than_the_pane() {
+        let mut compositor = compositor();
+        compositor.inject(b"alpha beta\r\n");
+        copy_mode(&mut compositor);
+        let from = compositor.copy_mode().expect("copy mode").cursor();
+        type_keys(&mut compositor, "kll");
+        let to = compositor.copy_mode().expect("copy mode").cursor();
+        assert_eq!(to, crate::selection::Anchor::new(from.line - 1, 2));
+    }
+
+    #[test]
+    fn a_selection_made_with_the_keyboard_is_yanked_to_the_clipboard() {
+        // The bug this mode exists for: leader [ then y used to copy exactly
+        // one character, whatever happened in between.
+        let mut compositor = compositor();
+        compositor.inject(b"alpha beta\r\n");
+        copy_mode(&mut compositor);
+        type_keys(&mut compositor, "kve");
+        let selected = compositor
+            .panes
+            .get(&compositor.session.focus())
+            .and_then(|pane| pane.selected_text());
+        assert_eq!(selected.as_deref(), Some("alpha"), "the highlight is wrong");
+        type_keys(&mut compositor, "y");
+        assert_eq!(compositor.clipboard(CLIPBOARD), Some(&b"alpha"[..]));
+    }
+
+    #[test]
+    fn copying_leaves_the_mode_and_takes_the_highlight_with_it() {
+        let mut compositor = compositor();
+        compositor.inject(b"alpha beta\r\n");
+        copy_mode(&mut compositor);
+        type_keys(&mut compositor, "kvey");
+        assert!(compositor.copy_mode().is_none(), "copy mode is still up");
+        let pane = compositor.panes.get(&compositor.session.focus()).unwrap();
+        assert!(
+            pane.selection.is_none(),
+            "a stale highlight was left behind"
+        );
+        assert!(
+            !pane.selecting,
+            "the pane still thinks it is being selected"
+        );
+        // And the keyboard is the pane's again.
+        press_key(
+            &mut compositor,
+            KeyCode::Char('d'),
+            tos_input::Modifiers::SUPER,
+        );
+        assert_eq!(compositor.panes.len(), 2);
+    }
+
+    #[test]
+    fn escape_leaves_copy_mode_without_touching_the_clipboard() {
+        let mut compositor = compositor();
+        compositor.inject(b"alpha beta\r\n");
+        copy_mode(&mut compositor);
+        type_keys(&mut compositor, "kve");
+        press_key(&mut compositor, KeyCode::Escape, tos_input::Modifiers::NONE);
+        assert!(compositor.copy_mode().is_none());
+        assert_eq!(compositor.clipboard(CLIPBOARD), None);
+    }
+
+    #[test]
+    fn walking_above_the_viewport_scrolls_into_history_instead_of_stopping() {
+        let mut compositor = compositor();
+        let rows = compositor
+            .panes
+            .get(&compositor.session.focus())
+            .map(|pane| pane.terminal.rows())
+            .expect("a pane");
+        for line in 0..rows * 2 {
+            compositor.inject(format!("line {line}\r\n").as_bytes());
+        }
+        copy_mode(&mut compositor);
+        for _ in 0..rows {
+            type_keys(&mut compositor, "k");
+        }
+        let pane = compositor.panes.get(&compositor.session.focus()).unwrap();
+        assert!(
+            pane.terminal.display_offset() > 0,
+            "the copy cursor stopped at the top of the screen"
+        );
+        // The viewport is following the cursor, so the cursor is still on
+        // screen at the end of the walk.
+        let copy = compositor.copy_mode().expect("copy mode");
+        assert_eq!(copy.scroll_to_show(pane.terminal.grid()), 0);
+        assert!(copy.display_cursor(pane.terminal.grid()).is_some());
+    }
+
+    #[test]
+    fn a_selection_dragged_up_through_history_copies_what_it_covered() {
+        let mut compositor = compositor();
+        compositor.inject(b"first\r\n");
+        let rows = compositor
+            .panes
+            .get(&compositor.session.focus())
+            .map(|pane| pane.terminal.rows())
+            .expect("a pane");
+        for line in 0..rows {
+            compositor.inject(format!("line {line}\r\n").as_bytes());
+        }
+        copy_mode(&mut compositor);
+        type_keys(&mut compositor, "v");
+        for _ in 0..rows * 2 {
+            type_keys(&mut compositor, "k");
+        }
+        type_keys(&mut compositor, "y");
+        let copied = compositor.clipboard(CLIPBOARD).expect("something copied");
+        let text = String::from_utf8_lossy(copied);
+        assert!(
+            text.starts_with("first"),
+            "the selection never reached history: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_mouse_press_takes_the_selection_back_from_copy_mode() {
+        // Two owners of one selection is one too many, and the press is about
+        // to start a selection of its own.
+        let mut compositor = compositor();
+        compositor.inject(b"alpha beta\r\n");
+        copy_mode(&mut compositor);
+        type_keys(&mut compositor, "kv");
+        compositor.handle_input(InputEvent::Mouse(MouseEvent {
+            button: Some(MouseButton::Left),
+            action: MouseAction::Press,
+            col: 2,
+            row: 0,
+            modifiers: tos_input::Modifiers::NONE,
+        }));
+        assert!(
+            compositor.copy_mode().is_none(),
+            "copy mode ignored the mouse"
+        );
     }
 
     // ---- the lock -------------------------------------------------------

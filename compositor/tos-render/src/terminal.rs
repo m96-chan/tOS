@@ -67,6 +67,16 @@ pub struct RenderOptions {
     pub draw_cursor: bool,
     pub selection: Option<Selection>,
     pub selection_background: Rgb,
+    /// Where the compositor's own cursor is, in displayed cells, when
+    /// something other than the program is driving this pane.
+    ///
+    /// It is drawn as an outline rather than a block so that it reads as a
+    /// second cursor and not as the terminal's own having jumped: while copy
+    /// mode is up both are on screen, one showing where the shell will type
+    /// and one showing where the keys are pointing, and a person who cannot
+    /// tell them apart has no idea what a `y` is about to take.
+    pub copy_cursor: Option<(usize, usize)>,
+    pub copy_cursor_color: Rgb,
     /// Repaint every row, ignoring damage.
     pub force: bool,
     /// Fade unfocused panes by this amount, 0 for none.
@@ -81,6 +91,8 @@ impl Default for RenderOptions {
             draw_cursor: true,
             selection: None,
             selection_background: Rgb::new(0x33, 0x44, 0x66),
+            copy_cursor: None,
+            copy_cursor_color: Rgb::new(0xc8, 0xc8, 0xd0),
             force: false,
             inactive_fade: 0,
         }
@@ -255,6 +267,15 @@ pub fn render(
 
         if options.draw_cursor {
             draw_cursor(surface, area, term, fonts, options);
+        }
+        // After the terminal's cursor, and with no regard for whether that
+        // one was drawn at all: the copy cursor is most needed exactly when
+        // the other is hidden, which is when the viewport has been scrolled
+        // back into history.
+        if let Some((col, row)) = options.copy_cursor {
+            if col < cols && row < rows {
+                draw_copy_cursor(surface, area, fonts, col, row, options);
+            }
         }
     });
 }
@@ -563,6 +584,37 @@ fn draw_cursor(
             );
         }
     }
+}
+
+/// Outline the cell the compositor's own cursor is on.
+///
+/// The outline is one cell wide even over the trailing half of a double width
+/// glyph, because the copy cursor addresses cells and a motion that stepped
+/// two columns at a time would be lying about where the next character is.
+fn draw_copy_cursor(
+    surface: &mut Surface<'_>,
+    area: Rect,
+    fonts: &mut FontStack,
+    col: usize,
+    row: usize,
+    options: &RenderOptions,
+) {
+    let metrics = fonts.metrics();
+    let (cw, ch) = (metrics.cell_width, metrics.cell_height);
+    let px = area.x + (col as u32 * cw) as i32;
+    let py = area.y + (row as u32 * ch) as i32;
+    let thickness = (ch / 8).max(1);
+    let color = options.copy_cursor_color;
+    surface.fill(Rect::new(px, py, cw, thickness), color);
+    surface.fill(
+        Rect::new(px, py + (ch - thickness) as i32, cw, thickness),
+        color,
+    );
+    surface.fill(Rect::new(px, py, thickness, ch), color);
+    surface.fill(
+        Rect::new(px + (cw - thickness) as i32, py, thickness, ch),
+        color,
+    );
 }
 
 #[cfg(test)]
