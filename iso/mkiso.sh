@@ -20,8 +20,14 @@ aarch64) RUST_TARGET=aarch64-unknown-linux-musl ;;
     ;;
 esac
 
-apk add --no-cache musl-dev linux-virt busybox-static \
-    grub grub-bios grub-efi xorriso mtools cpio
+apk add --no-cache musl-dev linux-virt busybox-static xorriso mtools cpio
+# grub's post-install trigger runs grub-probe against /, which fails on the
+# container's overlayfs; the scripts only matter for installed systems, not
+# for grub-mkrescue, so skip them.
+apk add --no-cache --no-scripts grub grub-bios grub-efi
+# The kmod trigger normally produces modules.dep; make sure it exists no
+# matter how the packages above were split up.
+depmod "$(basename /lib/modules/*)"
 
 # The rust:alpine image sets RUSTFLAGS=-crt-static; we want a fully static
 # binary that runs as PID 1 with no libc on disk.
