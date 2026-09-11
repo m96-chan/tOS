@@ -55,6 +55,13 @@ pub struct Config {
     pub source: ConfigSource,
     /// A font file to use instead of the built-in bitmap face.
     pub font: Option<PathBuf>,
+    /// Faces consulted, in order, for glyphs the primary does not have.
+    ///
+    /// Naming faces here adds to the stack rather than replacing what the
+    /// compositor finds on its own: if nothing in the list has kanji it still
+    /// goes looking for a CJK face, because Japanese silently rendering as
+    /// hollow boxes is never the outcome anyone was after.
+    pub font_fallback: Vec<PathBuf>,
     /// Font size in pixels; `None` derives one from the display.
     pub font_size: Option<f32>,
     /// Integer scale for the built-in bitmap face.
@@ -93,6 +100,7 @@ impl Default for Config {
             backend: Backend::Auto,
             source: ConfigSource::Search,
             font: None,
+            font_fallback: Vec::new(),
             font_size: None,
             bitmap_scale: None,
             scrollback: 10_000,
@@ -119,6 +127,7 @@ usage: tos [options] [-e command [args...]]
 options:
   --backend <auto|drm|nested|headless>   display backend (default: auto)
   --font <path>                          TrueType font file
+  --font-fallback <path>                 extra face for missing glyphs (repeatable)
   --font-size <pixels>                   font size in pixels
   --bitmap-scale <n>                     scale for the built-in bitmap font
   --scrollback <lines>                   scrollback per pane (default: 10000)
@@ -187,6 +196,11 @@ pub fn parse_args_over(base: Config, args: &[String]) -> Result<Config, String> 
             "--config" => config.source = ConfigSource::File(PathBuf::from(value("--config")?)),
             "--no-config" => config.source = ConfigSource::None,
             "--font" => config.font = Some(PathBuf::from(value("--font")?)),
+            // Repeating the flag appends, so the order on the command line is
+            // the order the faces are tried in.
+            "--font-fallback" => config
+                .font_fallback
+                .push(PathBuf::from(value("--font-fallback")?)),
             "--font-size" => {
                 let text = value("--font-size")?;
                 config.font_size = Some(
@@ -309,8 +323,31 @@ mod tests {
     }
 
     #[test]
+    fn font_fallbacks_accumulate_in_order() {
+        let config = parse_args(&args(&[
+            "--font-fallback",
+            "/a.ttf",
+            "--font-fallback",
+            "/b.ttf",
+        ]))
+        .unwrap();
+        let paths: Vec<&str> = config
+            .font_fallback
+            .iter()
+            .map(|p| p.to_str().unwrap())
+            .collect();
+        assert_eq!(paths, vec!["/a.ttf", "/b.ttf"]);
+    }
+
+    #[test]
+    fn no_font_fallbacks_by_default() {
+        assert!(parse_args(&[]).unwrap().font_fallback.is_empty());
+    }
+
+    #[test]
     fn missing_values_are_errors() {
         assert!(parse_args(&args(&["--font"])).is_err());
+        assert!(parse_args(&args(&["--font-fallback"])).is_err());
         assert!(parse_args(&args(&["-e"])).is_err());
     }
 
