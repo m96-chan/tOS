@@ -261,18 +261,23 @@ the empirical question on real hardware — does the kernel clear
 
 ### What the lock does not stop
 
-Stating these is part of the design, not an omission from it.
+Stating these is part of the design, not an omission from it. The first two
+are now decided, door by door, in
+[`lock-other-doors.md`](lock-other-doors.md), which also finds the ones this
+list missed and says what a tOS lock is not for.
 
 - **SysRq.** `Alt+SysRq+r` takes the keyboard out of raw mode and undoes the
   grab; `Alt+SysRq+k` kills everything on the VT. SysRq is above every
-  mechanism here. The ISO's kernel command line sets nothing, so whatever the
-  Debian kernel's default mask is, is the policy. On a locked machine that is
-  a hole; on a project at this stage SysRq is also the debugging lifeline.
-  It needs a decision, not a default.
+  mechanism here. *Decided in `lock-other-doors.md`:* the installed system
+  boots `sysctl.kernel.sysrq=434`, the live image `438`. The grab turns out to
+  close more of this than it looked — a grabbed keyboard's SysRq never reaches
+  the kernel — and what is left is an ungrabbed keyboard and the serial line.
 - **The serial console.** `iso/mkiso.sh` boots with `console=ttyS0
   console=tty0`, and `/init` execs a shell on `/dev/console` if `tos` exits.
   A serial line is an unauthenticated root shell. On the live ISO that is the
-  point. On an installed system it is a decision nobody has made.
+  point. *Decided in `lock-other-doors.md`:* the installed system has no
+  serial console, and the emergency shell now needs `tos.rescue` on the kernel
+  command line, which only the live image's GRUB entries carry.
 - **The disk.** This is a screen lock. Anyone who can reboot the machine reads
   everything on it. Disk encryption is a different feature and is not implied
   by this one.

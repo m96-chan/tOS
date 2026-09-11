@@ -185,17 +185,30 @@ cp "/boot/vmlinuz-$KVER" "$ISODIR/boot/vmlinuz"
 # The last console= on the command line is the one userspace gets as
 # /dev/console, so tty0 comes last: a person watching a screen is the common
 # case, and ttyS0 still carries the kernel log for anyone capturing it.
+#
+# sysctl.kernel.sysrq=438 is 0x1b6, which is this kernel's own
+# CONFIG_MAGIC_SYSRQ_DEFAULT_ENABLE. It changes nothing the image does today;
+# it means a kernel bump cannot move tOS's SysRq policy without somebody
+# editing a line that says what the policy is. There is no `sysrq=` boot
+# parameter — the mask is the kernel.sysrq sysctl, set through the generic
+# sysctl.*= form, which the kernel applies just before it starts /init.
+#
+# tos.rescue is what /init wants before it execs a shell when the compositor
+# exits. The live image asks for it: it has no credential, so by the rule in
+# docs/design/screen-lock.md it never locks, and a root shell on an image with
+# no locked session to protect is a rescue tool. The installer's command line
+# does not ask for it. See docs/design/lock-other-doors.md.
 cat >"$ISODIR/boot/grub/grub.cfg" <<'EOF'
 set timeout=10
 set default=0
 
 menuentry "tOS" {
-    linux /boot/vmlinuz console=ttyS0 console=tty0 quiet
+    linux /boot/vmlinuz console=ttyS0 console=tty0 sysctl.kernel.sysrq=438 tos.rescue quiet
     initrd /boot/initramfs.gz
 }
 
 menuentry "tOS (verbose)" {
-    linux /boot/vmlinuz console=ttyS0 console=tty0
+    linux /boot/vmlinuz console=ttyS0 console=tty0 sysctl.kernel.sysrq=438 tos.rescue
     initrd /boot/initramfs.gz
 }
 EOF
