@@ -38,7 +38,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86
           # Headless boot: success = the compositor announces itself on serial
           # within the timeout. GRUB's serial console is not configured, so we
-          # wait through its 1s timeout blindly.
+          # wait through its menu timeout blindly.
           timeout 120 qemu-system-x86_64 \
             -m 1024 -cdrom dist/tos-x86_64.iso \
             -vga std -display none -serial file:serial.log &

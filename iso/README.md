@@ -32,6 +32,16 @@ artifact.
 iso/run.sh            # QEMU, bochs-drm framebuffer, serial log on stdout
 ```
 
+Any virtual machine will do: the initramfs carries the DRM drivers QEMU,
+VirtualBox and VMware put in front of a guest (`bochs`, `virtio_gpu`,
+`vboxvideo`, `vmwgfx`, `cirrus`, `simpledrm`). The GRUB menu waits ten
+seconds, which is long enough to pick "tOS (verbose)" instead.
+
+The screen is the console: `tty0` comes last on the kernel command line, so
+`/init`'s messages and the emergency shell land where a person is looking.
+The same messages also go to `ttyS0` for anyone capturing a headless boot,
+which is how CI watches this image.
+
 ## Installing
 
 Every shell in the live session prints the banner from `.motd_art` and one
@@ -88,10 +98,12 @@ emergency busybox shell on the console.
 
 - x86_64 only for now; `ARCH=aarch64` is plumbed through `build.sh` and
   `mkiso.sh` but untested, and arm64 needs a different boot path anyway.
-- The initramfs carries only the QEMU-shaped display/input modules and
-  their dependency closure. Real hardware needs its GPU driver added to
-  the `MODULES` list in `mkiso.sh` (and matching firmware, which is not
-  packed at all yet).
+- The initramfs carries only the virtual machines' display/input modules
+  and their dependency closure. Real hardware needs its GPU driver added
+  to the `MODULES` list in `mkiso.sh` (and matching firmware, which is not
+  packed at all yet). Without a driver there is no `/dev/dri/card0`, and
+  the compositor falls back to running inside the console rather than
+  owning the screen.
 - No real rootfs yet: the installer copies the busybox initramfs world
   onto the disk, so an installed machine is the same small system the ISO
   boots. The next step per the top-level README is a Debian rootfs
