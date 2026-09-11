@@ -506,6 +506,8 @@ answered with an error, and frames carry the same raw formats images do.
 - [ ] Bluetooth controls
 - [ ] audio controls
 
+
+
 `tos-system`'s `power` module reads `/sys/class/power_supply`: which supplies
 are batteries and which are chargers, charge from `capacity` or worked out
 from `energy_*` or `charge_*` when it is missing, charging state, and time to
@@ -526,6 +528,16 @@ link administratively up or down, which is one `SIOCSIFFLAGS` ioctl. Joining a
 wireless network is not part of it: an associated interface's SSID and signal
 are reported, but scanning, WPA and DHCP need nl80211 and a supplicant, and
 those are a later item of their own.
+
+Bluetooth is read out of `/sys/class/bluetooth` and acted on over an
+`AF_BLUETOOTH` socket. `tos-system` lists the adapters, reads each one's
+address, whether it is up and whether rfkill has it blocked, takes an adapter
+up or down with `HCIDEVUP` and `HCIDEVDOWN`, sets and clears the soft block by
+writing to `/dev/rfkill`, lists the links the kernel currently holds, and runs
+an inquiry for devices in range. Pairing and connecting are not there, and the
+box stays unticked for that reason: both are BlueZ, BlueZ is D-Bus, and doing
+them here instead means implementing SMP and an agent to answer for the user,
+which is a piece of work in its own right rather than a missing function.
 
 ### 0.1 — Portable tOS
 
