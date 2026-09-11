@@ -161,8 +161,13 @@ fn encode_legacy(event: &KeyEvent, ctx: &EncodeContext) -> Vec<u8> {
             }
         },
         KeyCode::Keypad(key) => out.extend_from_slice(&encode_keypad(key, ctx, mods)),
-        // Keys with no legacy representation send nothing at all.
+        // Keys with no legacy representation send nothing at all. The
+        // Japanese conversion keys are in that company on purpose: no terminal
+        // convention assigns them bytes, so anything invented here would land
+        // in a program that never agreed to read it. They travel as events for
+        // the compositor to route and stop at the encoder.
         KeyCode::ModifierKey(_)
+        | KeyCode::Ime(_)
         | KeyCode::CapsLock
         | KeyCode::NumLock
         | KeyCode::ScrollLock
@@ -350,6 +355,11 @@ fn kitty_key(code: KeyCode) -> Option<(u32, u8)> {
             },
             b'u',
         ),
+        // The Kitty protocol numbers every key it knows about, and the
+        // Japanese conversion keys are not among them. The private use range
+        // is the protocol's to hand out, so a number picked here would mean
+        // two terminals disagreeing about what it stood for.
+        KeyCode::Ime(_) => return None,
         KeyCode::Unknown(_) => return None,
     })
 }
@@ -611,6 +621,7 @@ pub fn encode_focus(gained: bool) -> &'static [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::ImeKey;
 
     fn key(code: KeyCode, mods: Modifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
@@ -772,6 +783,30 @@ mod tests {
             String::from_utf8(encode_key(&repeat, &ctx)).unwrap(),
             "\x1b[97;1:2u"
         );
+    }
+
+    #[test]
+    fn the_yen_key_reaches_an_application_as_utf8() {
+        // Every other key in the built in layout is ASCII, so the yen sign is
+        // the first character in it that takes more than one byte on the wire.
+        let ctx = EncodeContext::default();
+        let bytes = encode_key(&key(KeyCode::Char('¥'), Modifiers::NONE), &ctx);
+        assert_eq!(bytes, "¥".as_bytes());
+    }
+
+    #[test]
+    fn conversion_keys_send_nothing_to_an_application() {
+        for ime in [ImeKey::Convert, ImeKey::NonConvert, ImeKey::KanaMode] {
+            assert_eq!(encode(KeyCode::Ime(ime), Modifiers::NONE), "");
+        }
+        // Not even in the escape-everything mode, which reports every key the
+        // Kitty protocol has a number for. These have none, and a guessed one
+        // would send an application bytes it cannot interpret.
+        let ctx = kitty_ctx(KeyboardFlags(
+            KeyboardFlags::DISAMBIGUATE.0 | KeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE.0,
+        ));
+        let event = key(KeyCode::Ime(ImeKey::Convert), Modifiers::NONE);
+        assert!(encode_key(&event, &ctx).is_empty());
     }
 
     #[test]
