@@ -47,7 +47,7 @@ fn main() -> ExitCode {
     }
     if has("--motd") {
         // Used by the live image's shell profile.
-        print!("{}", motd::live_message());
+        print!("{}", motd::message());
         return ExitCode::SUCCESS;
     }
 

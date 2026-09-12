@@ -6,6 +6,7 @@
 //! about than one that carried on after `mkfs` failed.
 
 use crate::exec::{Backend, Output};
+use crate::motd;
 use crate::plan::{Firmware, Plan, Settings, Step};
 
 /// Where tOS keeps its own files on an installed system.
@@ -295,6 +296,19 @@ impl<'a> Installer<'a> {
         self.write(&format!("{root}/etc/rc"), RC_SCRIPT)?;
         let rc = format!("{root}/etc/rc");
         let _ = self.backend.run("chmod", &["755", &rc]);
+
+        // Say that this disk was installed. /etc is copied from the live
+        // system, message of the day and all, so without a mark left here
+        // every shell on the finished machine would go on announcing a live
+        // session and offering to install the disk it is already on.
+        let directory = format!("{root}{CREDENTIAL_DIRECTORY}");
+        self.backend
+            .create_dir(&directory)
+            .map_err(|e| format!("cannot create {directory}: {e}"))?;
+        self.write(
+            &format!("{root}{}", motd::INSTALLED_PATH),
+            &format!("tOS {}\n", env!("CARGO_PKG_VERSION")),
+        )?;
         Ok(())
     }
 
@@ -939,6 +953,16 @@ mod tests {
         // the machine falls back to the ASCII face and every kana is a box.
         let backend = install(Firmware::Bios);
         assert!(backend.did("copy /usr -> /mnt/target/usr"));
+    }
+
+    #[test]
+    fn an_installed_disk_says_that_it_was_installed() {
+        let backend = install(Firmware::Bios);
+        let marker = written(&backend, "/mnt/target/etc/tos/installed");
+        assert!(
+            marker.starts_with("tOS "),
+            "the marker should name what put it there: {marker}"
+        );
     }
 
     #[test]

@@ -29,6 +29,20 @@ pub const ART_PATH: &str = "/etc/tos/motd_art";
 /// The command that installs tOS.
 pub const INSTALL_COMMAND: &str = "tos-install";
 
+/// Written by the installer onto the disk, and never present on the live
+/// image. Its existence is the whole of how a shell tells the two apart.
+///
+/// A machine cannot work this out for itself: an installed tOS and a live one
+/// run the same binaries out of the same layout, and by the time a shell asks,
+/// the only difference left is that somebody chose to put this one on a disk.
+/// So the installer records that it did.
+pub const INSTALLED_PATH: &str = "/etc/tos/installed";
+
+/// Whether this machine was installed rather than booted from a medium.
+pub fn is_installed() -> bool {
+    std::path::Path::new(INSTALLED_PATH).exists()
+}
+
 /// Load the banner, preferring the copy on this machine.
 pub fn art() -> String {
     std::fs::read_to_string(ART_PATH).unwrap_or_else(|_| ART.to_string())
@@ -194,6 +208,36 @@ pub fn live_message() -> String {
     out
 }
 
+/// The greeting for a machine that has been installed.
+///
+/// The banner and the keys, and nothing about installing: the disk is already
+/// the answer to that question, and inviting somebody to install the machine
+/// they are standing in is worse than saying nothing.
+pub fn installed_message() -> String {
+    let mut out = art();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(
+        "\x20 Type \x1b[1mexit\x1b[0m to close this pane.\n\
+         \n\
+         \x20 ctrl+a d  split beside     ctrl+a s  split below\n\
+         \x20 ctrl+a h/j/k/l  move focus ctrl+a q  quit\n\
+         \n",
+    );
+    out
+}
+
+/// The greeting for whichever machine this is.
+pub fn message() -> String {
+    if is_installed() {
+        installed_message()
+    } else {
+        live_message()
+    }
+}
+
 /// The same message with no escape sequences, for a console that has none.
 pub fn live_message_plain() -> String {
     strip_sgr(&live_message())
@@ -344,6 +388,25 @@ mod tests {
     fn art_lines_keep_the_blank_in_the_middle() {
         let lines = art_lines("a\n\nb\n");
         assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn the_installed_message_does_not_offer_to_install_the_disk_it_is_on() {
+        let message = installed_message();
+        assert!(
+            !message.contains(INSTALL_COMMAND),
+            "an installed machine should not be told to install: {message}"
+        );
+        assert!(!message.contains("live session"));
+        assert!(!message.contains("nothing is written to disk"));
+    }
+
+    #[test]
+    fn the_installed_message_still_carries_the_banner_and_the_keys() {
+        let message = installed_message();
+        assert!(message.contains("the terminal is the desktop"));
+        assert!(message.contains("ctrl+a d"));
+        assert!(message.contains("ctrl+a q"));
     }
 
     #[test]
