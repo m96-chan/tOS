@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use crate::cell::{Attrs, Cell, Flags, GraphicsRef, Underline};
 use crate::color::{Color, Palette, Rgb};
-use crate::graphics::{Action, GraphicsCommand, GraphicsStore};
+use crate::graphics::{Action, GraphicsCommand, GraphicsStore, Medium};
 use crate::grid::{Grid, Region};
+use crate::medium::{MediumReader, NoMedia};
 use crate::modes::{
     CursorShape, CursorStyle, KeyboardFlags, KeyboardStack, Modes, MouseEncoding, MouseState,
     MouseTracking,
@@ -247,6 +248,12 @@ pub struct Terminal {
     title: String,
 
     graphics: GraphicsStore,
+    /// How a `t=f`, `t=t` or `t=s` transmission gets its bytes.
+    ///
+    /// Boxed behind the trait because this crate has no filesystem of its
+    /// own; the compositor installs the reader that has one. See
+    /// [`crate::medium`].
+    media: Box<dyn MediumReader>,
     apc_buf: Vec<u8>,
     dcs_buf: Vec<u8>,
     dcs_kind: Option<u8>,
@@ -289,6 +296,7 @@ impl Terminal {
             hyperlinks: Vec::new(),
             title: String::new(),
             graphics: GraphicsStore::new(config.graphics_budget),
+            media: Box::new(NoMedia),
             apc_buf: Vec::new(),
             dcs_buf: Vec::new(),
             dcs_kind: None,
@@ -360,6 +368,16 @@ impl Terminal {
 
     pub fn graphics(&self) -> &GraphicsStore {
         &self.graphics
+    }
+
+    /// Give the terminal a way to read the files a graphics command names.
+    ///
+    /// Until this is called, `t=f`, `t=t` and `t=s` are refused. That is the
+    /// right default rather than an oversight: a `Terminal` on its own is a
+    /// model of a terminal, and a model that opened whatever path arrived
+    /// down a pipe would be a surprise to every test that drives one.
+    pub fn set_medium_reader(&mut self, reader: Box<dyn MediumReader>) {
+        self.media = reader;
     }
 
     pub fn hyperlink(&self, id: u16) -> Option<&str> {
@@ -1788,9 +1806,34 @@ impl Terminal {
                 self.graphics_response(&cmd, Ok(cmd.image_id));
             }
             Action::Transmit | Action::TransmitAndDisplay | Action::TransmitFrame => {
-                let Some((full, payload)) = self.graphics.accumulate(&cmd) else {
+                let Some((mut full, mut payload)) = self.graphics.accumulate(&cmd) else {
                     return; // more chunks to come
                 };
+                // A transfer that names a file is read here and not in the
+                // store, which owns no filesystem and is no place to decide
+                // what a compositor running as PID 1's child will open on a
+                // program's say-so. The reader the compositor installed
+                // decides that; see
+                // docs/design/graphics-file-transmission.md.
+                //
+                // Once its bytes are in hand the transfer *is* a direct one,
+                // and recording that is what lets the store go on refusing a
+                // medium nobody has resolved for it.
+                if full.medium != Medium::Direct {
+                    match self
+                        .media
+                        .read(full.medium, &payload, self.config.graphics_budget)
+                    {
+                        Ok(bytes) => {
+                            payload = bytes;
+                            full.medium = Medium::Direct;
+                        }
+                        Err(err) => {
+                            self.graphics_response(&full, Err(err));
+                            return;
+                        }
+                    }
+                }
                 // The continuation chunks of a transfer carry no action of
                 // their own, so what happens with the data is decided by the
                 // command that started it, not by the one that finished it.

@@ -11,6 +11,7 @@ pub mod color;
 pub mod graphics;
 pub mod grid;
 pub mod inflate;
+pub mod medium;
 pub mod modes;
 pub mod parser;
 pub mod png;
@@ -20,6 +21,7 @@ pub mod width;
 pub use cell::{Attrs, Cell, Flags, GraphicsRef, Underline};
 pub use color::{Color, Palette, Rgb};
 pub use grid::{Grid, Region, Row};
+pub use medium::{MediumReader, NoMedia};
 pub use modes::{
     CursorShape, CursorStyle, KeyboardFlags, Modes, MouseEncoding, MouseState, MouseTracking,
 };
