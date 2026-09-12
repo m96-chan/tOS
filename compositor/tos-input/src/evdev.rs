@@ -304,6 +304,49 @@ impl InputBackend {
         Ok(())
     }
 
+    /// Give every device back.
+    ///
+    /// The other half of [`InputBackend::grab_all`], for the one thing that
+    /// takes the machine away underneath a running session: a suspend. An
+    /// `EVIOCGRAB` is not something the kernel revokes, so this is not about
+    /// losing it — it is about what an exclusive grab means while nobody is
+    /// reading. A session that is asleep, or one whose suspend failed halfway,
+    /// holding every keyboard on the machine and draining none of them is a
+    /// machine that looks dead to everything else that could have been asked
+    /// for help.
+    ///
+    /// Every device is tried whatever the ones before it did, which is the
+    /// opposite of [`InputBackend::grab_all`]: stopping at the first refusal
+    /// on the way in leaves nothing half owned, and stopping on the way out
+    /// would leave the rest of the keyboards grabbed by a process that has
+    /// already decided to let go of them.
+    pub fn ungrab_all(&mut self) -> io::Result<()> {
+        let mut failure = None;
+        for device in &mut self.devices {
+            if let Err(e) = device.ungrab() {
+                failure.get_or_insert(e);
+            }
+        }
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Forget which keys and buttons were held.
+    ///
+    /// A suspend is the one place where a press can be delivered and its
+    /// release cannot: the key that asked for it is let go while the machine
+    /// is asleep, with no driver awake to report it. A modifier remembered as
+    /// held after that turns every later keystroke into a binding, and a
+    /// button remembered as down turns the next mouse move into a drag that
+    /// selects half the screen.
+    pub fn forget_held_keys(&mut self) {
+        self.modifiers = Modifiers::NONE;
+        self.modifier_keys.clear();
+        self.buttons_down = 0;
+    }
+
     pub fn devices(&self) -> &[Device] {
         &self.devices
     }

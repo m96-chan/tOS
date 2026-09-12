@@ -134,6 +134,7 @@ pub fn describe(action: &Action) -> String {
         Action::Lock => "lock the screen".into(),
         Action::CopyMode => "select with the keyboard".into(),
         Action::ShowBluetooth => "Bluetooth adapter and devices".into(),
+        Action::PowerMenu => "power off, reboot or suspend".into(),
         Action::Quit => "quit tOS".into(),
     }
 }
@@ -251,6 +252,9 @@ fn rank(action: &Action) -> (u16, u16) {
         Action::Lock => (9, 1),
         Action::CopyMode => (7, 0),
         Action::ShowBluetooth => (8, 3),
+        // With quitting rather than with the screen: both of these are how a
+        // session stops, and the sheet is read in the order things happen.
+        Action::PowerMenu => (9, 3),
         Action::Quit => (9, 2),
     }
 }

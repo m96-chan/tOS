@@ -73,6 +73,11 @@ pub enum Action {
     /// devices a scan found. Powering on, blocking and scanning all happen
     /// from inside it rather than each getting a key of its own.
     ShowBluetooth,
+    /// Open the power menu: power off, reboot or suspend. The menu is the
+    /// binding rather than the three actions being bound separately, because
+    /// two of the three cannot be taken back and neither should be one
+    /// keystroke away — the menu is where the confirmation lives.
+    PowerMenu,
 }
 
 /// A key combination.
@@ -246,6 +251,10 @@ impl Keymap {
             // b for Bluetooth, which nothing else wants and which is what the
             // radio is called everywhere a user has seen it before.
             (KeyCode::Char('b'), Modifiers::NONE, Action::ShowBluetooth),
+            // Delete, so that the leader and super aliases are the same key as
+            // the ctrl+alt+delete bound below: one key to remember for this,
+            // rather than one for the console gesture and another for tOS.
+            (KeyCode::Delete, Modifiers::NONE, Action::PowerMenu),
         ];
         for (code, modifiers, action) in bindings {
             keymap.bind_after_leader(Binding::new(*code, *modifiers), action.clone());
@@ -300,6 +309,17 @@ impl Keymap {
         keymap.bind(
             Binding::new(KeyCode::End, Modifiers::SHIFT),
             Action::ScrollToBottom,
+        );
+
+        // The one gesture every PC user already knows for "I want this machine
+        // to stop". tOS can claim it because it owns the keyboard: the console
+        // keyboard is in `K_OFF` while a session is up, so the kernel's own
+        // ctrl+alt+delete — which signals init — never sees the key. It opens
+        // the menu rather than doing anything, which is the whole difference
+        // between this and the reboot the BIOS does with the same fingers.
+        keymap.bind(
+            Binding::new(KeyCode::Delete, Modifiers::CTRL.union(Modifiers::ALT)),
+            Action::PowerMenu,
         );
         keymap
     }
@@ -679,6 +699,33 @@ mod tests {
         // A plain b is a b, which is most of what a pane is typed.
         assert_eq!(
             keymap.resolve(&press(KeyCode::Char('b'), Modifiers::NONE)),
+            Resolution::Passthrough
+        );
+    }
+
+    #[test]
+    fn the_power_menu_answers_to_the_gesture_people_already_have() {
+        let mut keymap = Keymap::default_bindings();
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Delete,
+                Modifiers::CTRL.union(Modifiers::ALT)
+            )),
+            Resolution::Action(Action::PowerMenu)
+        );
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Delete, Modifiers::SUPER)),
+            Resolution::Action(Action::PowerMenu)
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Delete, Modifiers::NONE)),
+            Resolution::Action(Action::PowerMenu)
+        );
+        // A bare delete is the key that deletes a character, which is most of
+        // what a pane gets it for.
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Delete, Modifiers::NONE)),
             Resolution::Passthrough
         );
     }

@@ -15,6 +15,7 @@ pub mod lock;
 pub mod notify;
 pub mod overlay;
 pub mod pane;
+pub mod power;
 pub mod selection;
 pub mod system;
 
