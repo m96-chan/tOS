@@ -691,10 +691,11 @@ pub fn planning_backend() -> crate::exec::Recorder {
 
 /// Where `unsquashfs` lives on a session that has one.
 ///
-/// Two paths because Debian is usr-merged and the installer runs on both sides
-/// of that: from the live rootfs, where `/usr/bin` is the real directory, and
-/// from anywhere that still has the old split.
-const UNSQUASHFS: [&str; 2] = ["/usr/bin/unsquashfs", "/bin/unsquashfs"];
+/// `/usr/bin` is where the rootfs build asserts it landed, and `/bin` is the
+/// same file on a usr-merged Debian. `/sbin` is where `iso/mkiso.sh` puts the
+/// tools it copies into the initramfs, so if the rescue session is ever given
+/// one this finds it there rather than having to be remembered.
+const UNSQUASHFS: [&str; 3] = ["/usr/bin/unsquashfs", "/bin/unsquashfs", "/sbin/unsquashfs"];
 
 /// Where the session's environment is written, and what /etc/inittab respawns.
 pub const SESSION_SCRIPT_PATH: &str = "/etc/tos-session";
