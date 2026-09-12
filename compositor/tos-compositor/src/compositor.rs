@@ -767,7 +767,21 @@ impl Compositor {
     ) -> bool {
         let area = self.grid_area();
 
-        // The bar first, because it is nowhere in the geometry below: the row
+        // Copy mode ends here, above everything else, because the rule is
+        // about the press and not about where it landed: one selection cannot
+        // have two owners, and whoever reached for the mouse has stopped
+        // driving one from the keyboard. The ordering is load-bearing — the
+        // bar below returns without ever looking at a pane, so a press there
+        // handled after this point would switch workspaces and leave copy
+        // mode holding a pane nobody can see, eating every keystroke with no
+        // highlight anywhere to explain why.
+        let mut changed = false;
+        if action == MouseAction::Press && self.copy.is_some() {
+            self.leave_copy_mode();
+            changed = true;
+        }
+
+        // The bar next, because it is nowhere in the geometry below: the row
         // it occupies is the row `grid_area` took away, so a press there
         // matches no pane and would be dropped. Only a press, and only the
         // left button: a drag that started in a pane and wandered down here
@@ -778,7 +792,7 @@ impl Compositor {
             && self.status_row() == Some(cell_y)
         {
             self.release_grab();
-            return self.click_status(cell_x);
+            return self.click_status(cell_x) || changed;
         }
 
         let geometry = self.session.active().geometry(area);
@@ -823,14 +837,6 @@ impl Compositor {
             return false;
         }
 
-        let mut changed = false;
-        // One selection cannot have two owners. Whoever reached for the mouse
-        // has stopped using the keyboard to select, and the press below is
-        // about to start a selection of its own.
-        if action == MouseAction::Press && self.copy.is_some() {
-            self.leave_copy_mode();
-            changed = true;
-        }
         if action == MouseAction::Press && self.session.focus() != pane_id {
             let previous = self.session.focus();
             self.session.set_focus(pane_id);
@@ -883,24 +889,31 @@ impl Compositor {
         };
         let mut copied = None;
         let mut paste = false;
+        // Whether the pointer is dragging this pane's selection, which is the
+        // grab and nothing else. Asking the pane instead would be asking the
+        // wrong question: its flag says a selection is being made, and copy
+        // mode is making one with the keyboard while the mouse hangs idle, so
+        // a bare motion across the pane would walk the highlight away from the
+        // copy cursor and `y` would yank text nobody saw highlighted.
+        let dragging = self.mouse_grab == Some(pane_id);
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             let at = pane.anchor_at(local.col, local.row);
             match action {
                 MouseAction::Press if button == Some(MouseButton::Left) => {
-                    pane.selecting = true;
+                    pane.selection_in_progress = true;
                     pane.set_selection(Some(Selection::new(at, modifiers.alt(), mode)));
                     self.mouse_grab = Some(pane_id);
                     changed = true;
                 }
-                MouseAction::Drag | MouseAction::Motion if pane.selecting => {
+                MouseAction::Drag | MouseAction::Motion if dragging => {
                     if let Some(mut selection) = pane.selection {
                         selection.drag_to(at);
                         pane.set_selection(Some(selection));
                     }
                     changed = true;
                 }
-                MouseAction::Release if pane.selecting => {
-                    pane.selecting = false;
+                MouseAction::Release if dragging => {
+                    pane.selection_in_progress = false;
                     self.mouse_grab = None;
                     copied = pane.selected_text();
                     changed = true;
@@ -969,7 +982,7 @@ impl Compositor {
     fn release_grab(&mut self) {
         if let Some(pane) = self.mouse_grab.take() {
             if let Some(pane) = self.panes.get_mut(&pane) {
-                pane.selecting = false;
+                pane.selection_in_progress = false;
             }
         }
     }
@@ -1222,8 +1235,11 @@ impl Compositor {
         let copy = CopyMode::new(pane.anchor_at(cursor.x, cursor.y));
         // The same flag a mouse drag sets, and for the same reason: it says a
         // selection belongs to an interaction that is still happening, so a
-        // program writing to the pane does not clear it out from under it.
-        pane.selecting = true;
+        // program writing to the pane does not clear it out from under it. It
+        // says nothing about the pointer, which is why the drag arms of
+        // `route_mouse` read the grab instead — a mode driven by the keyboard
+        // must not be dragged by a mouse that is only being moved past.
+        pane.selection_in_progress = true;
         pane.set_selection(copy.selection());
         pane.terminal.damage_mut().mark_all();
         self.copy = Some((focus, copy));
@@ -1241,7 +1257,7 @@ impl Compositor {
             return;
         };
         if let Some(pane) = self.panes.get_mut(&id) {
-            pane.selecting = false;
+            pane.selection_in_progress = false;
             pane.clear_selection();
             pane.terminal.damage_mut().mark_all();
         }
@@ -2148,11 +2164,22 @@ impl Compositor {
     /// Advance the blink phase and any animations. Returns true when anything
     /// changed.
     pub fn tick(&mut self) -> bool {
+        self.tick_at(Instant::now())
+    }
+
+    /// [`Compositor::tick`] against a time the caller names.
+    ///
+    /// Split out for the same reason [`Compositor::tick_clock`] takes one: the
+    /// rules below are about how long something has been on screen, and a test
+    /// that can only ask for the time now has to spend three real seconds to
+    /// watch a notification not be retired. One reading serves the whole tick,
+    /// including the blink phase, so everything the frame is told happened,
+    /// happened at the same instant.
+    fn tick_at(&mut self, now: Instant) -> bool {
         let mut changed = false;
         // Animated images move on their own clock. The compositor owns that
         // clock and hands the time to each terminal, which keeps the terminal
         // model free of time of its own.
-        let now = Instant::now();
         for pane in self.panes.values_mut() {
             if pane.terminal.advance_animations(now) {
                 changed = true;
@@ -2162,9 +2189,9 @@ impl Compositor {
         // reason the queue below does: a cursor nobody can see does not need
         // to be somewhere in particular, and flipping it would repaint the
         // whole session behind the blank twice a second.
-        if !self.blanked && self.last_blink.elapsed() >= BLINK_INTERVAL {
+        if !self.blanked && now.saturating_duration_since(self.last_blink) >= BLINK_INTERVAL {
             self.blink_visible = !self.blink_visible;
-            self.last_blink = Instant::now();
+            self.last_blink = now;
             changed = true;
         }
         // A notification only spends its time on screen while it is on screen:
@@ -2176,9 +2203,17 @@ impl Compositor {
         // the leader indicator holds it: time on screen means on screen. A
         // blanked screen is the same case again — there is nothing on it, and
         // it does not matter whose decision that was.
+        // Copy mode is the fourth, and it is the leader case exactly:
+        // [`Compositor::status_message`] hands it the same slot ahead of the
+        // queue, so a message raised while it is up is not drawn either — and
+        // copy mode is a mode somebody stays in, walking a selection across a
+        // screen, so three seconds behind it is not a near miss. The rule is
+        // about the slot rather than about any one thing that takes it, so
+        // anything new that claims the slot belongs on this list too.
         if self.lock.is_none()
             && !self.blanked
             && !self.keymap.is_pending()
+            && self.copy.is_none()
             && self.notifications.advance(now)
         {
             // Without a status bar the notification is a banner over the panes,
@@ -2528,7 +2563,9 @@ impl Compositor {
         // Copy mode belongs beside the leader indicator rather than in the
         // queue behind it: both say what the keyboard is doing at this
         // instant, and a notification allowed to cover either would be three
-        // seconds in which the sheet's account of the keys is wrong.
+        // seconds in which the sheet's account of the keys is wrong. And, like
+        // the leader, taking the slot costs the queue nothing: `tick` holds
+        // its clock for exactly as long as this returns something else.
         if let Some(copy) = self.copy_mode() {
             return Some(copy.status().to_string());
         }
@@ -3754,7 +3791,7 @@ mod tests {
             "a stale highlight was left behind"
         );
         assert!(
-            !pane.selecting,
+            !pane.selection_in_progress,
             "the pane still thinks it is being selected"
         );
         // And the keyboard is the pane's again.
@@ -3848,6 +3885,101 @@ mod tests {
         assert!(
             compositor.copy_mode().is_none(),
             "copy mode ignored the mouse"
+        );
+    }
+
+    #[test]
+    fn a_press_on_the_status_bar_ends_copy_mode_the_way_any_other_press_does() {
+        // The bar is answered before any pane is looked at and returns from
+        // there, so this press used to skip the rule entirely: the workspace
+        // switched, the highlight went off screen with it, and copy mode sat
+        // on a pane nobody could see swallowing every key until somebody
+        // guessed escape.
+        let mut compositor = compositor();
+        compositor.perform(Action::NewWorkspace);
+        compositor.inject(b"alpha beta\r\n");
+        copy_mode(&mut compositor);
+        type_keys(&mut compositor, "kv");
+        let left_behind = compositor.session.focus();
+
+        // The strip reads " 1  2 ", so the first workspace is cell one.
+        assert!(click_bar(&mut compositor, 1), "the click did nothing");
+        assert_eq!(compositor.session.active_index(), 0);
+        assert!(
+            compositor.copy_mode().is_none(),
+            "copy mode outlived the click and is eating the keyboard"
+        );
+        let pane = compositor
+            .panes
+            .get(&left_behind)
+            .expect("the pane it was in");
+        assert!(pane.selection.is_none(), "a highlight was left behind");
+        assert!(!pane.selection_in_progress);
+        // And the bindings answer again, which is what "the keyboard is back"
+        // means from the outside.
+        press_key(
+            &mut compositor,
+            KeyCode::Char('d'),
+            tos_input::Modifiers::SUPER,
+        );
+        assert_eq!(compositor.panes.len(), 3, "a binding was still swallowed");
+    }
+
+    #[test]
+    fn a_mouse_moved_with_nothing_held_down_does_not_drag_the_copy_highlight() {
+        let mut compositor = compositor();
+        compositor.inject(b"alpha beta\r\n");
+        copy_mode(&mut compositor);
+        type_keys(&mut compositor, "kve");
+        let focus = compositor.session.focus();
+        let highlighted = compositor.panes[&focus].selection.expect("a highlight");
+        assert_eq!(
+            compositor.panes[&focus].selected_text().as_deref(),
+            Some("alpha")
+        );
+
+        // A bare motion: the pointer crossing the pane with no button down,
+        // which is what a hand resting on a mouse produces. Copy mode's
+        // selection is one in progress, which is not the same claim as one
+        // the pointer is dragging, and only the second may move it.
+        compositor.handle_input(InputEvent::Mouse(MouseEvent {
+            button: None,
+            action: MouseAction::Motion,
+            col: 20,
+            row: 6,
+            modifiers: tos_input::Modifiers::NONE,
+        }));
+
+        assert_eq!(
+            compositor.panes[&focus].selection,
+            Some(highlighted),
+            "the pointer walked the highlight away from the copy cursor"
+        );
+        // The yank comes from the copy cursor either way, so the damage a
+        // moved highlight does is that the two stop agreeing.
+        type_keys(&mut compositor, "y");
+        assert_eq!(compositor.clipboard(CLIPBOARD), Some(&b"alpha"[..]));
+    }
+
+    #[test]
+    fn a_notification_raised_under_copy_mode_waits_for_the_slot_back() {
+        let mut compositor = compositor();
+        let focus = compositor.session.focus();
+        copy_mode(&mut compositor);
+        notify_from(&mut compositor, focus, "the build finished");
+        // Copy mode has the slot the message would be drawn in, so nothing of
+        // it is on screen; two ticks a long way apart are enough to retire it
+        // if the queue's clock is running, and it must not be.
+        let start = Instant::now();
+        compositor.tick_at(start);
+        compositor.tick_at(start + Duration::from_secs(10));
+        assert!(compositor.copy_mode().is_some());
+
+        press_key(&mut compositor, KeyCode::Escape, tos_input::Modifiers::NONE);
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("pane 1: the build finished"),
+            "the message spent its three seconds behind copy mode"
         );
     }
 
@@ -4050,7 +4182,7 @@ mod tests {
             pane.selection.is_none(),
             "the mouse selected under the lock"
         );
-        assert!(!pane.selecting);
+        assert!(!pane.selection_in_progress);
         assert!(compositor.mouse_grab.is_none());
     }
 

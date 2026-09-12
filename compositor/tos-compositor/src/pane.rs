@@ -30,8 +30,13 @@ pub struct Pane {
     /// the cache has to live with the thing it belongs to, which is the pane
     /// whose images they are.
     pub textures: TextureCache,
-    /// Whether the mouse button is still down on this pane.
-    pub selecting: bool,
+    /// Whether the selection is still being made, rather than finished and
+    /// sitting there. A button held down says so, and so does copy mode
+    /// driving one from the keyboard; what the two have in common is a person
+    /// watching the highlight, which is the only thing [`Pane::pump`] needs to
+    /// know. Whether the pointer in particular is dragging is the
+    /// compositor's mouse grab, not this.
+    pub selection_in_progress: bool,
     /// Input the PTY could not take yet.
     pending_input: Vec<u8>,
     /// Set once queued input had to be dropped.
@@ -82,7 +87,7 @@ impl Pane {
             exited: false,
             selection: None,
             textures: TextureCache::default(),
-            selecting: false,
+            selection_in_progress: false,
             pending_input: Vec::new(),
             input_overflowed: false,
         })
@@ -117,9 +122,11 @@ impl Pane {
                     self.terminal.advance(&buf[..n]);
                     // The program has drawn over the screen, so a selection
                     // left on it is describing text that may no longer be
-                    // there. A drag in progress is the exception: the user
-                    // still has the button down and is watching it.
-                    if !self.selecting {
+                    // there. A selection still being made is the exception:
+                    // somebody is watching that highlight — with the button
+                    // down, or with copy mode's cursor on one end of it — and
+                    // wiping it would be wiping work in progress.
+                    if !self.selection_in_progress {
                         self.clear_selection();
                     }
                     // A short read means the PTY is drained for now.
