@@ -870,3 +870,25 @@ fn an_unplaced_animation_asks_for_no_repaint() {
     // The frame still moved on, so the next placement shows the right one.
     assert_eq!(t.graphics().image(6).unwrap().current_frame(), 2);
 }
+
+#[test]
+fn kitty_graphics_repaints_a_placement_whose_image_was_retransmitted() {
+    let mut t = term(10, 4);
+    let red = encode_base64(&[255, 0, 0, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=T,f=32,s=8,v=16,i=5;{red}\x1b\\").as_bytes());
+    t.take_output();
+    t.clear_damage();
+
+    // Sending the image again under the placement that is already showing it
+    // is how a program streams: place once, then transmit a frame at a time.
+    // The pixels on screen have changed, so the rows they cover have to
+    // repaint — nothing else in the session is going to notice that they did.
+    let green = encode_base64(&[0, 255, 0, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=t,f=32,s=8,v=16,i=5;{green}\x1b\\").as_bytes());
+
+    assert_eq!(t.graphics().image(5).unwrap().data[..4], [0, 255, 0, 255]);
+    assert!(
+        t.damage().is_row_dirty(0),
+        "retransmitting an image under a live placement must repaint it"
+    );
+}

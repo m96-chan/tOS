@@ -1850,6 +1850,13 @@ impl Terminal {
                 }
                 match self.graphics.store(&full, &payload) {
                     Ok(id) => {
+                        // Retransmitting an image replaces the pixels under
+                        // every placement already showing it, which is how a
+                        // program streams: place once, then send a frame at a
+                        // time. Nothing else in the session would notice that
+                        // the picture changed, so the rows are marked here,
+                        // before any new placement adds its own.
+                        self.damage_image(id);
                         if full.action == Action::TransmitAndDisplay {
                             self.place_at_cursor(&full, id);
                         }
