@@ -16,9 +16,11 @@ use tos_input::{
 use tos_platform::Display;
 use tos_render::{render, Rect as PixelRect, RenderOptions, Surface};
 use tos_session::{describe, Action, Axis, Keymap, PaneId, Rect, Resolution, Session};
+use tos_system::bluetooth::{Adapter, Connection, SystemControl};
 use tos_system::Sysfs;
 use tos_term::TermEvent;
 
+use crate::bluetooth::{Choice, Controls, Scan, SCAN_SECONDS};
 use crate::chrome::{self, Chrome, StatusItem};
 use crate::config::Config;
 use crate::launcher;
@@ -85,6 +87,10 @@ pub enum OverlayKind {
     RenameWorkspace,
     /// The key bindings, which are a list to read rather than to choose from.
     Bindings,
+    /// The Bluetooth controls: the adapter and what can be done to it. Rebuilt
+    /// under the user when a scan lands, so the row that was chosen is looked
+    /// up in [`crate::bluetooth::Controls`] rather than read off the label.
+    Bluetooth,
 }
 
 /// The running compositor.
@@ -147,6 +153,11 @@ pub struct Compositor {
     /// re-read on a timer rather than on damage, because nothing a person does
     /// to a pane is what makes a cable go in. See [`crate::system`].
     machine: Machine,
+    /// The Bluetooth menu's state and the inquiry thread, if one is running.
+    /// Kept on the compositor rather than in the overlay, because a scan
+    /// outlives the menu that started it: closing the box does not stop the
+    /// controller listening, and the answer still has somewhere to land.
+    bluetooth: Controls,
 }
 
 impl Compositor {
@@ -182,6 +193,7 @@ impl Compositor {
             idle_lock_done: false,
             blank_refused: false,
             machine: Machine::at(Sysfs::new(&config.system_root)),
+            bluetooth: Controls::new(),
             config,
         };
 
@@ -971,6 +983,7 @@ impl Compositor {
                 true
             }
             Action::Lock => self.lock_session(),
+            Action::ShowBluetooth => self.open_bluetooth(),
             Action::Quit => {
                 self.running = false;
                 true
@@ -1240,6 +1253,10 @@ impl Compositor {
             // Nothing to choose: the sheet is there to be read, so enter
             // closes it the way escape does.
             OverlayKind::Bindings => {}
+            OverlayKind::Bluetooth => {
+                let Some(index) = row else { return };
+                self.choose_bluetooth(index);
+            }
         }
     }
 
@@ -1372,6 +1389,147 @@ impl Compositor {
         self.notifications.status(format!("{what} failed: {error}"));
     }
 
+    // ---- bluetooth ------------------------------------------------------
+
+    /// Put the Bluetooth controls up.
+    ///
+    /// The adapter and its links are read here rather than taken from
+    /// [`Machine::reading`](crate::system::Machine::reading), which can be a
+    /// second old. A second is nothing on a status bar and everything on a
+    /// menu: the row that says "power hci0 on" for an adapter that came up
+    /// while the key was being pressed is the one row a person would press
+    /// twice and then distrust.
+    fn open_bluetooth(&mut self) -> bool {
+        let (adapter, connections) = self.adapter_now();
+        let overlay = self.bluetooth.menu(adapter.as_ref(), &connections);
+        self.open_overlay(OverlayKind::Bluetooth, overlay);
+        true
+    }
+
+    /// The adapter and the links it holds, read now.
+    fn adapter_now(&mut self) -> (Option<Adapter>, Vec<Connection>) {
+        let adapter = self.machine.bluetooth().default_adapter();
+        let connections = match adapter.as_ref() {
+            Some(adapter) => self.machine.bluetooth().connections(&adapter.name),
+            None => Vec::new(),
+        };
+        (adapter, connections)
+    }
+
+    /// Do what the chosen row said, and come back with the menu redrawn.
+    ///
+    /// Reopening is not politeness. Every one of these is a step towards
+    /// something else — unblock, then power on, then scan — and a menu that
+    /// closed after each would make the ordinary errand four keystrokes of
+    /// reopening. The adapter is re-read on the way back in, so the menu that
+    /// returns is the one the action left behind rather than the one it
+    /// started from.
+    fn choose_bluetooth(&mut self, index: usize) {
+        let choice = self.bluetooth.choose(index);
+        // Before the adapter is looked for, not after: most rows of this menu
+        // are there to be read, and pressing enter on the line that says this
+        // machine has no Bluetooth must not answer "no adapter".
+        if choice == Choice::Nothing {
+            return;
+        }
+        let Some(adapter) = self.machine.bluetooth().default_adapter() else {
+            // The adapter went away between the menu being drawn and the row
+            // being chosen, which a USB dongle does by being pulled out.
+            self.notifications.status("bluetooth: no adapter");
+            return;
+        };
+        let outcome = match choice {
+            Choice::PowerOn => self
+                .machine
+                .bluetooth()
+                .power_on(&adapter)
+                .map(|()| format!("{} on", adapter.name)),
+            Choice::PowerOff => self
+                .machine
+                .bluetooth()
+                .power_off(&adapter)
+                .map(|()| format!("{} off", adapter.name)),
+            Choice::Block => self
+                .machine
+                .bluetooth()
+                .set_blocked(&adapter, true)
+                .map(|()| format!("{} blocked", adapter.name)),
+            Choice::Unblock => self
+                .machine
+                .bluetooth()
+                .set_blocked(&adapter, false)
+                .map(|()| format!("{} unblocked", adapter.name)),
+            Choice::Scan => self.start_scan(adapter.clone()),
+            Choice::Nothing => return,
+        };
+        match outcome {
+            Ok(said) => self.notifications.status(format!("bluetooth: {said}")),
+            Err(why) => self.notifications.status(format!("bluetooth: {why}")),
+        }
+        // The status bar is showing a reading taken up to a second ago, and
+        // the thing it is a reading of has just been changed by hand. Asking
+        // now is what stops the bar disagreeing with the menu in front of it.
+        self.machine.refresh(Instant::now());
+        self.open_bluetooth();
+    }
+
+    /// Start an inquiry on the thread that is not this one.
+    ///
+    /// The refusals in front of it — a scan already running, an adapter that
+    /// is down or blocked — are answered here rather than by the thread,
+    /// because an error that takes eight seconds to arrive reads as a failure
+    /// of the radio rather than of the request.
+    fn start_scan(&mut self, adapter: Adapter) -> Result<String, tos_system::bluetooth::Error> {
+        if self.bluetooth.is_scanning() {
+            return Ok("already scanning".to_string());
+        }
+        if adapter.is_blocked() {
+            return Err(tos_system::bluetooth::Error::Blocked {
+                hardware: adapter.is_hard_blocked(),
+            });
+        }
+        if !adapter.powered {
+            return Err(tos_system::bluetooth::Error::NotPowered(adapter.name));
+        }
+        let sysfs = self.machine.sysfs().clone();
+        self.bluetooth
+            .begin(Scan::spawn(sysfs, SystemControl, adapter, SCAN_SECONDS));
+        Ok(format!("scanning for {SCAN_SECONDS} seconds"))
+    }
+
+    /// Take in whatever the inquiry thread has to say. True when it said
+    /// anything, which is a frame.
+    fn collect_scan(&mut self) -> bool {
+        let Some(outcome) = self.bluetooth.finished() else {
+            return false;
+        };
+        match outcome {
+            Ok(found) => {
+                self.bluetooth.set_found(found);
+                let count = self.bluetooth.found().len();
+                self.notifications.status(match count {
+                    0 => "bluetooth: nothing answered".to_string(),
+                    1 => "bluetooth: one device".to_string(),
+                    n => format!("bluetooth: {n} devices"),
+                });
+            }
+            Err(why) => self.notifications.status(format!("bluetooth: {why}")),
+        }
+        // A menu still on screen was drawn before any of this was known, and
+        // the rows it is offering are the ones the next keystroke will be
+        // answered against. `set_items` rather than reopening, so that a query
+        // typed while the controller was listening survives the answer.
+        if matches!(self.overlay, Some((OverlayKind::Bluetooth, _))) {
+            let (adapter, connections) = self.adapter_now();
+            let items = self.bluetooth.items(adapter.as_ref(), &connections);
+            if let Some((_, overlay)) = &mut self.overlay {
+                overlay.set_items(items);
+            }
+            self.needs_full_redraw = true;
+        }
+        true
+    }
+
     // ---- rendering ------------------------------------------------------
 
     /// Advance the blink phase and any animations. Returns true when anything
@@ -1421,6 +1579,14 @@ impl Compositor {
         // is damaged by any of it, so this poll is the only thing that would
         // ever ask for the frame those changes belong on.
         if self.machine.poll(now, self.blanked) {
+            changed = true;
+        }
+        // An inquiry is the one thing in tOS that runs off this thread, and
+        // this is where its answer comes back on to it. Polled rather than
+        // waited on: the loop is here every tenth of a second anyway, and a
+        // scan that lands while the screen is blanked can wait for the
+        // keystroke that lights it, since nobody is reading it in the dark.
+        if self.collect_scan() {
             changed = true;
         }
         changed
@@ -3224,5 +3390,87 @@ mod tests {
             compositor.render_frame(&mut surface, true);
         }
         assert!(!compositor.needs_render());
+    }
+
+    // ---- bluetooth ------------------------------------------------------
+
+    /// Run `tick` until something lands, which is what the frame loop does.
+    ///
+    /// Bounded, because a broken channel should fail the test rather than hang
+    /// whoever is waiting for CI.
+    fn tick_until(compositor: &mut Compositor, what: impl Fn(&Compositor) -> bool) {
+        for _ in 0..1000 {
+            compositor.tick();
+            if what(compositor) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("it never arrived");
+    }
+
+    #[test]
+    fn the_bluetooth_binding_opens_the_controls() {
+        // The config every test here uses points at a root with no hardware
+        // under it, which is also the ordinary machine: most of them have no
+        // adapter, and the menu has to say that rather than open empty.
+        let mut compositor = compositor();
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            tos_input::Modifiers::SUPER,
+        )));
+        let overlay = compositor.overlay().expect("the controls should be open");
+        assert_eq!(overlay.title(), "bluetooth");
+        let labels: Vec<&str> = overlay.items().iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["this machine has no Bluetooth"]);
+    }
+
+    #[test]
+    fn choosing_a_row_that_is_only_there_to_be_read_does_nothing() {
+        let mut compositor = compositor();
+        assert!(compositor.perform(Action::ShowBluetooth));
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            tos_input::Modifiers::NONE,
+        )));
+        assert!(compositor.overlay().is_none(), "enter should close it");
+        assert!(
+            compositor.notifications.status_line().is_none(),
+            "there was nothing to report"
+        );
+    }
+
+    #[test]
+    fn what_a_scan_found_arrives_through_the_tick_and_into_the_open_menu() {
+        // The whole point of running the inquiry elsewhere: the answer has to
+        // find its way back on to the thread that draws, without that thread
+        // ever having waited for it.
+        let mut compositor = compositor();
+        assert!(compositor.perform(Action::ShowBluetooth));
+        compositor
+            .bluetooth
+            .begin(crate::bluetooth::scan_that_found(vec![
+                tos_system::bluetooth::Discovered {
+                    address: "11:22:33:44:55:66".into(),
+                    class: 0x240404,
+                },
+            ]));
+
+        tick_until(&mut compositor, |compositor| {
+            !compositor.bluetooth.is_scanning()
+        });
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("bluetooth: one device")
+        );
+        let overlay = compositor.overlay().expect("the menu should still be open");
+        assert!(
+            overlay
+                .items()
+                .iter()
+                .any(|item| item.label == "11:22:33:44:55:66"),
+            "the menu was not rebuilt: {:?}",
+            overlay.items()
+        );
     }
 }

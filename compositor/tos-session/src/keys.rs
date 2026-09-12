@@ -61,6 +61,10 @@ pub enum Action {
     Quit,
     /// Redraw everything.
     Refresh,
+    /// Open the Bluetooth controls: the adapter, what it is doing, and the
+    /// devices a scan found. Powering on, blocking and scanning all happen
+    /// from inside it rather than each getting a key of its own.
+    ShowBluetooth,
 }
 
 /// A key combination.
@@ -229,6 +233,9 @@ impl Keymap {
             // way vim does, and because every other desktop locks with an L.
             (KeyCode::Char('l'), Modifiers::SHIFT, Action::Lock),
             (KeyCode::Char('q'), Modifiers::NONE, Action::Quit),
+            // b for Bluetooth, which nothing else wants and which is what the
+            // radio is called everywhere a user has seen it before.
+            (KeyCode::Char('b'), Modifiers::NONE, Action::ShowBluetooth),
         ];
         for (code, modifiers, action) in bindings {
             keymap.bind_after_leader(Binding::new(*code, *modifiers), action.clone());
@@ -643,6 +650,25 @@ mod tests {
         keymap.unbind(&Binding::new(KeyCode::Function(1), Modifiers::NONE));
         assert_eq!(
             keymap.resolve(&press(KeyCode::Function(1), Modifiers::NONE)),
+            Resolution::Passthrough
+        );
+    }
+
+    #[test]
+    fn b_opens_the_bluetooth_controls_with_or_without_the_leader() {
+        let mut keymap = Keymap::default_bindings();
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('b'), Modifiers::SUPER)),
+            Resolution::Action(Action::ShowBluetooth)
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('b'), Modifiers::NONE)),
+            Resolution::Action(Action::ShowBluetooth)
+        );
+        // A plain b is a b, which is most of what a pane is typed.
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('b'), Modifiers::NONE)),
             Resolution::Passthrough
         );
     }

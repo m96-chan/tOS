@@ -44,6 +44,7 @@ dependencies = [
  "tos-pty",
  "tos-render",
  "tos-session",
+ "tos-system",
  "tos-term",
 ]
 
