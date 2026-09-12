@@ -14,6 +14,7 @@ use tos_platform::{Display, HeadlessDisplay, NestedDisplay};
 
 use tos_compositor::config::{usage, Backend, Config};
 use tos_compositor::config_file;
+use tos_compositor::power;
 use tos_compositor::Compositor;
 
 /// Set from a signal handler when the host terminal changes size.
@@ -166,8 +167,9 @@ fn run_headless(config: Config) -> io::Result<()> {
     // Without a screenshot, headless mode is only useful as a soak test.
     while compositor.is_running() && !TERMINATE.load(Ordering::Relaxed) {
         compositor.run_once(&mut display, &[], |_| Vec::new())?;
+        sleep_if_asked(&mut compositor);
     }
-    Ok(())
+    compositor.shut_down()
 }
 
 fn run_nested(config: Config) -> io::Result<()> {
@@ -217,10 +219,26 @@ fn run_nested(config: Config) -> io::Result<()> {
                 }
             }
         })?;
+        sleep_if_asked(&mut compositor);
     }
     display.release()?;
     io::stdout().flush()?;
-    Ok(())
+    compositor.shut_down()
+}
+
+/// Suspend on behalf of a session that owns none of the machine it is drawn
+/// on: the nested and headless backends.
+///
+/// There is no DRM master to give up and no device grabbed, because a session
+/// inside somebody else's terminal holds neither, so the whole of the suspend
+/// is the sleep itself. It is still offered rather than refused: it is still
+/// the user's machine, and they still asked it to sleep.
+fn sleep_if_asked(compositor: &mut Compositor) {
+    if !compositor.take_suspend_request() {
+        return;
+    }
+    let outcome = power::suspend(&mut power::Unowned, compositor.machine_mut().power());
+    compositor.resumed(&outcome);
 }
 
 /// One thing the DRM loop does about a VT switch the kernel is asking about.
@@ -271,6 +289,76 @@ fn switch_away_plan(locked: bool) -> &'static [SwitchStep] {
 fn run_drm(config: Config) -> io::Result<()> {
     use tos_input::evdev::InputBackend;
     use tos_platform::{DrmDisplay, VirtualTerminal};
+
+    /// The screen, the keyboard and the console, for the one thing that takes
+    /// all three away underneath a running session.
+    ///
+    /// This is the only place in tOS that holds all three at once, which is
+    /// why the order they are given up and taken back in lives in
+    /// `tos_compositor::power` and only the calls themselves live here.
+    struct Console<'a> {
+        display: &'a mut DrmDisplay,
+        input: &'a mut InputBackend,
+        /// `None` on a machine where the VT could not be taken over, which is
+        /// every nested and containerised one. There is then nothing to
+        /// reclaim, and the suspend is not worth refusing over it.
+        vt: Option<&'a mut VirtualTerminal>,
+    }
+
+    impl power::Hardware for Console<'_> {
+        fn release_display(&mut self) -> io::Result<()> {
+            // Drop DRM master. The mode on the far side is set from nothing by
+            // `restore_display` below, which is the only honest thing to do
+            // with a CRTC that a driver has been resetting while tOS was not
+            // running to watch it.
+            self.display.release()
+        }
+
+        fn ungrab_input(&mut self) -> io::Result<()> {
+            self.input.ungrab_all()
+        }
+
+        fn reclaim_terminal(&mut self) -> io::Result<()> {
+            let Some(vt) = self.vt.as_mut() else {
+                return Ok(());
+            };
+            // The same call that took the terminal at startup, and it is
+            // deliberately the same call: `KDSETMODE`, `KDSKBMODE` and
+            // `VT_SETMODE` are all idempotent, the saved console state was
+            // captured when the terminal was opened and is not touched again,
+            // and a resume is exactly when the kernel's own console has woken
+            // up and may start drawing text over the session.
+            vt.take_over(libc::SIGUSR1, libc::SIGUSR2)
+        }
+
+        fn restore_display(&mut self) -> io::Result<()> {
+            // Master again, and the next frame is a mode set rather than a
+            // page flip — which is `Display::restore`, the same path a VT
+            // switch back takes.
+            self.display.restore()
+        }
+
+        fn grab_input(&mut self) -> io::Result<()> {
+            // The devices opened at startup, and only those. tOS has no
+            // hotplug, so a keyboard the kernel re-enumerates under a
+            // different `/dev/input/eventN` across the resume is gone until
+            // the session is restarted, and no amount of re-grabbing here
+            // would find it. What this reclaims is the ordinary case: the
+            // node survived the sleep and only the exclusive grab did not.
+            self.input.grab_all()
+        }
+
+        fn drain_input(&mut self) -> io::Result<()> {
+            // Read and throw away, in that order: the queue has to be emptied
+            // through the translator or the events would simply be waiting on
+            // the next pass, and the modifier state has to be cleared after
+            // that or the translator would have put back the very keys this is
+            // forgetting.
+            let _ = self.input.poll()?;
+            self.input.forget_held_keys();
+            Ok(())
+        }
+    }
 
     let mut display = DrmDisplay::open().map_err(|e| {
         io::Error::new(
@@ -371,12 +459,35 @@ fn run_drm(config: Config) -> io::Result<()> {
         compositor.run_once(&mut display, &input_fds, |_fd| {
             input.poll().unwrap_or_default()
         })?;
+
+        // After the frame, so that what is on the panel while the machine
+        // sleeps is the screen the session meant to leave behind — the lock,
+        // on a machine that has a password.
+        if compositor.take_suspend_request() {
+            let outcome = {
+                let mut console = Console {
+                    display: &mut display,
+                    input: &mut input,
+                    vt: vt.as_mut(),
+                };
+                power::suspend(&mut console, compositor.machine_mut().power())
+            };
+            compositor.resumed(&outcome);
+        }
     }
 
     if let Some(vt) = vt.as_mut() {
         vt.restore();
     }
-    Ok(())
+    // Everything goes back before the machine is asked to stop: the console to
+    // text mode, the CRTC to the mode it was found in, the keyboards to
+    // whoever else wants them. A `reboot(2)` from a session still holding all
+    // three would say whatever the kernel has to say on the way down onto a
+    // screen in graphics mode that nobody can read — and if the syscall is
+    // refused, it would leave the user in front of exactly that.
+    drop(display);
+    drop(input);
+    compositor.shut_down()
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -16,6 +16,7 @@ use tos_input::{
 use tos_platform::Display;
 use tos_render::{render, Rect as PixelRect, RenderOptions, Surface};
 use tos_session::{describe, Action, Axis, Keymap, PaneId, Rect, Resolution, Session};
+use tos_system::power::PowerAction;
 use tos_system::Sysfs;
 use tos_term::TermEvent;
 
@@ -26,6 +27,7 @@ use crate::lock::{self, LockOutcome, LockScreen};
 use crate::notify::{self, Chosen, Notifications};
 use crate::overlay::{Overlay, OverlayItem, OverlayOutcome};
 use crate::pane::Pane;
+use crate::power;
 use crate::selection::{Selection, SelectionMode};
 use crate::system::Machine;
 
@@ -85,6 +87,13 @@ pub enum OverlayKind {
     RenameWorkspace,
     /// The key bindings, which are a list to read rather than to choose from.
     Bindings,
+    /// The three ways a machine stops: power off, reboot, suspend.
+    Power,
+    /// The second half of a power off or a reboot: the menu that has to be
+    /// answered before it happens. The action is carried in the kind rather
+    /// than looked up again from the row, so that the thing being confirmed is
+    /// decided once, by the menu that asked.
+    ConfirmPower(PowerAction),
 }
 
 /// The running compositor.
@@ -147,6 +156,23 @@ pub struct Compositor {
     /// re-read on a timer rather than on damage, because nothing a person does
     /// to a pane is what makes a cable go in. See [`crate::system`].
     machine: Machine,
+    /// A suspend has been agreed to and has not happened yet.
+    ///
+    /// The compositor cannot carry one out itself: giving up DRM master and
+    /// the input grabs is the loop's business, because the loop is what holds
+    /// the display and the devices. So this is a flag the loop takes, the same
+    /// shape as the VT switch the kernel asks about. See [`crate::power`].
+    suspend_requested: bool,
+    /// How this session is ending, when it is ending because somebody asked
+    /// the machine to stop rather than asked tOS to.
+    ///
+    /// Kept rather than acted on for the same reason, and for one more: a
+    /// `reboot(2)` from inside the loop would leave the console in graphics
+    /// mode with its keyboard off, so whatever the kernel says on the way down
+    /// — including why it could not unmount something — would be said onto a
+    /// screen nobody can read. The session ends first, the terminal and the
+    /// display go back, and only then does the machine stop.
+    shutdown: Option<PowerAction>,
 }
 
 impl Compositor {
@@ -182,6 +208,8 @@ impl Compositor {
             idle_lock_done: false,
             blank_refused: false,
             machine: Machine::at(Sysfs::new(&config.system_root)),
+            suspend_requested: false,
+            shutdown: None,
             config,
         };
 
@@ -971,6 +999,10 @@ impl Compositor {
                 true
             }
             Action::Lock => self.lock_session(),
+            Action::PowerMenu => {
+                self.open_overlay(OverlayKind::Power, power::menu());
+                true
+            }
             Action::Quit => {
                 self.running = false;
                 true
@@ -1240,6 +1272,29 @@ impl Compositor {
             // Nothing to choose: the sheet is there to be read, so enter
             // closes it the way escape does.
             OverlayKind::Bindings => {}
+            OverlayKind::Power => {
+                // A row that names nothing is a menu that has been rebuilt
+                // wrong; doing nothing is the only safe answer on this menu.
+                let Some(action) = power::action_named(label) else {
+                    return;
+                };
+                if power::needs_confirming(action) {
+                    self.open_overlay(
+                        OverlayKind::ConfirmPower(action),
+                        power::confirmation(action),
+                    );
+                    return;
+                }
+                self.request_power(action);
+            }
+            // Only the row that names the action goes ahead; every other
+            // answer, including escape and the enter that opened this, leaves
+            // the session alone. See [`crate::power::confirmation`].
+            OverlayKind::ConfirmPower(action) => {
+                if power::confirmed(action, label) {
+                    self.request_power(action);
+                }
+            }
         }
     }
 
@@ -1728,6 +1783,115 @@ impl Compositor {
             display.frame(&mut |surface| self.render_frame(surface, retained))?;
         }
         Ok(())
+    }
+
+    // ---- power ----------------------------------------------------------
+
+    /// Act on a power action that has been asked for and, where it needed one,
+    /// agreed to.
+    ///
+    /// Public because the menu is not the only way in: a test reaches it
+    /// without driving two overlays, and a lid switch or a power button would
+    /// arrive here too. It is also the one place that decides which of the
+    /// three the session is expected to survive, which is the difference
+    /// between the two fields it sets.
+    pub fn request_power(&mut self, action: PowerAction) -> bool {
+        match action {
+            PowerAction::Suspend => {
+                // Locked before the machine sleeps rather than after it wakes.
+                // Somebody who suspends a laptop is shutting the lid and
+                // walking away from it, and the session has to be behind the
+                // password by the time anything can be on the screen again; a
+                // lock applied on the way back is one that races whoever
+                // pressed the key to wake it. This is `lock_on_idle` and not
+                // `lock_session` because a machine with no password has no
+                // lock to offer, and "cannot lock" is not an answer to
+                // somebody who asked for a suspend.
+                self.lock_on_idle();
+                self.suspend_requested = true;
+                true
+            }
+            ending => {
+                self.shutdown = Some(ending);
+                // Ending the loop is what gets the console and the display
+                // handed back before [`Compositor::shut_down`] stops the
+                // machine. The panes are not asked anything: there is nothing
+                // to ask them with, which is what the confirmation said.
+                self.running = false;
+                true
+            }
+        }
+    }
+
+    /// Whether a suspend has been asked for since this was last called.
+    ///
+    /// Edge triggered, like [`tos_platform::take_switch_away`] and for the
+    /// same reason: the loop acts on it in a place where the display and the
+    /// input devices can safely be given up, and a flag that stayed set would
+    /// put the machine to sleep again the moment it woke.
+    pub fn take_suspend_request(&mut self) -> bool {
+        std::mem::take(&mut self.suspend_requested)
+    }
+
+    /// How this session is ending, when it is ending by request. `None` for a
+    /// session that stopped for any of the other reasons.
+    pub fn shutdown_request(&self) -> Option<PowerAction> {
+        self.shutdown
+    }
+
+    /// The machine is awake again.
+    ///
+    /// Everything the sleep invalidated, put back in one place: the loop has
+    /// already reclaimed the screen and the keyboard by the time this is
+    /// called, and this is the session's half of the same resume.
+    pub fn resumed(&mut self, outcome: &power::Outcome) {
+        // The CRTC has been set again from nothing, so there is no previous
+        // frame on the screen for a partial repaint to build on — and the
+        // damage that would have said which cells to repaint was collected
+        // against a screen that no longer exists.
+        self.needs_full_redraw = true;
+        let now = Instant::now();
+        // Where the caret is, is the first thing anyone looks for on a screen
+        // they have just brought back. The same reason unblanking does it.
+        self.blink_visible = true;
+        self.last_blink = now;
+        // Waking a machine is somebody being there, so the idle period starts
+        // again from here. Nothing was missed while it slept: `Instant` is
+        // `CLOCK_MONOTONIC`, which does not count time spent suspended, so the
+        // deadlines stood still along with everything else.
+        self.last_activity = now;
+        self.idle_lock_done = false;
+        self.blank_refused = false;
+        // Read the machine now rather than within the second the poll would
+        // take: a laptop that went to sleep on its charger and woke off it
+        // would otherwise still be showing last night's battery.
+        self.machine.refresh(now);
+        // A suspend that did not happen, or a screen that came back wrong, is
+        // a thing to say rather than a thing to end a session over — the same
+        // rule the display that will not blank follows.
+        for problem in &outcome.problems {
+            self.notifications
+                .status(format!("{}: {}", problem.step.what(), problem.message));
+        }
+    }
+
+    /// Carry out the ending this session was given, if it was given one.
+    ///
+    /// Called by the loop after it has stopped and handed the console and the
+    /// display back, which is the whole reason it is separate from asking for
+    /// it: `reboot(2)` does not return on success, so anything that has to
+    /// happen before the machine stops has to have happened before this call.
+    /// An error means the syscall was refused — tOS without `CAP_SYS_BOOT`, a
+    /// container — and by then there is no status bar left to say so on, which
+    /// is why this is an error to print rather than a notification to queue.
+    pub fn shut_down(&mut self) -> io::Result<()> {
+        let Some(action) = self.shutdown.take() else {
+            return Ok(());
+        };
+        // `request` is what puts the sync in front of it. There is no init
+        // here to flush the filesystems on the way down, so an unsynced
+        // poweroff loses whatever the panes were writing.
+        tos_system::power::request(self.machine.power(), action)
     }
 }
 

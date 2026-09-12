@@ -133,6 +133,7 @@ pub fn describe(action: &Action) -> String {
         Action::ShowBindings => "show these bindings".into(),
         Action::Refresh => "redraw the screen".into(),
         Action::Lock => "lock the screen".into(),
+        Action::PowerMenu => "power off, reboot or suspend".into(),
         Action::Quit => "quit tOS".into(),
     }
 }
@@ -249,6 +250,9 @@ fn rank(action: &Action) -> (u16, u16) {
         Action::ShowBindings => (8, 2),
         Action::Refresh => (9, 0),
         Action::Lock => (9, 1),
+        // With quitting rather than with the screen: both of these are how a
+        // session stops, and the sheet is read in the order things happen.
+        Action::PowerMenu => (9, 3),
         Action::Quit => (9, 2),
     }
 }
