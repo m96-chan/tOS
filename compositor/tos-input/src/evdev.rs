@@ -424,8 +424,27 @@ impl InputBackend {
             EV_ABS => match raw.code {
                 // Touch panels report absolute positions in their own units;
                 // without the device's axis range this is a direct mapping.
-                ABS_X => self.pointer.x = raw.value as f64,
-                ABS_Y => self.pointer.y = raw.value as f64,
+                //
+                // Clamped rather than left where it lands. A touchscreen or a
+                // VM's emulated tablet reports 0..32767, which taken raw is
+                // thousands of pixels past the edge of any panel: the arrow
+                // clips to nothing and a press lands on no pane, so the device
+                // does not merely point badly, it does nothing at all. On the
+                // edge of the panel is not where the finger was, but it is
+                // where every device whose range is smaller than the display
+                // already ended up, and it cannot put any device further out
+                // than it already was. Scaling by the axis range would be the
+                // real answer and is not this: `EVIOCGABS` is per device, and
+                // `poll` merges every device's events into one stream with
+                // nothing left on them to say which one they came from.
+                ABS_X => {
+                    self.pointer.x = raw.value as f64;
+                    self.clamp_pointer();
+                }
+                ABS_Y => {
+                    self.pointer.y = raw.value as f64;
+                    self.clamp_pointer();
+                }
                 _ => {}
             },
             // A report is only complete at the sync, and only worth sending
@@ -602,6 +621,52 @@ mod tests {
         // Arithmetic keys are the same either way.
         assert_eq!(keypad_navigation(Keypad::Add), None);
         assert_eq!(keypad_navigation(Keypad::Enter), None);
+    }
+
+    /// A backend with no devices open, for the translation that needs none.
+    fn backend(width: u32, height: u32) -> InputBackend {
+        InputBackend {
+            devices: Vec::new(),
+            modifiers: Modifiers::NONE,
+            modifier_keys: Vec::new(),
+            pointer: Pointer {
+                x: width as f64 / 2.0,
+                y: height as f64 / 2.0,
+            },
+            bounds: (width as f64, height as f64),
+            buttons_down: 0,
+            pending: Vec::new(),
+            motion: (0.0, 0.0),
+        }
+    }
+
+    #[test]
+    fn an_absolute_position_stays_on_the_panel_however_large_the_devices_units_are() {
+        // A touchscreen or a VM's emulated tablet reports 0..32767 in its own
+        // units. Taken raw that is thousands of pixels past the edge of any
+        // panel, and off the panel the pointer is not merely in the wrong
+        // place: the arrow clips away to nothing and a press lands on no pane,
+        // so the device stops doing anything at all. Scaling by the axis range
+        // is the answer this cannot give — `EVIOCGABS` is per device and the
+        // events reaching here have been merged from all of them — so what is
+        // pinned is the weaker thing, that the pointer is somewhere reachable.
+        let mut backend = backend(1920, 1080);
+        let mut out = Vec::new();
+        let abs = |code, value| RawEvent {
+            tv_sec: 0,
+            tv_usec: 0,
+            kind: EV_ABS,
+            code,
+            value,
+        };
+        backend.translate(abs(ABS_X, 32767), &mut out);
+        backend.translate(abs(ABS_Y, 32767), &mut out);
+        assert_eq!(backend.pointer_position(), (1919.0, 1079.0));
+
+        // And a device that reports below its own minimum is the same case the
+        // other way up.
+        backend.translate(abs(ABS_X, -40), &mut out);
+        assert_eq!(backend.pointer_position().0, 0.0);
     }
 
     #[test]

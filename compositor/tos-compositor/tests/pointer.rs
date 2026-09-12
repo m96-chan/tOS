@@ -10,15 +10,25 @@
 
 use tos_compositor::pointer;
 use tos_compositor::{Compositor, Config};
-use tos_input::{InputEvent, KeyCode, KeyEvent, Modifiers, MouseAction, PointerEvent};
+use tos_input::{InputEvent, KeyCode, KeyEvent, Modifiers, MouseAction, MouseEvent, PointerEvent};
 use tos_render::{OwnedFramebuffer, Rect};
-use tos_session::{Action, Axis};
+use tos_session::{Action, Axis, PaneId};
 
 const SIZE: (u32, u32) = (800, 480);
 
 /// A pane that will sit still: nothing it prints can repaint the cells a test
 /// is watching for an arrow.
+///
+/// Twice the built-in face, which puts the cell at 22 pixels tall and the arrow
+/// at one display pixel per pixel of its mask.
 fn quiet() -> Compositor {
+    quiet_at(2)
+}
+
+/// The same pane on a panel whose cells are big enough that the arrow is drawn
+/// scaled up, which is every HiDPI machine and neither of the sizes the rest of
+/// this file uses.
+fn quiet_at(bitmap_scale: u32) -> Compositor {
     let config = Config {
         command: Some(
             ["/bin/sh", "-c", "sleep 30"]
@@ -26,7 +36,7 @@ fn quiet() -> Compositor {
                 .map(|s| s.to_string())
                 .collect(),
         ),
-        bitmap_scale: Some(2),
+        bitmap_scale: Some(bitmap_scale),
         // The built-in face, so the cell size does not depend on the host's
         // fonts and a test can turn cells into pixels itself.
         font: Some("/nonexistent".into()),
@@ -86,6 +96,50 @@ fn type_a_letter(compositor: &mut Compositor) -> bool {
     )))
 }
 
+/// Two columns with the right one filled in a colour nothing else on screen is
+/// painted in, so a hole punched in it is unmistakable.
+///
+/// Returns the compositor, the right pane, and the display pixel its first
+/// column starts at.
+fn two_columns_with_a_coloured_right_pane() -> (Compositor, PaneId, u32) {
+    let mut compositor = quiet();
+    compositor.perform(Action::Split(Axis::Columns));
+    let geometry = compositor
+        .session()
+        .active()
+        .geometry(compositor.grid_area());
+    assert_eq!(geometry.len(), 2, "the split did not happen");
+    let (id, rect) = *geometry.iter().max_by_key(|(_, r)| r.x).expect("a pane");
+    let pane = compositor
+        .pane_mut(id)
+        .expect("the pane that was split off");
+    let cells = pane.terminal.cols() * pane.terminal.rows();
+    pane.terminal.advance(b"\x1b[41m");
+    pane.terminal.advance(" ".repeat(cells).as_bytes());
+    let edge = rect.x * compositor.cell_size().0;
+    (compositor, id, edge)
+}
+
+/// Put the arrow half on the divider and half in the right pane's first
+/// column. The half on the divider is what makes a frame paint the background
+/// back at all; the half on the pane is where that fill lands.
+fn straddle_the_divider(compositor: &mut Compositor, edge: u32, y: u32) -> u32 {
+    let x = edge - pointer::size(compositor.cell_size()).0 / 2;
+    move_to(compositor, x, y);
+    x
+}
+
+/// The part of an arrow drawn at `(x, y)` that falls inside the right pane.
+fn over_the_pane(compositor: &Compositor, x: u32, y: u32, edge: u32) -> Rect {
+    let inside =
+        arrow(compositor, x, y).intersect(&Rect::new(edge as i32, 0, SIZE.0 - edge, SIZE.1));
+    assert!(
+        !inside.is_empty(),
+        "the arrow did not reach across the divider into the pane"
+    );
+    inside
+}
+
 /// Where the arrow lands when its hotspot is at `(x, y)`.
 fn arrow(compositor: &Compositor, x: u32, y: u32) -> Rect {
     let (width, height) = pointer::size(compositor.cell_size());
@@ -130,6 +184,46 @@ fn the_pointer_is_drawn_at_the_pixel_it_was_moved_to() {
         differences(&empty, &shown, whole),
         differences(&empty, &shown, at),
         "the frame changed outside the arrow"
+    );
+}
+
+#[test]
+fn an_arrow_against_the_bottom_edge_is_cut_off_rather_than_drawn_at_a_smaller_scale() {
+    // How big the arrow is drawn is the cell's business: it has to keep its
+    // proportion to the text it is pointing at. The rectangle the frame hands
+    // the drawing is clipped to the panel first, so taking the size from that
+    // instead built a whole, unclipped arrow a third of the size in the band
+    // along the bottom edge where the clip bites — a pointer that shrank as the
+    // hand approached the edge and snapped back when it left.
+    let mut compositor = quiet_at(4);
+    let mut screen = Screen::new();
+    let (width, height) = pointer::size(compositor.cell_size());
+    assert!(
+        height > 17,
+        "these cells draw the arrow at one pixel per pixel, which is the one \
+         size at which a scale taken from the wrong number still comes out right"
+    );
+
+    let empty = screen.frame(&mut compositor);
+    // Far enough down that most of the arrow hangs off the bottom, and nowhere
+    // near the right edge, which never clipped it because the width was never
+    // read.
+    let (x, y) = (SIZE.0 / 2, SIZE.1 - height / 2);
+    move_to(&mut compositor, x, y);
+    let shown = screen.frame(&mut compositor);
+
+    // The bottom right corner of where the arrow belongs. An arrow rebuilt at a
+    // third of its size fits entirely above and to the left of this, so one
+    // changed pixel inside it is the whole assertion.
+    let corner = Rect::new(
+        (x + width / 2) as i32,
+        (y + height / 3) as i32,
+        width / 2,
+        SIZE.1 - y - height / 3,
+    );
+    assert!(
+        differences(&empty, &shown, corner) > 0,
+        "the arrow was rebuilt smaller instead of being cut off by the edge"
     );
 }
 
@@ -286,6 +380,84 @@ fn a_pointer_over_a_divider_is_uncovered_without_repainting_the_panel() {
 }
 
 #[test]
+fn uncovering_the_arrow_leaves_a_pane_holding_a_synchronized_update_alone() {
+    // A program that has opened DECSET 2026 has asked for the frame it is
+    // halfway through not to be shown, and nothing anywhere puts a timeout on
+    // that: the pane is skipped on every retained frame until the program says
+    // otherwise. Painting the background back over the old arrow used to reach
+    // across into it, which is not the one frame that trick was costed at but a
+    // hole in the picture for as long as the program keeps the update open.
+    let (mut compositor, right, edge) = two_columns_with_a_coloured_right_pane();
+    let mut screen = Screen::new();
+    let y = compositor.cell_size().1 * 4;
+    let coloured = screen.frame(&mut compositor);
+
+    let x = straddle_the_divider(&mut compositor, edge, y);
+    let shown = screen.frame(&mut compositor);
+    let inside = over_the_pane(&compositor, x, y, edge);
+    assert!(
+        differences(&coloured, &shown, inside) > 0,
+        "no arrow was drawn on the pane to uncover"
+    );
+
+    compositor
+        .pane_mut(right)
+        .expect("the pane")
+        .terminal
+        .advance(b"\x1b[?2026h");
+    move_to(&mut compositor, 40, y);
+    let moved = screen.frame(&mut compositor);
+    assert_eq!(
+        differences(&shown, &moved, inside),
+        0,
+        "a pane that asked not to be drawn was painted over to uncover the arrow"
+    );
+
+    // What it is owed instead is the rows the arrow was marked over, redeemed
+    // the moment it draws again: the arrow goes with them.
+    compositor
+        .pane_mut(right)
+        .expect("the pane")
+        .terminal
+        .advance(b"\x1b[?2026l");
+    let closed = screen.frame(&mut compositor);
+    assert_eq!(
+        differences(&coloured, &closed, inside),
+        0,
+        "the arrow outlived the synchronized update that was drawn under it"
+    );
+}
+
+#[test]
+fn a_pane_holding_a_synchronized_update_open_does_not_hold_the_render_loop_awake() {
+    // The other half of the same skip. A pane that is not drawn keeps its
+    // damage on purpose, so that the update is not lost — but answering yes to
+    // `needs_render` on the strength of it asks for a frame that is guaranteed
+    // to draw nothing of that pane, once per pass of the loop, for as long as
+    // the program keeps the update open. With no timeout on 2026 that is as
+    // long as it likes.
+    let (mut compositor, right, edge) = two_columns_with_a_coloured_right_pane();
+    let mut screen = Screen::new();
+    let y = compositor.cell_size().1 * 4;
+    screen.frame(&mut compositor);
+    assert!(!compositor.needs_render());
+
+    straddle_the_divider(&mut compositor, edge, y);
+    screen.frame(&mut compositor);
+    compositor
+        .pane_mut(right)
+        .expect("the pane")
+        .terminal
+        .advance(b"\x1b[?2026h");
+    move_to(&mut compositor, 40, y);
+    screen.frame(&mut compositor);
+    assert!(
+        !compositor.needs_render(),
+        "a pane that asked not to be drawn asks for a frame on every pass"
+    );
+}
+
+#[test]
 fn the_pointer_is_drawn_over_an_open_overlay() {
     let mut compositor = quiet();
     compositor.perform(Action::ShowBindings);
@@ -301,6 +473,38 @@ fn the_pointer_is_drawn_over_an_open_overlay() {
     assert!(
         differences(&menu, &shown, arrow(&compositor, x, y)) > 20,
         "the overlay was painted over the pointer"
+    );
+}
+
+#[test]
+fn a_host_terminals_mouse_report_puts_no_arrow_on_the_panel() {
+    // A `Mouse` event carries the host terminal's cell numbers, and the nested
+    // backend is the only thing that sends one. Its framebuffer is one pixel
+    // per host column and two per host row, so the arrow synthesised from those
+    // numbers and the compositor's own cell size stood several cells from the
+    // hand and, for anything past the top left corner, was clipped away
+    // altogether. The mapping that is wrong is the one the click shares, so
+    // this asserts the absence rather than a position: an arrow that agrees
+    // with the click is a change to where clicks land.
+    let mut compositor = quiet();
+    let mut screen = Screen::new();
+    let empty = screen.frame(&mut compositor);
+
+    assert!(
+        !compositor.handle_input(InputEvent::Mouse(MouseEvent {
+            button: None,
+            action: MouseAction::Motion,
+            col: 10,
+            row: 5,
+            modifiers: Modifiers::NONE,
+        })),
+        "a host terminal's motion asked for a frame with nothing to put in it"
+    );
+    let after = screen.frame(&mut compositor);
+    assert_eq!(
+        differences(&empty, &after, Rect::new(0, 0, SIZE.0, SIZE.1)),
+        0,
+        "a host terminal's mouse report drew an arrow somewhere"
     );
 }
 
