@@ -190,13 +190,32 @@ impl<'a> Installer<'a> {
                 .map_err(|e| format!("cannot create {path}: {e}"))?;
         }
 
-        if self.backend.exists(&self.plan.rootfs_image) {
+        // Both halves of the question, because the image being on the medium
+        // does not mean this session can open it. The rescue session — the one
+        // that runs when the squashfs would not mount and `/init` fell back to
+        // the initramfs — still has the medium and so still has the image,
+        // while its busybox world has no `unsquashfs` anywhere. Asking only
+        // about the file sent exactly that session down the path it cannot
+        // finish, and it found out here: after Partition, FormatEsp and
+        // FormatRoot had already been run over the disk it was installing to.
+        if self.backend.exists(&self.plan.rootfs_image) && self.can_unpack() {
             self.unpack_rootfs()?;
         } else {
             self.copy_live_system()?;
         }
 
         self.copy_boot_files()
+    }
+
+    /// Whether this session can open a squashfs at all.
+    ///
+    /// Looked for by path rather than run, because the only honest moment to
+    /// ask is before anything has been written to the disk, and running it to
+    /// find out is a thing that can go wrong on its own.
+    fn can_unpack(&self) -> bool {
+        UNSQUASHFS
+            .iter()
+            .any(|program| self.backend.exists(program))
     }
 
     /// Unpack the Debian rootfs from the medium onto the new root.
@@ -653,12 +672,29 @@ pub fn planning_backend() -> crate::exec::Recorder {
             .push(format!("{}/{file}", crate::plan::LIVE_MEDIUM_BOOT));
     }
     // The rootfs image too, so that what `--plan` prints is the installation
-    // that is going to happen rather than the fallback nobody will take.
+    // that is going to happen rather than the fallback nobody will take — and
+    // the tool that opens it, which is now half of that decision.
     backend
         .existing
         .push(crate::plan::LIVE_ROOTFS_IMAGE.to_string());
+    backend.existing.push(UNSQUASHFS[0].to_string());
+    // And the account files the unpacked rootfs brings with it, so the plan
+    // shows the append a real install does rather than the overwrite it would
+    // only do onto a disk that came from the initramfs.
+    for file in ["etc/passwd", "etc/group"] {
+        backend
+            .existing
+            .push(format!("{}/{file}", crate::plan::MOUNT_POINT));
+    }
     backend
 }
+
+/// Where `unsquashfs` lives on a session that has one.
+///
+/// Two paths because Debian is usr-merged and the installer runs on both sides
+/// of that: from the live rootfs, where `/usr/bin` is the real directory, and
+/// from anywhere that still has the old split.
+const UNSQUASHFS: [&str; 2] = ["/usr/bin/unsquashfs", "/bin/unsquashfs"];
 
 /// Where the session's environment is written, and what /etc/inittab respawns.
 pub const SESSION_SCRIPT_PATH: &str = "/etc/tos-session";
@@ -743,6 +779,13 @@ mod tests {
         backend
             .existing
             .retain(|path| path != crate::plan::LIVE_ROOTFS_IMAGE);
+        // And without the account files a rootfs would have brought with it:
+        // what the initramfs copy puts on the disk has no Debian passwd for
+        // the installer to append to, which is why it writes one.
+        for file in ["etc/passwd", "etc/group"] {
+            let path = format!("{}/{file}", crate::plan::MOUNT_POINT);
+            backend.existing.retain(|existing| *existing != path);
+        }
         backend
     }
 
@@ -964,6 +1007,27 @@ mod tests {
     }
 
     #[test]
+    fn a_session_that_cannot_open_a_squashfs_copies_instead_of_failing() {
+        // The rescue session: the squashfs would not mount, `/init` fell back
+        // to the initramfs, and the medium — and so the image on it — is still
+        // there while nothing in that busybox world can open it. Deciding on
+        // the image alone sent exactly that session down the unpack path, and
+        // it found out at the unpack: after Partition, FormatEsp and FormatRoot
+        // had already been run over the disk.
+        let mut backend = planning_backend();
+        backend
+            .existing
+            .retain(|path| !path.ends_with("unsquashfs"));
+        install_with(Firmware::Uefi, &mut backend);
+
+        assert!(
+            !backend.did("unsquashfs"),
+            "unpacked with a tool this session has not got"
+        );
+        assert!(backend.did("copy /bin -> /mnt/target/bin"));
+    }
+
+    #[test]
     fn the_configuration_names_the_machine_and_the_user() {
         let mut backend = live_backend();
         let settings = Settings {
@@ -977,10 +1041,13 @@ mod tests {
 
         assert_eq!(written(&backend, "/mnt/target/etc/hostname"), "workshop\n");
         assert!(written(&backend, "/mnt/target/etc/hosts").contains("workshop"));
-        let passwd = written(&backend, "/mnt/target/etc/passwd");
+        // Appended, not written: this install unpacks a Debian rootfs, which
+        // arrives with its own passwd and its own root line. The medium that
+        // carries no rootfs is where tOS writes the whole file, and that is
+        // where root's line is asserted.
+        let passwd = appended(&backend, "/mnt/target/etc/passwd");
         assert!(passwd.contains("yusuke:*:1000:1000"));
-        assert!(passwd.starts_with("root:*:0:0"));
-        assert!(written(&backend, "/mnt/target/etc/group").contains("yusuke:x:1000:"));
+        assert!(appended(&backend, "/mnt/target/etc/group").contains("yusuke:x:1000:"));
         assert!(backend.did("mkdir -p /mnt/target/home/yusuke"));
     }
 
@@ -989,7 +1056,11 @@ mod tests {
         // `x` means "the hash is in /etc/shadow", and there is no /etc/shadow:
         // the tOS credential is /etc/tos/shadow, which nothing that reads
         // passwd knows about. `*` is the true statement.
-        let backend = install(Firmware::Uefi);
+        // The file is tOS's to write only where no Debian rootfs was
+        // unpacked first; where one was, root belongs to Debian and the
+        // installer appends its one line.
+        let mut backend = rootfsless_backend();
+        install_with(Firmware::Uefi, &mut backend);
         let passwd = written(&backend, "/mnt/target/etc/passwd");
         assert!(
             !passwd.contains(":x:"),

@@ -190,6 +190,12 @@ pub const LIVE_MEDIUM_BOOT: &str = "/run/live/medium/boot";
 pub const LIVE_ROOTFS_IMAGE: &str = "/run/live/medium/live/filesystem.squashfs";
 
 /// Sizes of the partitions the installer creates.
+/// Where the target root is mounted while it is being installed to.
+///
+/// Named because more than the plan needs it: what `--plan` prints has to be
+/// able to talk about files under the new root before there is a `Plan` to ask.
+pub const MOUNT_POINT: &str = "/mnt/target";
+
 pub const ESP_MIB: u64 = 512;
 /// The BIOS boot partition GRUB embeds its core image into.
 pub const BIOS_BOOT_MIB: u64 = 1;
@@ -258,7 +264,7 @@ impl Plan {
             disk,
             firmware,
             settings,
-            mount_point: "/mnt/target".to_string(),
+            mount_point: MOUNT_POINT.to_string(),
             source_root: "/".to_string(),
             boot_source: LIVE_MEDIUM_BOOT.to_string(),
             rootfs_image: LIVE_ROOTFS_IMAGE.to_string(),

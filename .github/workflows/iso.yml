@@ -91,6 +91,13 @@ jobs:
             grep -qx "squashfs-root/$path" rootfs.list || {
               echo "the rootfs has no /$path"; exit 1; }
           done
+          # The Japanese face, which nothing else here would miss: the
+          # compositor falls back to its built-in bitmap and every kana turns
+          # into a hollow box, with the boot and every assertion above still
+          # green. It moved out of the initramfs and into the rootfs, so this
+          # is the only place left that can say it is on the image.
+          grep -q "^squashfs-root/usr/share/fonts/truetype/vlgothic/" rootfs.list || {
+            echo "the rootfs carries no Japanese face"; exit 1; }
           echo "rootfs entries: $(wc -l < rootfs.list)"
       - uses: actions/upload-artifact@v4
         with:

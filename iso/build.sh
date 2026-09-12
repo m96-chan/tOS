@@ -26,6 +26,36 @@ aarch64) platform=linux/arm64 ;;
     ;;
 esac
 
+# target/ is the one directory mkiso.sh cannot hand back itself. Docker creates
+# it in the checkout so it has somewhere to mount the named volume over, which
+# means the host ends up with a root-owned target/ that the container can no
+# longer see past its own mount. A `cargo build` on the host then fails on a
+# directory it cannot write, and `git worktree remove` fails on one it cannot
+# delete, and neither says why. Nothing here may use sudo: the hosts this is
+# run from have no passwordless one, which is the whole reason the build is in
+# a container. So the fix is another container, which is already root.
+#
+# Docker only. Under rootless podman the container's root is already the
+# invoking user on the host, so nothing is root-owned to begin with — and a
+# `chown` to this uid *inside* that container names a subuid, handing target/
+# to an id the user can neither write to nor chown back. That is the symptom
+# this exists to prevent, arrived at from the other side.
+#
+# On EXIT rather than after the build, because a build that failed is the case
+# that leaves target/ root-owned most often, and `set -e` would have skipped
+# the repair exactly then. Its own failure — no alpine image cached, nothing to
+# pull from — says so and is not allowed to fail a build that worked.
+hand_back_target() {
+    status=$?
+    if [ "$engine" = docker ]; then
+        "$engine" run --rm -v "$PWD":/src alpine \
+            chown "$(id -u):$(id -g)" /src/target 2>/dev/null ||
+            echo "iso/build.sh: target/ may still be root-owned" >&2
+    fi
+    return "$status"
+}
+trap hand_back_target EXIT
+
 # Named volumes keep the registry and target dir warm between builds, and
 # keep the container's Linux artifacts out of the host target/.
 # The container runs as root and writes dist/ into the checkout. Passing the
@@ -40,14 +70,3 @@ esac
     -w /src \
     rust:1-bookworm \
     sh iso/mkiso.sh
-
-# target/ is the one directory mkiso.sh cannot hand back itself. Docker creates
-# it in the checkout so it has somewhere to mount the named volume over, which
-# means the host ends up with a root-owned target/ that the container can no
-# longer see past its own mount. A `cargo build` on the host then fails on a
-# directory it cannot write, and `git worktree remove` fails on one it cannot
-# delete, and neither says why. Nothing here may use sudo: the hosts this is
-# run from have no passwordless one, which is the whole reason the build is in
-# a container. So the fix is another container, which is already root.
-"$engine" run --rm -v "$PWD":/src alpine \
-    chown "$(id -u):$(id -g)" /src/target

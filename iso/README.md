@@ -158,12 +158,14 @@ emergency busybox shell on the console.
   packed at all yet). Without a driver there is no `/dev/dri/card0`, and
   the compositor falls back to running inside the console rather than
   owning the screen.
-- The rootfs is a package manager, not yet a network. `dpkg` and `apt` are on
-  every installed machine, and `apt install ./something.deb` works off a
-  local file today. Reaching a mirror needs a driver for the machine's NIC,
-  which the initramfs does not carry yet (#84); the compositor has its own
-  DHCP client and writes `/etc/resolv.conf` itself, so `apt update` starts
-  working the moment there is a link for it to use.
+- The rootfs is a package manager, and now a network to reach with it.
+  `dpkg` and `apt` are on every installed machine, `apt install ./something.deb`
+  works off a local file, and the image carries and loads drivers for virtio,
+  e1000/e1000e, r8169 and igb — so a VM gets a link, a DHCP lease and a
+  `/etc/resolv.conf` written from it. Only virtio-net and e1000 have been seen
+  to bind to anything; the rest are packed and untried, and `r8169` ships
+  without its `rtl_nic` firmware. `docs/design/network.md` records what was
+  actually observed.
 - The session still runs `/bin/sh`, which in the rootfs is dash. `bash` is
   installed and `SHELL` in `iso/live-session` is the one line that chooses
   between them (#82).
