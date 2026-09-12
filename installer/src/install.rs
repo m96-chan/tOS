@@ -291,11 +291,16 @@ impl<'a> Installer<'a> {
         // The console starts tOS, which is the whole point of the machine.
         self.write(
             &format!("{root}/etc/inittab"),
-            "::sysinit:/etc/rc\n::respawn:/sbin/tos\n::ctrlaltdel:/sbin/reboot\n",
+            &format!(
+                "::sysinit:/etc/rc\n::respawn:{SESSION_SCRIPT_PATH}\n::ctrlaltdel:/sbin/reboot\n"
+            ),
         )?;
         self.write(&format!("{root}/etc/rc"), RC_SCRIPT)?;
         let rc = format!("{root}/etc/rc");
         let _ = self.backend.run("chmod", &["755", &rc]);
+        let session = format!("{root}{SESSION_SCRIPT_PATH}");
+        self.write(&session, SESSION_SCRIPT)?;
+        let _ = self.backend.run("chmod", &["755", &session]);
 
         // Say that this disk was installed. /etc is copied from the live
         // system, message of the day and all, so without a mark left here
@@ -586,6 +591,25 @@ pub fn planning_backend() -> crate::exec::Recorder {
     }
     backend
 }
+
+/// Where the session's environment is written, and what /etc/inittab respawns.
+pub const SESSION_SCRIPT_PATH: &str = "/etc/tos-session";
+
+/// The environment the session runs in, and then the compositor.
+///
+/// busybox init hands a program it respawns almost nothing, and none of what a
+/// tOS session needs: `ENV`, which is how each pane's shell comes to read
+/// `/etc/profile` and print the message of the day, nor `HOME`, nor `SHELL`.
+/// The live image exports these in `/init` and nothing carries an environment
+/// across `switch_root`, so an installed machine writes them down here
+/// instead. `iso/init` is the live counterpart and the two have to agree.
+const SESSION_SCRIPT: &str = "#!/bin/sh\n\
+                              # Written by the tOS installer.\n\
+                              export HOME=/root\n\
+                              export SHELL=/bin/sh\n\
+                              export TOS=1\n\
+                              export ENV=/etc/profile\n\
+                              exec /sbin/tos\n";
 
 /// The installed system's startup script.
 const RC_SCRIPT: &str = "#!/bin/sh\n\
@@ -942,9 +966,29 @@ mod tests {
             })
             .expect("no inittab");
         assert!(
-            inittab.contains("/sbin/tos"),
+            inittab.contains(SESSION_SCRIPT_PATH),
             "the machine has to boot into tOS: {inittab}"
         );
+        let session = written(&backend, &format!("/mnt/target{SESSION_SCRIPT_PATH}"));
+        assert!(
+            session.contains("exec /sbin/tos"),
+            "the session script has to end at the compositor: {session}"
+        );
+    }
+
+    #[test]
+    fn the_session_carries_the_environment_init_does_not() {
+        // busybox init respawns with almost nothing set. Without ENV no pane's
+        // shell reads /etc/profile, which is where the message of the day
+        // comes from; /init exports the same set on the live image.
+        let backend = install(Firmware::Bios);
+        let session = written(&backend, &format!("/mnt/target{SESSION_SCRIPT_PATH}"));
+        for variable in ["HOME=/root", "SHELL=/bin/sh", "TOS=1", "ENV=/etc/profile"] {
+            assert!(
+                session.contains(variable),
+                "the session should export {variable}: {session}"
+            );
+        }
     }
 
     #[test]
