@@ -627,6 +627,49 @@ fn kitty_graphics_plays_an_animation_and_damages_the_rows_it_covers() {
 }
 
 #[test]
+fn kitty_graphics_composes_one_frame_onto_another() {
+    let mut t = term(10, 4);
+    let red = encode_base64(&[255, 0, 0, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=T,f=32,s=8,v=16,i=5;{red}\x1b\\").as_bytes());
+    let green = encode_base64(&[0, 255, 0, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=f,f=32,s=8,v=16,i=5,z=40;{green}\x1b\\").as_bytes());
+    t.take_output();
+    t.clear_damage();
+
+    // The left half of frame two onto the left half of frame one, which is
+    // the frame on screen, so the row it covers has to repaint.
+    t.advance(b"\x1b_Ga=c,i=5,r=2,c=1,w=4,h=16\x1b\\");
+    let out = String::from_utf8(t.take_output()).unwrap();
+    assert!(
+        out.contains("i=5"),
+        "response should identify the image: {out}"
+    );
+    assert!(
+        out.contains("OK"),
+        "composition should have been accepted: {out}"
+    );
+    assert!(t.damage().is_row_dirty(0));
+
+    let image = t.graphics().image(5).unwrap();
+    assert_eq!(image.data[..4], [0, 255, 0, 255]);
+    // Past the rectangle the destination frame is untouched.
+    assert_eq!(image.data[16..20], [255, 0, 0, 255]);
+}
+
+#[test]
+fn kitty_graphics_rejects_composing_a_frame_that_was_never_sent() {
+    let mut t = term(10, 4);
+    let red = encode_base64(&[255, 0, 0, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=T,f=32,s=8,v=16,i=5;{red}\x1b\\").as_bytes());
+    t.take_output();
+
+    // The image is a still, so it has a frame one and nothing else.
+    t.advance(b"\x1b_Ga=c,i=5,r=2,c=1\x1b\\");
+    let out = String::from_utf8(t.take_output()).unwrap();
+    assert!(out.contains("EINVAL"), "response should be an error: {out}");
+}
+
+#[test]
 fn an_animation_scrolled_out_of_view_asks_for_no_repaint() {
     // A playing animation off the top of the viewport is still playing, but
     // nothing about the screen changes. Calling that a repaint would flip the

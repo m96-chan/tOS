@@ -14,7 +14,10 @@
 //! one that is on screen in [`Image::data`], so the renderer asks for an image
 //! and gets the current frame without knowing that animation exists. Time is
 //! never read here: [`GraphicsStore::advance_animations`] is told what time it
-//! is, which is what lets a test walk an animation frame by frame.
+//! is, which is what lets a test walk an animation frame by frame. Frames
+//! transmit in the same formats whole images do, and one frame's pixels can be
+//! composed onto another's (`a=c`) so that a client building a picture out of
+//! pieces never has to send a piece twice.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -39,7 +42,7 @@ pub enum Action {
     TransmitFrame,
     /// `a=a` animation control: play state, current frame, loops, gaps.
     AnimationControl,
-    /// `a=c` compose one existing frame onto another, not yet implemented.
+    /// `a=c` compose one existing frame onto another.
     ComposeFrames,
 }
 
@@ -245,6 +248,40 @@ impl GraphicsCommand {
         self.cell_y
     }
 
+    /// `a=c`: the 1-based frame the composition writes into. `a=f` spells the
+    /// frame it writes `r` and the frame it reads `c`; `a=c` is the other way
+    /// round. The accessors follow the protocol rather than each other.
+    pub fn compose_dest_frame(&self) -> u32 {
+        self.cols
+    }
+
+    /// `a=c`: the 1-based frame the composition reads from.
+    pub fn compose_src_frame(&self) -> u32 {
+        self.rows
+    }
+
+    /// `a=c`: top-left of the rectangle being written.
+    pub fn compose_dest_origin(&self) -> (u32, u32) {
+        (self.src_x, self.src_y)
+    }
+
+    /// `a=c`: top-left of the rectangle being read.
+    pub fn compose_src_origin(&self) -> (u32, u32) {
+        (self.cell_x, self.cell_y)
+    }
+
+    /// `a=c`: the size both rectangles share. Zero means "as much as fits",
+    /// which the store resolves because only it knows how big the image is.
+    pub fn compose_size(&self) -> (u32, u32) {
+        (self.src_w, self.src_h)
+    }
+
+    /// `C=1` overwrites the destination pixels instead of alpha blending onto
+    /// them. `a=f` spells the same choice `X=1`.
+    pub fn compose_overwrites(&self) -> bool {
+        self.cursor_stays
+    }
+
     /// `a=a`: 1 stops the animation, 2 runs it while more frames are still
     /// arriving, 3 runs it normally. 0 leaves the state alone.
     pub fn animation_state(&self) -> u32 {
@@ -378,6 +415,15 @@ impl Image {
             Some(&self.data)
         } else {
             self.frames.get(index).map(|f| f.data.as_slice())
+        }
+    }
+
+    /// Pixels of a frame by index for writing, following the same rule.
+    fn pixels_mut(&mut self, index: usize) -> Option<&mut [u8]> {
+        if index == self.current {
+            Some(&mut self.data)
+        } else {
+            self.frames.get_mut(index).map(|f| f.data.as_mut_slice())
         }
     }
 
@@ -797,18 +843,14 @@ impl GraphicsStore {
     ///
     /// The frame data covers a rectangle of the image, and the rest of the
     /// frame comes either from an earlier frame (`c=`) or from a flat
-    /// background colour (`Y=`), so a client can send only what moved.
+    /// background colour (`Y=`), so a client can send only what moved. The
+    /// rectangle arrives in any format a whole image may; see [`decode_frame`]
+    /// for why, and for what a PNG of the wrong size means.
     pub fn store_frame(
         &mut self,
         cmd: &GraphicsCommand,
         payload: &[u8],
     ) -> Result<u32, &'static str> {
-        if cmd.compressed {
-            return Err("EINVAL:compression not supported");
-        }
-        if cmd.format == Format::Png {
-            return Err("EINVAL:PNG not supported");
-        }
         if cmd.medium != Medium::Direct {
             return Err("EINVAL:only direct transmission supported");
         }
@@ -830,18 +872,6 @@ impl GraphicsStore {
         }
         if dest_x.saturating_add(w) > image.width || dest_y.saturating_add(h) > image.height {
             return Err("EINVAL:frame outside image");
-        }
-        let stride = match cmd.format {
-            Format::Rgb => 3,
-            Format::Rgba => 4,
-            Format::Png => unreachable!(),
-        };
-        let expected = (w as usize)
-            .checked_mul(h as usize)
-            .and_then(|n| n.checked_mul(stride))
-            .ok_or("EINVAL:frame too large")?;
-        if payload.len() < expected {
-            return Err("EINVAL:truncated payload");
         }
 
         let frame_bytes = image.frame_bytes();
@@ -868,6 +898,12 @@ impl GraphicsStore {
             return Err("EINVAL:animation exceeds graphics budget");
         }
 
+        // Decoding waits until here so that a frame with nowhere to be kept is
+        // refused before its payload is expanded: what a compressed stream
+        // costs to hold is only known once it has been inflated, and the point
+        // of the budget is to never find that out the hard way.
+        let payload = decode_frame(cmd, payload, w, h, budget)?;
+
         let mut pixels = match cmd.base_frame() {
             0 => {
                 let [r, g, b, a] = cmd.frame_background().to_be_bytes();
@@ -891,8 +927,7 @@ impl GraphicsStore {
             &mut pixels,
             image.width,
             (dest_x, dest_y, w, h),
-            &payload[..expected],
-            stride,
+            &payload,
             cmd.frame_overwrites(),
         );
 
@@ -928,6 +963,88 @@ impl GraphicsStore {
             }
         }
         self.evict_to_budget(id);
+        Ok(id)
+    }
+
+    /// Handle `a=c`: copy a rectangle of one frame onto a rectangle of
+    /// another, blending or overwriting.
+    ///
+    /// This is the cheap half of the animation protocol: a client that has
+    /// already sent a piece of picture can build later frames out of it
+    /// instead of transmitting those pixels again.
+    pub fn compose_frames(&mut self, cmd: &GraphicsCommand) -> Result<u32, &'static str> {
+        let id = cmd.image_id;
+        let image = self.images.get_mut(&id).ok_or("ENOENT:no such image")?;
+
+        // Frame numbers are 1-based and a missing key parses as zero, so a
+        // command that names no frame at all lands here rather than silently
+        // meaning the first one.
+        let frames = image.frame_count();
+        let (src, dest) = (cmd.compose_src_frame(), cmd.compose_dest_frame());
+        if src == 0 || dest == 0 || src as usize > frames || dest as usize > frames {
+            return Err("EINVAL:no such frame");
+        }
+        let (src, dest) = (src as usize - 1, dest as usize - 1);
+
+        // The rest of the command is untrusted geometry, checked against the
+        // image the same way `store_frame` checks a frame's rectangle — and
+        // checked for both rectangles, because either one running off the edge
+        // would be a read or a write outside the image.
+        let (dest_x, dest_y) = cmd.compose_dest_origin();
+        let (src_x, src_y) = cmd.compose_src_origin();
+        let (mut w, mut h) = cmd.compose_size();
+        if w == 0 {
+            w = image.width.saturating_sub(dest_x.max(src_x));
+        }
+        if h == 0 {
+            h = image.height.saturating_sub(dest_y.max(src_y));
+        }
+        if w == 0 || h == 0 {
+            return Err("EINVAL:empty frame");
+        }
+        if dest_x.saturating_add(w) > image.width
+            || dest_y.saturating_add(h) > image.height
+            || src_x.saturating_add(w) > image.width
+            || src_y.saturating_add(h) > image.height
+        {
+            return Err("EINVAL:frame outside image");
+        }
+
+        // A rectangle inside a wider frame is not contiguous, and `compose`
+        // wants a payload that is, so the source rows are lifted out first.
+        // That also settles the case where a frame is composed onto itself
+        // over rectangles that overlap: the copy is of the pixels as they
+        // were, not of ones this call has already written. Kitty refuses that
+        // case outright rather than making it mean anything; one rectangle of
+        // scratch space is a small price for it meaning the obvious thing.
+        let width = image.width;
+        let row_bytes = w as usize * 4;
+        let src_pixels = image.pixels(src).ok_or("EINVAL:no such frame")?;
+        let mut patch = Vec::with_capacity(row_bytes * h as usize);
+        for row in 0..h as usize {
+            let start = ((src_y as usize + row) * width as usize + src_x as usize) * 4;
+            let Some(pixels) = src_pixels.get(start..start + row_bytes) else {
+                return Err("EINVAL:frame outside image");
+            };
+            patch.extend_from_slice(pixels);
+        }
+
+        let visible = dest == image.current;
+        let target = image.pixels_mut(dest).ok_or("EINVAL:no such frame")?;
+        compose(
+            target,
+            width,
+            (dest_x, dest_y, w, h),
+            &patch,
+            cmd.compose_overwrites(),
+        );
+
+        // Only the frame on screen is pixels a renderer is holding a copy of;
+        // rewriting one of the others changes nothing it has cached.
+        if visible {
+            self.generations += 1;
+            image.generation = self.generations;
+        }
         Ok(id)
     }
 
@@ -1025,29 +1142,30 @@ fn gap_ms(requested: i32, current: u32) -> u32 {
     }
 }
 
-/// Draw transmitted frame data onto the frame's base pixels. `dest` is the
-/// rectangle within an image `width` pixels wide; both buffers are RGBA8 apart
-/// from the source stride, which is 3 for `f=24`.
+/// Draw a rectangle of RGBA8 pixels onto a frame's base pixels. `dest` is the
+/// rectangle within an image `width` pixels wide, and `payload` holds exactly
+/// that rectangle, packed. Both `a=f` and `a=c` arrive here, which is why the
+/// payload is RGBA rather than whatever the wire carried: converting first
+/// leaves one copy of the blending arithmetic instead of one per format.
 fn compose(
     pixels: &mut [u8],
     width: u32,
     dest: (u32, u32, u32, u32),
     payload: &[u8],
-    stride: usize,
     overwrite: bool,
 ) {
     let (dest_x, dest_y, w, h) = dest;
-    let row_bytes = w as usize * stride;
+    let row_bytes = w as usize * 4;
     for row in 0..h as usize {
         let src = &payload[row * row_bytes..][..row_bytes];
         let start = ((dest_y as usize + row) * width as usize + dest_x as usize) * 4;
-        let Some(dst) = pixels.get_mut(start..start + w as usize * 4) else {
+        let Some(dst) = pixels.get_mut(start..start + row_bytes) else {
             return;
         };
-        for (s, d) in src.chunks_exact(stride).zip(dst.chunks_exact_mut(4)) {
-            let alpha = if stride == 4 { s[3] } else { 0xff };
+        for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+            let alpha = s[3];
             if overwrite || alpha == 0xff {
-                d.copy_from_slice(&[s[0], s[1], s[2], alpha]);
+                d.copy_from_slice(s);
             } else if alpha != 0 {
                 // Source-over, kept in integers: the frames a terminal shows
                 // are not worth a round trip through floating point.
@@ -1089,39 +1207,88 @@ fn decode_payload(
             Ok((image.width, image.height, image.rgba))
         }
         Format::Rgb | Format::Rgba => {
-            let stride = if cmd.format == Format::Rgb { 3 } else { 4 };
             let (w, h) = (cmd.width, cmd.height);
             if w == 0 || h == 0 {
                 return Err("EINVAL:missing dimensions");
             }
-            let expected = (w as usize)
-                .checked_mul(h as usize)
-                .and_then(|pixels| pixels.checked_mul(stride))
-                .ok_or("EINVAL:image too large")?;
-
-            let decompressed;
-            let bytes = if cmd.compressed {
-                // Raw pixels decompress to exactly this many bytes, so the
-                // inflater can be told the answer in advance; an image that
-                // would not fit the budget is refused at the budget instead.
-                decompressed =
-                    inflate::zlib_decompress(payload, expected.min(budget)).map_err(zlib_error)?;
-                &decompressed[..]
-            } else {
-                payload
-            };
-            if bytes.len() < expected {
-                return Err("EINVAL:truncated payload");
-            }
-
-            let mut data = Vec::with_capacity((w as usize) * (h as usize) * 4);
-            for px in bytes[..expected].chunks_exact(stride) {
-                data.extend_from_slice(&[px[0], px[1], px[2]]);
-                data.push(if stride == 4 { px[3] } else { 0xff });
-            }
-            Ok((w, h, data))
+            Ok((w, h, decode_raw(cmd, payload, w, h, budget)?))
         }
     }
+}
+
+/// Turn an `a=f` payload into the RGBA8 pixels of a `w` by `h` frame
+/// rectangle.
+///
+/// Frames take every format a whole image takes. The argument for making them
+/// raw-only was that a frame is small, but the frames of an animation are
+/// exactly the payloads that most want compressing — a video-ish animation
+/// sends the same picture over and over — and [`decode_payload`] already
+/// refuses a decompression bomb against the budget, so raw-only would have
+/// cost clients bandwidth to buy nothing.
+///
+/// A PNG carries its own dimensions. For a whole image those dimensions *are*
+/// the image and `s=`/`v=` are advisory, but a frame is a rectangle the
+/// command has already placed within an image that exists, and a file of some
+/// other size would have to be cropped or leave part of that rectangle
+/// unwritten. Neither is what the client asked for, so a mismatch is refused
+/// instead of guessed at. A command that gives no rectangle gets the whole
+/// image, which is the case a client sending each frame as a PNG file wants.
+fn decode_frame(
+    cmd: &GraphicsCommand,
+    payload: &[u8],
+    w: u32,
+    h: u32,
+    budget: usize,
+) -> Result<Vec<u8>, &'static str> {
+    match cmd.format {
+        Format::Png => {
+            let (png_w, png_h, data) = decode_payload(cmd, payload, budget)?;
+            if (png_w, png_h) != (w, h) {
+                return Err("EINVAL:PNG is not the size of the frame");
+            }
+            Ok(data)
+        }
+        Format::Rgb | Format::Rgba => decode_raw(cmd, payload, w, h, budget),
+    }
+}
+
+/// Expand raw `f=24` or `f=32` pixels covering a `w` by `h` rectangle into
+/// RGBA8. Shared by whole images and by animation frames, which differ only in
+/// where the rectangle's size comes from.
+fn decode_raw(
+    cmd: &GraphicsCommand,
+    payload: &[u8],
+    w: u32,
+    h: u32,
+    budget: usize,
+) -> Result<Vec<u8>, &'static str> {
+    let stride = if cmd.format == Format::Rgb { 3 } else { 4 };
+    let expected = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|pixels| pixels.checked_mul(stride))
+        .ok_or("EINVAL:image too large")?;
+
+    let decompressed;
+    let bytes = if cmd.compressed {
+        // Raw pixels decompress to exactly this many bytes, so the inflater
+        // can be told the answer in advance; an image that would not fit the
+        // budget is refused at the budget instead.
+        decompressed =
+            inflate::zlib_decompress(payload, expected.min(budget)).map_err(zlib_error)?;
+        &decompressed[..]
+    } else {
+        payload
+    };
+    if bytes.len() < expected {
+        return Err("EINVAL:truncated payload");
+    }
+
+    let mut data = Vec::with_capacity((w as usize) * (h as usize) * 4);
+    for px in bytes[..expected].chunks_exact(stride) {
+        data.extend_from_slice(&[px[0], px[1], px[2]]);
+        data.push(if stride == 4 { px[3] } else { 0xff });
+    }
+    Ok(data)
 }
 
 /// Map a decompression failure onto a protocol error response. The one
@@ -1654,6 +1821,227 @@ mod tests {
     }
 
     #[test]
+    fn a_png_frame_lands_in_the_frame_rectangle() {
+        let mut store = GraphicsStore::new(1 << 20);
+        let base = command("a=t,f=32,s=2,v=1,i=1", &[0u8; 8]);
+        store.store(&base, &base.payload).unwrap();
+        let pixels = [1u8, 2, 3, 255, 4, 5, 6, 255];
+        let frame = command(
+            "a=f,f=100,s=2,v=1,i=1,z=40",
+            &crate::png::tests::rgba_png(2, 1, &pixels),
+        );
+        store.store_frame(&frame, &frame.payload).unwrap();
+
+        store
+            .control_animation(&command("a=a,i=1,c=2", &[]))
+            .unwrap();
+        assert_eq!(store.image(1).unwrap().data, pixels);
+    }
+
+    #[test]
+    fn a_png_frame_that_is_not_the_size_of_the_rectangle_is_refused() {
+        let mut store = GraphicsStore::new(1 << 20);
+        let base = command("a=t,f=32,s=4,v=4,i=1", &[0u8; 4 * 4 * 4]);
+        store.store(&base, &base.payload).unwrap();
+
+        // The rectangle is what the command is about, so the file does not get
+        // to win the way it does for a whole image.
+        let small = crate::png::tests::rgba_png(2, 2, &[0u8; 2 * 2 * 4]);
+        let frame = command("a=f,f=100,s=3,v=3,i=1,z=40", &small);
+        assert_eq!(
+            store.store_frame(&frame, &frame.payload),
+            Err("EINVAL:PNG is not the size of the frame")
+        );
+
+        // A command that names no rectangle means the whole image, which is
+        // how a client sending each frame as a file addresses it.
+        let pixels: Vec<u8> = [9u8, 9, 9, 255].repeat(4 * 4);
+        let whole = command(
+            "a=f,f=100,i=1,z=40",
+            &crate::png::tests::rgba_png(4, 4, &pixels),
+        );
+        store.store_frame(&whole, &whole.payload).unwrap();
+        store
+            .control_animation(&command("a=a,i=1,c=2", &[]))
+            .unwrap();
+        assert_eq!(store.image(1).unwrap().data, pixels);
+    }
+
+    #[test]
+    fn a_zlib_compressed_frame_is_decoded() {
+        let mut store = GraphicsStore::new(1 << 20);
+        let base = command("a=t,f=32,s=1,v=1,i=1", &[0, 0, 0, 255]);
+        store.store(&base, &base.payload).unwrap();
+        let frame = command(
+            "a=f,f=32,o=z,s=1,v=1,i=1,z=40",
+            &crate::inflate::tests::zlib_stored(&[7u8, 8, 9, 255]),
+        );
+        store.store_frame(&frame, &frame.payload).unwrap();
+
+        store
+            .control_animation(&command("a=a,i=1,c=2", &[]))
+            .unwrap();
+        assert_eq!(store.image(1).unwrap().data, vec![7, 8, 9, 255]);
+    }
+
+    #[test]
+    fn a_compressed_frame_is_refused_before_it_is_expanded() {
+        // Four mebibytes of zeroes, offered twice: once to a store with no
+        // room for another frame at all, and once to one that has room but
+        // whose frame is four pixels wide.
+        let bomb = crate::inflate::tests::zlib_stored(&vec![0u8; 4 << 20]);
+
+        let mut full = GraphicsStore::new(1024);
+        let base = command("a=t,f=32,s=16,v=16,i=1", &[0u8; 16 * 16 * 4]);
+        full.store(&base, &base.payload).unwrap();
+        let frame = command("a=f,f=32,o=z,s=16,v=16,i=1,z=40", &bomb);
+        assert_eq!(
+            full.store_frame(&frame, &frame.payload),
+            Err("EINVAL:animation exceeds graphics budget")
+        );
+
+        let mut roomy = GraphicsStore::new(1 << 20);
+        let base = command("a=t,f=32,s=2,v=2,i=1", &[0u8; 2 * 2 * 4]);
+        roomy.store(&base, &base.payload).unwrap();
+        let frame = command("a=f,f=32,o=z,s=2,v=2,i=1,z=40", &bomb);
+        assert_eq!(
+            roomy.store_frame(&frame, &frame.payload),
+            Err("EINVAL:compressed payload exceeds the image budget")
+        );
+        assert_eq!(roomy.image(1).unwrap().frame_count(), 1);
+    }
+
+    #[test]
+    fn composition_keys_reuse_the_placement_keys() {
+        // The protocol's own worked example: a 23x27 rectangle at (4, 8) in
+        // frame 7, composed onto (1, 3) in frame 9. Note that `a=c` names the
+        // frame it writes `c` and the frame it reads `r`, which is the
+        // opposite way round from `a=f`.
+        let cmd = GraphicsCommand::parse(b"a=c,i=1,r=7,c=9,w=23,h=27,X=4,Y=8,x=1,y=3,C=1").unwrap();
+        assert_eq!(cmd.action, Action::ComposeFrames);
+        assert_eq!(cmd.compose_src_frame(), 7);
+        assert_eq!(cmd.compose_dest_frame(), 9);
+        assert_eq!(cmd.compose_size(), (23, 27));
+        assert_eq!(cmd.compose_src_origin(), (4, 8));
+        assert_eq!(cmd.compose_dest_origin(), (1, 3));
+        assert!(cmd.compose_overwrites());
+    }
+
+    #[test]
+    fn a_rectangle_composes_from_one_frame_onto_another() {
+        let mut store = GraphicsStore::new(1 << 20);
+        // A 2x1 image: red, then green.
+        let base = command("a=t,f=32,s=2,v=1,i=1", &[255, 0, 0, 255, 0, 255, 0, 255]);
+        store.store(&base, &base.payload).unwrap();
+        // Frame two is blue, then black.
+        let frame = command("a=f,f=32,s=2,v=1,i=1,z=40", &[0, 0, 255, 255, 0, 0, 0, 255]);
+        store.store_frame(&frame, &frame.payload).unwrap();
+
+        // Frame two's left pixel onto frame one's right one.
+        let compose = command("a=c,i=1,r=2,c=1,w=1,h=1,x=1,y=0,X=0,Y=0", &[]);
+        assert_eq!(store.compose_frames(&compose), Ok(1));
+        assert_eq!(
+            store.image(1).unwrap().data,
+            vec![255, 0, 0, 255, 0, 0, 255, 255]
+        );
+        // Only the destination frame changed.
+        store
+            .control_animation(&command("a=a,i=1,c=2", &[]))
+            .unwrap();
+        assert_eq!(
+            store.image(1).unwrap().data,
+            vec![0, 0, 255, 255, 0, 0, 0, 255]
+        );
+    }
+
+    #[test]
+    fn composing_blends_unless_it_is_told_to_overwrite() {
+        for (spec, expected) in [
+            ("a=c,i=1,r=2,c=1", vec![128, 128, 128, 255]),
+            ("a=c,i=1,r=2,c=1,C=1", vec![255, 255, 255, 128]),
+        ] {
+            let mut store = GraphicsStore::new(1 << 20);
+            let base = command("a=t,f=32,s=1,v=1,i=1", &[0, 0, 0, 255]);
+            store.store(&base, &base.payload).unwrap();
+            // `X=1` keeps the half-transparent pixel as it was sent instead of
+            // blending it onto the background the frame starts from.
+            let frame = command("a=f,f=32,s=1,v=1,i=1,z=40,X=1", &[255, 255, 255, 128]);
+            store.store_frame(&frame, &frame.payload).unwrap();
+
+            // No `w`/`h`, so the rectangle is the whole one pixel image.
+            let compose = command(spec, &[]);
+            store.compose_frames(&compose).unwrap();
+            assert_eq!(store.image(1).unwrap().data, expected, "{spec}");
+        }
+    }
+
+    #[test]
+    fn a_frame_composed_onto_itself_does_not_smear() {
+        let mut store = GraphicsStore::new(1 << 20);
+        let base = command(
+            "a=t,f=32,s=4,v=1,i=1",
+            &[1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255, 4, 4, 4, 255],
+        );
+        store.store(&base, &base.payload).unwrap();
+
+        // Shift the first three pixels one to the right, within one frame, so
+        // that source and destination overlap. Reading as it writes would
+        // drag the first pixel across the whole row instead.
+        let compose = command("a=c,i=1,r=1,c=1,w=3,h=1,x=1,X=0", &[]);
+        store.compose_frames(&compose).unwrap();
+        assert_eq!(
+            store.image(1).unwrap().data,
+            vec![1, 1, 1, 255, 1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255]
+        );
+    }
+
+    #[test]
+    fn composing_onto_the_visible_frame_moves_the_generation() {
+        let mut store = GraphicsStore::new(1 << 20);
+        two_frame_image(&mut store);
+        assert_eq!(store.image(1).unwrap().current_frame(), 1);
+        let before = store.image(1).unwrap().generation();
+
+        // Frame one is on screen, so its pixels are the ones a renderer holds.
+        store
+            .compose_frames(&command("a=c,i=1,r=2,c=1", &[]))
+            .unwrap();
+        let after = store.image(1).unwrap().generation();
+        assert!(after > before);
+        assert_eq!(store.image(1).unwrap().data, vec![0, 255, 0, 255]);
+
+        // Frame two is not, so nothing a renderer has cached went stale.
+        store
+            .compose_frames(&command("a=c,i=1,r=1,c=2", &[]))
+            .unwrap();
+        assert_eq!(store.image(1).unwrap().generation(), after);
+    }
+
+    #[test]
+    fn malformed_compositions_are_rejected() {
+        let mut store = GraphicsStore::new(1 << 20);
+        let base = command("a=t,f=32,s=2,v=2,i=1", &[0u8; 16]);
+        store.store(&base, &base.payload).unwrap();
+        let frame = command("a=f,f=32,s=2,v=2,i=1,z=40", &[0u8; 16]);
+        store.store_frame(&frame, &frame.payload).unwrap();
+
+        for (spec, expected) in [
+            ("a=c,i=9,r=1,c=2", "ENOENT:no such image"),
+            ("a=c,i=1,r=7,c=1", "EINVAL:no such frame"),
+            ("a=c,i=1,r=1,c=7", "EINVAL:no such frame"),
+            ("a=c,i=1,r=1", "EINVAL:no such frame"), // no destination named
+            ("a=c,i=1,c=1", "EINVAL:no such frame"), // no source named
+            ("a=c,i=1,r=1,c=2,w=3", "EINVAL:frame outside image"),
+            ("a=c,i=1,r=1,c=2,w=2,h=2,x=1", "EINVAL:frame outside image"),
+            ("a=c,i=1,r=1,c=2,w=2,h=2,X=1", "EINVAL:frame outside image"),
+            ("a=c,i=1,r=1,c=2,x=2", "EINVAL:empty frame"),
+        ] {
+            let cmd = command(spec, &[]);
+            assert_eq!(store.compose_frames(&cmd), Err(expected), "{spec}");
+        }
+    }
+
+    #[test]
     fn a_frame_can_be_rewritten_in_place() {
         let mut store = GraphicsStore::new(1 << 20);
         two_frame_image(&mut store);
@@ -1695,8 +2083,8 @@ mod tests {
             "a=f,f=32,s=2,v=2,x=1,i=1", // rectangle runs past the edge
             "a=f,f=32,s=2,v=2,c=7,i=1", // no such base frame
             "a=f,f=32,s=2,v=2,r=9,i=1", // frame past the end
-            "a=f,f=100,s=2,v=2,i=1",    // PNG
-            "a=f,f=32,s=2,v=2,i=1,o=z", // compressed
+            "a=f,f=100,s=2,v=2,i=1",    // not a PNG at all
+            "a=f,f=32,s=2,v=2,i=1,o=z", // not a zlib stream
             "a=f,f=32,s=2,v=2,i=1,t=f", // file backed
         ] {
             let cmd = command(spec, &[0u8; 16]);

@@ -1839,9 +1839,14 @@ impl Terminal {
                 }
                 Err(err) => self.graphics_response(&cmd, Err(err)),
             },
-            Action::ComposeFrames => {
-                self.graphics_response(&cmd, Err("ENOSUP:frame composition not supported"))
-            }
+            Action::ComposeFrames => match self.graphics.compose_frames(&cmd) {
+                Ok(id) => {
+                    // The frame just rewritten may be the one on screen.
+                    self.damage_image(id);
+                    self.graphics_response(&cmd, Ok(id));
+                }
+                Err(err) => self.graphics_response(&cmd, Err(err)),
+            },
         }
     }
 
