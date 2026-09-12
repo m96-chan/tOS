@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use tos_font::{BitmapFont, FontStack, GlyphSource};
@@ -18,6 +19,7 @@ use tos_render::{render, Rect as PixelRect, RenderOptions, Surface};
 use tos_session::{describe, Action, Axis, Keymap, PaneId, Rect, Resolution, Session};
 use tos_system::audio::Volume;
 use tos_system::bluetooth::{Adapter, Connection, SystemControl};
+use tos_system::net::{dhcp, Interface, Kind, Lease};
 use tos_system::power::PowerAction;
 use tos_system::Sysfs;
 use tos_term::TermEvent;
@@ -104,6 +106,17 @@ pub enum OverlayKind {
     /// than looked up again from the row, so that the thing being confirmed is
     /// decided once, by the menu that asked.
     ConfirmPower(PowerAction),
+    /// The machine's interfaces. Choosing one opens [`OverlayKind::Link`]
+    /// for it.
+    Networks,
+    /// What can be done to the interface named by
+    /// [`Compositor::network_target`].
+    ///
+    /// The interface is not carried in the variant, because that would make
+    /// `OverlayKind` a type with a `String` in it: it is copied out of the
+    /// open overlay on every keystroke that closes one, and every other menu
+    /// would start paying for a payload it has not got.
+    Link,
 }
 
 /// Which way a volume binding turns the knob.
@@ -133,6 +146,43 @@ fn volume_status(volume: Volume) -> String {
     } else {
         format!("volume {}%", volume.percent)
     }
+}
+
+/// The rows of [`OverlayKind::Link`].
+///
+/// Named rather than written twice, because the label is how the row is
+/// matched when it is chosen: the menu that offers "bring the link up" and
+/// the arm that acts on it are the same string or they are a row that does
+/// nothing when pressed. Only one of the first two is ever offered — the one
+/// the link is not already doing.
+const BRING_UP: &str = "bring the link up";
+const TAKE_DOWN: &str = "take the link down";
+const REQUEST_ADDRESS: &str = "ask for an address";
+const JOIN: &str = "join a wireless network";
+
+/// The right hand column of a row in the interface list.
+///
+/// What somebody deciding which interface to poke wants, in the order they
+/// want it: what sort of link it is, what network it is on if it is wireless,
+/// and then the one fact that answers "is this the one" — an address, or the
+/// reason there is not one. `Interface::summary` is the status bar's answer
+/// to a related question and starts with the name, which is already the label
+/// here, so this is not it.
+fn link_detail(interface: &Interface) -> String {
+    let mut parts = vec![interface.kind.as_str().to_string()];
+    if let Some(ssid) = interface.ssid() {
+        parts.push(ssid.to_string());
+    }
+    match interface.ipv4().or_else(|| interface.ipv6()) {
+        Some(address) => parts.push(address.to_string()),
+        None if !interface.admin_up => parts.push("down".to_string()),
+        None if !interface.carrier => parts.push("no carrier".to_string()),
+        None => parts.push(format!("{}, no address", interface.state.as_str())),
+    }
+    if interface.is_default {
+        parts.push("default route".to_string());
+    }
+    parts.join("  ")
 }
 
 /// The running compositor.
@@ -245,6 +295,23 @@ pub struct Compositor {
     /// every second. Comparing what would be drawn answers both without the
     /// clock having to be asked how precise it is.
     clock_text: String,
+    /// The interface [`OverlayKind::Link`] is about, put here when the
+    /// interface list was chosen from and read when its menu is.
+    network_target: Option<String>,
+    /// A DHCP acquisition in flight: the interface it is for, and where its
+    /// answer will arrive.
+    ///
+    /// It is on a thread because of how long it is allowed to take. A server
+    /// that is there answers in milliseconds, but a network with no server on
+    /// it is fifteen seconds of waiting, and the frame loop cannot spend
+    /// fifteen seconds anywhere: the clock would stop, the cursor would stop
+    /// blinking, and the keyboard would appear to have died — on a machine
+    /// whose owner has just been told something is being asked for.
+    ///
+    /// Only the waiting is on the thread. The ioctls that put the lease on
+    /// the link happen back here, on the thread that owns the [`Machine`],
+    /// which is why nothing has to be shared but the answer.
+    dhcp: Option<(String, mpsc::Receiver<io::Result<Lease>>)>,
 }
 
 impl Compositor {
@@ -293,6 +360,8 @@ impl Compositor {
             // gap where one is about to appear.
             clock_text: clock.text(unix_now()),
             clock,
+            network_target: None,
+            dhcp: None,
             config,
         };
 
@@ -1123,6 +1192,10 @@ impl Compositor {
                 self.needs_full_redraw = true;
                 true
             }
+            Action::ShowNetworks => {
+                self.open_networks();
+                true
+            }
             Action::Quit => {
                 self.running = false;
                 true
@@ -1607,7 +1680,191 @@ impl Compositor {
                     self.request_power(action);
                 }
             }
+            // The list is rebuilt from the machine each time it is opened, so
+            // the row's text is the only thing about it that is still true by
+            // the time this runs: an interface that went away between opening
+            // the menu and choosing from it is simply a name the machine no
+            // longer knows, and every arm below already has to cope with that.
+            OverlayKind::Networks => self.open_link_menu(label),
+            OverlayKind::Link => self.act_on_link(label),
         }
+    }
+
+    // ---- the network ----------------------------------------------------
+
+    /// Put the interface list up.
+    ///
+    /// Reading it needs nothing: `/sys/class/net` is world readable and
+    /// `getifaddrs(3)` asks no permission, so this menu opens on the live ISO
+    /// and for an ordinary user exactly as it does for root. Only the rows
+    /// inside it can fail, and each of them says so when it does — which is
+    /// the shape the issue asks for, status everywhere and configuration
+    /// where it is allowed.
+    fn open_networks(&mut self) {
+        let interfaces = self.machine.network().visible_interfaces();
+        if interfaces.is_empty() {
+            // Not an empty menu. An empty list with a query line under it
+            // looks like a menu that has not loaded yet, and this machine is
+            // not going to grow an interface while it is open.
+            self.notifications.status("no wired or wireless interfaces");
+            return;
+        }
+        let items = interfaces
+            .iter()
+            .map(|interface| {
+                OverlayItem::with_detail(interface.name.clone(), link_detail(interface))
+            })
+            .collect();
+        self.open_overlay(OverlayKind::Networks, Overlay::new("network", items));
+    }
+
+    /// Put up what can be done to one interface.
+    fn open_link_menu(&mut self, interface: &str) {
+        let Some(found) = self.machine.network().interface(interface) else {
+            self.notifications
+                .status(format!("{interface} is no longer there"));
+            return;
+        };
+        let mut items = vec![
+            OverlayItem::with_detail(
+                if found.admin_up { TAKE_DOWN } else { BRING_UP },
+                if found.admin_up {
+                    "switch the link off"
+                } else {
+                    "switch the link on"
+                },
+            ),
+            OverlayItem::with_detail(REQUEST_ADDRESS, "DHCP, and the route and resolvers with it"),
+        ];
+        if found.kind == Kind::Wireless {
+            // A row that does nothing, on purpose. A wireless interface in
+            // this menu with no mention of joining reads as a bug; a line
+            // saying what is missing and where the reasoning is written down
+            // reads as a decision.
+            items.push(OverlayItem::with_detail(JOIN, "not yet — see the note"));
+        }
+        self.network_target = Some(found.name.clone());
+        self.open_overlay(OverlayKind::Link, Overlay::new(found.summary(), items));
+    }
+
+    /// Do what a row of the link menu says.
+    fn act_on_link(&mut self, label: &str) {
+        let Some(interface) = self.network_target.take() else {
+            return;
+        };
+        match label {
+            BRING_UP | TAKE_DOWN => {
+                let up = label == BRING_UP;
+                let result = if up {
+                    self.machine.network().bring_up(&interface)
+                } else {
+                    self.machine.network().take_down(&interface)
+                };
+                match result {
+                    // The link has just moved, so the poll interval is not
+                    // the right amount of time to wait before saying so.
+                    Ok(()) => {
+                        self.machine.refresh(Instant::now());
+                        self.notifications
+                            .status(format!("{interface} {}", if up { "up" } else { "down" }));
+                    }
+                    Err(error) => self.report_error(
+                        &format!("{interface} {}", if up { "up" } else { "down" }),
+                        error,
+                    ),
+                }
+            }
+            REQUEST_ADDRESS => self.request_address(&interface),
+            JOIN => {
+                self.notifications.status(
+                    "joining a wireless network needs a supplicant; see docs/design/network.md",
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Start a DHCP acquisition on an interface.
+    ///
+    /// Everything that can be decided here is decided here, so that the
+    /// thread below carries no judgement at all: whether one is already
+    /// running, and whether the interface has a hardware address to be known
+    /// by. A DISCOVER from `00:00:00:00:00:00` is one no server will answer,
+    /// and finding that out fifteen seconds later is worse than not starting.
+    fn request_address(&mut self, interface: &str) {
+        if let Some((busy, _)) = &self.dhcp {
+            self.notifications
+                .status(format!("already asking on {busy}"));
+            return;
+        }
+        let Some(mac) = self.machine.network().hardware_address(interface) else {
+            self.notifications
+                .status(format!("{interface} has no hardware address to ask from"));
+            return;
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let on = interface.to_string();
+        // Named, because a thread that is asleep in `recvfrom` for fifteen
+        // seconds is a thread somebody will eventually find in a backtrace.
+        let spawned = std::thread::Builder::new()
+            .name("tos-dhcp".to_string())
+            // The receiver is dropped when the answer is collected, so a send
+            // into a closed channel is the ordinary end of a conversation
+            // nobody is listening to any more, not a failure.
+            .spawn(move || drop(sender.send(dhcp::acquire_on(&on, mac))));
+
+        match spawned {
+            Ok(_) => {
+                self.dhcp = Some((interface.to_string(), receiver));
+                self.notifications
+                    .status(format!("asking for an address on {interface}"));
+            }
+            Err(error) => self.report_error(&format!("dhcp on {interface}"), error),
+        }
+    }
+
+    /// Take the answer if the DHCP thread has one, and put it on the link.
+    ///
+    /// Called from [`Compositor::tick`], which runs at least once a second
+    /// because the machine poll is on that deadline — so a lease is applied
+    /// within a second of arriving without anything new having to be woken
+    /// up for it. Returns true when there is something new to paint.
+    fn collect_address(&mut self) -> bool {
+        let Some((interface, receiver)) = &self.dhcp else {
+            return false;
+        };
+        let answer = match receiver.try_recv() {
+            Ok(answer) => answer,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            // The thread went away without sending, which means it panicked:
+            // there is no answer coming, and leaving the slot occupied would
+            // mean no address could ever be asked for again.
+            Err(mpsc::TryRecvError::Disconnected) => Err(io::Error::other(
+                "the DHCP client stopped without answering",
+            )),
+        };
+        let interface = interface.clone();
+        self.dhcp = None;
+
+        match answer {
+            Ok(lease) => match self.machine.network().configure(&interface, &lease) {
+                Ok(()) => {
+                    self.machine.refresh(Instant::now());
+                    self.notifications
+                        .status(format!("{interface} {}", lease.describe()));
+                }
+                // The lease is real and the machine is not allowed to use it,
+                // which is the live ISO's whole situation. Both halves are
+                // said: what was offered, and what stopped it being taken.
+                Err(error) => self.notifications.status(format!(
+                    "{interface}: cannot take {}: {error}",
+                    lease.describe()
+                )),
+            },
+            Err(error) => self.notifications.status(format!("{interface}: {error}")),
+        }
+        true
     }
 
     /// The cheat sheet, built from the keymap that is resolving these keys.
@@ -1952,6 +2209,12 @@ impl Compositor {
         // change in any reading, so it would report nothing and the bar would
         // go on showing the old minute until somebody typed.
         if self.tick_clock(unix_now()) {
+            changed = true;
+        }
+        // Not folded into the poll above: a DHCP answer is something somebody
+        // asked for and is waiting on, so it is collected even while the
+        // screen is dark rather than left in the channel until it is woken.
+        if self.collect_address() {
             changed = true;
         }
         changed
@@ -4451,6 +4714,95 @@ mod tests {
         );
     }
 
+    // ---- the network menu -----------------------------------------------
+
+    /// The interface name every test below uses.
+    ///
+    /// Not `eth0`. The sysfs half of these tests is a directory of text files,
+    /// but the ioctls are not faked: [`crate::system::Machine`] holds a real
+    /// `SystemKernel`, so anything that asks the kernel to change a link asks
+    /// the kernel the test is running on. A name no machine has means those
+    /// calls fail with `ENODEV` before they touch anything, which is both what
+    /// makes the failure path assertable and what makes running the suite
+    /// safe on a machine with an `eth0` on it.
+    const FAKE_LINK: &str = "tosfake0";
+
+    /// A directory laid out like a machine with one wired interface in it,
+    /// which cleans up after itself.
+    struct FakeMachine {
+        root: std::path::PathBuf,
+    }
+
+    impl FakeMachine {
+        fn new(name: &str) -> FakeMachine {
+            let root = std::env::temp_dir().join(format!(
+                "tos-compositor-net-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("temp dir");
+            FakeMachine { root }
+        }
+
+        fn file(&self, path: &str, contents: &str) -> &FakeMachine {
+            let full = self.root.join(path.trim_start_matches('/'));
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("dirs");
+            std::fs::write(full, contents).expect("write");
+            self
+        }
+
+        /// A wired interface that is administratively down.
+        ///
+        /// The `device/uevent` file is what tells a real interface from a
+        /// bridge, and without it this is classified as virtual and never
+        /// reaches the menu at all.
+        fn with_wired_link(&self, mac: &str) -> &FakeMachine {
+            let dir = format!("/sys/class/net/{FAKE_LINK}");
+            self.file(&format!("{dir}/flags"), "0x1002\n")
+                .file(&format!("{dir}/type"), "1\n")
+                .file(&format!("{dir}/operstate"), "down\n")
+                .file(&format!("{dir}/carrier"), "0\n")
+                .file(&format!("{dir}/address"), &format!("{mac}\n"))
+                .file(&format!("{dir}/device/uevent"), "")
+        }
+
+        /// A compositor whose every reader is pointed at this directory.
+        ///
+        /// Not [`compositor_with`], which pins `system_root` at a path that
+        /// does not exist so that no other test can see the developer's own
+        /// hardware. That is exactly the right default and exactly wrong
+        /// here, so the rest of what it fills in is repeated rather than
+        /// loosened for everybody.
+        fn compositor(&self) -> Compositor {
+            let config = Config {
+                command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()]),
+                bitmap_scale: Some(1),
+                font: Some("/nonexistent-so-the-bitmap-font-is-used".into()),
+                system_root: self.root.clone(),
+                ..Config::default()
+            };
+            Compositor::new(config, (640, 360), None).expect("compositor")
+        }
+    }
+
+    impl Drop for FakeMachine {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn a_machine_with_no_interfaces_says_so_rather_than_opening_an_empty_menu() {
+        let mut compositor = compositor();
+        compositor.perform_action(Action::ShowNetworks);
+        assert!(compositor.overlay().is_none(), "an empty menu went up");
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("no wired or wireless interfaces")
+        );
+    }
+
     #[test]
     fn a_clock_behind_a_dark_screen_keeps_time_without_asking_for_frames() {
         let mut compositor = compositor_showing(&[], &[Segment::Clock]);
@@ -4656,6 +5008,128 @@ mod tests {
     }
 
     #[test]
+    fn the_network_menu_lists_a_link_with_what_state_it_is_in() {
+        let fake = FakeMachine::new("list");
+        fake.with_wired_link("aa:bb:cc:dd:ee:01");
+        let mut compositor = fake.compositor();
+
+        compositor.perform_action(Action::ShowNetworks);
+        let overlay = compositor.overlay().expect("the network menu");
+        assert_eq!(overlay.title(), "network");
+        let row = overlay.items().first().expect("a row");
+        assert_eq!(row.label, FAKE_LINK);
+        assert!(row.detail.contains("wired"), "no kind: {}", row.detail);
+        assert!(row.detail.contains("down"), "no state: {}", row.detail);
+    }
+
+    #[test]
+    fn choosing_a_link_offers_what_can_be_done_to_it() {
+        let fake = FakeMachine::new("actions");
+        fake.with_wired_link("aa:bb:cc:dd:ee:01");
+        let mut compositor = fake.compositor();
+
+        compositor.choose(OverlayKind::Networks, Some(0), FAKE_LINK);
+        let overlay = compositor.overlay().expect("the link menu");
+        let labels: Vec<&str> = overlay
+            .items()
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        // Down, so bringing it up is offered and taking it down is not.
+        assert_eq!(labels, vec![BRING_UP, REQUEST_ADDRESS]);
+        assert_eq!(
+            compositor.network_target.as_deref(),
+            Some(FAKE_LINK),
+            "the menu forgot which link it is about"
+        );
+    }
+
+    #[test]
+    fn a_link_that_went_away_between_the_two_menus_is_said_rather_than_acted_on() {
+        let fake = FakeMachine::new("vanished");
+        let mut compositor = fake.compositor();
+        compositor.choose(OverlayKind::Networks, Some(0), FAKE_LINK);
+        assert!(compositor.overlay().is_none());
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("tosfake0 is no longer there")
+        );
+    }
+
+    #[test]
+    fn an_ioctl_the_kernel_refuses_is_put_on_the_status_line() {
+        // The live ISO's whole situation, and an ordinary user's: the menu
+        // opens, the row is there, and the kernel says no. What must not
+        // happen is that it silently does nothing.
+        let fake = FakeMachine::new("refused");
+        fake.with_wired_link("aa:bb:cc:dd:ee:01");
+        let mut compositor = fake.compositor();
+
+        compositor.network_target = Some(FAKE_LINK.to_string());
+        compositor.choose(OverlayKind::Link, Some(0), BRING_UP);
+
+        let said = compositor
+            .notifications
+            .status_line()
+            .expect("it said nothing at all");
+        assert!(said.starts_with("tosfake0 up failed:"), "unhelpful: {said}");
+    }
+
+    #[test]
+    fn a_link_with_no_hardware_address_is_not_asked_to_run_a_dhcp_client() {
+        let fake = FakeMachine::new("nomac");
+        fake.with_wired_link("00:00:00:00:00:00");
+        let mut compositor = fake.compositor();
+
+        compositor.network_target = Some(FAKE_LINK.to_string());
+        compositor.choose(OverlayKind::Link, Some(1), REQUEST_ADDRESS);
+
+        assert!(compositor.dhcp.is_none(), "a thread was started anyway");
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("tosfake0 has no hardware address to ask from")
+        );
+    }
+
+    #[test]
+    fn a_dhcp_request_that_cannot_even_open_a_socket_comes_back_saying_so() {
+        // The socket is bound to the device by name, so an interface that is
+        // not there fails at the bind whether or not this has CAP_NET_RAW —
+        // which is what makes the whole path, thread included, assertable
+        // without any privilege and without touching real networking.
+        let fake = FakeMachine::new("socket");
+        fake.with_wired_link("aa:bb:cc:dd:ee:01");
+        let mut compositor = fake.compositor();
+
+        compositor.network_target = Some(FAKE_LINK.to_string());
+        compositor.choose(OverlayKind::Link, Some(1), REQUEST_ADDRESS);
+        assert!(compositor.dhcp.is_some(), "nothing was started");
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("asking for an address on tosfake0")
+        );
+
+        // The answer is collected by the tick the frame loop already does.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while compositor.dhcp.is_some() && Instant::now() < deadline {
+            compositor.tick();
+        }
+        assert!(compositor.dhcp.is_none(), "the answer never arrived");
+        // The history rather than the status line: the line still holds the
+        // "asking" notification, which has not been on screen long enough to
+        // be retired, and the answer is queued behind it.
+        let said: Vec<String> = compositor
+            .notifications
+            .history()
+            .map(|notification| notification.text())
+            .collect();
+        assert!(
+            said.iter().any(|line| line.starts_with("tosfake0: ")),
+            "it never said what happened: {said:?}"
+        );
+    }
+
+    #[test]
     fn the_bar_takes_its_colours_from_the_configuration() {
         let bar = tos_term::Rgb::new(0x22, 0x00, 0x44);
         let mut compositor = compositor_with(Config {
@@ -4678,5 +5152,45 @@ mod tests {
         );
         // And nothing above it moved: this colour is the bar's alone.
         assert!(!framebuffer.pixels()[..above].contains(&bar.pack()));
+    }
+
+    #[test]
+    fn a_link_detail_says_the_kind_then_the_network_then_the_address() {
+        let interface = Interface {
+            name: "wlan0".into(),
+            kind: Kind::Wireless,
+            state: tos_system::net::LinkState::Up,
+            carrier: true,
+            admin_up: true,
+            mac: None,
+            mtu: None,
+            speed_mbps: None,
+            addresses: vec![tos_system::net::Address::parse("192.168.1.5/24").expect("an address")],
+            is_default: true,
+            gateway: None,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            wireless: Some(tos_system::net::Wireless {
+                ssid: Some("kitchen-table".into()),
+                link_quality: None,
+                signal_dbm: None,
+            }),
+        };
+        assert_eq!(
+            link_detail(&interface),
+            "wireless  kitchen-table  192.168.1.5/24  default route"
+        );
+
+        // The same link with the cable out: the reason there is no address is
+        // more use than the absence of one.
+        let unplugged = Interface {
+            carrier: false,
+            addresses: Vec::new(),
+            is_default: false,
+            wireless: None,
+            kind: Kind::Wired,
+            ..interface
+        };
+        assert_eq!(link_detail(&unplugged), "wired  no carrier");
     }
 }

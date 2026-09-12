@@ -61,6 +61,28 @@ impl Sysfs {
         names
     }
 
+    /// Replace a file under this root, making the directories above it first.
+    ///
+    /// The one write in a module whose name says reading, and it is here
+    /// rather than anywhere else because of the root. `/etc/resolv.conf` is
+    /// the file a DHCP lease has to land in, and a test that could not point
+    /// that write at a temporary directory would either have to skip it or
+    /// overwrite the resolver of the machine it is running on. Putting it on
+    /// [`Sysfs`] means the write is redirected by the same one line that
+    /// redirects every read: `Config::system_root`.
+    ///
+    /// Unlike the reads, this reports its failure. A file that cannot be read
+    /// is a machine that does not have that thing, which is ordinary; a file
+    /// that cannot be written is something somebody asked for that did not
+    /// happen, and they are owed the reason.
+    pub fn write(&self, path: &str, contents: &str) -> std::io::Result<()> {
+        let full = self.path(path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(full, contents)
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -142,5 +164,35 @@ mod tests {
     fn listing_somewhere_that_is_not_there_is_empty() {
         let fake = Fake::new("nolist");
         assert!(fake.sysfs().list("/sys/class/net").is_empty());
+    }
+
+    #[test]
+    fn a_write_lands_under_the_root_and_not_on_the_real_machine() {
+        let fake = Fake::new("write");
+        let sysfs = fake.sysfs();
+        // `/etc` does not exist in the temporary directory, which is the
+        // ordinary case on a fresh root: the write makes it rather than
+        // failing.
+        sysfs
+            .write("/etc/resolv.conf", "nameserver 192.168.1.1\n")
+            .expect("write");
+        assert_eq!(
+            sysfs.read("/etc/resolv.conf"),
+            Some("nameserver 192.168.1.1".to_string())
+        );
+        assert!(
+            fake.root.join("etc/resolv.conf").exists(),
+            "it went somewhere else entirely"
+        );
+    }
+
+    #[test]
+    fn a_write_that_cannot_happen_says_so_rather_than_going_quiet() {
+        // A root that is not a directory, which is what pointing the
+        // compositor at a path that does not exist gives.
+        let sysfs = Sysfs::new("/proc/self/cmdline/not-a-directory");
+        assert!(sysfs
+            .write("/etc/resolv.conf", "nameserver 1.1.1.1\n")
+            .is_err());
     }
 }

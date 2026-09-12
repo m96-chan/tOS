@@ -92,6 +92,9 @@ pub enum Action {
     /// a long file than it does the rest of the time, and restarting the
     /// compositor to change your mind means losing every pane.
     ToggleStatusBar,
+    /// Open the network menu: the machine's interfaces, what state each is
+    /// in, and what can be done to one.
+    ShowNetworks,
 }
 
 /// A key combination.
@@ -289,6 +292,10 @@ impl Keymap {
                 Modifiers::SHIFT,
                 Action::ToggleStatusBar,
             ),
+            // n is the next workspace and w is not taken, but neither reads
+            // as "network"; shift and the n key does, and shift is where the
+            // bindings that open a system menu have started to live.
+            (KeyCode::Char('n'), Modifiers::SHIFT, Action::ShowNetworks),
         ];
         for (code, modifiers, action) in bindings {
             keymap.bind_after_leader(Binding::new(*code, *modifiers), action.clone());

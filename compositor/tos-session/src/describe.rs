@@ -139,6 +139,7 @@ pub fn describe(action: &Action) -> String {
         Action::VolumeDown => "volume down".into(),
         Action::ToggleMute => "mute".into(),
         Action::ToggleStatusBar => "show or hide the status bar".into(),
+        Action::ShowNetworks => "network interfaces".into(),
         Action::Quit => "quit tOS".into(),
     }
 }
@@ -261,6 +262,7 @@ fn rank(action: &Action) -> (u16, u16) {
         // With the other things that change what is on screen rather than what
         // is in the session, not with the things that end one.
         Action::ToggleStatusBar => (8, 6),
+        Action::ShowNetworks => (8, 7),
         Action::Refresh => (9, 0),
         Action::Lock => (9, 1),
         Action::CopyMode => (7, 0),
