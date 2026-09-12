@@ -13,7 +13,7 @@
 //! into a range, and the key column is cut off before it can crowd out the
 //! description it belongs to.
 
-use tos_input::{ImeKey, KeyCode, Keypad, ModifierKey, Modifiers};
+use tos_input::{ImeKey, KeyCode, Keypad, MediaKey, ModifierKey, Modifiers};
 
 use crate::keys::{Action, Binding, Keymap};
 use crate::layout::{Axis, Direction};
@@ -133,6 +133,9 @@ pub fn describe(action: &Action) -> String {
         Action::ShowBindings => "show these bindings".into(),
         Action::Refresh => "redraw the screen".into(),
         Action::Lock => "lock the screen".into(),
+        Action::VolumeUp => "volume up".into(),
+        Action::VolumeDown => "volume down".into(),
+        Action::ToggleMute => "mute".into(),
         Action::Quit => "quit tOS".into(),
     }
 }
@@ -247,6 +250,12 @@ fn rank(action: &Action) -> (u16, u16) {
         Action::RenameWorkspace => (5, 5),
         Action::ShowNotifications => (8, 1),
         Action::ShowBindings => (8, 2),
+        // Beside the launcher and the notification list rather than beside
+        // quitting: all three are things done to the machine the session is
+        // sitting on, not to the session.
+        Action::VolumeUp => (8, 3),
+        Action::VolumeDown => (8, 4),
+        Action::ToggleMute => (8, 5),
         Action::Refresh => (9, 0),
         Action::Lock => (9, 1),
         Action::Quit => (9, 2),
@@ -352,6 +361,14 @@ fn code_name(code: KeyCode) -> String {
         KeyCode::Pause => "pause".into(),
         KeyCode::Menu => "menu".into(),
         KeyCode::ModifierKey(key) => modifier_name(key).into(),
+        // The names the kernel gives these keys, minus the KEY_ prefix, which
+        // is what somebody reading a cheat sheet beside a keyboard with the
+        // symbols printed on it will recognise.
+        KeyCode::Media(key) => match key {
+            MediaKey::VolumeUp => "volumeup".into(),
+            MediaKey::VolumeDown => "volumedown".into(),
+            MediaKey::Mute => "mute".into(),
+        },
         // The conversion keys a Japanese keyboard has. Nothing binds them
         // today; an input method is what will.
         KeyCode::Ime(key) => match key {
@@ -583,6 +600,22 @@ mod tests {
             )),
             "ctrl+enter"
         );
+    }
+
+    #[test]
+    fn the_volume_keys_name_themselves_beside_the_leader_combination() {
+        // The key with the symbol on it is what somebody reaches for first,
+        // so it has to be the name the sheet leads with; the combination is
+        // there for the keyboard that has no such key and for the nested
+        // session, where no bare key reaches the compositor at all.
+        let sheet = cheat_sheet(&Keymap::default_bindings());
+        let up = &row(&sheet, "volume up").keys;
+        assert!(up.starts_with("volumeup"), "{up:?}");
+        assert!(up.contains("leader >"), "{up:?}");
+        let down = &row(&sheet, "volume down").keys;
+        assert!(down.starts_with("volumedown"), "{down:?}");
+        assert!(down.contains("leader <"), "{down:?}");
+        assert!(row(&sheet, "mute").keys.starts_with("mute"));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! the shape of this module is what matters, because everything above it works
 //! in [`KeyCode`] rather than in scancodes.
 
-use crate::event::{ImeKey, KeyCode, Keypad, ModifierKey};
+use crate::event::{ImeKey, KeyCode, Keypad, MediaKey, ModifierKey};
 
 /// What one physical key produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +152,15 @@ pub fn lookup(code: u16) -> Option<KeyMapping> {
         109 => KeyMapping::key(K::PageDown),
         110 => KeyMapping::key(K::Insert),
         111 => KeyMapping::key(K::Delete),
+        // The volume keys, which are not a layout question: a keyboard that
+        // has them sends these three scancodes whatever is printed on the
+        // rest of it, and the kernel's own names for them — KEY_MUTE,
+        // KEY_VOLUMEDOWN, KEY_VOLUMEUP — say what they mean rather than where
+        // they sit. Left unmapped they produced nothing at all, which is a
+        // key that looks broken rather than one that is unbound.
+        113 => KeyMapping::key(K::Media(MediaKey::Mute)),
+        114 => KeyMapping::key(K::Media(MediaKey::VolumeDown)),
+        115 => KeyMapping::key(K::Media(MediaKey::VolumeUp)),
         117 => KeyMapping::key(K::Keypad(Keypad::Equal)),
         119 => KeyMapping::key(K::Pause),
         // The yen key, which sits where a US keyboard has nothing at all.
@@ -256,6 +265,26 @@ mod tests {
             let key = lookup(code).unwrap();
             assert_eq!(key.character(false, false), None);
             assert_eq!(key.character(true, false), None);
+        }
+    }
+
+    #[test]
+    fn the_volume_keys_are_named_rather_than_dropped() {
+        assert_eq!(lookup(113).unwrap().code, KeyCode::Media(MediaKey::Mute));
+        assert_eq!(
+            lookup(114).unwrap().code,
+            KeyCode::Media(MediaKey::VolumeDown)
+        );
+        assert_eq!(
+            lookup(115).unwrap().code,
+            KeyCode::Media(MediaKey::VolumeUp)
+        );
+        // None of the three is text, so neither shift nor caps lock makes one
+        // into a character the pane would be sent.
+        for code in [113, 114, 115] {
+            let key = lookup(code).unwrap();
+            assert_eq!(key.character(false, false), None);
+            assert_eq!(key.character(true, true), None);
         }
     }
 

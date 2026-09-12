@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use tos_input::{KeyCode, KeyEvent, KeyState, Modifiers};
+use tos_input::{KeyCode, KeyEvent, KeyState, MediaKey, Modifiers};
 
 use crate::layout::{Axis, Direction};
 
@@ -61,6 +61,12 @@ pub enum Action {
     Quit,
     /// Redraw everything.
     Refresh,
+    /// Turn the default card up by one step.
+    VolumeUp,
+    /// Turn it down by one step.
+    VolumeDown,
+    /// Flip the default card between muted and not.
+    ToggleMute,
 }
 
 /// A key combination.
@@ -229,6 +235,16 @@ impl Keymap {
             // way vim does, and because every other desktop locks with an L.
             (KeyCode::Char('l'), Modifiers::SHIFT, Action::Lock),
             (KeyCode::Char('q'), Modifiers::NONE, Action::Quit),
+            // The angle brackets, because they point the way the volume goes
+            // and because both keys are free once shifted: plain comma
+            // renames a workspace and plain period is bound to nothing, so
+            // neither loses anything it was already doing. Mute takes shift
+            // and the m key rather than a plain m, which is the notification
+            // history — one letter, the two things you want from a machine
+            // that has just started making a noise at you.
+            (KeyCode::Char('.'), Modifiers::SHIFT, Action::VolumeUp),
+            (KeyCode::Char(','), Modifiers::SHIFT, Action::VolumeDown),
+            (KeyCode::Char('m'), Modifiers::SHIFT, Action::ToggleMute),
         ];
         for (code, modifiers, action) in bindings {
             keymap.bind_after_leader(Binding::new(*code, *modifiers), action.clone());
@@ -284,6 +300,20 @@ impl Keymap {
             Binding::new(KeyCode::End, Modifiers::SHIFT),
             Action::ScrollToBottom,
         );
+
+        // The keys on the keyboard that are already labelled with what they
+        // do. They take no modifier and go nowhere near the leader, because a
+        // key that exists to change the volume has nothing else it could
+        // mean: there is no program in a pane that is owed a volume key, and
+        // a laptop whose volume keys do nothing under tOS while they work
+        // under every other system reads as tOS being broken.
+        for (code, action) in [
+            (MediaKey::VolumeUp, Action::VolumeUp),
+            (MediaKey::VolumeDown, Action::VolumeDown),
+            (MediaKey::Mute, Action::ToggleMute),
+        ] {
+            keymap.bind(Binding::new(KeyCode::Media(code), Modifiers::NONE), action);
+        }
         keymap
     }
 
@@ -626,6 +656,52 @@ mod tests {
         assert_eq!(
             keymap.resolve(&press(KeyCode::PageUp, Modifiers::SHIFT)),
             Resolution::Action(Action::ScrollPage(-1))
+        );
+    }
+
+    #[test]
+    fn a_keyboards_own_volume_keys_need_no_modifier_and_no_leader() {
+        let mut keymap = Keymap::default_bindings();
+        for (media, action) in [
+            (MediaKey::VolumeUp, Action::VolumeUp),
+            (MediaKey::VolumeDown, Action::VolumeDown),
+            (MediaKey::Mute, Action::ToggleMute),
+        ] {
+            assert_eq!(
+                keymap.resolve(&press(KeyCode::Media(media), Modifiers::NONE)),
+                Resolution::Action(action)
+            );
+        }
+    }
+
+    #[test]
+    fn the_volume_combination_does_not_take_the_keys_under_it() {
+        // Shift is what tells the three of them apart from a plain comma,
+        // which renames a workspace, and from a plain m, which opens the
+        // notification list. Losing either to a mistake here would be a
+        // binding silently stolen rather than a volume key that does nothing.
+        let mut keymap = Keymap::default_bindings();
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('.'), Modifiers::SHIFT)),
+            Resolution::Action(Action::VolumeUp)
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char(','), Modifiers::NONE)),
+            Resolution::Action(Action::RenameWorkspace)
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('m'), Modifiers::NONE)),
+            Resolution::Action(Action::ShowNotifications)
+        );
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('m'),
+                Modifiers::SUPER.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::ToggleMute)
         );
     }
 

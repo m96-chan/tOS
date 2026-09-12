@@ -9,8 +9,8 @@ use tos_term::modes::{KeyboardFlags, MouseEncoding, MouseState, MouseTracking};
 use tos_term::Terminal;
 
 use crate::event::{
-    KeyCode, KeyEvent, KeyState, Keypad, ModifierKey, Modifiers, MouseAction, MouseButton,
-    MouseEvent,
+    KeyCode, KeyEvent, KeyState, Keypad, MediaKey, ModifierKey, Modifiers, MouseAction,
+    MouseButton, MouseEvent,
 };
 
 /// The terminal state that input encoding depends on.
@@ -172,6 +172,7 @@ fn encode_legacy(event: &KeyEvent, ctx: &EncodeContext) -> Vec<u8> {
         // the compositor to route and stop at the encoder.
         KeyCode::ModifierKey(_)
         | KeyCode::Ime(_)
+        | KeyCode::Media(_)
         | KeyCode::CapsLock
         | KeyCode::NumLock
         | KeyCode::ScrollLock
@@ -364,6 +365,20 @@ fn kitty_key(code: KeyCode) -> Option<(u32, u8)> {
         // is the protocol's to hand out, so a number picked here would mean
         // two terminals disagreeing about what it stood for.
         KeyCode::Ime(_) => return None,
+        // These three the protocol does number, in the same private use block
+        // the modifier keys above come out of. They are given their numbers
+        // even though the compositor claims the keys before an encoder sees
+        // them, because the claim is a binding and a binding can be taken
+        // away: a keymap that unbinds volume should leave the key working
+        // the way every other terminal works it, not turn it into nothing.
+        KeyCode::Media(key) => (
+            match key {
+                MediaKey::VolumeDown => 57438,
+                MediaKey::VolumeUp => 57439,
+                MediaKey::Mute => 57440,
+            },
+            b'u',
+        ),
         KeyCode::Unknown(_) => return None,
     })
 }
@@ -625,7 +640,7 @@ pub fn encode_focus(gained: bool) -> &'static [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::ImeKey;
+    use crate::event::{ImeKey, MediaKey};
 
     fn key(code: KeyCode, mods: Modifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
@@ -817,6 +832,30 @@ mod tests {
         ));
         let event = key(KeyCode::Ime(ImeKey::Convert), Modifiers::NONE);
         assert!(encode_key(&event, &ctx).is_empty());
+    }
+
+    #[test]
+    fn a_volume_key_sends_no_legacy_bytes_but_has_a_kitty_number() {
+        // No terminal convention gives these keys bytes, so an application
+        // reading the old encoding is sent nothing rather than something it
+        // would have to guess at.
+        for media in [MediaKey::VolumeUp, MediaKey::VolumeDown, MediaKey::Mute] {
+            assert_eq!(encode(KeyCode::Media(media), Modifiers::NONE), "");
+        }
+        // The Kitty protocol does number them, so an application that asked
+        // for the protocol is told which key it was.
+        let ctx = kitty_ctx(KeyboardFlags(
+            KeyboardFlags::DISAMBIGUATE.0 | KeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE.0,
+        ));
+        for (media, number) in [
+            (MediaKey::VolumeDown, "57438"),
+            (MediaKey::VolumeUp, "57439"),
+            (MediaKey::Mute, "57440"),
+        ] {
+            let event = key(KeyCode::Media(media), Modifiers::NONE);
+            let bytes = String::from_utf8(encode_key(&event, &ctx)).unwrap();
+            assert_eq!(bytes, format!("\x1b[{number}u"));
+        }
     }
 
     #[test]

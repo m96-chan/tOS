@@ -16,6 +16,7 @@ use tos_input::{
 use tos_platform::Display;
 use tos_render::{render, Rect as PixelRect, RenderOptions, Surface};
 use tos_session::{describe, Action, Axis, Keymap, PaneId, Rect, Resolution, Session};
+use tos_system::audio::Volume;
 use tos_system::Sysfs;
 use tos_term::TermEvent;
 
@@ -87,6 +88,35 @@ pub enum OverlayKind {
     Bindings,
 }
 
+/// Which way a volume binding turns the knob.
+///
+/// One [`Compositor::change_volume`] rather than three near-identical methods,
+/// because everything except the one call into the mixer — no card, a card
+/// that refused, refreshing the reading, saying what happened — is the same
+/// for all three, and three copies of it would be three places for the "no
+/// card" case to be got wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Knob {
+    Up,
+    Down,
+    Mute,
+}
+
+/// What to put on the status bar after the volume moved.
+///
+/// Muted is said instead of the level, not beside it, because the level of a
+/// muted card is not the question anybody has: turning a muted card up is a
+/// thing people do by mistake, and "45%" would look exactly like it had
+/// worked. A card with no mute switch is muted by being turned to zero, so on
+/// that hardware the two readings agree anyway.
+fn volume_status(volume: Volume) -> String {
+    if volume.muted {
+        "muted".to_string()
+    } else {
+        format!("volume {}%", volume.percent)
+    }
+}
+
 /// The running compositor.
 pub struct Compositor {
     config: Config,
@@ -147,6 +177,15 @@ pub struct Compositor {
     /// re-read on a timer rather than on damage, because nothing a person does
     /// to a pane is what makes a cable go in. See [`crate::system`].
     machine: Machine,
+    /// This machine has already been told it has no sound card.
+    ///
+    /// Whether there is a card is settled once, at the first ask, and never
+    /// changes for the life of the session — so saying it again is saying the
+    /// same true thing a second time. Without this, holding a volume key down
+    /// on a machine with no card fills the notification queue with one
+    /// sentence repeated, and pushes off the bar whatever was actually worth
+    /// reading.
+    said_no_sound_card: bool,
 }
 
 impl Compositor {
@@ -182,6 +221,7 @@ impl Compositor {
             idle_lock_done: false,
             blank_refused: false,
             machine: Machine::at(Sysfs::new(&config.system_root)),
+            said_no_sound_card: false,
             config,
         };
 
@@ -971,8 +1011,90 @@ impl Compositor {
                 true
             }
             Action::Lock => self.lock_session(),
+            Action::VolumeUp => self.change_volume(Knob::Up),
+            Action::VolumeDown => self.change_volume(Knob::Down),
+            Action::ToggleMute => self.change_volume(Knob::Mute),
             Action::Quit => {
                 self.running = false;
+                true
+            }
+        }
+    }
+
+    // ---- sound ----------------------------------------------------------
+
+    // Picking an output device is not built, and this is why rather than an
+    // oversight.
+    //
+    // `tos-system` can already enumerate cards and attach a mixer to any of them,
+    // so the menu itself would be an afternoon: an `OverlayKind` variant over
+    // `audio::card_order`, the way the launcher is an overlay over `$PATH`. What
+    // it would not be is the thing the issue is asking for. A card is not an
+    // output. The machine this is most likely to run on has two cards — the codec
+    // and the HDMI audio on the graphics card — and choosing between speakers and
+    // the headphone socket, which is what "output device" means to the person
+    // asking, happens *within* one card, through its own auto-mute enumeration or
+    // through whichever of `Speaker` and `Headphone` that hardware exposes. A card
+    // picker would therefore be a menu that confidently does not do what its title
+    // says, which is worse than no menu.
+    //
+    // The second output that is genuinely a different device is a Bluetooth sink,
+    // and a Bluetooth sink has no `/dev/snd/controlC*` at all: it is a BlueZ
+    // transport, reached over a bus tOS does not carry. So the shape of the
+    // chooser — a list of ALSA cards, or a list of sinks of which some are not
+    // cards — is decided by #18 and by the sound server question in
+    // `docs/design/audio.md`, and building the ALSA-card version first would mean
+    // building the wrong one and then throwing it away. The live ISO also ships no
+    // `snd_*` modules at all (`iso/mkiso.sh`), so today the list this menu would
+    // show is empty on the only hardware tOS actually boots on.
+
+    /// Move the default card's volume and say where it ended up.
+    ///
+    /// The mixer answers with the level as it reads back rather than with the
+    /// level that was asked for, and that answer is what reaches the bar: a
+    /// card whose range is `0..=3` cannot be at 55%, and a card that is muted
+    /// by a switch does not get louder when it is turned up. Telling the user
+    /// what was asked for would be right almost always and wrong exactly when
+    /// it mattered.
+    ///
+    /// [`Machine::refresh`] is called rather than waited for because the poll
+    /// that would otherwise notice is up to a second away, and a second is
+    /// long enough to press the key again — so the status bar would show the
+    /// level from two presses ago while the user is still pressing. The
+    /// reading is refreshed rather than written from the [`Volume`] in hand so
+    /// that there is one path by which the machine's state gets into the
+    /// reading, and it is the one that asks the machine.
+    fn change_volume(&mut self, knob: Knob) -> bool {
+        // The borrow of the mixer ends with this statement: `refresh` and the
+        // notification below both want the compositor back.
+        let moved = self.machine.mixer().map(|mixer| match knob {
+            Knob::Up => mixer.volume_up(),
+            Knob::Down => mixer.volume_down(),
+            Knob::Mute => mixer.toggle_mute(),
+        });
+        match moved {
+            None => {
+                // Said once a session, not once a keypress; see
+                // `said_no_sound_card`. Said at all, because a volume key that
+                // does nothing and says nothing is indistinguishable from a
+                // volume key tOS failed to read.
+                if !self.said_no_sound_card {
+                    self.said_no_sound_card = true;
+                    self.notifications.status("no sound card");
+                    return true;
+                }
+                false
+            }
+            // A card that is there and will not take a write is worth the same
+            // complaint as a split that would not open: what the kernel said,
+            // once, rather than a key that quietly stops working.
+            Some(Err(error)) => {
+                self.report_error("volume", error);
+                true
+            }
+            Some(Ok(volume)) => {
+                self.machine.refresh(Instant::now());
+                self.notifications.status(volume_status(volume));
                 true
             }
         }
@@ -3212,6 +3334,67 @@ mod tests {
         let mut panel = Panel::new();
         compositor.apply_idle(start + Duration::from_secs(60), &mut panel);
         assert!(compositor.is_blanked());
+    }
+
+    #[test]
+    fn a_machine_with_no_sound_card_is_told_so_once() {
+        let mut compositor = compositor();
+        // The guard that makes the rest of this test safe to run: the config
+        // above points the machine at a root that does not exist, so there is
+        // nothing here that could turn the volume up on whoever is running
+        // `cargo test`. If this ever stops holding, it fails here rather than
+        // in the speakers.
+        assert!(
+            compositor.machine_mut().mixer().is_none(),
+            "the test machine found a sound card"
+        );
+
+        assert!(compositor.perform(Action::VolumeUp), "said nothing at all");
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("no sound card")
+        );
+
+        // Held down, or pressed again later: the answer has not changed, so
+        // it is not repeated, and nothing asks for a frame on its account.
+        for action in [Action::VolumeUp, Action::VolumeDown, Action::ToggleMute] {
+            assert!(
+                !compositor.perform(action.clone()),
+                "{action:?} said it twice"
+            );
+        }
+        assert_eq!(
+            compositor.notifications.history().count(),
+            1,
+            "the queue filled up with the same sentence"
+        );
+    }
+
+    #[test]
+    fn the_volume_a_card_reports_is_what_reaches_the_bar() {
+        // Muted wins over the level, because turning a muted card up is the
+        // case where showing a percentage would look like it had worked.
+        assert_eq!(
+            volume_status(Volume {
+                percent: 45,
+                muted: false
+            }),
+            "volume 45%"
+        );
+        assert_eq!(
+            volume_status(Volume {
+                percent: 45,
+                muted: true
+            }),
+            "muted"
+        );
+        assert_eq!(
+            volume_status(Volume {
+                percent: 0,
+                muted: false
+            }),
+            "volume 0%"
+        );
     }
 
     #[test]
