@@ -2,7 +2,11 @@
 //! dividers that can be dragged. Real panes, real pointer events, and no
 //! display anywhere.
 
-use tos_compositor::{Compositor, Config, Overlay, OverlayItem, OverlayKind, Placement};
+use tos_compositor::chrome::pane_label;
+use tos_compositor::status::{Piece, Settings};
+use tos_compositor::{
+    Bar, Compositor, Config, Hit, Overlay, OverlayItem, OverlayKind, Placement, Segment,
+};
 use tos_input::{InputEvent, KeyCode, KeyEvent, Modifiers, MouseAction, MouseButton, PointerEvent};
 use tos_session::{Action, Axis, Direction, PaneId, Rect};
 
@@ -505,5 +509,111 @@ fn a_divider_held_while_a_pane_is_split_beside_it_does_not_become_the_next_gap_a
         geometry(&c),
         before,
         "the drag moved a divider nobody was holding"
+    );
+}
+
+// ---- the pane list on the status bar -------------------------------------
+
+/// A quiet pane on a bar that is nothing but the list of panes. `panes` is not
+/// in the default layout, so a test that wants a pane's own label to click on
+/// has to ask for it, and asking for it alone keeps the bar's left end to the
+/// one segment this is about.
+fn labelled_panes() -> Compositor {
+    let config = Config {
+        command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()]),
+        bitmap_scale: Some(2),
+        font: Some("/nonexistent".into()),
+        status: Settings {
+            left: vec![Segment::Panes],
+            right: Vec::new(),
+            ..Settings::default()
+        },
+        ..Config::default()
+    };
+    Compositor::new(config, SIZE, None).expect("compositor")
+}
+
+/// The cell a pane's label is drawn in, found by laying the bar out the way
+/// the compositor lays it out rather than by counting characters here. A click
+/// that misses says so, since the focus it was aiming at does not move.
+fn label_cell(c: &Compositor, pane: PaneId) -> (u32, u32) {
+    let labels: Vec<Piece> = c
+        .session()
+        .active()
+        .panes()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| {
+            let found = c.pane(*id)?;
+            Some(
+                Piece::new(pane_label(index, &found.terminal, &found.title))
+                    .clicking(Hit::Pane(*id)),
+            )
+        })
+        .collect();
+    let bar = Bar::lay_out(&[labels], &[], c.grid_area().width);
+    let col = bar
+        .pieces()
+        .iter()
+        .find(|piece| piece.hit == Some(Hit::Pane(pane)))
+        .map(|piece| piece.col)
+        .expect("every pane has a label on the bar");
+    (col, c.grid_area().height)
+}
+
+/// What the child on the other end of a pane's PTY believes its window to be.
+/// Asked of the kernel rather than worked out from the pane, because a program
+/// drawing itself at the wrong size is the whole of the complaint and the PTY
+/// is the only place the program hears its size from.
+fn child_size(c: &Compositor, pane: PaneId) -> (u32, u32) {
+    let fd = c.pane(pane).expect("a live pane").pty.fd();
+    let mut ws = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let answered = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+    assert_eq!(answered, 0, "the pty would not say how big it is");
+    (u32::from(ws.ws_col), u32::from(ws.ws_row))
+}
+
+#[test]
+fn clicking_a_hidden_pane_on_the_bar_resizes_the_zoom_it_drops() {
+    // The bar is the one way to reach a pane the zoom is hiding, and reaching
+    // one leaves the zoom. The panes were never told: the workspace came back
+    // as two columns while the pane that had been zoomed, its terminal and its
+    // child were all still the size of the whole workspace, and the program
+    // inside it drew at that size until something else resynced.
+    let mut c = labelled_panes();
+    assert!(c.perform(Action::Split(Axis::Columns)));
+    let panes = c.session().active().panes();
+    let zoomed = c.session().focus();
+    let hidden = *panes
+        .iter()
+        .find(|id| **id != zoomed)
+        .expect("two panes after a split");
+    assert!(c.perform(Action::ToggleZoom));
+    assert_eq!(c.session().active().zoomed(), Some(zoomed));
+
+    let label = label_cell(&c, hidden);
+    click(&mut c, label);
+    assert_eq!(c.session().focus(), hidden, "the click missed the label");
+    assert!(
+        c.session().active().zoomed().is_none(),
+        "focusing a hidden pane leaves the zoom"
+    );
+
+    let rect = rect_of(&c, zoomed);
+    let terminal = &c.pane(zoomed).expect("the pane is still there").terminal;
+    assert_eq!(
+        (terminal.grid().cols() as u32, terminal.grid().rows() as u32),
+        (rect.width, rect.height),
+        "the pane that had been zoomed kept the zoomed terminal"
+    );
+    assert_eq!(
+        child_size(&c, zoomed),
+        (rect.width, rect.height),
+        "and the program inside it was never told it had shrunk"
     );
 }
