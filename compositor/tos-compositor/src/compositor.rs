@@ -1219,16 +1219,17 @@ impl Compositor {
         button: Option<MouseButton>,
         action: MouseAction,
     ) -> Option<bool> {
-        if action == MouseAction::Press {
+        // The left button only, because it is the only one that starts a drag.
+        // A wheel notch arrives here as a press too — it is how the device
+        // reports one — and it is not the beginning of anything, so it falls
+        // through to the arm below that swallows it while a divider is held.
+        if action == MouseAction::Press && button == Some(MouseButton::Left) {
             // A press starts a new interaction whatever the last one was, so
             // a release that never arrived — a button let go over another
             // virtual terminal, a device that stopped reporting — cannot wedge
             // a divider to the pointer forever.
             if matches!(self.mouse_grab, Some(Grab::Divider(_))) {
                 self.mouse_grab = None;
-            }
-            if button != Some(MouseButton::Left) {
-                return None;
             }
             // A zoomed workspace draws no dividers, and a strip that resizes
             // a layout nobody can see is worse than one that does nothing.
