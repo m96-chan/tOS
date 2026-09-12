@@ -422,6 +422,11 @@ Implemented items are ticked. Everything ticked is covered by tests in the
 workspace; see [Status](#status) for what has and has not been run on real
 hardware.
 
+Everything before 0.1 is a proof of concept and is run at that pace: a
+milestone lands when its idea has been demonstrated, and a version can be
+skipped outright rather than held up. 0.0.6 is one — it was merged without a
+tag of its own, and `v0.0.7` is the release that carries it.
+
 ### 0.0.1 — Direct terminal
 
 - [x] DRM/KMS initialization
@@ -618,8 +623,8 @@ fallback list are named but not answered yet, and land with the code behind
 them, the way `[status]` has.
 
 The status bar is a list of segments per side rather than a fixed strip. It
-ships showing the workspaces and the focused pane on the left, and the message
-slot, the link, the battery and a clock on the right; `[status] left` and
+ships showing the workspaces, the arrangement and the focused pane on the left,
+and the message slot, the link, the battery and a clock on the right; `[status] left` and
 `[status] right` name segments in the order they read on screen, out of
 `workspaces`, `panes`, `title`, `layout`, `message`, `clock`, `battery`,
 `network`, `volume` and `bluetooth`. A segment whose machine cannot answer — a battery on
@@ -807,6 +812,78 @@ got: refusing a VT switch with `VT_RELDISP 0`
 ([#47](https://github.com/m96-chan/tOS/issues/47)). Until that, the lock defends
 the session rather than the machine — which on the nested and headless backends
 is all there was ever going to be to defend.
+
+### 0.0.6 — Japanese input
+
+- [x] romaji to kana
+- [x] an SKK dictionary, read and looked up
+- [x] the dictionary on the ISO
+- [x] a preedit drawn at the cursor
+- [x] a candidate window
+- [x] okurigana
+- [x] learning
+- [ ] the keys a JIS keyboard has left ([#62](https://github.com/m96-chan/tOS/issues/62))
+
+Romaji becomes kana through one `const` table of a few hundred entries, binary
+searched, and the lone `n` everybody states as a special case is not one here:
+it falls out of the rule that an entry which is also the prefix of a longer
+entry cannot commit until the next key arrives. Katakana is not a second
+table — hiragana and katakana are the same list of kana 0x60 apart, so the
+table is read differently rather than written twice, and halfwidth katakana is
+a third reading of it.
+
+Conversion goes through an SKK dictionary. Debian's `SKK-JISYO.L` is EUC-JP,
+so it is converted at build time and the ISO ships one; it is read once into a
+list of line offsets and binary searched there rather than held in memory as a
+map. Okurigana is found by searching for the boundary instead of asking the
+typist to mark it: on 52 everyday inflected words, 43 convert right on the
+first candidate and 50 are in the first three. What was chosen is remembered
+in an append-only journal replayed forwards, so the last choice wins and
+nothing already written has to be rewritten.
+
+The preedit is drawn at the cursor of the pane it belongs to and erased by
+marking the rows it used rather than by redrawing the screen. The candidate
+window is deliberately not an overlay, for reasons that accumulated as it was
+written — among them that typing during a conversion extends the preedit,
+which is the opposite of what typing into an overlay does. Turning the IME on
+is `super+i` and not 半角/全角: what that key sends through the kernel's event
+stream has not been established yet, which is the one item above still open.
+`[ime] dictionary` under [Configuration](#configuration) says where the
+dictionary is looked for.
+
+### 0.0.7 — Kitty-like
+
+- [x] window and tab bindings that follow Kitty
+- [x] layout arrangements
+- [x] a pointer that can be seen
+- [x] menus that answer a click
+- [x] dividers that can be dragged
+
+`ctrl+shift` is a third binding table, bound directly rather than mirrored onto
+the leader and super — those two go on mirroring each other, because that is
+what a nested session needs. A binding matches on the whole modifier set, so
+`ctrl+shift+l` and `super+shift+l` cannot collide, which is what lets the
+layout key and the lock key share a letter. The keys are listed under
+[Building and running](#building-and-running), including the two left unbound
+on purpose: `ctrl+shift+c` and `ctrl+shift+v` stay with the programs in the
+panes.
+
+The mouse is the other half. There is a pointer on screen, the overlays answer
+a click, and the gap between two panes can be taken hold of and dragged. A
+grab is one thing at a time and is dropped by everything ordinary that
+interrupts it — a lock, a menu, a workspace change, the pane underneath
+closing — which is most of what the milestone's review was about.
+
+Four defects found after the merge are open against this milestone rather than
+fixed in it: nested mode reads a host terminal's cell numbers as compositor
+cells, so most clicks in a nested session land nowhere
+([#88](https://github.com/m96-chan/tOS/issues/88)); clicking a pane on the
+status bar drops the zoom without resizing it
+([#87](https://github.com/m96-chan/tOS/issues/87)); an expired notification
+banner is never erased on a bar with no message segment
+([#86](https://github.com/m96-chan/tOS/issues/86)); and a refused
+`MovePaneToWorkspace` orphans the pane
+([#85](https://github.com/m96-chan/tOS/issues/85)).
 
 ### 0.1 — Portable tOS
 
@@ -1140,7 +1217,7 @@ selection = #5f87d7
 # nothing, and layout says nothing while the panes are where the splits left
 # them.
 [status]
-left = workspaces title
+left = workspaces layout title
 right = message network battery clock
 # A strftime subset. %a %d %b %H:%M is the one with a date on it.
 clock = %H:%M
