@@ -611,8 +611,8 @@ The status bar is a list of segments per side rather than a fixed strip. It
 ships showing the workspaces and the focused pane on the left, and the message
 slot, the link, the battery and a clock on the right; `[status] left` and
 `[status] right` name segments in the order they read on screen, out of
-`workspaces`, `panes`, `title`, `message`, `clock`, `battery`, `network`,
-`volume` and `bluetooth`. A segment whose machine cannot answer — a battery on
+`workspaces`, `panes`, `title`, `layout`, `message`, `clock`, `battery`,
+`network`, `volume` and `bluetooth`. A segment whose machine cannot answer — a battery on
 a desktop, an adapter on a machine with no Bluetooth — draws nothing at all
 rather than a slot saying so, and the rule that would have gone beside it does
 not appear either. One segment on the bar is elastic, and by default it is the
@@ -915,6 +915,22 @@ a pane with nowhere to go, and a virtual terminal is only taken over once the
 VT switch signals have handlers, so switching away with Ctrl+Alt+F2 cannot
 leave the console in graphics mode with no keyboard.
 
+Panes sit where the splits that made them put them, and a workspace can also
+be read through one of three named arrangements: `tall` gives one full-height
+pane the left and stacks the rest beside it, `fat` gives one full-width pane
+the top and puts the rest side by side underneath, and `grid` makes as square
+a grid as the pane count allows. `ctrl+shift+l` walks them and `ctrl+shift+b`
+walks back. None of the three touches the split tree — each works out where
+the panes go from the order they are in — so leaving `splits` and returning to
+it gives back every manual split and every dragged divider exactly as it was,
+where Kitty discards them the moment the layout is cycled past. Kitty's
+`stack` is missing on purpose: zooming a pane with `super+z` already shows the
+focused pane alone and full screen, and one behaviour does not need two keys.
+While a derived arrangement is up there is no divider on screen to drag, so
+the resize and balance keys refuse and say why rather than moving something
+nobody can see. The status bar names the arrangement in force, and says
+nothing at all while it is the tree, which is where every session starts.
+
 The last row is the honest gap: the kernel-facing backends have not yet been
 run on hardware. Everything above them has, through the nested and headless
 backends.
@@ -1068,8 +1084,10 @@ divider-focused = #5f87d7
 selection = #5f87d7
 
 # What the status bar says, in the order it reads on screen, and what it says
-# it in. Segments: workspaces, panes, title, message, clock, battery, network,
-# volume, bluetooth. A segment this machine cannot answer draws nothing.
+# it in. Segments: workspaces, panes, title, layout, message, clock, battery,
+# network, volume, bluetooth. A segment this machine cannot answer draws
+# nothing, and layout says nothing while the panes are where the splits left
+# them.
 [status]
 left = workspaces title
 right = message network battery clock
