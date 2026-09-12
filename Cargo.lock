@@ -60,6 +60,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tos-ime"
+version = "0.0.5"
+
+[[package]]
 name = "tos-input"
 version = "0.0.5"
 dependencies = [

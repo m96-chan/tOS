@@ -1,0 +1,10 @@
+[package]
+name = "tos-ime"
+description = "Japanese input for tOS: the romaji table and the SKK dictionary the compositor converts through"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
