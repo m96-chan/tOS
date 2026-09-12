@@ -89,6 +89,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tos-preview"
+version = "0.0.4"
+dependencies = [
+ "libc",
+ "tos-compositor",
+ "tos-platform",
+ "tos-render",
+ "tos-term",
+]
+
+[[package]]
 name = "tos-pty"
 version = "0.0.4"
 dependencies = [
