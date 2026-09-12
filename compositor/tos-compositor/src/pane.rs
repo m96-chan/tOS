@@ -8,6 +8,7 @@ use tos_render::TextureCache;
 use tos_session::Rect;
 use tos_term::{Palette, Terminal, TerminalConfig};
 
+use crate::imagefile::ImageFiles;
 use crate::selection::{Anchor, Selection};
 
 /// A running pane.
@@ -77,6 +78,12 @@ impl Pane {
             },
         );
         terminal.set_palette(palette.clone());
+        // The programs in a pane are the ones that send `t=f`, so this is
+        // where a terminal is given the rules for what tOS will open for
+        // them. A terminal built anywhere else — the chrome, a test — is
+        // given none and refuses, which is what a terminal that is not
+        // somebody's shell should do.
+        terminal.set_medium_reader(Box::new(ImageFiles::system()));
 
         Ok(Pane {
             terminal,

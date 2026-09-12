@@ -10,6 +10,13 @@
 //! protocol's error response rather than being silently dropped, so
 //! applications can fall back instead of hanging.
 //!
+//! Bytes may also arrive by name rather than inline — a path (`t=f`), a
+//! temporary file to read and delete (`t=t`) or a shared memory object
+//! (`t=s`). Nothing here opens any of them: [`crate::term::Terminal`] reads
+//! the name through a [`crate::medium::MediumReader`] first and hands the
+//! bytes down as an ordinary direct transmission, so this module stays a
+//! store that can be driven from a test with a byte slice.
+//!
 //! Images may also be animations. The store keeps every frame but holds the
 //! one that is on screen in [`Image::data`], so the renderer asks for an image
 //! and gets the current frame without knowing that animation exists. Time is
@@ -640,6 +647,10 @@ impl GraphicsStore {
     /// Store an image, converting the payload to RGBA. Returns an error string
     /// suitable for the protocol response.
     pub fn store(&mut self, cmd: &GraphicsCommand, payload: &[u8]) -> Result<u32, &'static str> {
+        // By the time a transmission reaches the store its bytes are in hand,
+        // whichever medium carried them: the terminal resolves a named one
+        // and says so. A command that still names a medium here was never
+        // resolved, and its payload is a path rather than an image.
         if cmd.medium != Medium::Direct {
             return Err("EINVAL:only direct transmission supported");
         }
