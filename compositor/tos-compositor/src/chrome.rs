@@ -219,6 +219,196 @@ pub fn clip_marked(text: &str, cols: usize) -> String {
     out
 }
 
+/// Extend `text` with `fill` until it is `cols` cells wide.
+///
+/// Stops short rather than overshooting, so padding a row with a double width
+/// character can leave it a cell narrower than asked; a box whose border ran
+/// one cell past its corner would be worse than one a cell short.
+pub fn pad_to(text: &mut String, cols: usize, fill: char) {
+    let mut used = tos_term::str_width(text);
+    let step = tos_term::char_width(fill).max(1) as usize;
+    while used + step <= cols {
+        text.push(fill);
+        used += step;
+    }
+}
+
+/// Where a box goes: a corner in pixels and a size in cells.
+///
+/// The size is in cells because every decision about a box is made in cells —
+/// how many rows the list gets, how many columns are left for its text — and
+/// the corner is in pixels because that is what a [`Surface`] is painted in,
+/// and because the thing a box is placed against need not sit on the screen's
+/// own grid: an overlay is centred in whatever is left under the status bar,
+/// and the IME's candidate window will be placed at a cursor inside a pane.
+///
+/// Whoever wants the box works the rectangle out. [`draw_box`] deliberately
+/// does not centre one itself, because the second caller does not want a
+/// centred box: a candidate list belongs at the cursor whose text it offers
+/// replacements for, and above the cursor's row when there is no room below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoxRect {
+    pub x: i32,
+    pub y: i32,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+impl BoxRect {
+    pub fn new(x: i32, y: i32, cols: usize, rows: usize) -> Self {
+        BoxRect { x, y, cols, rows }
+    }
+}
+
+/// One row of a box's interior, borders excluded.
+///
+/// Borrowed rather than owned, so that a caller which already has the strings
+/// — a candidate window holding a dictionary's entries — does not copy them
+/// once per frame to say where they go.
+#[derive(Debug, Clone, Copy)]
+pub enum BoxLine<'a> {
+    /// Text, clipped to the width that is left and padded out to it, so a row
+    /// is opaque from border to border however short its text is.
+    Text {
+        text: &'a str,
+        fg: Rgb,
+        /// The row's own background, for the row a cursor is on. `None` means
+        /// the box's, which is the usual answer.
+        bg: Option<Rgb>,
+        bold: bool,
+    },
+    /// A rule across the box, `├───┤`: what separates a query from the list it
+    /// filters.
+    Rule,
+    /// Borders and background and nothing between them, for a row the caller
+    /// paints itself. An overlay's query line is three colours and a block
+    /// cursor, and a description of it in this enum would be a worse helper
+    /// than an empty row and one piece of code that knows.
+    Blank,
+}
+
+impl<'a> BoxLine<'a> {
+    /// A plain row on the box's own background.
+    pub fn text(text: &'a str, fg: Rgb) -> Self {
+        BoxLine::Text {
+            text,
+            fg,
+            bg: None,
+            bold: false,
+        }
+    }
+}
+
+/// Draw a bordered box of cells, with `title` set into its top border and one
+/// [`BoxLine`] per interior row.
+///
+/// This is the compositor's one box. The overlay drew it by hand and was the
+/// only thing in the tree that knew how, which was fine while the overlay was
+/// the only modal surface; the IME's candidate window needs the same box and
+/// must not be an `Overlay`, because an overlay owns the keyboard and a
+/// candidate window that took every key would be an input method that stops
+/// you typing. So the border, the clipping and the padding live here, where
+/// something that is not modal can reach them.
+///
+/// Rows past the end of `lines` are drawn empty and lines past the end of the
+/// box are not drawn at all: the caller chose the rectangle, so the rectangle
+/// wins.
+pub fn draw_box(
+    surface: &mut Surface<'_>,
+    fonts: &mut FontStack,
+    rect: BoxRect,
+    title: Option<&str>,
+    lines: &[BoxLine<'_>],
+    chrome: &Chrome,
+) {
+    // Two borders and a cell between them is the smallest box there is; below
+    // that there is nothing honest to draw, and a border drawn over itself
+    // would read as a stray glyph rather than as a box.
+    if rect.cols < 3 || rect.rows < 2 {
+        return;
+    }
+    let metrics = fonts.metrics();
+    let (cw, ch) = (metrics.cell_width.max(1), metrics.cell_height.max(1));
+    let inner = rect.cols - 2;
+    let row_y = |row: usize| rect.y + (row as u32 * ch) as i32;
+    let border = chrome.divider_focused;
+    let background = Some(chrome.background);
+
+    // Whatever is underneath must not show through. A box is a surface in its
+    // own right, and one with the panes visible through it is unreadable.
+    surface.fill(
+        Rect::new(rect.x, rect.y, rect.cols as u32 * cw, rect.rows as u32 * ch),
+        chrome.background,
+    );
+
+    // The title sits in the top border rather than on a row of its own, which
+    // is a whole row saved on a box that is mostly border already.
+    let mut top = match title {
+        Some(title) => format!("┌─ {} ", clip(title, inner.saturating_sub(4))),
+        None => "┌".to_string(),
+    };
+    pad_to(&mut top, rect.cols - 1, '─');
+    top.push('┐');
+    draw_text(
+        surface,
+        fonts,
+        rect.x,
+        row_y(0),
+        &top,
+        border,
+        background,
+        false,
+    );
+
+    // A row the caller said nothing about is a row with borders and nothing
+    // in it, which is what [`BoxLine::Blank`] asks for anyway.
+    for row in 0..rect.rows - 2 {
+        let y = row_y(row + 1);
+        let line = lines.get(row).copied().unwrap_or(BoxLine::Blank);
+        if let BoxLine::Rule = line {
+            let mut rule = "├".to_string();
+            pad_to(&mut rule, rect.cols - 1, '─');
+            rule.push('┤');
+            draw_text(surface, fonts, rect.x, y, &rule, border, background, false);
+            continue;
+        }
+        draw_text(surface, fonts, rect.x, y, "│", border, background, false);
+        let right = rect.x + ((rect.cols - 1) as u32 * cw) as i32;
+        draw_text(surface, fonts, right, y, "│", border, background, false);
+        if let BoxLine::Text { text, fg, bg, bold } = line {
+            // The clipping and the padding together are what make a row a
+            // row: cut to the cells there are, and filled out to them so the
+            // border has an unbroken run of background to sit at the end of.
+            let mut text = clip(text, inner);
+            pad_to(&mut text, inner, ' ');
+            draw_text(
+                surface,
+                fonts,
+                rect.x + cw as i32,
+                y,
+                &text,
+                fg,
+                Some(bg.unwrap_or(chrome.background)),
+                bold,
+            );
+        }
+    }
+
+    let mut bottom = "└".to_string();
+    pad_to(&mut bottom, rect.cols - 1, '─');
+    bottom.push('┘');
+    draw_text(
+        surface,
+        fonts,
+        rect.x,
+        row_y(rect.rows - 1),
+        &bottom,
+        border,
+        background,
+        false,
+    );
+}
+
 /// The label a pane shows in the status bar.
 pub fn pane_label(index: usize, terminal: &Terminal, title: &str) -> String {
     let title = if title.is_empty() {
@@ -326,6 +516,116 @@ mod tests {
             let inked = (0..metrics.cell_width).any(|x| fb.pixel(x, y) != 0);
             assert!(inked, "divider missing on row {row}");
         }
+    }
+
+    /// The colour nothing in a box is allowed to be, so that a pixel still
+    /// wearing it is a pixel the box did not touch.
+    const UNTOUCHED: Rgb = Rgb::new(0xff, 0x00, 0xff);
+
+    #[test]
+    fn a_box_is_drawn_where_it_was_put_rather_than_centred() {
+        let mut fonts = fonts();
+        let metrics = fonts.metrics();
+        let (cw, ch) = (metrics.cell_width, metrics.cell_height);
+        let chrome = Chrome::default();
+        let mut fb = OwnedFramebuffer::new(cw * 20, ch * 10);
+        {
+            let mut surface = fb.surface();
+            surface.clear(UNTOUCHED);
+            draw_box(
+                &mut surface,
+                &mut fonts,
+                BoxRect::new((cw * 3) as i32, (ch * 2) as i32, 8, 4),
+                Some("t"),
+                &[BoxLine::text("hi", chrome.foreground), BoxLine::Rule],
+                &chrome,
+            );
+        }
+        // Nothing outside the rectangle it was handed. This is the property
+        // the candidate window needs and an overlay cannot give it: a box
+        // that centred itself would be four cells to the right of here.
+        for y in 0..ch * 10 {
+            for x in 0..cw * 20 {
+                let inside = (cw * 3..cw * 11).contains(&x) && (ch * 2..ch * 6).contains(&y);
+                if !inside {
+                    assert_eq!(fb.pixel(x, y), UNTOUCHED.pack(), "painted at {x},{y}");
+                }
+            }
+        }
+        // And inside it is opaque, so the panes do not show through.
+        assert!(fb.pixel(cw * 3 + 1, ch * 2 + 1) != UNTOUCHED.pack());
+    }
+
+    #[test]
+    fn a_box_pads_a_short_line_and_clips_a_long_one_to_the_same_cells() {
+        let metrics = fonts().metrics();
+        let (cw, ch) = (metrics.cell_width, metrics.cell_height);
+        // A highlight no other part of the box shares. The default accent and
+        // the focused divider are deliberately the same blue, so a border
+        // painted in it would count as a row that reached too far.
+        let highlight = Rgb::new(0x00, 0xff, 0x00);
+        let chrome = Chrome::default();
+        // Six cells wide is two borders and four to write in.
+        let row_is = |text: &str| {
+            let mut fonts = fonts();
+            let mut fb = OwnedFramebuffer::new(cw * 6, ch * 3);
+            {
+                let mut surface = fb.surface();
+                surface.clear(UNTOUCHED);
+                draw_box(
+                    &mut surface,
+                    &mut fonts,
+                    BoxRect::new(0, 0, 6, 3),
+                    None,
+                    &[BoxLine::Text {
+                        text,
+                        fg: chrome.foreground,
+                        // A row with a background of its own is the row a
+                        // cursor is on, and it is also the only way to see
+                        // from the outside where a row stopped.
+                        bg: Some(highlight),
+                        bold: false,
+                    }],
+                    &chrome,
+                );
+            }
+            (0..6)
+                .map(|col| {
+                    (0..ch).any(|y| {
+                        (0..cw).any(|x| fb.pixel(col * cw + x, ch + y) == highlight.pack())
+                    })
+                })
+                .collect::<Vec<bool>>()
+        };
+        // The row is highlighted up to each border and into neither, whether
+        // the text ran out early or was cut short.
+        let expected = vec![false, true, true, true, true, false];
+        assert_eq!(row_is("a"), expected);
+        assert_eq!(row_is("abcdefghij"), expected);
+        // A double width character is not cut in half to make it fit.
+        assert_eq!(row_is("漢字です"), expected);
+    }
+
+    #[test]
+    fn a_box_with_no_room_between_its_borders_draws_nothing() {
+        let mut fonts = fonts();
+        let metrics = fonts.metrics();
+        let (cw, ch) = (metrics.cell_width, metrics.cell_height);
+        let mut fb = OwnedFramebuffer::new(cw * 4, ch * 4);
+        {
+            let mut surface = fb.surface();
+            // Two columns is two borders with nothing between them, which is
+            // not a box; better nothing than a pair of stray glyphs.
+            draw_box(
+                &mut surface,
+                &mut fonts,
+                BoxRect::new(0, 0, 2, 4),
+                Some("t"),
+                &[BoxLine::Blank],
+                &Chrome::default(),
+            );
+        }
+        assert!(fb.pixels().iter().all(|&px| px == 0));
     }
 
     #[test]
