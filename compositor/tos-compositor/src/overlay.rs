@@ -12,12 +12,27 @@
 //! which keys are text and which are bindings to swallow, where the cursor is
 //! drawn, how a line too long for the box is shown — is the same question in
 //! both, and worth answering once.
+//!
+//! The box itself is no longer the overlay's own. It is
+//! [`chrome::draw_box`](crate::chrome::draw_box), because the IME's candidate
+//! window needs the same border, the same clipping and the same padding, and
+//! must not be an overlay to get them: an overlay owns the keyboard, and a
+//! candidate window that took every key would be an input method that stops
+//! you typing. What is left here is what is the overlay's own — where the box
+//! goes, what the query line looks like and what the list says.
 
 use tos_font::FontStack;
 use tos_input::{KeyCode, KeyEvent, Modifiers};
 use tos_render::{Rect, Surface};
 
-use crate::chrome::{clip, draw_text, Chrome};
+use crate::chrome::{draw_box, draw_text, BoxLine, BoxRect, Chrome};
+
+/// The two pieces the overlay's box was made of, re-exported under the names
+/// they had here. The lock screen still draws its box by hand out of them and
+/// reaches for them through this module — it is the next caller [`draw_box`]
+/// should take — and the tests at the bottom of this file check the behaviour
+/// the box relies on.
+pub use crate::chrome::{clip, pad_to};
 
 /// The widest the overlay grows, however wide the display is. A launcher that
 /// spans a 4K screen is harder to read, not easier.
@@ -294,48 +309,59 @@ impl Overlay {
             self.scroll = self.cursor + 1 - list_rows;
         }
 
-        // The panes underneath must not show through.
-        surface.fill(
-            Rect::new(x0, y0, box_cols as u32 * cw, box_rows as u32 * ch),
-            chrome.background,
-        );
-
-        let border = chrome.divider_focused;
-        let row_y = |row: usize| y0 + (row as u32 * ch) as i32;
-        let title = clip(&self.title, inner.saturating_sub(4));
-        let mut top = format!("┌─ {title} ");
-        pad_to(&mut top, box_cols - 1, '─');
-        top.push('┐');
-        draw_text(
+        // The interior, row by row. The query line is left empty for the
+        // code below: it is three colours and a block cursor, and no
+        // description of it belongs in the box helper.
+        let mut texts: Vec<String> = Vec::with_capacity(list_rows);
+        for row in 0..list_rows {
+            texts.push(match self.matches.get(self.scroll + row) {
+                Some(&index) => format!(" {}", self.items[index].label),
+                // An empty list still gets a row, so the box does not collapse
+                // to nothing while the query is being corrected.
+                None if self.matches.is_empty() && row == 0 => " (no matches)".to_string(),
+                None => String::new(),
+            });
+        }
+        let mut lines = Vec::with_capacity(list_rows + 2);
+        lines.push(BoxLine::Blank);
+        // With no list under it there is nothing for a divider to divide.
+        if list_rows > 0 {
+            lines.push(BoxLine::Rule);
+        }
+        for (row, text) in texts.iter().enumerate() {
+            let position = self.scroll + row;
+            lines.push(match self.matches.get(position) {
+                Some(_) if position == self.cursor => BoxLine::Text {
+                    text,
+                    fg: chrome.accent_text,
+                    bg: Some(chrome.accent),
+                    bold: true,
+                },
+                Some(_) => BoxLine::text(text, chrome.foreground),
+                None => BoxLine::text(text, chrome.dim),
+            });
+        }
+        draw_box(
             surface,
             fonts,
-            x0,
-            row_y(0),
-            &top,
-            border,
-            Some(chrome.background),
-            false,
+            BoxRect::new(x0, y0, box_cols, box_rows),
+            Some(&self.title),
+            &lines,
+            chrome,
         );
 
+        let row_y = |row: usize| y0 + (row as u32 * ch) as i32;
+
         // The query line, ending in a block cursor so it is obvious where the
-        // keyboard is going.
+        // keyboard is going. It starts a cell in, because the box has already
+        // drawn the border it starts after.
         let y = row_y(1);
         let mut x = draw_text(
             surface,
             fonts,
-            x0,
+            x0 + cw as i32,
             y,
-            "│ ",
-            border,
-            Some(chrome.background),
-            false,
-        );
-        x = draw_text(
-            surface,
-            fonts,
-            x,
-            y,
-            "> ",
+            " > ",
             chrome.accent,
             Some(chrome.background),
             true,
@@ -352,143 +378,46 @@ impl Overlay {
             false,
         );
         surface.fill(Rect::new(x, y, cw, ch), chrome.accent);
-        x += cw as i32;
-        let used = 4 + width_of(&shown);
-        let mut tail = " ".repeat(inner.saturating_sub(used.min(inner)));
-        tail.push('│');
-        draw_text(
-            surface,
-            fonts,
-            x,
-            y,
-            &tail,
-            border,
-            Some(chrome.background),
-            false,
-        );
+        // Nothing after the cursor: the box filled the row with its own
+        // background before handing it over, and the query is clipped short
+        // enough that the cursor never reaches the border.
 
-        // With no list under it there is nothing for a divider to divide, and
-        // the loop below has no rows to draw.
-        if list_rows > 0 {
-            let mut divider = "├".to_string();
-            pad_to(&mut divider, box_cols - 1, '─');
-            divider.push('┤');
-            draw_text(
-                surface,
-                fonts,
-                x0,
-                row_y(2),
-                &divider,
-                border,
-                Some(chrome.background),
-                false,
-            );
-        }
-
+        // The detail is drawn over the padding of the row it belongs to,
+        // right aligned, and only when there is room for it and a gap after
+        // the label. It stays here rather than becoming part of a box line
+        // because a line is one run of text, and a second column that appears
+        // only sometimes is the overlay's own idea.
         for row in 0..list_rows {
-            let y = row_y(3 + row);
-            draw_text(
-                surface,
-                fonts,
-                x0,
-                y,
-                "│",
-                border,
-                Some(chrome.background),
-                false,
-            );
-            let right = x0 + ((box_cols - 1) as u32 * cw) as i32;
-            draw_text(
-                surface,
-                fonts,
-                right,
-                y,
-                "│",
-                border,
-                Some(chrome.background),
-                false,
-            );
-            let x = x0 + cw as i32;
             let position = self.scroll + row;
             let Some(&index) = self.matches.get(position) else {
-                // An empty list still gets a row, so the box does not collapse
-                // to nothing while the query is being corrected.
-                if self.matches.is_empty() && row == 0 {
-                    let mut text = clip(" (no matches)", inner);
-                    pad_to(&mut text, inner, ' ');
-                    draw_text(
-                        surface,
-                        fonts,
-                        x,
-                        y,
-                        &text,
-                        chrome.dim,
-                        Some(chrome.background),
-                        false,
-                    );
-                } else {
-                    let blank = " ".repeat(inner);
-                    draw_text(
-                        surface,
-                        fonts,
-                        x,
-                        y,
-                        &blank,
-                        chrome.dim,
-                        Some(chrome.background),
-                        false,
-                    );
-                }
                 continue;
             };
             let item = &self.items[index];
+            let detail_width = width_of(&item.detail);
+            let label_width = width_of(&item.label) + 1;
+            if detail_width == 0 || label_width + detail_width + 2 > inner {
+                continue;
+            }
             let selected = position == self.cursor;
             let (fg, bg) = if selected {
                 (chrome.accent_text, chrome.accent)
             } else {
-                (chrome.foreground, chrome.background)
+                (chrome.dim, chrome.background)
             };
-            let mut label = clip(&format!(" {}", item.label), inner);
-            pad_to(&mut label, inner, ' ');
-            draw_text(surface, fonts, x, y, &label, fg, Some(bg), selected);
-
-            // The detail is drawn over the padding, right aligned, and only
-            // when there is room for it and a gap after the label.
-            let detail_width = width_of(&item.detail);
-            let label_width = width_of(&item.label) + 1;
-            if detail_width > 0 && label_width + detail_width + 2 <= inner {
-                let offset = inner - detail_width - 1;
-                let detail_fg = if selected {
-                    chrome.accent_text
-                } else {
-                    chrome.dim
-                };
-                draw_text(
-                    surface,
-                    fonts,
-                    x + (offset as u32 * cw) as i32,
-                    y,
-                    &item.detail,
-                    detail_fg,
-                    Some(bg),
-                    false,
-                );
-            }
+            // A cell for the border, then as far right as the detail goes
+            // while leaving the last interior cell clear.
+            let offset = inner - detail_width;
+            draw_text(
+                surface,
+                fonts,
+                x0 + (offset as u32 * cw) as i32,
+                row_y(3 + row),
+                &item.detail,
+                fg,
+                Some(bg),
+                false,
+            );
         }
-
-        let mut bottom = "└".to_string();
-        pad_to(&mut bottom, box_cols - 1, '─');
-        bottom.push('┘');
-        draw_text(
-            surface,
-            fonts,
-            x0,
-            row_y(box_rows - 1),
-            &bottom,
-            border,
-            Some(chrome.background),
-            false,
-        );
     }
 }
 
@@ -560,19 +489,6 @@ fn clip_end(text: &str, cols: usize) -> String {
         used += w;
     }
     out.into_iter().rev().collect()
-}
-
-/// Extend `text` with `fill` until it is `cols` cells wide.
-///
-/// Visible to the crate so that the lock screen beside this one draws its box
-/// out of the same cells rather than out of its own copy of this.
-pub(crate) fn pad_to(text: &mut String, cols: usize, fill: char) {
-    let mut used = width_of(text);
-    let step = tos_term::char_width(fill).max(1) as usize;
-    while used + step <= cols {
-        text.push(fill);
-        used += step;
-    }
 }
 
 #[cfg(test)]

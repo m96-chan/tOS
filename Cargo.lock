@@ -39,6 +39,7 @@ dependencies = [
  "libc",
  "tos-crypt",
  "tos-font",
+ "tos-ime",
  "tos-input",
  "tos-platform",
  "tos-pty",
@@ -58,6 +59,10 @@ version = "0.0.5"
 dependencies = [
  "fontdue",
 ]
+
+[[package]]
+name = "tos-ime"
+version = "0.0.5"
 
 [[package]]
 name = "tos-input"

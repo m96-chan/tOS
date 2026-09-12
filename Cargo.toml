@@ -10,6 +10,7 @@ members = [
     "compositor/tos-session",
     "compositor/tos-platform",
     "compositor/tos-system",
+    "compositor/tos-ime",
     "compositor/tos-compositor",
     "installer",
     "preview",
@@ -32,6 +33,7 @@ tos-input = { path = "compositor/tos-input" }
 tos-session = { path = "compositor/tos-session" }
 tos-platform = { path = "compositor/tos-platform" }
 tos-system = { path = "compositor/tos-system" }
+tos-ime = { path = "compositor/tos-ime" }
 tos-compositor = { path = "compositor/tos-compositor" }
 tos-install = { path = "installer" }
 tos-preview = { path = "preview" }
