@@ -104,6 +104,11 @@ pub struct GraphicsCommand {
     pub delete: u8,
     /// `o=z` zlib compression.
     pub compressed: bool,
+    /// `O`: the offset within a named file at which the payload starts.
+    pub data_offset: u64,
+    /// `S`: how many bytes of a named file the payload is, 0 meaning "to the
+    /// end".
+    pub data_size: u64,
     pub payload: Vec<u8>,
 }
 
@@ -132,6 +137,8 @@ impl Default for GraphicsCommand {
             quiet: 0,
             delete: b'a',
             compressed: false,
+            data_offset: 0,
+            data_size: 0,
             payload: Vec::new(),
         }
     }
@@ -206,6 +213,14 @@ impl GraphicsCommand {
                 b'q' => cmd.quiet = text.parse().ok()?,
                 b'd' => cmd.delete = *value.first().unwrap_or(&b'a'),
                 b'o' => cmd.compressed = value.first() == Some(&b'z'),
+                // `O` and `S` name a slice of a file rather than the whole of
+                // it, which is how a sender that keeps several pictures in one
+                // shared memory object — or one rounded up to a page — says
+                // which part of it this command means. Ignoring them would not
+                // be a smaller feature, it would be a wrong picture answered
+                // with `OK`.
+                b'O' => cmd.data_offset = text.parse().ok()?,
+                b'S' => cmd.data_size = text.parse().ok()?,
                 // Unknown keys are ignored, as the protocol requires.
                 _ => {}
             }
@@ -287,6 +302,33 @@ impl GraphicsCommand {
     /// them. `a=f` spells the same choice `X=1`.
     pub fn compose_overwrites(&self) -> bool {
         self.cursor_stays
+    }
+
+    /// Narrow what a named medium handed over to the part `O=` and `S=` asked
+    /// for.
+    ///
+    /// Both default to "all of it", so a command that says nothing about
+    /// either gets the whole file and this is a no-op. They exist because a
+    /// shared memory object is sized in pages and a sender may keep more than
+    /// one picture in one: `O` says where this picture starts and `S` how long
+    /// it is. Reading the whole object and cutting here rather than seeking is
+    /// the same bytes for the caller and keeps the seam at
+    /// [`crate::medium::MediumReader`] a plain "read what this names".
+    ///
+    /// A start past the end is refused rather than treated as an empty
+    /// payload: the sender named bytes that are not there, and it is owed the
+    /// error rather than a protocol success over a picture nobody sent.
+    pub fn slice_named_payload(&self, mut bytes: Vec<u8>) -> Result<Vec<u8>, &'static str> {
+        if self.data_offset > 0 {
+            if self.data_offset >= bytes.len() as u64 {
+                return Err("EINVAL:the offset is past the end of the file");
+            }
+            bytes.drain(..self.data_offset as usize);
+        }
+        if self.data_size != 0 && self.data_size < bytes.len() as u64 {
+            bytes.truncate(self.data_size as usize);
+        }
+        Ok(bytes)
     }
 
     /// `a=a`: 1 stops the animation, 2 runs it while more frames are still
@@ -1267,15 +1309,24 @@ fn decode_frame(
             // The number is what `png::decode` measures against: the
             // scanlines and the RGBA they become, both held at once. Sixteen
             // bits a sample is the widest a PNG goes, so eight bytes a pixel
-            // plus a filter byte a row is the most an honest `w` by `h` file
-            // can cost, and anything dearer than that is not one.
+            // is the most an honest `w` by `h` file spends on samples.
+            //
+            // The per-row overhead is not one byte a row, because Adam7
+            // splits the picture into seven passes and each pass row carries
+            // its own filter byte and its own rounding up to a whole byte: the
+            // pass heights of a `h`-row image sum to just under `2h`, so four
+            // bytes a row covers both with room to spare. Getting that wrong
+            // is not a hole — the ceiling is still the rectangle's own size —
+            // but it would refuse an interlaced sixteen-bit file that is
+            // exactly the frame it says it is.
             let pixels = (w as usize)
                 .checked_mul(h as usize)
                 .ok_or("EINVAL:frame too large")?;
             let scanlines = (w as usize)
                 .checked_mul(8)
-                .and_then(|row| row.checked_add(1))
+                .and_then(|row| row.checked_add(4))
                 .and_then(|row| row.checked_mul(h as usize))
+                .and_then(|bytes| bytes.checked_add(64))
                 .ok_or("EINVAL:frame too large")?;
             let cap = pixels
                 .checked_mul(4)

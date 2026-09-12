@@ -346,14 +346,22 @@ Names are validated as POSIX spells them — one optional leading slash, no
 other slash, and not `.` or `..` — which is the same single component the
 directory holds.
 
-**A known gap.** kitty lets `t=f`, `t=t` and `t=s` carry `O=` (an offset into
-the file) and `S=` (how many bytes to read); tOS's parser ignores unknown
-keys, as the protocol requires, so both are ignored. The effect is that tOS
-reads the whole file from the start. For a shared memory object rounded up to
-a page that means trailing zeros the decoder does not mind — raw pixel formats
-take the first `s*v*stride` bytes and a PNG ends at its `IEND` — so clients
-work, but a client using `O=` to pack several images into one object will get
-the wrong one. That is a small, separable issue and it is listed at the end.
+**`O=` and `S=`.** kitty lets `t=f`, `t=t` and `t=s` carry `O=` (an offset into
+the file) and `S=` (how many bytes to read), which is how a client packs more
+than one picture into one shared memory object, or points at a picture inside
+an object rounded up to a page. Both are honoured, in
+`GraphicsCommand::slice_named_payload`, and honouring them is not a nicety: a
+terminal that ignored `O=` would answer `OK` over the wrong pixels rather than
+refusing anything, because raw pixel formats take the first `s*v*stride` bytes
+of whatever they are handed and would find them at the wrong place.
+
+They are applied after the read rather than by seeking, because the whole
+object was going to be read anyway — it is bounded by the store's budget
+either way — and because it keeps `MediumReader` a plain "read what this
+name names" rather than a file API with an offset in it. An `O=` past the end
+of the file is refused with `EINVAL:the offset is past the end of the file`:
+the sender named bytes that are not there, and it is owed the error rather
+than a success over an empty picture.
 
 ---
 
@@ -459,7 +467,5 @@ a limit nobody has.
 1. **Read off the parse loop.** Everything in Decisions 3 and 4 that is a
    latency argument rather than a memory one wants this, and it is the only
    real answer to a file on a filesystem that has stopped answering.
-2. **`O=` and `S=`.** The offset and size keys, which `t=s` clients use to
-   pack an object. Small, and separable from the policy.
-3. **Open as the asker.** Blocked on panes having a uid of their own; the
+2. **Open as the asker.** Blocked on panes having a uid of their own; the
    right shape for Decision 1 the moment they do.
