@@ -519,7 +519,13 @@ const PARTITION_WAIT_ATTEMPTS: usize = 20;
 /// The live image is an initramfs, so this is the whole of it: the compositor,
 /// busybox and the kernel modules. `/boot` is not among them, because it is
 /// on the medium rather than in the initramfs.
-pub const COPIED_DIRECTORIES: &[&str] = &["/bin", "/sbin", "/lib", "/etc", "/root"];
+///
+/// `/usr` is here for the font. Every path the compositor searches is under
+/// `/usr/share/fonts`, so a machine installed without it finds no face at all
+/// and falls back to the built-in ASCII one, which draws every kana as a
+/// hollow box. `/usr/lib/grub` rides along, which is what an installed machine
+/// would need to put its bootloader back.
+pub const COPIED_DIRECTORIES: &[&str] = &["/bin", "/sbin", "/lib", "/usr", "/etc", "/root"];
 
 /// The files GRUB loads, taken from the live medium.
 pub const BOOT_FILES: &[&str] = &["vmlinuz", "initramfs.gz"];
@@ -925,6 +931,14 @@ mod tests {
             inittab.contains("/sbin/tos"),
             "the machine has to boot into tOS: {inittab}"
         );
+    }
+
+    #[test]
+    fn the_font_comes_along_so_an_installed_machine_can_draw_japanese() {
+        // Every path tos-font searches is under /usr/share/fonts. Without it
+        // the machine falls back to the ASCII face and every kana is a box.
+        let backend = install(Firmware::Bios);
+        assert!(backend.did("copy /usr -> /mnt/target/usr"));
     }
 
     #[test]
