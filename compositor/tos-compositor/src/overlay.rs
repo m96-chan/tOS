@@ -152,7 +152,15 @@ impl Placement {
         if !self.contains(col, row) {
             return None;
         }
-        let ch = self.cell.1;
+        let (cw, ch) = self.cell;
+        // The two columns the frame is drawn in are inside the box, which is
+        // all `contains` is asked, and they are not the row beside them: the
+        // item's text starts one column in. Pressing the `│` at the edge of a
+        // row launched what that row named, which is a click nobody aimed.
+        let column = (((col * cw) as i32 - self.x) / cw as i32) as usize;
+        if column == 0 || column + 1 >= self.cols {
+            return None;
+        }
         let within = (((row * ch) as i32 - self.y) / ch as i32) as usize;
         let list = within.checked_sub(FIRST_LIST_ROW)?;
         (list < self.list_rows).then_some(self.scroll + list)
@@ -1178,6 +1186,17 @@ mod tests {
                 press(&mut overlay, at, area, cell),
                 OverlayOutcome::Consumed,
                 "row {row} of the box is not a list row"
+            );
+        }
+        // And the columns the border is drawn in, on a row that does hold an
+        // item: they are inside the box, which is all `contains` asks, and
+        // they are not the row beside them.
+        let list_row = placement.row_y(FIRST_LIST_ROW) as u32 / ch;
+        for col in [left, left + placement.cols as u32 - 1] {
+            assert_eq!(
+                press(&mut overlay, (col, list_row), area, cell),
+                OverlayOutcome::Consumed,
+                "column {col} of the box is a border, not the row it runs beside"
             );
         }
     }
