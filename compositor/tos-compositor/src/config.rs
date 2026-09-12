@@ -241,8 +241,23 @@ pub fn bindings(keymap: &Keymap) -> String {
         text.push(')');
     }
     text.push_str(":\n");
-    for row in describe::cheat_sheet(keymap) {
-        text.push_str(&format!("  {:<30} {}\n", row.keys, row.action));
+    let rows = describe::cheat_sheet(keymap);
+    // Padded to the widest key column there actually is rather than to a
+    // fixed number: the sheet gives each row as much of its width to the keys
+    // as its description can spare, so a constant here would either wrap the
+    // widest row or indent every other one past where it needs to be.
+    let column = rows
+        .iter()
+        .map(|row| row.keys.chars().count())
+        .max()
+        .unwrap_or(0);
+    for row in rows {
+        text.push_str(&format!(
+            "  {:<column$} {}\n",
+            row.keys,
+            row.action,
+            column = column
+        ));
     }
     text
 }

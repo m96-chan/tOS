@@ -288,6 +288,31 @@ fn a_split_layout_renders_every_pane() {
 }
 
 #[test]
+fn cycling_focus_reaches_every_pane_and_gives_a_zoom_back() {
+    // The directions stop at the edge of the workspace and refuse to move at
+    // all while a pane is zoomed, which is what the cycle is for: it is the
+    // way to the pane you cannot see from the one you are in.
+    let mut c = compositor(&["/bin/sh", "-c", "sleep 5"]);
+    let first = c.session().focus();
+    c.perform(Action::Split(Axis::Columns));
+    let second = c.session().focus();
+
+    assert!(c.perform(Action::FocusNext));
+    assert_eq!(c.session().focus(), first);
+    assert!(c.perform(Action::FocusPrevious));
+    assert_eq!(c.session().focus(), second);
+
+    // Zoomed, the direction keys have nowhere to go and the cycle takes the
+    // zoom off on its way out, so the pane it lands on is one that is drawn.
+    assert!(c.perform(Action::ToggleZoom));
+    assert!(!c.perform(Action::Focus(Direction::Left)));
+    assert!(c.perform(Action::FocusNext));
+    assert_eq!(c.session().focus(), first);
+    let area = c.grid_area();
+    assert_eq!(c.session().active().geometry(area).len(), 2);
+}
+
+#[test]
 fn a_zoomed_pane_fills_the_workspace() {
     let mut c = compositor(&["/bin/sh", "-c", "sleep 5"]);
     c.perform(Action::Split(Axis::Columns));
@@ -647,6 +672,47 @@ fn a_synchronized_update_is_painted_once_it_ends() {
         framebuffer.pixel(1, 1),
         0xcc5757,
         "the update was never drawn"
+    );
+}
+
+#[test]
+fn a_pane_holding_a_synchronized_update_open_asks_for_no_frame() {
+    // The damage left standing on a skipped pane is not a frame to draw but a
+    // frame owed once the program lets go, and DECSET 2026 has no timeout
+    // anywhere in tOS: reading it as a frame to draw costs one composed frame
+    // per pass of the loop for as long as the update stays open.
+    // `needs_render` declines to ask for that frame — and `pump_panes`, which
+    // the loop ors into the same decision, has to decline as well or the
+    // decline means nothing.
+    let mut c = compositor(&["/bin/sh", "-c", "sleep 30"]);
+    let focus = c.session().focus();
+    let mut framebuffer = OwnedFramebuffer::new(SIZE.0, SIZE.1);
+    // The first frame is the full redraw every session starts owing.
+    {
+        let mut surface = framebuffer.surface();
+        c.render_frame(&mut surface, true);
+    }
+
+    c.inject(b"\x1b[?2026h");
+    c.inject(b"\x1b[41m          \x1b[0m");
+    {
+        let mut surface = framebuffer.surface();
+        c.render_frame(&mut surface, true);
+    }
+    assert!(
+        c.pane(focus).unwrap().terminal.damage().is_dirty(),
+        "damage must survive a frame that skipped the pane"
+    );
+    assert!(!c.needs_render(), "a skipped pane asked to be drawn again");
+    assert!(
+        !c.pump_panes(),
+        "the pump reported the damage the frame deliberately left standing"
+    );
+
+    c.inject(b"\x1b[?2026l");
+    assert!(
+        c.needs_render(),
+        "the frame owed by the finished update never came"
     );
 }
 

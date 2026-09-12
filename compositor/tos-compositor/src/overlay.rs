@@ -22,7 +22,7 @@
 //! goes, what the query line looks like and what the list says.
 
 use tos_font::FontStack;
-use tos_input::{KeyCode, KeyEvent, Modifiers};
+use tos_input::{KeyCode, KeyEvent, Modifiers, MouseAction, MouseButton};
 use tos_render::{Rect, Surface};
 
 use crate::chrome::{draw_box, draw_text, BoxLine, BoxRect, Chrome};
@@ -41,6 +41,13 @@ const MAX_WIDTH: usize = 64;
 const MAX_LIST_ROWS: usize = 14;
 /// Rows the overlay spends on itself: two borders, the query and its divider.
 const CHROME_ROWS: usize = 4;
+/// Which row of the box the list starts on: the top border, the query line
+/// and the rule under it come first.
+const FIRST_LIST_ROW: usize = 3;
+/// How far one notch of the wheel moves a list. Three is what the scrollback
+/// uses, and a menu that jumped a whole page per notch would be a menu nobody
+/// can stop in the middle of.
+const WHEEL_ROWS: isize = 3;
 
 /// One row of an overlay's list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +95,78 @@ pub enum OverlayOutcome {
     Cancelled,
 }
 
+/// Where an overlay's box landed, and what is drawn in each of its rows.
+///
+/// The box is centred in whatever area the frame hands over, so where it is
+/// depends on the display size, the cell size and how long the list is — none
+/// of which the overlay is told until it is asked to draw. It is worked out
+/// once, by [`Overlay::placement`], and both the drawing and the mouse read
+/// the answer, the way [`crate::status::Bar`] places its pieces once and lets
+/// `draw` and `hit` share them. Two copies of this arithmetic would be two
+/// copies that agree until one of the numbers above changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    /// Top left corner of the box, in pixels.
+    pub x: i32,
+    pub y: i32,
+    /// The box in cells, borders counted.
+    pub cols: usize,
+    pub rows: usize,
+    /// How many of those rows the list got.
+    pub list_rows: usize,
+    /// The position within [`Overlay::matches`] drawn on the first list row,
+    /// already pulled back far enough to keep the cursor on screen.
+    pub scroll: usize,
+    /// The cell size the box was laid out for.
+    pub cell: (u32, u32),
+}
+
+impl Placement {
+    /// The top of one row of the box, in pixels, counting the top border as
+    /// row zero.
+    fn row_y(&self, row: usize) -> i32 {
+        self.y + (row as u32 * self.cell.1) as i32
+    }
+
+    /// Whether the cell at `col`, `row` of the display is inside the box.
+    ///
+    /// In pixels rather than cells, because that is what the box was placed
+    /// in: a cell counts as inside when the pixel it starts at is.
+    pub fn contains(&self, col: u32, row: u32) -> bool {
+        let (cw, ch) = self.cell;
+        let (x, y) = ((col * cw) as i32, (row * ch) as i32);
+        x >= self.x
+            && y >= self.y
+            && x < self.x + (self.cols as u32 * cw) as i32
+            && y < self.y + (self.rows as u32 * ch) as i32
+    }
+
+    /// The position within [`Overlay::matches`] drawn at a cell, if the cell
+    /// is on a list row at all. The borders, the title, the query line and
+    /// the rule are all `None`, and so is every cell of a prompt, which has
+    /// no list.
+    ///
+    /// The position can still be past the end of the match list: the row an
+    /// empty list says so on is a list row like any other.
+    pub fn row_at(&self, col: u32, row: u32) -> Option<usize> {
+        if !self.contains(col, row) {
+            return None;
+        }
+        let (cw, ch) = self.cell;
+        // The two columns the frame is drawn in are inside the box, which is
+        // all `contains` is asked, and they are not the row beside them: the
+        // item's text starts one column in. Pressing the `│` at the edge of a
+        // row launched what that row named, which is a click nobody aimed.
+        let column = (((col * cw) as i32 - self.x) / cw as i32) as usize;
+        if column == 0 || column + 1 >= self.cols {
+            return None;
+        }
+        let within = (((row * ch) as i32 - self.y) / ch as i32) as usize;
+        let list = within.checked_sub(FIRST_LIST_ROW)?;
+        (list < self.list_rows).then_some(self.scroll + list)
+    }
+}
+
 /// A titled list with a query line.
 ///
 /// Build it with the items already gathered — the overlay filters what it is
@@ -102,8 +181,8 @@ pub struct Overlay {
     matches: Vec<usize>,
     /// Position within `matches`, not within `items`.
     cursor: usize,
-    /// First visible row, kept in range by [`Overlay::draw`], which is the
-    /// only place the number of visible rows is known.
+    /// First visible row, kept in range by [`Overlay::placement`], which is
+    /// the only place the number of visible rows is known.
     scroll: usize,
     /// Whether the line itself is the answer rather than a filter over the
     /// list. A prompt has no list to choose from, so enter takes the text.
@@ -168,6 +247,13 @@ impl Overlay {
     /// The index into [`Overlay::items`] under the cursor, if anything matches.
     pub fn selected(&self) -> Option<usize> {
         self.matches.get(self.cursor).copied()
+    }
+
+    /// The position within [`Overlay::matches`] on the first visible row, as
+    /// of the last frame. Only the wheel moves this on its own, which is what
+    /// there is to look at from outside.
+    pub fn scroll(&self) -> usize {
+        self.scroll
     }
 
     pub fn selected_item(&self) -> Option<&OverlayItem> {
@@ -243,6 +329,129 @@ impl Overlay {
         OverlayOutcome::Changed
     }
 
+    /// Offer a mouse event to the overlay, in display cells.
+    ///
+    /// `area` and `cell` are the ones the frame draws with, so that the row
+    /// this answers for is the row under the pointer rather than the row
+    /// under where the box was last time the list was this long.
+    ///
+    /// The outcomes are the ones [`Overlay::handle_key`] already reports: a
+    /// click on a row is the same event as moving there and pressing enter,
+    /// and a press outside is escape. Nothing here is a second kind of
+    /// answer, so nothing downstream needs a second way to handle one.
+    pub fn handle_mouse(
+        &mut self,
+        col: u32,
+        row: u32,
+        button: Option<MouseButton>,
+        action: MouseAction,
+        area: Rect,
+        cell: (u32, u32),
+    ) -> OverlayOutcome {
+        let Some(placement) = self.placement(area, cell) else {
+            // A display too small to draw the box on still has an overlay
+            // open on it, eating every key. A press is the only evidence
+            // anybody is trying to get out of a menu they cannot see, so it
+            // is taken as one rather than swallowed.
+            return match action {
+                MouseAction::Press => OverlayOutcome::Cancelled,
+                _ => OverlayOutcome::Consumed,
+            };
+        };
+
+        // The wheel goes to the list wherever the pointer is. An overlay is
+        // modal: there is nothing else on screen for a notch to mean, and
+        // asking people to aim at a fourteen row box before they can scroll
+        // it is a rule that only ever costs them a notch.
+        if button.is_some_and(MouseButton::is_wheel) {
+            if action != MouseAction::Press {
+                return OverlayOutcome::Consumed;
+            }
+            return match button {
+                Some(MouseButton::WheelUp) => self.scroll_list(-WHEEL_ROWS, &placement),
+                Some(MouseButton::WheelDown) => self.scroll_list(WHEEL_ROWS, &placement),
+                _ => OverlayOutcome::Consumed,
+            };
+        }
+
+        match action {
+            MouseAction::Press => {
+                if !placement.contains(col, row) {
+                    // A list costs nothing to dismiss by accident: the same
+                    // rows are there again the moment it is reopened. A
+                    // half-typed name is not, so a prompt keeps what has been
+                    // typed and waits for an answer aimed at the question —
+                    // enter or escape. Clicking away from a box is also how
+                    // somebody moves the pointer off text they are reading,
+                    // and that gesture must not be able to rename a
+                    // workspace or throw the new name away.
+                    return if self.prompt {
+                        OverlayOutcome::Consumed
+                    } else {
+                        OverlayOutcome::Cancelled
+                    };
+                }
+                if button != Some(MouseButton::Left) {
+                    return OverlayOutcome::Consumed;
+                }
+                match placement.row_at(col, row) {
+                    Some(position) if position < self.matches.len() => {
+                        self.cursor = position;
+                        OverlayOutcome::Chosen(self.matches[position])
+                    }
+                    _ => OverlayOutcome::Consumed,
+                }
+            }
+            // Hover highlights, on bare motion and not only while a button is
+            // held: a menu whose rows light up only once you are already
+            // pressing is a menu that tells you what you chose after you have
+            // chosen it. The repaint that costs is bounded by the number of
+            // rows crossed rather than the number of events, because moving
+            // within one row reports `Consumed` and asks for no frame.
+            MouseAction::Motion | MouseAction::Drag => match placement.row_at(col, row) {
+                Some(position) if position < self.matches.len() => self.hover(position),
+                // Off the list, including off the box: the highlight stays
+                // where it was rather than clearing, so that the row the
+                // keyboard is on is still shown while the pointer is parked
+                // somewhere else.
+                _ => OverlayOutcome::Consumed,
+            },
+            MouseAction::Release => OverlayOutcome::Consumed,
+        }
+    }
+
+    /// Put the cursor on a row the pointer is over.
+    fn hover(&mut self, position: usize) -> OverlayOutcome {
+        if position == self.cursor {
+            return OverlayOutcome::Consumed;
+        }
+        self.cursor = position;
+        OverlayOutcome::Changed
+    }
+
+    /// Scroll the list, taking the cursor with it.
+    ///
+    /// The cursor moves because [`Overlay::placement`] pulls the scroll back
+    /// to wherever the cursor is: a wheel that moved the view alone would be
+    /// undone by the very next frame, and the list would sit still however
+    /// hard it was spun. Keeping the highlight on the same screen row is also
+    /// what the pointer expects, since the pointer has not moved either.
+    fn scroll_list(&mut self, delta: isize, placement: &Placement) -> OverlayOutcome {
+        let rows = placement.list_rows;
+        if rows == 0 || self.matches.len() <= rows {
+            return OverlayOutcome::Consumed;
+        }
+        let last = self.matches.len() - rows;
+        let next = (placement.scroll as isize + delta).clamp(0, last as isize) as usize;
+        if next == placement.scroll {
+            return OverlayOutcome::Consumed;
+        }
+        let offset = self.cursor.saturating_sub(placement.scroll);
+        self.scroll = next;
+        self.cursor = (next + offset).min(self.matches.len() - 1);
+        OverlayOutcome::Changed
+    }
+
     /// Rebuild the match list for the current query.
     fn refilter(&mut self) {
         let mut scored: Vec<(i32, usize)> = self
@@ -259,25 +468,22 @@ impl Overlay {
         self.scroll = 0;
     }
 
-    /// Draw the overlay centred in `area`, which is in pixels.
+    /// Where the box goes inside `area`, which is in pixels, when it is drawn
+    /// with cells of size `cell`.
     ///
-    /// Takes `&mut self` because this is where the number of visible rows is
-    /// known, and so where the scroll offset can be brought back into range.
-    pub fn draw(
-        &mut self,
-        surface: &mut Surface<'_>,
-        fonts: &mut FontStack,
-        area: Rect,
-        chrome: &Chrome,
-    ) {
-        let metrics = fonts.metrics();
-        let (cw, ch) = (metrics.cell_width.max(1), metrics.cell_height.max(1));
+    /// `None` when there is no honest way to draw it: a box needs a list row
+    /// plus the overlay's own rows, and a cell of margin on every side, and
+    /// one with no room inside it is worse than none.
+    ///
+    /// This takes `&self` and reports the scroll offset it would use rather
+    /// than storing it, so that a hit test costs the caller nothing and
+    /// cannot move the list out from under the frame that is about to draw
+    /// it. [`Overlay::draw`] is where the answer is kept.
+    pub fn placement(&self, area: Rect, cell: (u32, u32)) -> Option<Placement> {
+        let (cw, ch) = (cell.0.max(1), cell.1.max(1));
         let cols = (area.width / cw) as usize;
         let rows = (area.height / ch) as usize;
 
-        // A list row plus the overlay's own rows, and a cell of margin on
-        // every side. Below that there is no honest way to draw this, and a
-        // box with no room inside it is worse than none.
         // An empty list still gets a row, so that it has somewhere to say so.
         // A prompt has no list at all, and so no divider either.
         let chrome_rows = if self.prompt {
@@ -295,19 +501,60 @@ impl Overlay {
             .min(rows.saturating_sub(chrome_rows + 2));
         let box_cols = cols.saturating_sub(2).min(MAX_WIDTH);
         if (list_rows == 0 && !self.prompt) || rows < chrome_rows + 2 || box_cols < 12 {
-            return;
+            return None;
         }
         let box_rows = list_rows + chrome_rows;
-        let inner = box_cols - 2;
-        let x0 = area.x + (((cols - box_cols) / 2) * cw as usize) as i32;
-        let y0 = area.y + (((rows - box_rows) / 2) * ch as usize) as i32;
 
-        // Keep the cursor on screen now that the row count is known.
-        if self.cursor < self.scroll {
-            self.scroll = self.cursor;
+        // Keep the cursor on screen now that the row count is known, and the
+        // list itself with it. Pulling back is not enough on its own: a box
+        // that grew — a console that gained rows, a host terminal resized —
+        // keeps a scroll taken at the bottom of a shorter window and draws
+        // the tail of the list against a full height of blank rows.
+        let scroll = if self.cursor < self.scroll {
+            self.cursor
         } else if list_rows > 0 && self.cursor >= self.scroll + list_rows {
-            self.scroll = self.cursor + 1 - list_rows;
-        }
+            self.cursor + 1 - list_rows
+        } else {
+            self.scroll
+        };
+        // The last window that still ends on the last match. Clamping to it
+        // cannot hide the cursor, because that window covers the whole tail.
+        let scroll = scroll.min(self.matches.len().saturating_sub(list_rows));
+
+        Some(Placement {
+            x: area.x + (((cols - box_cols) / 2) * cw as usize) as i32,
+            y: area.y + (((rows - box_rows) / 2) * ch as usize) as i32,
+            cols: box_cols,
+            rows: box_rows,
+            list_rows,
+            scroll,
+            cell: (cw, ch),
+        })
+    }
+
+    /// Draw the overlay centred in `area`, which is in pixels.
+    ///
+    /// Takes `&mut self` because the scroll offset [`Overlay::placement`]
+    /// worked out is kept here: the frame that has just been drawn is what
+    /// the next keystroke and the next click are answered against.
+    pub fn draw(
+        &mut self,
+        surface: &mut Surface<'_>,
+        fonts: &mut FontStack,
+        area: Rect,
+        chrome: &Chrome,
+    ) {
+        let metrics = fonts.metrics();
+        let cell = (metrics.cell_width.max(1), metrics.cell_height.max(1));
+        let Some(placement) = self.placement(area, cell) else {
+            return;
+        };
+        self.scroll = placement.scroll;
+        let (cw, ch) = placement.cell;
+        let (x0, y0) = (placement.x, placement.y);
+        let (box_cols, box_rows) = (placement.cols, placement.rows);
+        let list_rows = placement.list_rows;
+        let inner = box_cols - 2;
 
         // The interior, row by row. The query line is left empty for the
         // code below: it is three colours and a block cursor, and no
@@ -350,12 +597,10 @@ impl Overlay {
             chrome,
         );
 
-        let row_y = |row: usize| y0 + (row as u32 * ch) as i32;
-
         // The query line, ending in a block cursor so it is obvious where the
         // keyboard is going. It starts a cell in, because the box has already
         // drawn the border it starts after.
-        let y = row_y(1);
+        let y = placement.row_y(1);
         let mut x = draw_text(
             surface,
             fonts,
@@ -411,7 +656,7 @@ impl Overlay {
                 surface,
                 fonts,
                 x0 + (offset as u32 * cw) as i32,
-                row_y(3 + row),
+                placement.row_y(FIRST_LIST_ROW + row),
                 &item.detail,
                 fg,
                 Some(bg),
@@ -869,6 +1114,274 @@ mod tests {
             fb.pixels().iter().all(|&px| px == 0),
             "nothing should be drawn"
         );
+    }
+
+    /// The cell size the bitmap face is drawn at, which is what turns the
+    /// pixels a placement is in into the cells a mouse event arrives in.
+    fn cell(fonts: &mut FontStack) -> (u32, u32) {
+        let metrics = fonts.metrics();
+        (metrics.cell_width.max(1), metrics.cell_height.max(1))
+    }
+
+    /// The cell one row of the list is drawn in, a little way in from the
+    /// left border so that the answer does not depend on the label's width.
+    fn row_cell(placement: &Placement, row: usize) -> (u32, u32) {
+        let (cw, ch) = placement.cell;
+        let x = placement.x as u32 / cw + 2;
+        let y = placement.row_y(FIRST_LIST_ROW + row) as u32 / ch;
+        (x, y)
+    }
+
+    fn press(
+        overlay: &mut Overlay,
+        at: (u32, u32),
+        area: Rect,
+        cell: (u32, u32),
+    ) -> OverlayOutcome {
+        overlay.handle_mouse(
+            at.0,
+            at.1,
+            Some(MouseButton::Left),
+            MouseAction::Press,
+            area,
+            cell,
+        )
+    }
+
+    fn motion(
+        overlay: &mut Overlay,
+        at: (u32, u32),
+        area: Rect,
+        cell: (u32, u32),
+    ) -> OverlayOutcome {
+        overlay.handle_mouse(at.0, at.1, None, MouseAction::Motion, area, cell)
+    }
+
+    fn wheel(
+        overlay: &mut Overlay,
+        button: MouseButton,
+        area: Rect,
+        cell: (u32, u32),
+    ) -> OverlayOutcome {
+        overlay.handle_mouse(0, 0, Some(button), MouseAction::Press, area, cell)
+    }
+
+    #[test]
+    fn a_press_on_a_row_chooses_what_is_drawn_there() {
+        let mut fonts = fonts();
+        let cell = cell(&mut fonts);
+        let area = Rect::new(0, 0, cell.0 * 60, cell.1 * 20);
+        let mut overlay = overlay(&["ls", "vim", "cat"]);
+        let placement = overlay.placement(area, cell).unwrap();
+        let outcome = press(&mut overlay, row_cell(&placement, 1), area, cell);
+        assert_eq!(outcome, OverlayOutcome::Chosen(1));
+        assert_eq!(overlay.items()[1].label, "vim");
+    }
+
+    #[test]
+    fn a_press_on_the_query_line_or_a_border_chooses_nothing() {
+        let mut fonts = fonts();
+        let cell = cell(&mut fonts);
+        let area = Rect::new(0, 0, cell.0 * 60, cell.1 * 20);
+        let mut overlay = overlay(&["ls", "vim"]);
+        let placement = overlay.placement(area, cell).unwrap();
+        let (cw, ch) = cell;
+        let left = placement.x as u32 / cw;
+        for row in [0, 1, 2] {
+            let at = (left + 2, placement.row_y(row) as u32 / ch);
+            assert_eq!(
+                press(&mut overlay, at, area, cell),
+                OverlayOutcome::Consumed,
+                "row {row} of the box is not a list row"
+            );
+        }
+        // And the columns the border is drawn in, on a row that does hold an
+        // item: they are inside the box, which is all `contains` asks, and
+        // they are not the row beside them.
+        let list_row = placement.row_y(FIRST_LIST_ROW) as u32 / ch;
+        for col in [left, left + placement.cols as u32 - 1] {
+            assert_eq!(
+                press(&mut overlay, (col, list_row), area, cell),
+                OverlayOutcome::Consumed,
+                "column {col} of the box is a border, not the row it runs beside"
+            );
+        }
+    }
+
+    #[test]
+    fn a_press_outside_the_box_cancels_a_list_and_is_swallowed_by_a_prompt() {
+        let mut fonts = fonts();
+        let cell = cell(&mut fonts);
+        let area = Rect::new(0, 0, cell.0 * 60, cell.1 * 20);
+        let mut list = overlay(&["ls"]);
+        assert_eq!(
+            press(&mut list, (0, 0), area, cell),
+            OverlayOutcome::Cancelled
+        );
+
+        let mut prompt = Overlay::prompt("rename workspace", "build");
+        assert_eq!(
+            press(&mut prompt, (0, 0), area, cell),
+            OverlayOutcome::Consumed
+        );
+        assert_eq!(prompt.query(), "build");
+    }
+
+    #[test]
+    fn the_pointer_highlights_the_row_it_is_over_and_repaints_only_when_it_changes() {
+        let mut fonts = fonts();
+        let cell = cell(&mut fonts);
+        let area = Rect::new(0, 0, cell.0 * 60, cell.1 * 20);
+        let mut overlay = overlay(&["one", "two", "three"]);
+        let placement = overlay.placement(area, cell).unwrap();
+
+        let at = row_cell(&placement, 2);
+        assert_eq!(
+            motion(&mut overlay, at, area, cell),
+            OverlayOutcome::Changed
+        );
+        assert_eq!(overlay.selected_item().unwrap().label, "three");
+        assert_eq!(
+            motion(&mut overlay, (at.0 + 1, at.1), area, cell),
+            OverlayOutcome::Consumed,
+            "still the same row"
+        );
+        // Off the box entirely: the keyboard's row is still the row shown.
+        assert_eq!(
+            motion(&mut overlay, (0, 0), area, cell),
+            OverlayOutcome::Consumed
+        );
+        assert_eq!(overlay.selected_item().unwrap().label, "three");
+    }
+
+    #[test]
+    fn the_wheel_scrolls_a_long_list_and_the_row_under_the_pointer_is_what_it_chooses() {
+        let names: Vec<String> = (0..40).map(|i| format!("program-{i}")).collect();
+        let items = names.iter().map(OverlayItem::new).collect();
+        let mut overlay = Overlay::new("many", items);
+        let mut fonts = fonts();
+        let cell = cell(&mut fonts);
+        let area = Rect::new(0, 0, cell.0 * 60, cell.1 * 24);
+        let placement = overlay.placement(area, cell).unwrap();
+        let at = row_cell(&placement, 1);
+
+        assert_eq!(
+            wheel(&mut overlay, MouseButton::WheelDown, area, cell),
+            OverlayOutcome::Changed
+        );
+        assert_eq!(overlay.scroll(), WHEEL_ROWS as usize);
+        // The scroll is what the next frame would draw, so the row under a
+        // pointer that has not moved is a different program now.
+        let placement = overlay.placement(area, cell).unwrap();
+        assert_eq!(placement.scroll, WHEEL_ROWS as usize);
+        assert_eq!(
+            press(&mut overlay, at, area, cell),
+            OverlayOutcome::Chosen(WHEEL_ROWS as usize + 1)
+        );
+    }
+
+    #[test]
+    fn the_wheel_stops_at_the_ends_and_a_list_that_fits_does_not_scroll() {
+        let mut short = overlay(&["ls", "vim"]);
+        let names: Vec<String> = (0..20).map(|i| format!("program-{i}")).collect();
+        let items = names.iter().map(OverlayItem::new).collect();
+        let mut long = Overlay::new("many", items);
+        let mut fonts = fonts();
+        let cell = cell(&mut fonts);
+        let area = Rect::new(0, 0, cell.0 * 60, cell.1 * 24);
+        assert_eq!(
+            wheel(&mut long, MouseButton::WheelUp, area, cell),
+            OverlayOutcome::Consumed,
+            "already at the top"
+        );
+        for _ in 0..20 {
+            wheel(&mut long, MouseButton::WheelDown, area, cell);
+        }
+        let placement = long.placement(area, cell).unwrap();
+        assert_eq!(long.scroll(), 20 - placement.list_rows);
+
+        assert_eq!(
+            wheel(&mut short, MouseButton::WheelDown, area, cell),
+            OverlayOutcome::Consumed
+        );
+        assert_eq!(short.scroll(), 0);
+    }
+
+    #[test]
+    fn a_list_scrolled_to_its_end_does_not_stay_there_when_the_box_grows_taller() {
+        // The window a list is read through is worked out afresh every frame,
+        // from a display size that changes: a host terminal is resized, a
+        // console gains rows on a mode set. Keeping the cursor on screen is
+        // only half of staying in range — a scroll left behind by a box that
+        // grew draws a full height frame with three items in it.
+        let mut fonts = fonts();
+        let cell = cell(&mut fonts);
+        let names: Vec<String> = (0..20).map(|i| format!("program-{i}")).collect();
+        let items = names.iter().map(OverlayItem::new).collect();
+        let mut overlay = Overlay::new("many", items);
+
+        let small = Rect::new(0, 0, cell.0 * 60, cell.1 * 9);
+        let placement = overlay.placement(small, cell).unwrap();
+        assert_eq!(placement.list_rows, 3, "a window worth scrolling");
+        for _ in 0..20 {
+            wheel(&mut overlay, MouseButton::WheelDown, small, cell);
+        }
+        assert_eq!(overlay.scroll(), 20 - 3, "the wheel should reach the end");
+
+        let grown = Rect::new(0, 0, cell.0 * 60, cell.1 * 24);
+        let placement = overlay.placement(grown, cell).unwrap();
+        assert_eq!(
+            placement.scroll + placement.list_rows,
+            20,
+            "the taller box drew blank rows under the end of the list"
+        );
+    }
+
+    #[test]
+    fn the_row_the_hit_test_names_is_the_row_that_was_drawn_highlighted() {
+        let mut fonts = fonts();
+        let cell = cell(&mut fonts);
+        let (cw, ch) = cell;
+        let (w, h) = (cw * 60, ch * 20);
+        let chrome = Chrome::default();
+        let area = Rect::new(0, 0, w, h);
+        let mut overlay = overlay(&["one", "two", "three", "four"]);
+
+        // One placement, asked for once: the click below and the assertions
+        // about the pixels are both answered out of it, so a box drawn
+        // somewhere other than where the hit test looks fails here rather
+        // than agreeing with a second copy of the same arithmetic.
+        let placement = overlay.placement(area, cell).unwrap();
+        let at = row_cell(&placement, 2);
+        assert_eq!(
+            motion(&mut overlay, at, area, cell),
+            OverlayOutcome::Changed
+        );
+
+        let mut fb = OwnedFramebuffer::new(w, h);
+        {
+            let mut surface = fb.surface();
+            overlay.draw(&mut surface, &mut fonts, area, &chrome);
+        }
+        // The interior of the row, not its borders: the box is drawn in the
+        // same blue the highlight is, so a scan that took the border in would
+        // find every row highlighted.
+        let accent = chrome.accent.pack();
+        let painted = |row: usize| -> bool {
+            let y = placement.row_y(FIRST_LIST_ROW + row) as u32;
+            let left = placement.x as u32 + cw;
+            (0..ch).any(|dy| {
+                (0..(placement.cols as u32 - 2) * cw)
+                    .any(|dx| fb.pixel(left + dx, y + dy) == accent)
+            })
+        };
+        assert!(
+            painted(2),
+            "the row the pointer is on is the highlighted one"
+        );
+        for row in [0, 1, 3] {
+            assert!(!painted(row), "row {row} should not be highlighted");
+        }
     }
 
     #[test]

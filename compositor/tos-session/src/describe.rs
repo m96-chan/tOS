@@ -18,12 +18,37 @@ use tos_input::{ImeKey, KeyCode, Keypad, MediaKey, ModifierKey, Modifiers};
 use crate::keys::{Action, Binding, Keymap};
 use crate::layout::{Axis, Direction};
 
-/// The widest the key column is allowed to get, in characters.
+/// How wide a row of the sheet can be, in characters.
 ///
-/// Every alias a binding has is true, but not all of them are worth the width.
-/// The overlay only draws the key column when it fits beside the description,
-/// so a row that lists four ways to do one thing ends up showing none of them.
-const MAX_KEYS_WIDTH: usize = 30;
+/// The overlay draws the sheet in a box of at most 64 columns, which leaves
+/// 62 inside the border, and it keeps a space between the description and the
+/// keys and two at the end.
+const ROW_WIDTH: usize = 62;
+
+/// What a row spends on something other than the keys: the space before them
+/// and the two after.
+const ROW_PADDING: usize = 3;
+
+/// How much of a row is left for the keys once the description has had its
+/// share.
+///
+/// Every alias a binding has is true, but not all of them are worth the
+/// width, and the overlay only draws the key column when it fits beside the
+/// description — so a row that lists four ways to do one thing ends up
+/// showing none of them.
+///
+/// The budget is per row rather than one number for the column because the
+/// descriptions are not all the same length, and a fixed cap is the wrong
+/// shape for the thing it is capping. A flat 30 was enough until the Kitty
+/// bindings arrived: `ctrl+shift+pagedown` is 19 characters on its own, so
+/// the page rows spent their whole allowance on the new alias and dropped
+/// `shift+pagedown` — advertising the longer key and hiding the one every
+/// other terminal on the machine uses. Short descriptions like "scroll back
+/// a page" have the room to spare; "move the pane to a workspace" does not,
+/// and only it should have to pay for that.
+fn keys_budget(action: &str) -> usize {
+    ROW_WIDTH.saturating_sub(action.chars().count() + ROW_PADDING)
+}
 
 /// The fewest bindings in a digit run before it is worth folding into a range.
 const MIN_RUN: usize = 3;
@@ -76,7 +101,7 @@ pub fn cheat_sheet(keymap: &Keymap) -> Vec<BindingHelp> {
             group.names.dedup();
             let names: Vec<String> = group.names.into_iter().map(|(_, name)| name).collect();
             BindingHelp {
-                keys: join(&collapse_digits(&names)),
+                keys: join(&collapse_digits(&names), keys_budget(&group.action)),
                 action: group.action,
             }
         })
@@ -111,9 +136,13 @@ pub fn describe(action: &Action) -> String {
         Action::Split(Axis::Rows) => "split into rows".into(),
         Action::ClosePane => "close the focused pane".into(),
         Action::Focus(direction) => format!("move focus {}", toward(*direction)),
+        Action::FocusNext => "focus the next pane".into(),
+        Action::FocusPrevious => "focus the previous pane".into(),
         Action::Resize(direction, _) => format!("move the divider {}", toward(*direction)),
         Action::ToggleZoom => "zoom the focused pane".into(),
         Action::Balance => "even out every split".into(),
+        Action::NextLayout => "next layout".into(),
+        Action::PreviousLayout => "previous layout".into(),
         Action::NewWorkspace => "new workspace".into(),
         Action::NextWorkspace => "next workspace".into(),
         Action::PreviousWorkspace => "previous workspace".into(),
@@ -156,7 +185,14 @@ pub fn key_name(binding: &Binding) -> String {
     // binding is known as "?", and "shift+/" is the same thing said the long
     // way round. Letters and digits keep their shift, because "ctrl+shift+t"
     // is how that one is written and nobody calls shift+3 "#".
-    if modifiers.contains(Modifiers::SHIFT) {
+    //
+    // Only when shift is doing the shifting on its own, though. Holding ctrl
+    // or alt as well means the key types nothing at all, so naming it after a
+    // character it cannot produce would be naming it after something that does
+    // not happen — and "ctrl+}" is not what the terminal these combinations
+    // come from calls ctrl+shift+].
+    let typed = !modifiers.contains(Modifiers::CTRL) && !modifiers.contains(Modifiers::ALT);
+    if typed && modifiers.contains(Modifiers::SHIFT) {
         if let KeyCode::Char(c) = binding.code {
             if !c.is_alphanumeric() && !c.is_whitespace() {
                 if let Some(shifted) = tos_input::keymap::shifted(c) {
@@ -235,8 +271,16 @@ fn rank(action: &Action) -> (u16, u16) {
         Action::Split(Axis::Rows) => (0, 1),
         Action::ClosePane => (1, 0),
         Action::Focus(direction) => (2, toward(*direction)),
+        // After the four directions, because they are the same question asked
+        // without having to know where the answer is on screen.
+        Action::FocusNext => (2, 4),
+        Action::FocusPrevious => (2, 5),
         Action::ToggleZoom => (3, 0),
         Action::Balance => (3, 1),
+        // With the zoom and the balance: all four are ways of rearranging the
+        // panes you already have, and the two layout keys are read as a pair.
+        Action::NextLayout => (3, 2),
+        Action::PreviousLayout => (3, 3),
         Action::Resize(direction, _) => (4, toward(*direction)),
         Action::NewWorkspace => (5, 0),
         Action::NextWorkspace => (5, 1),
@@ -332,16 +376,17 @@ fn split_digit(name: &str) -> (&str, Option<char>) {
     }
 }
 
-/// Join as many names as fit in the key column, keeping the first whatever
-/// happens: a row with no keys on it is not a row.
-fn join(names: &[String]) -> String {
+/// Join as many names as fit in `budget`, keeping the first whatever happens:
+/// a row with no keys on it is not a row, even when the description has eaten
+/// the width the keys wanted.
+fn join(names: &[String], budget: usize) -> String {
     let mut joined = String::new();
     for name in names {
         if joined.is_empty() {
             joined.push_str(name);
             continue;
         }
-        if joined.chars().count() + 3 + name.chars().count() > MAX_KEYS_WIDTH {
+        if joined.chars().count() + 3 + name.chars().count() > budget {
             break;
         }
         joined.push_str(" / ");
@@ -494,6 +539,9 @@ mod tests {
             "split into rows",
             "close the focused pane",
             "move focus left",
+            "focus the next pane",
+            "focus the previous pane",
+            "scroll back",
             "move the divider up",
             "zoom the focused pane",
             "even out every split",
@@ -561,12 +609,34 @@ mod tests {
 
     #[test]
     fn the_key_column_stays_narrow() {
-        // It is drawn beside the description, and only when it fits.
+        // It is drawn beside the description, and only when it fits — so what
+        // has to hold is that the whole row fits, not that the keys fit some
+        // number of their own.
         for help in cheat_sheet(&Keymap::default_bindings()) {
+            let width = help.action.chars().count() + ROW_PADDING + help.keys.chars().count();
+            assert!(width <= ROW_WIDTH, "{help:?} needs {width} columns");
+        }
+    }
+
+    #[test]
+    fn a_row_with_room_to_spare_keeps_the_key_the_rest_of_the_world_uses() {
+        // The regression the per-row budget exists to stop: ctrl+shift+pageup
+        // is long enough to have spent a flat 30-character column by itself,
+        // which left the page rows advertising the Kitty key and hiding the
+        // bare shift combination every other terminal has.
+        let sheet = cheat_sheet(&Keymap::default_bindings());
+        for action in ["scroll back a page", "scroll forward a page"] {
+            let row = sheet
+                .iter()
+                .find(|help| help.action == action)
+                .unwrap_or_else(|| panic!("no {action:?} row"));
             assert!(
-                help.keys.chars().count() <= MAX_KEYS_WIDTH,
-                "{:?} is too wide",
-                help.keys
+                row.keys.contains("ctrl+shift+page"),
+                "{row:?} lost the Kitty key"
+            );
+            assert!(
+                row.keys.contains("/ shift+page"),
+                "{row:?} lost the key every other terminal uses"
             );
         }
     }
@@ -592,6 +662,16 @@ mod tests {
                 Modifiers::SUPER.union(Modifiers::SHIFT)
             )),
             "super+shift+3"
+        );
+        // And punctuation keeps its shift once ctrl is holding it down,
+        // because then the key types nothing at all: the combination Kitty
+        // calls ctrl+shift+] is not a way of typing a brace.
+        assert_eq!(
+            key_name(&Binding::new(
+                KeyCode::Char(']'),
+                Modifiers::CTRL.union(Modifiers::SHIFT)
+            )),
+            "ctrl+shift+]"
         );
     }
 

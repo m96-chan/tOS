@@ -593,6 +593,16 @@ nor the other bindings see a key. `$PATH` is read once when it opens, and a
 directory that is missing, unreadable or enormous costs the launcher nothing
 worse than the names it would have contributed.
 
+The mouse reaches the box as well. A pointer moving over a row highlights it, a
+left press on one chooses it — the same answer enter gives — the wheel scrolls a
+list too long to fit, and a press outside closes it the way escape does. A
+prompt is the exception: a click away from it keeps what has been typed, because
+a list can be reopened unchanged and a half-typed name cannot be got back. The
+gaps between panes are draggable in the same spirit: a press on a divider takes
+hold of that divider and no other, moving the pointer moves it, and letting go
+drops it. What the mouse is holding is one thing at a time, so a drag along a
+divider never leaves a selection highlighted in the pane it crossed.
+
 The box itself is not the launcher. It is a list-and-filter surface that takes
 a title, a list of labels and their details, and reports which one was chosen —
 which is exactly the shape the four remaining items need. Power, network,
@@ -611,8 +621,8 @@ The status bar is a list of segments per side rather than a fixed strip. It
 ships showing the workspaces and the focused pane on the left, and the message
 slot, the link, the battery and a clock on the right; `[status] left` and
 `[status] right` name segments in the order they read on screen, out of
-`workspaces`, `panes`, `title`, `message`, `clock`, `battery`, `network`,
-`volume` and `bluetooth`. A segment whose machine cannot answer — a battery on
+`workspaces`, `panes`, `title`, `layout`, `message`, `clock`, `battery`,
+`network`, `volume` and `bluetooth`. A segment whose machine cannot answer — a battery on
 a desktop, an adapter on a machine with no Bluetooth — draws nothing at all
 rather than a slot saying so, and the rule that would have gone beside it does
 not appear either. One segment on the bar is elastic, and by default it is the
@@ -915,6 +925,22 @@ a pane with nowhere to go, and a virtual terminal is only taken over once the
 VT switch signals have handlers, so switching away with Ctrl+Alt+F2 cannot
 leave the console in graphics mode with no keyboard.
 
+Panes sit where the splits that made them put them, and a workspace can also
+be read through one of three named arrangements: `tall` gives one full-height
+pane the left and stacks the rest beside it, `fat` gives one full-width pane
+the top and puts the rest side by side underneath, and `grid` makes as square
+a grid as the pane count allows. `ctrl+shift+l` walks them and `ctrl+shift+b`
+walks back. None of the three touches the split tree — each works out where
+the panes go from the order they are in — so leaving `splits` and returning to
+it gives back every manual split and every dragged divider exactly as it was,
+where Kitty discards them the moment the layout is cycled past. Kitty's
+`stack` is missing on purpose: zooming a pane with `super+z` already shows the
+focused pane alone and full screen, and one behaviour does not need two keys.
+While a derived arrangement is up there is no divider on screen to drag, so
+the resize and balance keys refuse and say why rather than moving something
+nobody can see. The status bar names the arrangement in force, and says
+nothing at all while it is the tree, which is where every session starts.
+
 The last row is the honest gap: the kernel-facing backends have not yet been
 run on hardware. Everything above them has, through the nested and headless
 backends.
@@ -973,20 +999,61 @@ To render a frame without a display at all:
     -e /bin/sh -c 'ls; sleep 1'
 ```
 
-`tos --help` lists the options and the default key bindings. The leader key is
-`ctrl+a`; on hardware the same bindings work directly with `super`. The two
-bindings that grow a session are also where most people expect them:
-`ctrl+shift+enter` splits the focused pane and `ctrl+shift+t` opens a new
-workspace. `super+space` opens the launcher, `super+m` opens the notifications,
-`super+,` names the workspace and `super+shift+l` locks the screen on a machine
-that has a password to unlock with. `super+[` takes the keyboard into copy
-mode, where vi's motions — `h j k l`, `w b e`, `0 $`, `g G` and a screenful on
-`ctrl+f` and `ctrl+b` — move a copy cursor through the pane and its history,
-`v` fixes one end of the selection and `y` copies it and leaves; the arrow,
-home, end and page keys do the same for anyone who does not think in vi. From
-inside a session, `leader ?` puts the
-binding list over the panes; both it and `--help` are generated from the keymap
-that is running, so neither can fall behind it.
+`tos --help` lists the options and the default key bindings.
+
+Panes and workspaces answer to the combinations Kitty uses, because a pane is
+Kitty's window and a workspace is its tab, and tOS agrees with Kitty on every
+other protocol it speaks. These need nothing pressed first:
+
+| Key | Does |
+| --- | --- |
+| `ctrl+shift+enter` | split the focused pane |
+| `ctrl+shift+w` | close it |
+| `ctrl+shift+]` / `ctrl+shift+[` | focus the next or the previous pane |
+| `ctrl+shift+t` | open a workspace |
+| `ctrl+shift+right` / `ctrl+shift+left` | the next or the previous workspace |
+| `ctrl+shift+1` … `ctrl+shift+9` | a workspace by number |
+| `ctrl+shift+alt+t` | name the workspace |
+| `ctrl+shift+up` / `ctrl+shift+down` | scroll a line |
+| `ctrl+shift+page_up` / `ctrl+shift+page_down` | scroll a page |
+| `ctrl+shift+end` | jump back to the live screen |
+
+Kitty's `ctrl+shift+c` and `ctrl+shift+v` are deliberately left alone. tOS
+sends the Kitty keyboard protocol *into* its panes, so a program running in one
+can legitimately be handed `ctrl+shift+c`; claiming it at the compositor would
+take the combination away from every program in tOS at once. `ctrl+shift+q`
+closes a tab in Kitty and tOS has no close-workspace action to give it — only
+`Quit`, which leaves the compositor entirely — so it is left alone too.
+
+Everything else is on a leader key, `ctrl+a`, pressed and released before the
+key it prefixes. On hardware the same table works directly with `super`, which
+only a compositor that owns the keyboard can claim; the leader is what a nested
+development session has instead. So `leader x` and `super+x` close a pane,
+`leader h j k l` and the arrows move focus the way vim does, `super+space`
+opens the launcher, `super+m` opens the notifications, `super+,` names the
+workspace and `super+shift+l` locks the screen on a machine that has a password
+to unlock with.
+
+`super+[` takes the keyboard into copy mode, where vi's motions — `h j k l`,
+`w b e`, `0 $`, `g G` and a screenful on `ctrl+f` and `ctrl+b` — move a copy
+cursor through the pane and its history, `v` fixes one end of the selection and
+`y` copies it and leaves; the arrow, home, end and page keys do the same for
+anyone who does not think in vi. Copy and paste are `leader y` and `leader ]`.
+
+From inside a session, `leader ?` puts the binding list over the panes; both it
+and `--help` are generated from the keymap that is running, so neither can fall
+behind it.
+
+The mouse has a pointer to move. It is a small arrow drawn in software into the
+composited frame, after everything else and over everything else, outlined so
+that it stays findable against any background a pane or a menu can put behind
+it — a cell inversion needs no geometry but is several characters wide and says
+nothing about where the tip is. It appears the first time a pointing device is
+heard from and never before, so a machine that has no mouse is never given one
+to look for, and it goes away while somebody is typing and comes back on the
+next motion. Moving it repaints the rows of the pane it was over rather than the
+screen, the same way the Japanese preedit does, so a hand resting on a mouse
+costs a few rows of one pane per report instead of a frame of the panel.
 
 ## Configuration
 
@@ -1068,8 +1135,10 @@ divider-focused = #5f87d7
 selection = #5f87d7
 
 # What the status bar says, in the order it reads on screen, and what it says
-# it in. Segments: workspaces, panes, title, message, clock, battery, network,
-# volume, bluetooth. A segment this machine cannot answer draws nothing.
+# it in. Segments: workspaces, panes, title, layout, message, clock, battery,
+# network, volume, bluetooth. A segment this machine cannot answer draws
+# nothing, and layout says nothing while the panes are where the splits left
+# them.
 [status]
 left = workspaces title
 right = message network battery clock

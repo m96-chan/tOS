@@ -3,8 +3,26 @@
 //! tOS owns the whole keyboard, so bindings are direct combinations rather
 //! than a prefix key. A leader key is still supported, because a nested
 //! development session cannot rely on the super key reaching the compositor.
-//! The two bindings that grow a session, splitting a pane and opening a
-//! workspace, are also on their familiar ctrl+shift combinations.
+//!
+//! There are three tables, and two of them are the same table written twice:
+//! everything bound behind the leader is bound again with super, so `leader x`
+//! and `super+x` always do the same thing and a reader only has to learn one
+//! of them. The third is the window and workspace bindings, which follow
+//! Kitty's defaults on ctrl+shift — tOS speaks Kitty's graphics and keyboard
+//! protocols and invites the comparison everywhere else, so the keys that
+//! manage panes and workspaces are the ones a Kitty user already has in their
+//! fingers rather than whatever letters happened to be free. A pane is Kitty's
+//! window and a workspace is Kitty's tab. Anything new of that kind belongs in
+//! that table, not hunted for beside the leader.
+//!
+//! The Kitty table is bound direct only, and is deliberately not mirrored onto
+//! the leader and super the way the first table is. The L is why: `super+l`
+//! moves focus right and `super+shift+l` locks the screen, while `ctrl+shift+l`
+//! is the key Kitty cycles layouts with, so the moment ctrl+shift carries its
+//! own meanings the two modifiers have stopped being aliases for each other.
+//! Pretending otherwise would mean giving one of them up. [`Binding::matches`]
+//! compares modifiers for equality rather than containment, so however far the
+//! two tables diverge a key in one can never fire a binding in the other.
 
 use std::collections::HashMap;
 
@@ -21,12 +39,28 @@ pub enum Action {
     ClosePane,
     /// Move focus.
     Focus(Direction),
+    /// Move focus to the next pane in the workspace, wrapping at the end.
+    ///
+    /// Cycling and the four directions answer different questions. A direction
+    /// needs the user to know where the pane they want is on screen and stops
+    /// at the edge; cycling reaches every pane in the workspace from any of
+    /// them without anybody having to look. Kitty has only the cycle, tOS's
+    /// panes are a directional tree that makes the directions the natural
+    /// thing to want, and neither is the other's replacement.
+    FocusNext,
+    /// The same the other way round.
+    FocusPrevious,
     /// Move the divider next to the focused pane.
     Resize(Direction, i32),
     /// Make the focused pane fill the workspace, or restore it.
     ToggleZoom,
     /// Even out every split.
     Balance,
+    /// Arrange the workspace the next way, wrapping around; see
+    /// [`crate::layout::Arrangement`].
+    NextLayout,
+    /// The same walk backwards.
+    PreviousLayout,
     NewWorkspace,
     NextWorkspace,
     PreviousWorkspace,
@@ -164,9 +198,9 @@ impl Keymap {
     ///
     /// Direct bindings use super, which only a compositor that owns the
     /// keyboard can claim. The same set is available after the leader key for
-    /// nested sessions, where super never arrives. Splitting and opening a
-    /// workspace are additionally bound to ctrl+shift+enter and ctrl+shift+t,
-    /// which is where most people expect them.
+    /// nested sessions, where super never arrives. The window and workspace
+    /// bindings are additionally on Kitty's ctrl+shift combinations, which is
+    /// where a person who has used a terminal emulator will look first.
     pub fn default_bindings() -> Self {
         let mut keymap = Keymap::empty();
         keymap.leader = Some(Binding::new(KeyCode::Char('a'), Modifiers::CTRL));
@@ -342,19 +376,95 @@ impl Keymap {
             );
         }
 
-        // The combinations people arrive with from browsers, editors and other
-        // terminal emulators. tOS owns the keyboard, so these can be direct
-        // defaults rather than something the leader has to reach.
+        // Kitty's kitty_mod, and with it Kitty's defaults for everything that
+        // manages a window or a tab. tOS owns the keyboard, so these are
+        // direct rather than something the leader has to reach, and they are
+        // the answer to "what does this terminal do" for anybody who has used
+        // the terminal tOS spends the rest of its protocols agreeing with.
+        // They are not mirrored onto the leader and super: the table above is
+        // the set of things a nested session can still reach, and ctrl+shift
+        // carries meanings of its own that super already spends elsewhere.
+        const KITTY: Modifiers = Modifiers::CTRL.union(Modifiers::SHIFT);
+        let kitty: &[(KeyCode, Modifiers, Action)] = &[
+            (KeyCode::Enter, KITTY, Action::Split(Axis::Columns)),
+            (KeyCode::Char('w'), KITTY, Action::ClosePane),
+            // The bracket keys, where Kitty cycles through its windows. They
+            // read as the ends of a list rather than as a direction, which is
+            // what cycling is: the four arrows stay on super and the leader,
+            // because a tree of panes is the thing they are good at.
+            (KeyCode::Char(']'), KITTY, Action::FocusNext),
+            (KeyCode::Char('['), KITTY, Action::FocusPrevious),
+            (KeyCode::Char('t'), KITTY, Action::NewWorkspace),
+            (KeyCode::Right, KITTY, Action::NextWorkspace),
+            (KeyCode::Left, KITTY, Action::PreviousWorkspace),
+            // Kitty's set_tab_title, alt and all. The alt is what keeps this
+            // off ctrl+shift+t, which is a new workspace one key away from it
+            // and the more common of the two by a long way.
+            (
+                KeyCode::Char('t'),
+                KITTY.union(Modifiers::ALT),
+                Action::RenameWorkspace,
+            ),
+            // The scrollback, which Kitty puts on the navigation keys and
+            // which tOS had no line-at-a-time binding for at all: `Scroll` was
+            // in the action list with nothing to fire it.
+            (KeyCode::Up, KITTY, Action::Scroll(-1)),
+            (KeyCode::Down, KITTY, Action::Scroll(1)),
+            (KeyCode::PageUp, KITTY, Action::ScrollPage(-1)),
+            (KeyCode::PageDown, KITTY, Action::ScrollPage(1)),
+            (KeyCode::End, KITTY, Action::ScrollToBottom),
+        ];
+        for (code, modifiers, action) in kitty {
+            keymap.bind(Binding::new(*code, *modifiers), action.clone());
+        }
+        for n in 1..=9usize {
+            let digit = KeyCode::Char((b'0' + n as u8) as char);
+            keymap.bind(Binding::new(digit, KITTY), Action::SelectWorkspace(n));
+        }
+
+        // Some of Kitty's defaults are deliberately absent, and their absence
+        // is a decision rather than an oversight. ctrl+shift+c and ctrl+shift+v are
+        // Kitty's copy and paste, but Kitty can claim them because it is the
+        // terminal: tOS sends the Kitty keyboard protocol *into* its panes, so
+        // a program running in one can legitimately be sent ctrl+shift+c and
+        // `tos_input::encode` exists partly to encode exactly that. Binding
+        // them here would take the combination away from every program in tOS
+        // for good, which is too large a thing to do in passing; copy and
+        // paste stay on leader y and leader ] and their super aliases.
+        // ctrl+shift+q closes a tab in Kitty, and tOS has no close-workspace
+        // action to give it — the nearest thing is `Quit`, which leaves the
+        // whole compositor, and a key that quits everything when the user
+        // meant to close one workspace is worse than a key that does nothing.
+        // ctrl+shift+home scrolls to the top of the scrollback, and there is
+        // only `ScrollToBottom` to bind: there is no action that goes the
+        // other way. Each of them wants a decision that is not this table's to
+        // take, so the pane keeps the key until one is taken.
+
+        // Cycling the arrangement, on ctrl+shift and on nothing else. These
+        // two are not mirrored onto the leader or onto super, because both
+        // letters are already spoken for there: super+shift+l locks the
+        // screen, which every desktop does with an L and which nobody should
+        // lose to a layout, and super+b is the Bluetooth menu. They do not
+        // collide with these, because `Binding::matches` compares the whole
+        // modifier set for equality — ctrl+shift+l is not super+shift+l with
+        // something extra held down.
+        //
+        // ctrl+shift+l is Kitty's `next_layout`. ctrl+shift+b is a deliberate
+        // divergence: Kitty spends it on `move_window_backward` and has no
+        // previous-layout binding at all, and tOS would rather have the pair
+        // of keys than the match, since a cycle you can only walk forwards is
+        // a cycle you overshoot. Please do not "fix" this back.
+        keymap.bind(Binding::new(KeyCode::Char('l'), KITTY), Action::NextLayout);
         keymap.bind(
-            Binding::new(KeyCode::Enter, Modifiers::CTRL.union(Modifiers::SHIFT)),
-            Action::Split(Axis::Columns),
-        );
-        keymap.bind(
-            Binding::new(KeyCode::Char('t'), Modifiers::CTRL.union(Modifiers::SHIFT)),
-            Action::NewWorkspace,
+            Binding::new(KeyCode::Char('b'), KITTY),
+            Action::PreviousLayout,
         );
 
-        // Scrolling is useful without any prefix at all.
+        // Scrolling is useful without any prefix at all, and the bare shift
+        // combinations stay bound beside the ctrl+shift ones above rather than
+        // being replaced by them: they are what every other terminal on the
+        // machine uses, and a scrollback that needs a third finger where it
+        // used to need two would be a key taken away rather than one added.
         keymap.bind(
             Binding::new(KeyCode::PageUp, Modifiers::SHIFT),
             Action::ScrollPage(-1),
@@ -564,6 +674,72 @@ mod tests {
     }
 
     #[test]
+    fn the_layout_keys_and_the_keys_they_share_a_letter_with_do_not_collide() {
+        let mut keymap = Keymap::default_bindings();
+        // `Binding::matches` compares the whole modifier set for equality, so
+        // ctrl+shift+l and super+shift+l are two bindings and not one binding
+        // pressed carelessly. This is the test that says so, because the two
+        // sat on separate modifiers only by argument until now.
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('l'),
+                Modifiers::CTRL.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::NextLayout)
+        );
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('l'),
+                Modifiers::SUPER.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::Lock)
+        );
+        // Holding both modifiers is neither of them rather than whichever was
+        // inserted last.
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('l'),
+                Modifiers::CTRL
+                    .union(Modifiers::SHIFT)
+                    .union(Modifiers::SUPER)
+            )),
+            Resolution::Passthrough
+        );
+        // Same shape on the B: previous layout takes ctrl+shift, Bluetooth
+        // keeps super.
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('b'),
+                Modifiers::CTRL.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::PreviousLayout)
+        );
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('b'), Modifiers::SUPER)),
+            Resolution::Action(Action::ShowBluetooth)
+        );
+    }
+
+    #[test]
+    fn the_layout_keys_are_not_mirrored_onto_the_leader() {
+        // Every other binding is reachable three ways; these two are not,
+        // because the letters are taken behind the leader — leader l moves
+        // focus right and leader b opens the Bluetooth menu — and a nested
+        // session losing the layout keys is a smaller loss than losing those.
+        let mut keymap = Keymap::default_bindings();
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('l'), Modifiers::NONE)),
+            Resolution::Action(Action::Focus(Direction::Right))
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('b'), Modifiers::NONE)),
+            Resolution::Action(Action::ShowBluetooth)
+        );
+    }
+
+    #[test]
     fn super_bindings_fire_without_the_leader() {
         let mut keymap = Keymap::default_bindings();
         assert_eq!(
@@ -686,22 +862,223 @@ mod tests {
 
     #[test]
     fn the_ctrl_shift_bindings_need_both_modifiers() {
-        // Plain enter and a lone ctrl+t belong to the program in the pane.
+        // Ctrl+shift is a whole table now, so this is no longer two keys being
+        // careful: every key in it is one that a program in a pane is still
+        // owed with one modifier or none. Plain enter is the only thing a
+        // shell ever waits for, ctrl+w erases a word in readline and ctrl+[ is
+        // how a terminal spells escape.
         let mut keymap = Keymap::default_bindings();
-        for (code, modifiers) in [
-            (KeyCode::Enter, Modifiers::NONE),
-            (KeyCode::Enter, Modifiers::CTRL),
-            (KeyCode::Enter, Modifiers::SHIFT),
-            (KeyCode::Char('t'), Modifiers::NONE),
-            (KeyCode::Char('t'), Modifiers::CTRL),
-            (KeyCode::Char('t'), Modifiers::SHIFT),
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('t'),
+            KeyCode::Char('w'),
+            KeyCode::Char(']'),
+            KeyCode::Char('['),
+            KeyCode::Char('1'),
+            KeyCode::Char('9'),
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+        ] {
+            for modifiers in [Modifiers::NONE, Modifiers::CTRL, Modifiers::SHIFT] {
+                assert_eq!(
+                    keymap.resolve(&press(code, modifiers)),
+                    Resolution::Passthrough,
+                    "{code:?} with {modifiers:?} should reach the pane"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_shift_w_closes_the_pane_the_way_kitty_closes_a_window() {
+        let mut keymap = Keymap::default_bindings();
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('w'),
+                Modifiers::CTRL.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::ClosePane)
+        );
+        // And the key it had before is still the key it had before.
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('x'), Modifiers::NONE)),
+            Resolution::Action(Action::ClosePane)
+        );
+    }
+
+    #[test]
+    fn the_bracket_keys_cycle_focus_through_the_panes() {
+        let mut keymap = Keymap::default_bindings();
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char(']'),
+                Modifiers::CTRL.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::FocusNext)
+        );
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('['),
+                Modifiers::CTRL.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::FocusPrevious)
+        );
+        // The same two keys behind the leader are the clipboard and copy mode,
+        // which they were before this table existed and still are: the Kitty
+        // bindings are a table of their own rather than a rename of that one.
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char(']'), Modifiers::NONE)),
+            Resolution::Action(Action::Paste)
+        );
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('['), Modifiers::SUPER)),
+            Resolution::Action(Action::CopyMode)
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_and_the_side_arrows_change_workspace() {
+        let mut keymap = Keymap::default_bindings();
+        for (code, action) in [
+            (KeyCode::Right, Action::NextWorkspace),
+            (KeyCode::Left, Action::PreviousWorkspace),
         ] {
             assert_eq!(
-                keymap.resolve(&press(code, modifiers)),
-                Resolution::Passthrough,
-                "{code:?} with {modifiers:?} should reach the pane"
+                keymap.resolve(&press(code, Modifiers::CTRL.union(Modifiers::SHIFT))),
+                Resolution::Action(action)
             );
         }
+        // Super and the same arrows move focus between panes, which is the
+        // divergence the two tables exist to allow.
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Right, Modifiers::SUPER)),
+            Resolution::Action(Action::Focus(Direction::Right))
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_and_a_digit_selects_a_workspace() {
+        let mut keymap = Keymap::default_bindings();
+        for n in 1..=9usize {
+            let digit = KeyCode::Char((b'0' + n as u8) as char);
+            assert_eq!(
+                keymap.resolve(&press(digit, Modifiers::CTRL.union(Modifiers::SHIFT))),
+                Resolution::Action(Action::SelectWorkspace(n))
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_shift_alt_t_names_the_workspace_and_ctrl_shift_t_opens_one() {
+        // One key apart, and the wrong one of the two costs a workspace nobody
+        // asked for, so this is worth asserting together rather than singly.
+        let mut keymap = Keymap::default_bindings();
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('t'),
+                Modifiers::CTRL
+                    .union(Modifiers::SHIFT)
+                    .union(Modifiers::ALT)
+            )),
+            Resolution::Action(Action::RenameWorkspace)
+        );
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('t'),
+                Modifiers::CTRL.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::NewWorkspace)
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_and_the_up_and_down_keys_scroll_a_line_at_a_time() {
+        // The action existed from the beginning with nothing bound to it: a
+        // session could jump a page or jump to the bottom and had no way at
+        // all to move one line.
+        let mut keymap = Keymap::default_bindings();
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Up, Modifiers::CTRL.union(Modifiers::SHIFT))),
+            Resolution::Action(Action::Scroll(-1))
+        );
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Down,
+                Modifiers::CTRL.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::Scroll(1))
+        );
+    }
+
+    #[test]
+    fn the_scrollback_answers_to_kitty_without_losing_the_bare_shift_keys() {
+        let mut keymap = Keymap::default_bindings();
+        for (code, action) in [
+            (KeyCode::PageUp, Action::ScrollPage(-1)),
+            (KeyCode::PageDown, Action::ScrollPage(1)),
+            (KeyCode::End, Action::ScrollToBottom),
+        ] {
+            assert_eq!(
+                keymap.resolve(&press(code, Modifiers::CTRL.union(Modifiers::SHIFT))),
+                Resolution::Action(action.clone())
+            );
+            // The combination every other terminal on the machine uses is not
+            // taken away by the one Kitty uses arriving beside it.
+            assert_eq!(
+                keymap.resolve(&press(code, Modifiers::SHIFT)),
+                Resolution::Action(action)
+            );
+        }
+    }
+
+    #[test]
+    fn copy_paste_and_close_keep_their_kitty_keys_for_the_pane() {
+        // Three of Kitty's defaults are deliberately unbound, and this is what
+        // says so: tOS sends ctrl+shift to the program in the pane, so taking
+        // c and v here would take copy and paste from every program in tOS at
+        // once, and q would quit the compositor where Kitty closes a tab.
+        // Each of the three wants a decision of its own, and until one is
+        // taken the pane keeps the key — which is a thing to break on purpose,
+        // not by somebody filling in the table.
+        let mut keymap = Keymap::default_bindings();
+        for code in [KeyCode::Char('c'), KeyCode::Char('v'), KeyCode::Char('q')] {
+            assert_eq!(
+                keymap.resolve(&press(code, Modifiers::CTRL.union(Modifiers::SHIFT))),
+                Resolution::Passthrough,
+                "ctrl+shift+{code:?} is not ours to take"
+            );
+        }
+        // Nor is the top of the scrollback, which has no action to reach it.
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Home,
+                Modifiers::CTRL.union(Modifiers::SHIFT)
+            )),
+            Resolution::Passthrough
+        );
+    }
+
+    #[test]
+    fn the_kitty_table_is_not_mirrored_onto_the_leader_or_super() {
+        // The leader and super are two ways to say one table; ctrl+shift is a
+        // third table, and cycling focus lives only there. A nested session
+        // reaches it with ctrl+shift or not at all, which is the price of the
+        // two modifiers no longer having to agree.
+        let mut keymap = Keymap::default_bindings();
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('w'), Modifiers::SUPER)),
+            Resolution::Passthrough
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('w'), Modifiers::NONE)),
+            // Swallowed rather than performed: nothing is bound to it.
+            Resolution::Action(Action::Refresh)
+        );
     }
 
     #[test]

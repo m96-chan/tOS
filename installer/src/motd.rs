@@ -184,6 +184,22 @@ fn extended_color(rest: &[u16], palette: &Palette) -> (Option<Color>, usize) {
     }
 }
 
+/// The keys the greeting names, and the one thing in tOS that says what a
+/// binding is without asking the keymap.
+///
+/// Everything else — the sheet over the panes, `tos --help` — is generated
+/// from the map that is resolving keys, and cannot come to disagree with it.
+/// This cannot be: it is printed by a shell profile on a machine where the
+/// compositor is not the thing running, so it is a copy, and a copy has to be
+/// kept. It leads with the ctrl+shift combinations because they are the ones a
+/// person arrives already knowing from a terminal emulator, and names the
+/// leader underneath because that is what still works in a nested session,
+/// which is most of what anybody develops in.
+const KEYS: &str = "\x20 ctrl+shift+enter  split     ctrl+shift+w  close the pane\n\
+                    \x20 ctrl+shift+t  new workspace ctrl+shift+]  the next pane\n\
+                    \x20 ctrl+a d  split beside      ctrl+a s  split below\n\
+                    \x20 ctrl+a h/j/k/l  move focus  ctrl+a q  quit\n";
+
 /// The message a shell prints when it starts on the live image.
 ///
 /// This is the whole reason the art exists in a file rather than in the
@@ -201,9 +217,7 @@ pub fn live_message() -> String {
          \x20 Type \x1b[1m{INSTALL_COMMAND}\x1b[0m to install tOS on this machine.\n\
          \x20 Type \x1b[1mexit\x1b[0m to close this pane.\n\
          \n\
-         \x20 ctrl+a d  split beside     ctrl+a s  split below\n\
-         \x20 ctrl+a h/j/k/l  move focus ctrl+a q  quit\n\
-         \n"
+         {KEYS}\n"
     ));
     out
 }
@@ -219,13 +233,11 @@ pub fn installed_message() -> String {
         out.push('\n');
     }
     out.push('\n');
-    out.push_str(
+    out.push_str(&format!(
         "\x20 Type \x1b[1mexit\x1b[0m to close this pane.\n\
          \n\
-         \x20 ctrl+a d  split beside     ctrl+a s  split below\n\
-         \x20 ctrl+a h/j/k/l  move focus ctrl+a q  quit\n\
-         \n",
-    );
+         {KEYS}\n"
+    ));
     out
 }
 
@@ -405,8 +417,29 @@ mod tests {
     fn the_installed_message_still_carries_the_banner_and_the_keys() {
         let message = installed_message();
         assert!(message.contains("the terminal is the desktop"));
+        assert!(message.contains("ctrl+shift+enter"));
+        assert!(message.contains("ctrl+shift+t"));
         assert!(message.contains("ctrl+a d"));
         assert!(message.contains("ctrl+a q"));
+    }
+
+    #[test]
+    fn the_keys_lead_with_the_ones_a_terminal_user_already_has() {
+        // The greeting is the first thing a booted machine says, and the first
+        // keys in it should be the ones somebody would have tried anyway.
+        let message = installed_message();
+        let kitty = message.find("ctrl+shift+enter").expect("the Kitty keys");
+        let leader = message.find("ctrl+a d").expect("the leader keys");
+        assert!(kitty < leader, "the leader should be the second mention");
+    }
+
+    #[test]
+    fn the_keys_fit_the_console_the_banner_fits() {
+        // Wrapping a two column list turns it into four ragged lines, and the
+        // pane this is printed into is narrower than the screen.
+        for line in KEYS.lines() {
+            assert!(line.chars().count() <= 60, "{line:?} is too wide");
+        }
     }
 
     #[test]
@@ -427,6 +460,7 @@ mod tests {
     #[test]
     fn the_live_message_lists_the_keys_that_are_not_obvious() {
         let message = live_message();
+        assert!(message.contains("ctrl+shift+w"));
         assert!(message.contains("ctrl+a"));
         assert!(message.contains("split"));
     }
