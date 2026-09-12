@@ -721,27 +721,36 @@ impl Compositor {
                 self.handle_key(key) || put_away
             }
             // A host terminal reports cells; a device reports pixels. The two
-            // are separate types so the conversion can never be skipped.
-            InputEvent::Mouse(mouse) => {
-                let (cw, ch) = self.cell_size();
-                // Synthesised back the other way, so a nested session gets a
-                // pointer too. It snaps to the corner of the cell because SGR
-                // mouse reporting carries a cell number and nothing finer:
-                // there is no sub-cell position to be had, and an arrow drawn
-                // at the middle of the cell would be claiming a precision the
-                // host terminal never sent.
-                let moved = self
-                    .pointer
-                    .moved_to(mouse.col as u32 * cw, mouse.row as u32 * ch);
-                let routed = self.route_mouse(
-                    mouse.col as u32,
-                    mouse.row as u32,
-                    mouse.button,
-                    mouse.action,
-                    mouse.modifiers,
-                );
-                routed || moved
-            }
+            // are separate types so the conversion can never be skipped — and
+            // this arm deliberately does not make one, so there is no arrow
+            // here.
+            //
+            // The obvious synthesis is the cell numbers multiplied by the
+            // compositor's own cell size, and it is wrong: the only thing that
+            // sends a `Mouse` event is the nested backend, whose framebuffer is
+            // one pixel per host column and two per host row. It put the arrow
+            // several cells from the hand and, for anything past the top left
+            // corner of the display, clipped it away entirely.
+            //
+            // Multiplying by the right numbers is not this change to make.
+            // `route_mouse` below reads the same cell numbers as compositor
+            // grid cells, so the mapping that is wrong is the one the click and
+            // the arrow share: correcting it here alone would leave the arrow
+            // pointing somewhere the click does not land, which is worse than
+            // no arrow. It is a change to where clicks go, and belongs with the
+            // routing rather than with the drawing.
+            //
+            // Nothing is lost meanwhile. A nested session is running inside
+            // somebody's terminal window, which is drawing the host's own
+            // cursor under their hand already — it is the one backend that has
+            // a pointer without tOS painting one.
+            InputEvent::Mouse(mouse) => self.route_mouse(
+                mouse.col as u32,
+                mouse.row as u32,
+                mouse.button,
+                mouse.action,
+                mouse.modifiers,
+            ),
             InputEvent::Pointer(pointer) => {
                 let (cw, ch) = self.cell_size();
                 let x = pointer.x.max(0.0) as u32;

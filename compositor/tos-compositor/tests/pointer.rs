@@ -10,7 +10,7 @@
 
 use tos_compositor::pointer;
 use tos_compositor::{Compositor, Config};
-use tos_input::{InputEvent, KeyCode, KeyEvent, Modifiers, MouseAction, PointerEvent};
+use tos_input::{InputEvent, KeyCode, KeyEvent, Modifiers, MouseAction, MouseEvent, PointerEvent};
 use tos_render::{OwnedFramebuffer, Rect};
 use tos_session::{Action, Axis, PaneId};
 
@@ -473,6 +473,38 @@ fn the_pointer_is_drawn_over_an_open_overlay() {
     assert!(
         differences(&menu, &shown, arrow(&compositor, x, y)) > 20,
         "the overlay was painted over the pointer"
+    );
+}
+
+#[test]
+fn a_host_terminals_mouse_report_puts_no_arrow_on_the_panel() {
+    // A `Mouse` event carries the host terminal's cell numbers, and the nested
+    // backend is the only thing that sends one. Its framebuffer is one pixel
+    // per host column and two per host row, so the arrow synthesised from those
+    // numbers and the compositor's own cell size stood several cells from the
+    // hand and, for anything past the top left corner, was clipped away
+    // altogether. The mapping that is wrong is the one the click shares, so
+    // this asserts the absence rather than a position: an arrow that agrees
+    // with the click is a change to where clicks land.
+    let mut compositor = quiet();
+    let mut screen = Screen::new();
+    let empty = screen.frame(&mut compositor);
+
+    assert!(
+        !compositor.handle_input(InputEvent::Mouse(MouseEvent {
+            button: None,
+            action: MouseAction::Motion,
+            col: 10,
+            row: 5,
+            modifiers: Modifiers::NONE,
+        })),
+        "a host terminal's motion asked for a frame with nothing to put in it"
+    );
+    let after = screen.frame(&mut compositor);
+    assert_eq!(
+        differences(&empty, &after, Rect::new(0, 0, SIZE.0, SIZE.1)),
+        0,
+        "a host terminal's mouse report drew an arrow somewhere"
     );
 }
 
