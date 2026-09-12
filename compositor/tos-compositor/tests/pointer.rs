@@ -217,6 +217,26 @@ fn a_motion_inside_one_pane_repaints_that_pane_and_not_the_panel() {
 }
 
 #[test]
+fn a_pointer_that_has_stopped_moving_stops_asking_for_frames() {
+    // The other half of a motion producing a frame. `needs_render` is asked on
+    // every pass of the loop, and a pointer that went on answering yes would
+    // hold the loop awake and the panes repainting for as long as a hand was
+    // resting on the mouse.
+    let mut compositor = quiet();
+    let mut screen = Screen::new();
+    screen.frame(&mut compositor);
+    assert!(!compositor.needs_render());
+
+    assert!(move_to(&mut compositor, 120, 90));
+    assert!(compositor.needs_render(), "a motion asked for no frame");
+    screen.frame(&mut compositor);
+    assert!(
+        !compositor.needs_render(),
+        "a pointer standing still asks for a frame on every pass"
+    );
+}
+
+#[test]
 fn a_pointer_over_a_divider_is_uncovered_without_repainting_the_panel() {
     // Dividers are drawn only on a full redraw, so the obvious way to uncover
     // an arrow that was sitting on one is to ask for the panel back. Dragging a

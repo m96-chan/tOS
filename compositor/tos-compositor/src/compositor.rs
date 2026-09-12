@@ -4597,6 +4597,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_locked_screen_stops_asking_for_frames_on_the_pointer_s_account() {
+        // `needs_render` answers the pointer's part of the question by
+        // comparing where the arrow belongs against where it was last drawn,
+        // and the lock says it belongs nowhere. A locked frame that did not
+        // also forget the old rectangle would leave those two unable ever to
+        // agree, which is a frame per pass of the loop for as long as nobody
+        // is there to see one.
+        let mut compositor = compositor_with_password("pointer-idle");
+        compositor.handle_input(InputEvent::Pointer(tos_input::PointerEvent {
+            x: 40.0,
+            y: 40.0,
+            button: None,
+            action: MouseAction::Motion,
+            modifiers: tos_input::Modifiers::NONE,
+        }));
+        let mut framebuffer = tos_render::OwnedFramebuffer::new(640, 360);
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, true);
+        }
+        assert!(
+            !compositor.needs_render(),
+            "a pointer standing still asks for a frame on every pass"
+        );
+
+        compositor.lock_session();
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, true);
+        }
+        assert!(compositor.is_locked());
+        assert!(
+            !compositor.needs_render(),
+            "a locked session repaints on every pass"
+        );
+    }
+
     // ---- idle -----------------------------------------------------------
 
     /// A display that remembers what it was told about blanking.
