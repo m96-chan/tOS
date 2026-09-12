@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use tos_input::{KeyCode, KeyEvent, KeyState, Modifiers};
+use tos_input::{KeyCode, KeyEvent, KeyState, MediaKey, Modifiers};
 
 use crate::layout::{Axis, Direction};
 
@@ -44,8 +44,6 @@ pub enum Action {
     ScrollToBottom,
     Copy,
     Paste,
-    /// Start a selection with the keyboard.
-    BeginSelection,
     /// Open the launcher: a filtered list of programs, one of which starts in
     /// a new pane.
     OpenLauncher,
@@ -61,6 +59,42 @@ pub enum Action {
     Quit,
     /// Redraw everything.
     Refresh,
+    /// Take the keyboard and drive a selection with it: motions move a copy
+    /// cursor through the pane and its history, `v` fixes one end of the
+    /// selection, `y` copies it and leaves.
+    ///
+    /// This replaced a `BeginSelection` that made a selection of exactly one
+    /// cell and had no way to make it any bigger, because there was no action
+    /// that could move either end of it. A mode is what that was missing: the
+    /// leader disarms after one key, so extending a selection through the
+    /// keymap would be one leader press per cell.
+    CopyMode,
+    /// Open the Bluetooth controls: the adapter, what it is doing, and the
+    /// devices a scan found. Powering on, blocking and scanning all happen
+    /// from inside it rather than each getting a key of its own.
+    ShowBluetooth,
+    /// Open the power menu: power off, reboot or suspend. The menu is the
+    /// binding rather than the three actions being bound separately, because
+    /// two of the three cannot be taken back and neither should be one
+    /// keystroke away — the menu is where the confirmation lives.
+    PowerMenu,
+    /// Turn the default card up by one step.
+    VolumeUp,
+    /// Turn it down by one step.
+    VolumeDown,
+    /// Flip the default card between muted and not.
+    ToggleMute,
+    /// Show or hide the status bar.
+    ///
+    /// `--no-status-bar` decides what a session starts as, which is the wrong
+    /// granularity for the thing it decides: whether a row of the display is
+    /// worth spending is a question that has a different answer while reading
+    /// a long file than it does the rest of the time, and restarting the
+    /// compositor to change your mind means losing every pane.
+    ToggleStatusBar,
+    /// Open the network menu: the machine's interfaces, what state each is
+    /// in, and what can be done to one.
+    ShowNetworks,
 }
 
 /// A key combination.
@@ -209,7 +243,6 @@ impl Keymap {
             (KeyCode::Char(','), Modifiers::NONE, Action::RenameWorkspace),
             (KeyCode::PageUp, Modifiers::NONE, Action::ScrollPage(-1)),
             (KeyCode::PageDown, Modifiers::NONE, Action::ScrollPage(1)),
-            (KeyCode::Char('['), Modifiers::NONE, Action::BeginSelection),
             (KeyCode::Char(']'), Modifiers::NONE, Action::Paste),
             (KeyCode::Char('y'), Modifiers::NONE, Action::Copy),
             (KeyCode::Char('r'), Modifiers::NONE, Action::Refresh),
@@ -229,6 +262,40 @@ impl Keymap {
             // way vim does, and because every other desktop locks with an L.
             (KeyCode::Char('l'), Modifiers::SHIFT, Action::Lock),
             (KeyCode::Char('q'), Modifiers::NONE, Action::Quit),
+            // Where tmux keeps copy mode, and the key that used to start a
+            // selection nothing could extend.
+            (KeyCode::Char('['), Modifiers::NONE, Action::CopyMode),
+            // b for Bluetooth, which nothing else wants and which is what the
+            // radio is called everywhere a user has seen it before.
+            (KeyCode::Char('b'), Modifiers::NONE, Action::ShowBluetooth),
+            // Delete, so that the leader and super aliases are the same key as
+            // the ctrl+alt+delete bound below: one key to remember for this,
+            // rather than one for the console gesture and another for tOS.
+            (KeyCode::Delete, Modifiers::NONE, Action::PowerMenu),
+            // The angle brackets, because they point the way the volume goes
+            // and because both keys are free once shifted: plain comma
+            // renames a workspace and plain period is bound to nothing, so
+            // neither loses anything it was already doing. Mute takes shift
+            // and the m key rather than a plain m, which is the notification
+            // history — one letter, the two things you want from a machine
+            // that has just started making a noise at you.
+            (KeyCode::Char('.'), Modifiers::SHIFT, Action::VolumeUp),
+            (KeyCode::Char(','), Modifiers::SHIFT, Action::VolumeDown),
+            (KeyCode::Char('m'), Modifiers::SHIFT, Action::ToggleMute),
+            // Shift and the s key: s on its own splits into rows, and the
+            // shifted key is free. b would have been the letter the bar is
+            // named after, but b is the radio — a person looking for
+            // Bluetooth has one word for it and a person looking for the bar
+            // has several, so the unambiguous name wins the letter.
+            (
+                KeyCode::Char('s'),
+                Modifiers::SHIFT,
+                Action::ToggleStatusBar,
+            ),
+            // n is the next workspace and w is not taken, but neither reads
+            // as "network"; shift and the n key does, and shift is where the
+            // bindings that open a system menu have started to live.
+            (KeyCode::Char('n'), Modifiers::SHIFT, Action::ShowNetworks),
         ];
         for (code, modifiers, action) in bindings {
             keymap.bind_after_leader(Binding::new(*code, *modifiers), action.clone());
@@ -284,6 +351,30 @@ impl Keymap {
             Binding::new(KeyCode::End, Modifiers::SHIFT),
             Action::ScrollToBottom,
         );
+
+        // The one gesture every PC user already knows for "I want this machine
+        // to stop". tOS can claim it because it owns the keyboard: the console
+        // keyboard is in `K_OFF` while a session is up, so the kernel's own
+        // ctrl+alt+delete — which signals init — never sees the key. It opens
+        // the menu rather than doing anything, which is the whole difference
+        // between this and the reboot the BIOS does with the same fingers.
+        keymap.bind(
+            Binding::new(KeyCode::Delete, Modifiers::CTRL.union(Modifiers::ALT)),
+            Action::PowerMenu,
+        );
+        // The keys on the keyboard that are already labelled with what they
+        // do. They take no modifier and go nowhere near the leader, because a
+        // key that exists to change the volume has nothing else it could
+        // mean: there is no program in a pane that is owed a volume key, and
+        // a laptop whose volume keys do nothing under tOS while they work
+        // under every other system reads as tOS being broken.
+        for (code, action) in [
+            (MediaKey::VolumeUp, Action::VolumeUp),
+            (MediaKey::VolumeDown, Action::VolumeDown),
+            (MediaKey::Mute, Action::ToggleMute),
+        ] {
+            keymap.bind(Binding::new(KeyCode::Media(code), Modifiers::NONE), action);
+        }
         keymap
     }
 
@@ -621,11 +712,85 @@ mod tests {
     }
 
     #[test]
+    fn the_status_bar_can_be_hidden_from_the_keyboard() {
+        // `--no-status-bar` is a decision taken before there is a session;
+        // this is the same decision taken while looking at one.
+        let mut keymap = Keymap::default_bindings();
+        let shift_s = || press(KeyCode::Char('s'), Modifiers::SHIFT);
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('s'),
+                Modifiers::SUPER.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::ToggleStatusBar)
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&shift_s()),
+            Resolution::Action(Action::ToggleStatusBar)
+        );
+        // A shifted s is an S, which is most of what a pane gets it for, and
+        // the unshifted key still splits.
+        assert_eq!(keymap.resolve(&shift_s()), Resolution::Passthrough);
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('s'), Modifiers::NONE)),
+            Resolution::Action(Action::Split(Axis::Rows))
+        );
+    }
+
+    #[test]
     fn scrollback_keys_need_no_prefix() {
         let mut keymap = Keymap::default_bindings();
         assert_eq!(
             keymap.resolve(&press(KeyCode::PageUp, Modifiers::SHIFT)),
             Resolution::Action(Action::ScrollPage(-1))
+        );
+    }
+
+    #[test]
+    fn a_keyboards_own_volume_keys_need_no_modifier_and_no_leader() {
+        let mut keymap = Keymap::default_bindings();
+        for (media, action) in [
+            (MediaKey::VolumeUp, Action::VolumeUp),
+            (MediaKey::VolumeDown, Action::VolumeDown),
+            (MediaKey::Mute, Action::ToggleMute),
+        ] {
+            assert_eq!(
+                keymap.resolve(&press(KeyCode::Media(media), Modifiers::NONE)),
+                Resolution::Action(action)
+            );
+        }
+    }
+
+    #[test]
+    fn the_volume_combination_does_not_take_the_keys_under_it() {
+        // Shift is what tells the three of them apart from a plain comma,
+        // which renames a workspace, and from a plain m, which opens the
+        // notification list. Losing either to a mistake here would be a
+        // binding silently stolen rather than a volume key that does nothing.
+        let mut keymap = Keymap::default_bindings();
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('.'), Modifiers::SHIFT)),
+            Resolution::Action(Action::VolumeUp)
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char(','), Modifiers::NONE)),
+            Resolution::Action(Action::RenameWorkspace)
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('m'), Modifiers::NONE)),
+            Resolution::Action(Action::ShowNotifications)
+        );
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('m'),
+                Modifiers::SUPER.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::ToggleMute)
         );
     }
 
@@ -643,6 +808,52 @@ mod tests {
         keymap.unbind(&Binding::new(KeyCode::Function(1), Modifiers::NONE));
         assert_eq!(
             keymap.resolve(&press(KeyCode::Function(1), Modifiers::NONE)),
+            Resolution::Passthrough
+        );
+    }
+
+    #[test]
+    fn b_opens_the_bluetooth_controls_with_or_without_the_leader() {
+        let mut keymap = Keymap::default_bindings();
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('b'), Modifiers::SUPER)),
+            Resolution::Action(Action::ShowBluetooth)
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('b'), Modifiers::NONE)),
+            Resolution::Action(Action::ShowBluetooth)
+        );
+        // A plain b is a b, which is most of what a pane is typed.
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('b'), Modifiers::NONE)),
+            Resolution::Passthrough
+        );
+    }
+
+    #[test]
+    fn the_power_menu_answers_to_the_gesture_people_already_have() {
+        let mut keymap = Keymap::default_bindings();
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Delete,
+                Modifiers::CTRL.union(Modifiers::ALT)
+            )),
+            Resolution::Action(Action::PowerMenu)
+        );
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Delete, Modifiers::SUPER)),
+            Resolution::Action(Action::PowerMenu)
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Delete, Modifiers::NONE)),
+            Resolution::Action(Action::PowerMenu)
+        );
+        // A bare delete is the key that deletes a character, which is most of
+        // what a pane gets it for.
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Delete, Modifiers::NONE)),
             Resolution::Passthrough
         );
     }

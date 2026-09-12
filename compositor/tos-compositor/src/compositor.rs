@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use tos_font::{BitmapFont, FontStack, GlyphSource};
@@ -16,16 +17,27 @@ use tos_input::{
 use tos_platform::Display;
 use tos_render::{render, Rect as PixelRect, RenderOptions, Surface};
 use tos_session::{describe, Action, Axis, Keymap, PaneId, Rect, Resolution, Session};
+use tos_system::audio::Volume;
+use tos_system::bluetooth::{Adapter, Connection, SystemControl};
+use tos_system::net::{dhcp, Interface, Kind, Lease};
+use tos_system::power::PowerAction;
+use tos_system::Sysfs;
 use tos_term::TermEvent;
 
-use crate::chrome::{self, Chrome, StatusItem};
+use crate::bluetooth::{Choice, Controls, Scan, SCAN_SECONDS};
+use crate::chrome::{self, Chrome};
+use crate::clock::Clock;
 use crate::config::Config;
+use crate::copymode::{CopyMode, CopyOutcome};
 use crate::launcher;
 use crate::lock::{self, LockOutcome, LockScreen};
 use crate::notify::{self, Chosen, Notifications};
 use crate::overlay::{Overlay, OverlayItem, OverlayOutcome};
 use crate::pane::Pane;
+use crate::power;
 use crate::selection::{Selection, SelectionMode};
+use crate::status::{self, Bar, Hit, Piece, Segment};
+use crate::system::Machine;
 
 /// How often the cursor and blinking text change phase.
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
@@ -83,6 +95,94 @@ pub enum OverlayKind {
     RenameWorkspace,
     /// The key bindings, which are a list to read rather than to choose from.
     Bindings,
+    /// The Bluetooth controls: the adapter and what can be done to it. Rebuilt
+    /// under the user when a scan lands, so the row that was chosen is looked
+    /// up in [`crate::bluetooth::Controls`] rather than read off the label.
+    Bluetooth,
+    /// The three ways a machine stops: power off, reboot, suspend.
+    Power,
+    /// The second half of a power off or a reboot: the menu that has to be
+    /// answered before it happens. The action is carried in the kind rather
+    /// than looked up again from the row, so that the thing being confirmed is
+    /// decided once, by the menu that asked.
+    ConfirmPower(PowerAction),
+    /// The machine's interfaces. Choosing one opens [`OverlayKind::Link`]
+    /// for it.
+    Networks,
+    /// What can be done to the interface named by
+    /// [`Compositor::network_target`].
+    ///
+    /// The interface is not carried in the variant, because that would make
+    /// `OverlayKind` a type with a `String` in it: it is copied out of the
+    /// open overlay on every keystroke that closes one, and every other menu
+    /// would start paying for a payload it has not got.
+    Link,
+}
+
+/// Which way a volume binding turns the knob.
+///
+/// One [`Compositor::change_volume`] rather than three near-identical methods,
+/// because everything except the one call into the mixer — no card, a card
+/// that refused, refreshing the reading, saying what happened — is the same
+/// for all three, and three copies of it would be three places for the "no
+/// card" case to be got wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Knob {
+    Up,
+    Down,
+    Mute,
+}
+
+/// What to put on the status bar after the volume moved.
+///
+/// Muted is said instead of the level, not beside it, because the level of a
+/// muted card is not the question anybody has: turning a muted card up is a
+/// thing people do by mistake, and "45%" would look exactly like it had
+/// worked. A card with no mute switch is muted by being turned to zero, so on
+/// that hardware the two readings agree anyway.
+fn volume_status(volume: Volume) -> String {
+    if volume.muted {
+        "muted".to_string()
+    } else {
+        format!("volume {}%", volume.percent)
+    }
+}
+
+/// The rows of [`OverlayKind::Link`].
+///
+/// Named rather than written twice, because the label is how the row is
+/// matched when it is chosen: the menu that offers "bring the link up" and
+/// the arm that acts on it are the same string or they are a row that does
+/// nothing when pressed. Only one of the first two is ever offered — the one
+/// the link is not already doing.
+const BRING_UP: &str = "bring the link up";
+const TAKE_DOWN: &str = "take the link down";
+const REQUEST_ADDRESS: &str = "ask for an address";
+const JOIN: &str = "join a wireless network";
+
+/// The right hand column of a row in the interface list.
+///
+/// What somebody deciding which interface to poke wants, in the order they
+/// want it: what sort of link it is, what network it is on if it is wireless,
+/// and then the one fact that answers "is this the one" — an address, or the
+/// reason there is not one. `Interface::summary` is the status bar's answer
+/// to a related question and starts with the name, which is already the label
+/// here, so this is not it.
+fn link_detail(interface: &Interface) -> String {
+    let mut parts = vec![interface.kind.as_str().to_string()];
+    if let Some(ssid) = interface.ssid() {
+        parts.push(ssid.to_string());
+    }
+    match interface.ipv4().or_else(|| interface.ipv6()) {
+        Some(address) => parts.push(address.to_string()),
+        None if !interface.admin_up => parts.push("down".to_string()),
+        None if !interface.carrier => parts.push("no carrier".to_string()),
+        None => parts.push(format!("{}, no address", interface.state.as_str())),
+    }
+    if interface.is_default {
+        parts.push("default route".to_string());
+    }
+    parts.join("  ")
 }
 
 /// The running compositor.
@@ -109,6 +209,15 @@ pub struct Compositor {
     /// input — every kind of it, not only the keys — and the screen shows
     /// nothing of the session.
     lock: Option<LockScreen>,
+    /// Copy mode, and the pane it is selecting in. While it is up it owns the
+    /// keyboard: no key reaches the pane and no binding fires.
+    ///
+    /// The pane is remembered rather than looked up from the focus each time,
+    /// because a selection belongs to the text it was drawn over. Nothing can
+    /// move the focus while copy mode has the keyboard, but a pane can still
+    /// die under it, and a copy mode that followed the focus would come back
+    /// pointing at lines it never saw.
+    copy: Option<(PaneId, CopyMode)>,
     /// The last pane died while the screen was locked.
     ///
     /// Ending the session is a way out of a locked screen, so a locked one
@@ -141,6 +250,68 @@ pub struct Compositor {
     idle_lock_done: bool,
     /// The display refused to go dark, so this idle period stops asking.
     blank_refused: bool,
+    /// The machine underneath the session: battery, link, volume and adapter,
+    /// re-read on a timer rather than on damage, because nothing a person does
+    /// to a pane is what makes a cable go in. See [`crate::system`].
+    machine: Machine,
+    /// The Bluetooth menu's state and the inquiry thread, if one is running.
+    /// Kept on the compositor rather than in the overlay, because a scan
+    /// outlives the menu that started it: closing the box does not stop the
+    /// controller listening, and the answer still has somewhere to land.
+    bluetooth: Controls,
+    /// A suspend has been agreed to and has not happened yet.
+    ///
+    /// The compositor cannot carry one out itself: giving up DRM master and
+    /// the input grabs is the loop's business, because the loop is what holds
+    /// the display and the devices. So this is a flag the loop takes, the same
+    /// shape as the VT switch the kernel asks about. See [`crate::power`].
+    suspend_requested: bool,
+    /// How this session is ending, when it is ending because somebody asked
+    /// the machine to stop rather than asked tOS to.
+    ///
+    /// Kept rather than acted on for the same reason, and for one more: a
+    /// `reboot(2)` from inside the loop would leave the console in graphics
+    /// mode with its keyboard off, so whatever the kernel says on the way down
+    /// — including why it could not unmount something — would be said onto a
+    /// screen nobody can read. The session ends first, the terminal and the
+    /// display go back, and only then does the machine stop.
+    shutdown: Option<PowerAction>,
+    /// This machine has already been told it has no sound card.
+    ///
+    /// Whether there is a card is settled once, at the first ask, and never
+    /// changes for the life of the session — so saying it again is saying the
+    /// same true thing a second time. Without this, holding a volume key down
+    /// on a machine with no card fills the notification queue with one
+    /// sentence repeated, and pushes off the bar whatever was actually worth
+    /// reading.
+    said_no_sound_card: bool,
+    /// The clock on the status bar, with its zone already read.
+    clock: Clock,
+    /// What the clock last said.
+    ///
+    /// The repaint trigger, and the reason it is the rendered text rather than
+    /// a timestamp: a bar showing `%H:%M` has to repaint when the minute turns
+    /// over and not sixty times before it, and one showing `%S` has to repaint
+    /// every second. Comparing what would be drawn answers both without the
+    /// clock having to be asked how precise it is.
+    clock_text: String,
+    /// The interface [`OverlayKind::Link`] is about, put here when the
+    /// interface list was chosen from and read when its menu is.
+    network_target: Option<String>,
+    /// A DHCP acquisition in flight: the interface it is for, and where its
+    /// answer will arrive.
+    ///
+    /// It is on a thread because of how long it is allowed to take. A server
+    /// that is there answers in milliseconds, but a network with no server on
+    /// it is fifteen seconds of waiting, and the frame loop cannot spend
+    /// fifteen seconds anywhere: the clock would stop, the cursor would stop
+    /// blinking, and the keyboard would appear to have died — on a machine
+    /// whose owner has just been told something is being asked for.
+    ///
+    /// Only the waiting is on the thread. The ioctls that put the lease on
+    /// the link happen back here, on the thread that owns the [`Machine`],
+    /// which is why nothing has to be shared but the answer.
+    dhcp: Option<(String, mpsc::Receiver<io::Result<Lease>>)>,
 }
 
 impl Compositor {
@@ -151,6 +322,9 @@ impl Compositor {
         physical_mm: Option<(u32, u32)>,
     ) -> io::Result<Self> {
         let fonts = build_fonts(&config, size, physical_mm);
+        // Before the config is moved into the struct, and once rather than per
+        // frame: this reads the time zone database off the disk.
+        let clock = Clock::new(&config.status.clock_format, &config.status.zone);
         let mut compositor = Compositor {
             session: Session::new(),
             panes: HashMap::new(),
@@ -164,6 +338,7 @@ impl Compositor {
             notifications: Notifications::new(),
             overlay: None,
             lock: None,
+            copy: None,
             session_ended_while_locked: false,
             needs_full_redraw: true,
             running: true,
@@ -175,6 +350,18 @@ impl Compositor {
             blanked: false,
             idle_lock_done: false,
             blank_refused: false,
+            machine: Machine::at(Sysfs::new(&config.system_root)),
+            bluetooth: Controls::new(),
+            suspend_requested: false,
+            shutdown: None,
+            said_no_sound_card: false,
+            // Seeded rather than left empty, so that the first frame — which
+            // happens before the first tick — has a time on it rather than a
+            // gap where one is about to appear.
+            clock_text: clock.text(unix_now()),
+            clock,
+            network_target: None,
+            dhcp: None,
             config,
         };
 
@@ -228,6 +415,16 @@ impl Compositor {
 
     pub fn is_running(&self) -> bool {
         self.running
+    }
+
+    /// The machine underneath: what the last poll found, and the seams that
+    /// change it.
+    pub fn machine(&self) -> &Machine {
+        &self.machine
+    }
+
+    pub fn machine_mut(&mut self) -> &mut Machine {
+        &mut self.machine
     }
 
     pub fn session(&self) -> &Session {
@@ -521,6 +718,14 @@ impl Compositor {
         if self.overlay.is_some() {
             return self.overlay_key(&key);
         }
+        // Copy mode owns it in the same way, and for the same reason: its
+        // whole keymap is single letters that the pane would otherwise get.
+        // It is gated here rather than in `handle_input` because, unlike the
+        // lock, it claims only the keyboard — the mouse still selects, and a
+        // press on it is what ends the mode.
+        if self.copy.is_some() {
+            return self.copy_key(&key);
+        }
         // The leader indicator is drawn from the keymap rather than queued as
         // a notification: arming the leader is not news, and a message that
         // says so would cost whatever is in the queue its turn on screen. The
@@ -561,6 +766,35 @@ impl Compositor {
         modifiers: tos_input::Modifiers,
     ) -> bool {
         let area = self.grid_area();
+
+        // Copy mode ends here, above everything else, because the rule is
+        // about the press and not about where it landed: one selection cannot
+        // have two owners, and whoever reached for the mouse has stopped
+        // driving one from the keyboard. The ordering is load-bearing — the
+        // bar below returns without ever looking at a pane, so a press there
+        // handled after this point would switch workspaces and leave copy
+        // mode holding a pane nobody can see, eating every keystroke with no
+        // highlight anywhere to explain why.
+        let mut changed = false;
+        if action == MouseAction::Press && self.copy.is_some() {
+            self.leave_copy_mode();
+            changed = true;
+        }
+
+        // The bar next, because it is nowhere in the geometry below: the row
+        // it occupies is the row `grid_area` took away, so a press there
+        // matches no pane and would be dropped. Only a press, and only the
+        // left button: a drag that started in a pane and wandered down here
+        // still belongs to the selection it started, and falls through to the
+        // clamp that keeps it in its own pane.
+        if action == MouseAction::Press
+            && button == Some(MouseButton::Left)
+            && self.status_row() == Some(cell_y)
+        {
+            self.release_grab();
+            return self.click_status(cell_x) || changed;
+        }
+
         let geometry = self.session.active().geometry(area);
 
         // A drag that started in a pane keeps going there even once the
@@ -603,7 +837,6 @@ impl Compositor {
             return false;
         }
 
-        let mut changed = false;
         if action == MouseAction::Press && self.session.focus() != pane_id {
             let previous = self.session.focus();
             self.session.set_focus(pane_id);
@@ -656,24 +889,31 @@ impl Compositor {
         };
         let mut copied = None;
         let mut paste = false;
+        // Whether the pointer is dragging this pane's selection, which is the
+        // grab and nothing else. Asking the pane instead would be asking the
+        // wrong question: its flag says a selection is being made, and copy
+        // mode is making one with the keyboard while the mouse hangs idle, so
+        // a bare motion across the pane would walk the highlight away from the
+        // copy cursor and `y` would yank text nobody saw highlighted.
+        let dragging = self.mouse_grab == Some(pane_id);
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             let at = pane.anchor_at(local.col, local.row);
             match action {
                 MouseAction::Press if button == Some(MouseButton::Left) => {
-                    pane.selecting = true;
+                    pane.selection_in_progress = true;
                     pane.set_selection(Some(Selection::new(at, modifiers.alt(), mode)));
                     self.mouse_grab = Some(pane_id);
                     changed = true;
                 }
-                MouseAction::Drag | MouseAction::Motion if pane.selecting => {
+                MouseAction::Drag | MouseAction::Motion if dragging => {
                     if let Some(mut selection) = pane.selection {
                         selection.drag_to(at);
                         pane.set_selection(Some(selection));
                     }
                     changed = true;
                 }
-                MouseAction::Release if pane.selecting => {
-                    pane.selecting = false;
+                MouseAction::Release if dragging => {
+                    pane.selection_in_progress = false;
                     self.mouse_grab = None;
                     copied = pane.selected_text();
                     changed = true;
@@ -742,7 +982,7 @@ impl Compositor {
     fn release_grab(&mut self) {
         if let Some(pane) = self.mouse_grab.take() {
             if let Some(pane) = self.panes.get_mut(&pane) {
-                pane.selecting = false;
+                pane.selection_in_progress = false;
             }
         }
     }
@@ -923,16 +1163,6 @@ impl Compositor {
                 self.paste_text(&text);
                 true
             }
-            Action::BeginSelection => {
-                let focus = self.session.focus();
-                if let Some(pane) = self.panes.get_mut(&focus) {
-                    let cursor = pane.terminal.cursor();
-                    let at = pane.anchor_at(cursor.x, cursor.y);
-                    pane.set_selection(Some(Selection::new(at, false, SelectionMode::Cell)));
-                    return true;
-                }
-                false
-            }
             Action::OpenLauncher => {
                 // The scan happens here, once, rather than per keystroke.
                 let overlay = Overlay::new("run a program", launcher::programs_on_path());
@@ -954,11 +1184,227 @@ impl Compositor {
                 true
             }
             Action::Lock => self.lock_session(),
+            Action::CopyMode => self.enter_copy_mode(),
+            Action::ShowBluetooth => self.open_bluetooth(),
+            Action::PowerMenu => {
+                self.open_overlay(OverlayKind::Power, power::menu());
+                true
+            }
+            Action::VolumeUp => self.change_volume(Knob::Up),
+            Action::VolumeDown => self.change_volume(Knob::Down),
+            Action::ToggleMute => self.change_volume(Knob::Mute),
+            Action::ToggleStatusBar => {
+                // The bar owns a row of the display, so this is a layout
+                // change as much as a drawing one: `grid_area` gives the row
+                // back, `sync_layout` tells the panes they are a line taller,
+                // and the terminals inside them are resized and told so. A
+                // toggle that only stopped drawing would leave every pane the
+                // wrong height and the bottom row of the session unpainted.
+                self.config.status_bar = !self.config.status_bar;
+                self.sync_layout();
+                self.needs_full_redraw = true;
+                true
+            }
+            Action::ShowNetworks => {
+                self.open_networks();
+                true
+            }
             Action::Quit => {
                 self.running = false;
                 true
             }
         }
+    }
+
+    // ---- copy mode ------------------------------------------------------
+
+    /// Take the keyboard and start moving a selection with it.
+    ///
+    /// The mode starts where the terminal's cursor is drawn rather than where
+    /// the program thinks it is. The two differ only when the viewport has
+    /// been scrolled back, and there the program's cursor is off screen
+    /// entirely: entering copy mode at a point nobody can see, and then
+    /// yanking the viewport back to it on the first motion, would undo the
+    /// scrolling the user did to find what they wanted to copy.
+    fn enter_copy_mode(&mut self) -> bool {
+        let focus = self.session.focus();
+        let Some(pane) = self.panes.get_mut(&focus) else {
+            return false;
+        };
+        let cursor = pane.terminal.cursor();
+        let copy = CopyMode::new(pane.anchor_at(cursor.x, cursor.y));
+        // The same flag a mouse drag sets, and for the same reason: it says a
+        // selection belongs to an interaction that is still happening, so a
+        // program writing to the pane does not clear it out from under it. It
+        // says nothing about the pointer, which is why the drag arms of
+        // `route_mouse` read the grab instead — a mode driven by the keyboard
+        // must not be dragged by a mouse that is only being moved past.
+        pane.selection_in_progress = true;
+        pane.set_selection(copy.selection());
+        pane.terminal.damage_mut().mark_all();
+        self.copy = Some((focus, copy));
+        true
+    }
+
+    /// Give the pane back its keyboard and its selection.
+    ///
+    /// The highlight goes with the mode. What was copied is in the clipboard
+    /// by then, and a highlight left behind is the stale selection #36 was
+    /// about: the text under it moves on, and the highlight stops describing
+    /// anything.
+    fn leave_copy_mode(&mut self) {
+        let Some((id, _)) = self.copy.take() else {
+            return;
+        };
+        if let Some(pane) = self.panes.get_mut(&id) {
+            pane.selection_in_progress = false;
+            pane.clear_selection();
+            pane.terminal.damage_mut().mark_all();
+        }
+    }
+
+    /// Hand a key to copy mode, and act on what it says.
+    ///
+    /// The mode is taken out of the compositor and put back rather than
+    /// borrowed where it lies, because every outcome but one reaches for a
+    /// second piece of the compositor: the pane for its grid and its
+    /// viewport, and a yank for the clipboard and the status queue as well.
+    fn copy_key(&mut self, key: &KeyEvent) -> bool {
+        let Some((id, mut copy)) = self.copy.take() else {
+            return false;
+        };
+        let Some(pane) = self.panes.get_mut(&id) else {
+            // The pane died under the mode. There is nothing left to select
+            // in, and `self.copy` is already None.
+            return true;
+        };
+        match copy.handle_key(key, pane.terminal.grid()) {
+            CopyOutcome::Consumed => {
+                self.copy = Some((id, copy));
+                false
+            }
+            CopyOutcome::Changed => {
+                // The viewport follows the cursor rather than the cursor
+                // being held inside the viewport, which is what lets a `k` on
+                // the top row scroll into history instead of doing nothing.
+                let delta = copy.scroll_to_show(pane.terminal.grid());
+                if delta != 0 {
+                    pane.terminal.scroll_display(delta);
+                }
+                pane.set_selection(copy.selection());
+                // The copy cursor is drawn by the compositor over cells the
+                // terminal has no reason to think have changed, so moving it
+                // has to ask for the repaint itself.
+                pane.terminal.damage_mut().mark_all();
+                self.copy = Some((id, copy));
+                true
+            }
+            CopyOutcome::Copied => {
+                let text = copy.yanked().text(pane.terminal.grid());
+                self.copy = Some((id, copy));
+                self.leave_copy_mode();
+                // An explicit copy writes the clipboard, not primary: this is
+                // somebody deciding to keep something, which is exactly what
+                // a drag over a word must not be allowed to overwrite.
+                match text {
+                    Some(text) => {
+                        self.clipboard.insert(CLIPBOARD, text.into_bytes());
+                        self.notifications.status("copied");
+                    }
+                    None => self.notifications.status("nothing to copy"),
+                }
+                true
+            }
+            CopyOutcome::Left => {
+                self.copy = Some((id, copy));
+                self.leave_copy_mode();
+                true
+            }
+        }
+    }
+
+    // ---- sound ----------------------------------------------------------
+
+    // Picking an output device is not built, and this is why rather than an
+    // oversight.
+    //
+    // `tos-system` can already enumerate cards and attach a mixer to any of them,
+    // so the menu itself would be an afternoon: an `OverlayKind` variant over
+    // `audio::card_order`, the way the launcher is an overlay over `$PATH`. What
+    // it would not be is the thing the issue is asking for. A card is not an
+    // output. The machine this is most likely to run on has two cards — the codec
+    // and the HDMI audio on the graphics card — and choosing between speakers and
+    // the headphone socket, which is what "output device" means to the person
+    // asking, happens *within* one card, through its own auto-mute enumeration or
+    // through whichever of `Speaker` and `Headphone` that hardware exposes. A card
+    // picker would therefore be a menu that confidently does not do what its title
+    // says, which is worse than no menu.
+    //
+    // The second output that is genuinely a different device is a Bluetooth sink,
+    // and a Bluetooth sink has no `/dev/snd/controlC*` at all: it is a BlueZ
+    // transport, reached over a bus tOS does not carry. So the shape of the
+    // chooser — a list of ALSA cards, or a list of sinks of which some are not
+    // cards — is decided by #18 and by the sound server question in
+    // `docs/design/audio.md`, and building the ALSA-card version first would mean
+    // building the wrong one and then throwing it away. The live ISO also ships no
+    // `snd_*` modules at all (`iso/mkiso.sh`), so today the list this menu would
+    // show is empty on the only hardware tOS actually boots on.
+
+    /// Move the default card's volume and say where it ended up.
+    ///
+    /// The mixer answers with the level as it reads back rather than with the
+    /// level that was asked for, and that answer is what reaches the bar: a
+    /// card whose range is `0..=3` cannot be at 55%, and a card that is muted
+    /// by a switch does not get louder when it is turned up. Telling the user
+    /// what was asked for would be right almost always and wrong exactly when
+    /// it mattered.
+    ///
+    /// [`Machine::refresh`] is called rather than waited for because the poll
+    /// that would otherwise notice is up to a second away, and a second is
+    /// long enough to press the key again — so the status bar would show the
+    /// level from two presses ago while the user is still pressing. The
+    /// reading is refreshed rather than written from the [`Volume`] in hand so
+    /// that there is one path by which the machine's state gets into the
+    /// reading, and it is the one that asks the machine.
+    fn change_volume(&mut self, knob: Knob) -> bool {
+        // The borrow of the mixer ends with this statement: `refresh` and the
+        // notification below both want the compositor back.
+        let moved = self.machine.mixer().map(|mixer| match knob {
+            Knob::Up => mixer.volume_up(),
+            Knob::Down => mixer.volume_down(),
+            Knob::Mute => mixer.toggle_mute(),
+        });
+        match moved {
+            None => {
+                // Said once a session, not once a keypress; see
+                // `said_no_sound_card`. Said at all, because a volume key that
+                // does nothing and says nothing is indistinguishable from a
+                // volume key tOS failed to read.
+                if !self.said_no_sound_card {
+                    self.said_no_sound_card = true;
+                    self.notifications.status("no sound card");
+                    return true;
+                }
+                false
+            }
+            // A card that is there and will not take a write is worth the same
+            // complaint as a split that would not open: what the kernel said,
+            // once, rather than a key that quietly stops working.
+            Some(Err(error)) => {
+                self.report_error("volume", error);
+                true
+            }
+            Some(Ok(volume)) => {
+                self.machine.refresh(Instant::now());
+                self.notifications.status(volume_status(volume));
+                true
+            }
+        }
+    }
+
+    /// The copy mode that is up, if any.
+    pub fn copy_mode(&self) -> Option<&CopyMode> {
+        self.copy.as_ref().map(|(_, copy)| copy)
     }
 
     // ---- the lock -------------------------------------------------------
@@ -1223,7 +1669,218 @@ impl Compositor {
             // Nothing to choose: the sheet is there to be read, so enter
             // closes it the way escape does.
             OverlayKind::Bindings => {}
+            OverlayKind::Bluetooth => {
+                let Some(index) = row else { return };
+                self.choose_bluetooth(index);
+            }
+            OverlayKind::Power => {
+                // A row that names nothing is a menu that has been rebuilt
+                // wrong; doing nothing is the only safe answer on this menu.
+                let Some(action) = power::action_named(label) else {
+                    return;
+                };
+                if power::needs_confirming(action) {
+                    self.open_overlay(
+                        OverlayKind::ConfirmPower(action),
+                        power::confirmation(action),
+                    );
+                    return;
+                }
+                self.request_power(action);
+            }
+            // Only the row that names the action goes ahead; every other
+            // answer, including escape and the enter that opened this, leaves
+            // the session alone. See [`crate::power::confirmation`].
+            OverlayKind::ConfirmPower(action) => {
+                if power::confirmed(action, label) {
+                    self.request_power(action);
+                }
+            }
+            // The list is rebuilt from the machine each time it is opened, so
+            // the row's text is the only thing about it that is still true by
+            // the time this runs: an interface that went away between opening
+            // the menu and choosing from it is simply a name the machine no
+            // longer knows, and every arm below already has to cope with that.
+            OverlayKind::Networks => self.open_link_menu(label),
+            OverlayKind::Link => self.act_on_link(label),
         }
+    }
+
+    // ---- the network ----------------------------------------------------
+
+    /// Put the interface list up.
+    ///
+    /// Reading it needs nothing: `/sys/class/net` is world readable and
+    /// `getifaddrs(3)` asks no permission, so this menu opens on the live ISO
+    /// and for an ordinary user exactly as it does for root. Only the rows
+    /// inside it can fail, and each of them says so when it does — which is
+    /// the shape the issue asks for, status everywhere and configuration
+    /// where it is allowed.
+    fn open_networks(&mut self) {
+        let interfaces = self.machine.network().visible_interfaces();
+        if interfaces.is_empty() {
+            // Not an empty menu. An empty list with a query line under it
+            // looks like a menu that has not loaded yet, and this machine is
+            // not going to grow an interface while it is open.
+            self.notifications.status("no wired or wireless interfaces");
+            return;
+        }
+        let items = interfaces
+            .iter()
+            .map(|interface| {
+                OverlayItem::with_detail(interface.name.clone(), link_detail(interface))
+            })
+            .collect();
+        self.open_overlay(OverlayKind::Networks, Overlay::new("network", items));
+    }
+
+    /// Put up what can be done to one interface.
+    fn open_link_menu(&mut self, interface: &str) {
+        let Some(found) = self.machine.network().interface(interface) else {
+            self.notifications
+                .status(format!("{interface} is no longer there"));
+            return;
+        };
+        let mut items = vec![
+            OverlayItem::with_detail(
+                if found.admin_up { TAKE_DOWN } else { BRING_UP },
+                if found.admin_up {
+                    "switch the link off"
+                } else {
+                    "switch the link on"
+                },
+            ),
+            OverlayItem::with_detail(REQUEST_ADDRESS, "DHCP, and the route and resolvers with it"),
+        ];
+        if found.kind == Kind::Wireless {
+            // A row that does nothing, on purpose. A wireless interface in
+            // this menu with no mention of joining reads as a bug; a line
+            // saying what is missing and where the reasoning is written down
+            // reads as a decision.
+            items.push(OverlayItem::with_detail(JOIN, "not yet — see the note"));
+        }
+        self.network_target = Some(found.name.clone());
+        self.open_overlay(OverlayKind::Link, Overlay::new(found.summary(), items));
+    }
+
+    /// Do what a row of the link menu says.
+    fn act_on_link(&mut self, label: &str) {
+        let Some(interface) = self.network_target.take() else {
+            return;
+        };
+        match label {
+            BRING_UP | TAKE_DOWN => {
+                let up = label == BRING_UP;
+                let result = if up {
+                    self.machine.network().bring_up(&interface)
+                } else {
+                    self.machine.network().take_down(&interface)
+                };
+                match result {
+                    // The link has just moved, so the poll interval is not
+                    // the right amount of time to wait before saying so.
+                    Ok(()) => {
+                        self.machine.refresh(Instant::now());
+                        self.notifications
+                            .status(format!("{interface} {}", if up { "up" } else { "down" }));
+                    }
+                    Err(error) => self.report_error(
+                        &format!("{interface} {}", if up { "up" } else { "down" }),
+                        error,
+                    ),
+                }
+            }
+            REQUEST_ADDRESS => self.request_address(&interface),
+            JOIN => {
+                self.notifications.status(
+                    "joining a wireless network needs a supplicant; see docs/design/network.md",
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Start a DHCP acquisition on an interface.
+    ///
+    /// Everything that can be decided here is decided here, so that the
+    /// thread below carries no judgement at all: whether one is already
+    /// running, and whether the interface has a hardware address to be known
+    /// by. A DISCOVER from `00:00:00:00:00:00` is one no server will answer,
+    /// and finding that out fifteen seconds later is worse than not starting.
+    fn request_address(&mut self, interface: &str) {
+        if let Some((busy, _)) = &self.dhcp {
+            self.notifications
+                .status(format!("already asking on {busy}"));
+            return;
+        }
+        let Some(mac) = self.machine.network().hardware_address(interface) else {
+            self.notifications
+                .status(format!("{interface} has no hardware address to ask from"));
+            return;
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let on = interface.to_string();
+        // Named, because a thread that is asleep in `recvfrom` for fifteen
+        // seconds is a thread somebody will eventually find in a backtrace.
+        let spawned = std::thread::Builder::new()
+            .name("tos-dhcp".to_string())
+            // The receiver is dropped when the answer is collected, so a send
+            // into a closed channel is the ordinary end of a conversation
+            // nobody is listening to any more, not a failure.
+            .spawn(move || drop(sender.send(dhcp::acquire_on(&on, mac))));
+
+        match spawned {
+            Ok(_) => {
+                self.dhcp = Some((interface.to_string(), receiver));
+                self.notifications
+                    .status(format!("asking for an address on {interface}"));
+            }
+            Err(error) => self.report_error(&format!("dhcp on {interface}"), error),
+        }
+    }
+
+    /// Take the answer if the DHCP thread has one, and put it on the link.
+    ///
+    /// Called from [`Compositor::tick`], which runs at least once a second
+    /// because the machine poll is on that deadline — so a lease is applied
+    /// within a second of arriving without anything new having to be woken
+    /// up for it. Returns true when there is something new to paint.
+    fn collect_address(&mut self) -> bool {
+        let Some((interface, receiver)) = &self.dhcp else {
+            return false;
+        };
+        let answer = match receiver.try_recv() {
+            Ok(answer) => answer,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            // The thread went away without sending, which means it panicked:
+            // there is no answer coming, and leaving the slot occupied would
+            // mean no address could ever be asked for again.
+            Err(mpsc::TryRecvError::Disconnected) => Err(io::Error::other(
+                "the DHCP client stopped without answering",
+            )),
+        };
+        let interface = interface.clone();
+        self.dhcp = None;
+
+        match answer {
+            Ok(lease) => match self.machine.network().configure(&interface, &lease) {
+                Ok(()) => {
+                    self.machine.refresh(Instant::now());
+                    self.notifications
+                        .status(format!("{interface} {}", lease.describe()));
+                }
+                // The lease is real and the machine is not allowed to use it,
+                // which is the live ISO's whole situation. Both halves are
+                // said: what was offered, and what stopped it being taken.
+                Err(error) => self.notifications.status(format!(
+                    "{interface}: cannot take {}: {error}",
+                    lease.describe()
+                )),
+            },
+            Err(error) => self.notifications.status(format!("{interface}: {error}")),
+        }
+        true
     }
 
     /// The cheat sheet, built from the keymap that is resolving these keys.
@@ -1346,6 +2003,12 @@ impl Compositor {
             if self.mouse_grab == Some(pane) {
                 self.mouse_grab = None;
             }
+            // A copy mode whose pane has gone has nothing left to select in,
+            // and leaving it up would swallow the keyboard on behalf of text
+            // that no longer exists.
+            if self.copy.as_ref().is_some_and(|(id, _)| *id == pane) {
+                self.copy = None;
+            }
         }
         self.sync_layout();
         self.needs_full_redraw = true;
@@ -1355,16 +2018,168 @@ impl Compositor {
         self.notifications.status(format!("{what} failed: {error}"));
     }
 
+    // ---- bluetooth ------------------------------------------------------
+
+    /// Put the Bluetooth controls up.
+    ///
+    /// The adapter and its links are read here rather than taken from
+    /// [`Machine::reading`](crate::system::Machine::reading), which can be a
+    /// second old. A second is nothing on a status bar and everything on a
+    /// menu: the row that says "power hci0 on" for an adapter that came up
+    /// while the key was being pressed is the one row a person would press
+    /// twice and then distrust.
+    fn open_bluetooth(&mut self) -> bool {
+        let (adapter, connections) = self.adapter_now();
+        let overlay = self.bluetooth.menu(adapter.as_ref(), &connections);
+        self.open_overlay(OverlayKind::Bluetooth, overlay);
+        true
+    }
+
+    /// The adapter and the links it holds, read now.
+    fn adapter_now(&mut self) -> (Option<Adapter>, Vec<Connection>) {
+        let adapter = self.machine.bluetooth().default_adapter();
+        let connections = match adapter.as_ref() {
+            Some(adapter) => self.machine.bluetooth().connections(&adapter.name),
+            None => Vec::new(),
+        };
+        (adapter, connections)
+    }
+
+    /// Do what the chosen row said, and come back with the menu redrawn.
+    ///
+    /// Reopening is not politeness. Every one of these is a step towards
+    /// something else — unblock, then power on, then scan — and a menu that
+    /// closed after each would make the ordinary errand four keystrokes of
+    /// reopening. The adapter is re-read on the way back in, so the menu that
+    /// returns is the one the action left behind rather than the one it
+    /// started from.
+    fn choose_bluetooth(&mut self, index: usize) {
+        let choice = self.bluetooth.choose(index);
+        // Before the adapter is looked for, not after: most rows of this menu
+        // are there to be read, and pressing enter on the line that says this
+        // machine has no Bluetooth must not answer "no adapter".
+        if choice == Choice::Nothing {
+            return;
+        }
+        let Some(adapter) = self.machine.bluetooth().default_adapter() else {
+            // The adapter went away between the menu being drawn and the row
+            // being chosen, which a USB dongle does by being pulled out.
+            self.notifications.status("bluetooth: no adapter");
+            return;
+        };
+        let outcome = match choice {
+            Choice::PowerOn => self
+                .machine
+                .bluetooth()
+                .power_on(&adapter)
+                .map(|()| format!("{} on", adapter.name)),
+            Choice::PowerOff => self
+                .machine
+                .bluetooth()
+                .power_off(&adapter)
+                .map(|()| format!("{} off", adapter.name)),
+            Choice::Block => self
+                .machine
+                .bluetooth()
+                .set_blocked(&adapter, true)
+                .map(|()| format!("{} blocked", adapter.name)),
+            Choice::Unblock => self
+                .machine
+                .bluetooth()
+                .set_blocked(&adapter, false)
+                .map(|()| format!("{} unblocked", adapter.name)),
+            Choice::Scan => self.start_scan(adapter.clone()),
+            Choice::Nothing => return,
+        };
+        match outcome {
+            Ok(said) => self.notifications.status(format!("bluetooth: {said}")),
+            Err(why) => self.notifications.status(format!("bluetooth: {why}")),
+        }
+        // The status bar is showing a reading taken up to a second ago, and
+        // the thing it is a reading of has just been changed by hand. Asking
+        // now is what stops the bar disagreeing with the menu in front of it.
+        self.machine.refresh(Instant::now());
+        self.open_bluetooth();
+    }
+
+    /// Start an inquiry on the thread that is not this one.
+    ///
+    /// The refusals in front of it — a scan already running, an adapter that
+    /// is down or blocked — are answered here rather than by the thread,
+    /// because an error that takes eight seconds to arrive reads as a failure
+    /// of the radio rather than of the request.
+    fn start_scan(&mut self, adapter: Adapter) -> Result<String, tos_system::bluetooth::Error> {
+        if self.bluetooth.is_scanning() {
+            return Ok("already scanning".to_string());
+        }
+        if adapter.is_blocked() {
+            return Err(tos_system::bluetooth::Error::Blocked {
+                hardware: adapter.is_hard_blocked(),
+            });
+        }
+        if !adapter.powered {
+            return Err(tos_system::bluetooth::Error::NotPowered(adapter.name));
+        }
+        let sysfs = self.machine.sysfs().clone();
+        self.bluetooth
+            .begin(Scan::spawn(sysfs, SystemControl, adapter, SCAN_SECONDS));
+        Ok(format!("scanning for {SCAN_SECONDS} seconds"))
+    }
+
+    /// Take in whatever the inquiry thread has to say. True when it said
+    /// anything, which is a frame.
+    fn collect_scan(&mut self) -> bool {
+        let Some(outcome) = self.bluetooth.finished() else {
+            return false;
+        };
+        match outcome {
+            Ok(found) => {
+                self.bluetooth.set_found(found);
+                let count = self.bluetooth.found().len();
+                self.notifications.status(match count {
+                    0 => "bluetooth: nothing answered".to_string(),
+                    1 => "bluetooth: one device".to_string(),
+                    n => format!("bluetooth: {n} devices"),
+                });
+            }
+            Err(why) => self.notifications.status(format!("bluetooth: {why}")),
+        }
+        // A menu still on screen was drawn before any of this was known, and
+        // the rows it is offering are the ones the next keystroke will be
+        // answered against. `set_items` rather than reopening, so that a query
+        // typed while the controller was listening survives the answer.
+        if matches!(self.overlay, Some((OverlayKind::Bluetooth, _))) {
+            let (adapter, connections) = self.adapter_now();
+            let items = self.bluetooth.items(adapter.as_ref(), &connections);
+            if let Some((_, overlay)) = &mut self.overlay {
+                overlay.set_items(items);
+            }
+            self.needs_full_redraw = true;
+        }
+        true
+    }
+
     // ---- rendering ------------------------------------------------------
 
     /// Advance the blink phase and any animations. Returns true when anything
     /// changed.
     pub fn tick(&mut self) -> bool {
+        self.tick_at(Instant::now())
+    }
+
+    /// [`Compositor::tick`] against a time the caller names.
+    ///
+    /// Split out for the same reason [`Compositor::tick_clock`] takes one: the
+    /// rules below are about how long something has been on screen, and a test
+    /// that can only ask for the time now has to spend three real seconds to
+    /// watch a notification not be retired. One reading serves the whole tick,
+    /// including the blink phase, so everything the frame is told happened,
+    /// happened at the same instant.
+    fn tick_at(&mut self, now: Instant) -> bool {
         let mut changed = false;
         // Animated images move on their own clock. The compositor owns that
         // clock and hands the time to each terminal, which keeps the terminal
         // model free of time of its own.
-        let now = Instant::now();
         for pane in self.panes.values_mut() {
             if pane.terminal.advance_animations(now) {
                 changed = true;
@@ -1374,9 +2189,9 @@ impl Compositor {
         // reason the queue below does: a cursor nobody can see does not need
         // to be somewhere in particular, and flipping it would repaint the
         // whole session behind the blank twice a second.
-        if !self.blanked && self.last_blink.elapsed() >= BLINK_INTERVAL {
+        if !self.blanked && now.saturating_duration_since(self.last_blink) >= BLINK_INTERVAL {
             self.blink_visible = !self.blink_visible;
-            self.last_blink = Instant::now();
+            self.last_blink = now;
             changed = true;
         }
         // A notification only spends its time on screen while it is on screen:
@@ -1388,15 +2203,53 @@ impl Compositor {
         // the leader indicator holds it: time on screen means on screen. A
         // blanked screen is the same case again — there is nothing on it, and
         // it does not matter whose decision that was.
+        // Copy mode is the fourth, and it is the leader case exactly:
+        // [`Compositor::status_message`] hands it the same slot ahead of the
+        // queue, so a message raised while it is up is not drawn either — and
+        // copy mode is a mode somebody stays in, walking a selection across a
+        // screen, so three seconds behind it is not a near miss. The rule is
+        // about the slot rather than about any one thing that takes it, so
+        // anything new that claims the slot belongs on this list too.
         if self.lock.is_none()
             && !self.blanked
             && !self.keymap.is_pending()
+            && self.copy.is_none()
             && self.notifications.advance(now)
         {
             // Without a status bar the notification is a banner over the panes,
             // and the cells it covered are only repainted on damage they have
             // not got. Retiring it has to uncover them.
             self.needs_full_redraw |= !self.config.status_bar;
+            changed = true;
+        }
+        // The machine moves without anybody touching the session: a battery
+        // drains, a charger comes out, a link goes down. Nothing in the panes
+        // is damaged by any of it, so this poll is the only thing that would
+        // ever ask for the frame those changes belong on.
+        if self.machine.poll(now, self.blanked) {
+            changed = true;
+        }
+        // An inquiry is the one thing in tOS that runs off this thread, and
+        // this is where its answer comes back on to it. Polled rather than
+        // waited on: the loop is here every tenth of a second anyway, and a
+        // scan that lands while the screen is blanked can wait for the
+        // keystroke that lights it, since nobody is reading it in the dark.
+        if self.collect_scan() {
+            changed = true;
+        }
+        // And the clock moves without the machine moving either. The poll
+        // above is what wakes the loop for it — its deadline is folded into
+        // the wait in `frame_timeout_ms_at`, so the loop is up within a tenth
+        // of a second of every second — but a minute turning over is not a
+        // change in any reading, so it would report nothing and the bar would
+        // go on showing the old minute until somebody typed.
+        if self.tick_clock(unix_now()) {
+            changed = true;
+        }
+        // Not folded into the poll above: a DHCP answer is something somebody
+        // asked for and is waiting on, so it is collected even while the
+        // screen is dark rather than left in the channel until it is woken.
+        if self.collect_address() {
             changed = true;
         }
         changed
@@ -1451,7 +2304,17 @@ impl Compositor {
                 focused: *id == focus,
                 draw_cursor: true,
                 selection: pane.display_selection(),
-                selection_background: self.chrome.accent,
+                selection_background: self.chrome.selection(),
+                copy_cursor: self
+                    .copy
+                    .as_ref()
+                    .filter(|(copying, _)| copying == id)
+                    .and_then(|(_, copy)| copy.display_cursor(pane.terminal.grid())),
+                // The chrome's foreground rather than the accent the
+                // selection is painted in: the copy cursor spends most of its
+                // life sitting on one end of that highlight, and an outline
+                // in the colour of the thing under it is no outline at all.
+                copy_cursor_color: self.chrome.foreground,
                 force,
                 inactive_fade: self.config.inactive_fade,
             };
@@ -1506,12 +2369,18 @@ impl Compositor {
 
         if self.config.status_bar {
             self.draw_status(surface, area, ch);
-        } else if let Some(text) = self.notifications.status_line() {
-            // With no bar there is nowhere for a message to live, and going
-            // quiet is the one thing it must not do: this used to be why
-            // `--no-status-bar` made a failed split look like a dead key.
-            let over = PixelRect::new(0, 0, area.width * cw, ch);
-            notify::draw_banner(surface, &mut self.fonts, over, &self.chrome, &text);
+        }
+        // With no bar there is nowhere for a message to live, and going quiet
+        // is the one thing it must not do: this used to be why
+        // `--no-status-bar` made a failed split look like a dead key. A bar
+        // whose layout leaves the `message` segment out is the same case
+        // arrived at a different way, and gets the same banner rather than a
+        // configuration that silently swallows every failure.
+        if !self.config.status_bar || !self.config.status.shows_message() {
+            if let Some(text) = self.notifications.status_line() {
+                let over = PixelRect::new(0, 0, area.width * cw, ch);
+                notify::draw_banner(surface, &mut self.fonts, over, &self.chrome, &text);
+            }
         }
 
         // Last, and over everything: the overlay is modal, and the panes below
@@ -1562,56 +2431,235 @@ impl Compositor {
         self.needs_full_redraw = false;
     }
 
-    /// What the left of the status bar says: every workspace's name, in
-    /// position order, with the active one marked.
+    /// The bar as it will be drawn this frame: every configured segment asked
+    /// for its pieces, then laid out.
     ///
-    /// Separate from the drawing so that a test can read the bar's own words
-    /// rather than infer them from pixels.
-    fn status_items(&self) -> Vec<StatusItem> {
-        let active = self.session.active_index();
-        self.session
-            .workspaces()
-            .iter()
-            .enumerate()
-            .map(|(i, workspace)| StatusItem::new(workspace.name.clone(), i == active))
-            .collect()
+    /// Built rather than cached because everything on it is derived from state
+    /// that moves — the focused pane's title, the notification queue, the last
+    /// reading — and a cache would need invalidating from each of those. It is
+    /// a handful of `String`s once per frame, against a frame that touches
+    /// every pixel of the display.
+    ///
+    /// Also what a click consults, which is the point of it being a value:
+    /// where the third workspace starts is worked out once, and the drawing
+    /// and the routing read the same answer.
+    fn status_bar(&self) -> Bar {
+        let pieces = |segments: &[Segment]| -> Vec<Vec<Piece>> {
+            segments
+                .iter()
+                .map(|segment| self.segment_pieces(*segment))
+                .collect()
+        };
+        Bar::lay_out(
+            &pieces(&self.config.status.left),
+            &pieces(&self.config.status.right),
+            self.grid_area().width,
+        )
+    }
+
+    /// What one segment has to say, which is sometimes nothing.
+    ///
+    /// An empty vector is how absence is said, and it is said for two
+    /// different reasons that ought to look the same on the bar: a machine
+    /// with no battery has no charge to report, and a session with nothing
+    /// queued has no message to show. Neither is worth a slot saying so.
+    fn segment_pieces(&self, segment: Segment) -> Vec<Piece> {
+        let reading = self.machine.reading();
+        let one = |text: String| vec![Piece::new(text)];
+        match segment {
+            Segment::Workspaces => {
+                let active = self.session.active_index();
+                self.session
+                    .workspaces()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, workspace)| {
+                        // Numbered from one, the way the digit bindings are, so
+                        // that clicking the third workspace and pressing
+                        // super+3 reach the same call with the same argument.
+                        Piece::new(workspace.name.clone())
+                            .active(index == active)
+                            .clicking(Hit::Workspace(index + 1))
+                    })
+                    .collect()
+            }
+            Segment::Panes => {
+                let focus = self.session.focus();
+                self.session
+                    .active()
+                    .panes()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, id)| {
+                        let pane = self.panes.get(id)?;
+                        Some(
+                            Piece::new(chrome::pane_label(index, &pane.terminal, &pane.title))
+                                .active(*id == focus)
+                                .clicking(Hit::Pane(*id)),
+                        )
+                    })
+                    .collect()
+            }
+            Segment::Title => match self.focused_label() {
+                Some(label) => one(label),
+                None => Vec::new(),
+            },
+            Segment::Message => match self.status_message() {
+                // The elastic one: it is the only thing on the bar whose
+                // length is not the compositor's own choice, and clicking it
+                // opens the history, because the message that has just gone
+                // past is the one somebody wants back.
+                Some(text) => vec![Piece::new(text).elastic().clicking(Hit::Notifications)],
+                None => Vec::new(),
+            },
+            // What [`Compositor::tick_clock`] last worked out, rather than
+            // the time now. One reading per tick, drawn by every frame in
+            // between, which is also what makes the repaint trigger and the
+            // thing on screen provably the same string.
+            Segment::Clock => one(self.clock_text.clone()),
+            Segment::Battery => match reading.power.as_ref().and_then(status::battery_text) {
+                Some(text) => one(text),
+                None => Vec::new(),
+            },
+            Segment::Network => match &reading.link {
+                Some(link) => one(status::network_text(link)),
+                None => Vec::new(),
+            },
+            Segment::Volume => match &reading.volume {
+                Some(volume) => one(status::volume_text(volume)),
+                None => Vec::new(),
+            },
+            Segment::Bluetooth => match &reading.adapter {
+                Some(adapter) => one(status::bluetooth_text(adapter)),
+                None => Vec::new(),
+            },
+        }
+    }
+
+    /// The focused pane's label, and how far back it is looking.
+    fn focused_label(&self) -> Option<String> {
+        let focus = self.session.focus();
+        let panes = self.session.active().panes();
+        let index = panes.iter().position(|id| *id == focus).unwrap_or(0);
+        let pane = self.panes.get(&focus)?;
+        let label = chrome::pane_label(index, &pane.terminal, &pane.title);
+        match pane.terminal.display_offset() {
+            0 => Some(label),
+            scrolled => Some(format!("{label}  [scrollback {scrolled}]")),
+        }
+    }
+
+    /// The leader indicator, or else whatever is at the front of the queue.
+    ///
+    /// The leader comes first because it is the state of the keyboard right
+    /// now and lasts only until the next key, where a notification has three
+    /// seconds it can just as well spend later. Arming the leader does not
+    /// cost the queue its turn: [`Compositor::tick`] stops the clock on the
+    /// message while the indicator has the slot.
+    fn status_message(&self) -> Option<String> {
+        if self.keymap.is_pending() {
+            return Some("leader".to_string());
+        }
+        // Copy mode belongs beside the leader indicator rather than in the
+        // queue behind it: both say what the keyboard is doing at this
+        // instant, and a notification allowed to cover either would be three
+        // seconds in which the sheet's account of the keys is wrong. And, like
+        // the leader, taking the slot costs the queue nothing: `tick` holds
+        // its clock for exactly as long as this returns something else.
+        if let Some(copy) = self.copy_mode() {
+            return Some(copy.status().to_string());
+        }
+        self.notifications.status_line()
+    }
+
+    /// The row the bar sits on, when there is one.
+    ///
+    /// `None` when the bar is off, and also when the display is too short for
+    /// [`Compositor::grid_area`] to have given up a row for it — otherwise a
+    /// click on the last row of a two row display would switch workspaces
+    /// instead of reaching the pane that is drawn there.
+    fn status_row(&self) -> Option<u32> {
+        let (_, ch) = self.cell_size();
+        let rows = (self.size.1 / ch).max(1);
+        let area = self.grid_area();
+        (self.config.status_bar && area.height < rows).then_some(area.height)
+    }
+
+    /// A left press on the status bar.
+    ///
+    /// The bar is outside every pane's geometry — that is what `grid_area`
+    /// subtracting a row means — so before this a press here matched nothing
+    /// and was dropped, which left a strip of workspaces that looks clickable
+    /// and was not.
+    fn click_status(&mut self, col: u32) -> bool {
+        match self.status_bar().hit(col) {
+            Some(Hit::Workspace(number)) => {
+                // `select_workspace` says it succeeded when it was asked for
+                // the one already active, which is the right answer for a
+                // binding and the wrong one here: a click on the workspace you
+                // are in should not cost a full redraw of the session.
+                if self.session.active_index() + 1 == number {
+                    return false;
+                }
+                let changed = self.session.select_workspace(number);
+                if changed {
+                    self.sync_layout();
+                    self.needs_full_redraw = true;
+                }
+                changed
+            }
+            Some(Hit::Pane(id)) => {
+                if self.session.focus() == id {
+                    return false;
+                }
+                let previous = self.session.focus();
+                self.session.set_focus(id);
+                self.clear_selection(previous);
+                self.needs_full_redraw = true;
+                true
+            }
+            Some(Hit::Notifications) => self.perform(Action::ShowNotifications),
+            None => false,
+        }
+    }
+
+    /// Let the clock catch up, and say whether the bar has to be repainted.
+    ///
+    /// Separate from [`Compositor::tick`], and taking the time rather than
+    /// reading it, so that a test can watch a minute turn over without having
+    /// to wait one out.
+    ///
+    /// A session with no clock on its bar does none of this and asks for no
+    /// frames on account of one — which matters, because the alternative is a
+    /// machine that wakes up, paints every pixel and goes back to sleep once a
+    /// minute for the rest of its life in order to redraw nothing.
+    fn tick_clock(&mut self, unix: i64) -> bool {
+        if !self.config.status.shows_clock() {
+            return false;
+        }
+        let text = self.clock.text(unix);
+        if text == self.clock_text {
+            return false;
+        }
+        self.clock_text = text;
+        // The clock is kept current even while nobody can see it, because it
+        // costs one formatted string and it means the bar is right on the
+        // frame it comes back rather than on the one after. Asking for that
+        // frame is the part that is skipped: there is nothing on a dark or
+        // hidden bar for a new minute to change.
+        !self.blanked && self.config.status_bar
     }
 
     fn draw_status(&mut self, surface: &mut Surface<'_>, area: Rect, cell_height: u32) {
-        let items = self.status_items();
-
-        let focus = self.session.focus();
-        // The leader indicator comes first: it is the state of the keyboard
-        // right now and it lasts only until the next key. Then the queue, and
-        // when it is empty, what the focused pane is.
-        let right = if self.keymap.is_pending() {
-            "leader".to_string()
-        } else if let Some(line) = self.notifications.status_line() {
-            line
-        } else {
-            let panes = self.session.active().panes();
-            let index = panes.iter().position(|p| *p == focus).unwrap_or(0);
-            match self.panes.get(&focus) {
-                Some(pane) => {
-                    let scrolled = pane.terminal.display_offset();
-                    let label = chrome::pane_label(index, &pane.terminal, &pane.title);
-                    if scrolled > 0 {
-                        format!("{label}  [scrollback {scrolled}]")
-                    } else {
-                        label
-                    }
-                }
-                None => String::new(),
-            }
-        };
-
-        let bar = PixelRect::new(
+        let bar = self.status_bar();
+        let colors = self.chrome.bar();
+        let rect = PixelRect::new(
             0,
             (area.height * cell_height) as i32,
             self.size.0,
             cell_height,
         );
-        chrome::draw_status_bar(surface, &mut self.fonts, bar, &self.chrome, &items, &right);
+        bar.draw(surface, &mut self.fonts, rect, &colors);
     }
 
     /// Feed bytes straight into the focused pane's terminal, bypassing the
@@ -1649,7 +2697,12 @@ impl Compositor {
             .filter_map(|pane| pane.terminal.next_animation_delay(now))
             .min()
             .filter(|_| !self.blanked);
-        let soonest = [animation, self.next_idle_deadline(now)]
+        // The poll is a deadline like the others: folded into the wait rather
+        // than given a timer, so a clock turns over on the second instead of
+        // up to a tenth of one after it. Skipped while the screen is dark,
+        // because a dark screen is not polled either.
+        let poll = self.machine.next_poll(now).filter(|_| !self.blanked);
+        let soonest = [animation, poll, self.next_idle_deadline(now)]
             .into_iter()
             .flatten()
             .min();
@@ -1700,6 +2753,128 @@ impl Compositor {
         }
         Ok(())
     }
+
+    // ---- power ----------------------------------------------------------
+
+    /// Act on a power action that has been asked for and, where it needed one,
+    /// agreed to.
+    ///
+    /// Public because the menu is not the only way in: a test reaches it
+    /// without driving two overlays, and a lid switch or a power button would
+    /// arrive here too. It is also the one place that decides which of the
+    /// three the session is expected to survive, which is the difference
+    /// between the two fields it sets.
+    pub fn request_power(&mut self, action: PowerAction) -> bool {
+        match action {
+            PowerAction::Suspend => {
+                // Locked before the machine sleeps rather than after it wakes.
+                // Somebody who suspends a laptop is shutting the lid and
+                // walking away from it, and the session has to be behind the
+                // password by the time anything can be on the screen again; a
+                // lock applied on the way back is one that races whoever
+                // pressed the key to wake it. This is `lock_on_idle` and not
+                // `lock_session` because a machine with no password has no
+                // lock to offer, and "cannot lock" is not an answer to
+                // somebody who asked for a suspend.
+                self.lock_on_idle();
+                self.suspend_requested = true;
+                true
+            }
+            ending => {
+                self.shutdown = Some(ending);
+                // Ending the loop is what gets the console and the display
+                // handed back before [`Compositor::shut_down`] stops the
+                // machine. The panes are not asked anything: there is nothing
+                // to ask them with, which is what the confirmation said.
+                self.running = false;
+                true
+            }
+        }
+    }
+
+    /// Whether a suspend has been asked for since this was last called.
+    ///
+    /// Edge triggered, like [`tos_platform::take_switch_away`] and for the
+    /// same reason: the loop acts on it in a place where the display and the
+    /// input devices can safely be given up, and a flag that stayed set would
+    /// put the machine to sleep again the moment it woke.
+    pub fn take_suspend_request(&mut self) -> bool {
+        std::mem::take(&mut self.suspend_requested)
+    }
+
+    /// How this session is ending, when it is ending by request. `None` for a
+    /// session that stopped for any of the other reasons.
+    pub fn shutdown_request(&self) -> Option<PowerAction> {
+        self.shutdown
+    }
+
+    /// The machine is awake again.
+    ///
+    /// Everything the sleep invalidated, put back in one place: the loop has
+    /// already reclaimed the screen and the keyboard by the time this is
+    /// called, and this is the session's half of the same resume.
+    pub fn resumed(&mut self, outcome: &power::Outcome) {
+        // The CRTC has been set again from nothing, so there is no previous
+        // frame on the screen for a partial repaint to build on — and the
+        // damage that would have said which cells to repaint was collected
+        // against a screen that no longer exists.
+        self.needs_full_redraw = true;
+        let now = Instant::now();
+        // Where the caret is, is the first thing anyone looks for on a screen
+        // they have just brought back. The same reason unblanking does it.
+        self.blink_visible = true;
+        self.last_blink = now;
+        // Waking a machine is somebody being there, so the idle period starts
+        // again from here. Nothing was missed while it slept: `Instant` is
+        // `CLOCK_MONOTONIC`, which does not count time spent suspended, so the
+        // deadlines stood still along with everything else.
+        self.last_activity = now;
+        self.idle_lock_done = false;
+        self.blank_refused = false;
+        // Read the machine now rather than within the second the poll would
+        // take: a laptop that went to sleep on its charger and woke off it
+        // would otherwise still be showing last night's battery.
+        self.machine.refresh(now);
+        // A suspend that did not happen, or a screen that came back wrong, is
+        // a thing to say rather than a thing to end a session over — the same
+        // rule the display that will not blank follows.
+        for problem in &outcome.problems {
+            self.notifications
+                .status(format!("{}: {}", problem.step.what(), problem.message));
+        }
+    }
+
+    /// Carry out the ending this session was given, if it was given one.
+    ///
+    /// Called by the loop after it has stopped and handed the console and the
+    /// display back, which is the whole reason it is separate from asking for
+    /// it: `reboot(2)` does not return on success, so anything that has to
+    /// happen before the machine stops has to have happened before this call.
+    /// An error means the syscall was refused — tOS without `CAP_SYS_BOOT`, a
+    /// container — and by then there is no status bar left to say so on, which
+    /// is why this is an error to print rather than a notification to queue.
+    pub fn shut_down(&mut self) -> io::Result<()> {
+        let Some(action) = self.shutdown.take() else {
+            return Ok(());
+        };
+        // `request` is what puts the sync in front of it. There is no init
+        // here to flush the filesystems on the way down, so an unsynced
+        // poweroff loses whatever the panes were writing.
+        tos_system::power::request(self.machine.power(), action)
+    }
+}
+
+/// Seconds since the epoch, which is the only form of the time anything here
+/// deals in: [`crate::clock`] turns it into a date, and nothing else needs it.
+///
+/// A clock the kernel has set before 1970 reads as the epoch rather than as an
+/// error. There is no sensible thing for a status bar to do about a machine
+/// whose battery-backed clock has failed, and refusing to draw one is not it.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// The selectors OSC 52 defines: the clipboard, primary, secondary, select,
@@ -1776,6 +2951,11 @@ mod tests {
             command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()]),
             bitmap_scale: Some(1),
             font: Some("/nonexistent-so-the-bitmap-font-is-used".into()),
+            // A machine with no battery, no card, no link and no adapter, so
+            // that what a test asserts about the session is not the
+            // developer's laptop showing through — and so that nothing here
+            // can reach a real sound card.
+            system_root: "/nonexistent-so-this-machine-has-no-hardware".into(),
             ..config
         };
         Compositor::new(config, (640, 360), None).expect("compositor")
@@ -2364,9 +3544,15 @@ mod tests {
         rename_to(&mut compositor, "build");
         assert!(compositor.overlay().is_none(), "accepting should close it");
         assert_eq!(compositor.session.active().name, "build");
-        let items = compositor.status_items();
-        assert_eq!(items[0].text, "build");
-        assert!(items[0].highlighted, "the active workspace is marked");
+        let bar = compositor.status_bar();
+        let first = &bar.pieces()[0];
+        assert_eq!(first.text, " build ");
+        assert_eq!(
+            first.ink,
+            crate::status::Ink::Active,
+            "the active workspace is marked"
+        );
+        assert_eq!(first.hit, Some(crate::status::Hit::Workspace(1)));
     }
 
     #[test]
@@ -2421,7 +3607,7 @@ mod tests {
         compositor.perform(Action::NewWorkspace);
         compositor.perform(Action::SelectWorkspace(1));
         compositor.perform(Action::ClosePane);
-        assert_eq!(compositor.status_items()[0].text, "1");
+        assert_eq!(compositor.status_bar().pieces()[0].text, " 1 ");
     }
 
     #[test]
@@ -2531,6 +3717,270 @@ mod tests {
             .terminal
             .advance_animations(due));
         assert!(compositor.needs_render());
+    }
+
+    // ---- copy mode ------------------------------------------------------
+
+    /// Open copy mode the way a person does, on the binding.
+    fn copy_mode(compositor: &mut Compositor) {
+        press_key(compositor, KeyCode::Char('['), tos_input::Modifiers::SUPER);
+    }
+
+    /// Press a run of characters at whatever owns the keyboard.
+    fn type_keys(compositor: &mut Compositor, keys: &str) {
+        for ch in keys.chars() {
+            press_key(compositor, KeyCode::Char(ch), tos_input::Modifiers::NONE);
+        }
+    }
+
+    #[test]
+    fn the_binding_opens_copy_mode_and_the_bindings_stop_firing() {
+        let mut compositor = compositor();
+        copy_mode(&mut compositor);
+        assert!(compositor.copy_mode().is_some(), "the binding did nothing");
+        // Every key belongs to the mode now, including the ones that would
+        // otherwise split a pane.
+        press_key(
+            &mut compositor,
+            KeyCode::Char('d'),
+            tos_input::Modifiers::SUPER,
+        );
+        assert_eq!(compositor.panes.len(), 1, "a binding fired in copy mode");
+        assert!(compositor.is_running());
+        assert!(compositor.copy_mode().is_some());
+    }
+
+    #[test]
+    fn the_motions_move_the_copy_cursor_rather_than_the_pane() {
+        let mut compositor = compositor();
+        compositor.inject(b"alpha beta\r\n");
+        copy_mode(&mut compositor);
+        let from = compositor.copy_mode().expect("copy mode").cursor();
+        type_keys(&mut compositor, "kll");
+        let to = compositor.copy_mode().expect("copy mode").cursor();
+        assert_eq!(to, crate::selection::Anchor::new(from.line - 1, 2));
+    }
+
+    #[test]
+    fn a_selection_made_with_the_keyboard_is_yanked_to_the_clipboard() {
+        // The bug this mode exists for: leader [ then y used to copy exactly
+        // one character, whatever happened in between.
+        let mut compositor = compositor();
+        compositor.inject(b"alpha beta\r\n");
+        copy_mode(&mut compositor);
+        type_keys(&mut compositor, "kve");
+        let selected = compositor
+            .panes
+            .get(&compositor.session.focus())
+            .and_then(|pane| pane.selected_text());
+        assert_eq!(selected.as_deref(), Some("alpha"), "the highlight is wrong");
+        type_keys(&mut compositor, "y");
+        assert_eq!(compositor.clipboard(CLIPBOARD), Some(&b"alpha"[..]));
+    }
+
+    #[test]
+    fn copying_leaves_the_mode_and_takes_the_highlight_with_it() {
+        let mut compositor = compositor();
+        compositor.inject(b"alpha beta\r\n");
+        copy_mode(&mut compositor);
+        type_keys(&mut compositor, "kvey");
+        assert!(compositor.copy_mode().is_none(), "copy mode is still up");
+        let pane = compositor.panes.get(&compositor.session.focus()).unwrap();
+        assert!(
+            pane.selection.is_none(),
+            "a stale highlight was left behind"
+        );
+        assert!(
+            !pane.selection_in_progress,
+            "the pane still thinks it is being selected"
+        );
+        // And the keyboard is the pane's again.
+        press_key(
+            &mut compositor,
+            KeyCode::Char('d'),
+            tos_input::Modifiers::SUPER,
+        );
+        assert_eq!(compositor.panes.len(), 2);
+    }
+
+    #[test]
+    fn escape_leaves_copy_mode_without_touching_the_clipboard() {
+        let mut compositor = compositor();
+        compositor.inject(b"alpha beta\r\n");
+        copy_mode(&mut compositor);
+        type_keys(&mut compositor, "kve");
+        press_key(&mut compositor, KeyCode::Escape, tos_input::Modifiers::NONE);
+        assert!(compositor.copy_mode().is_none());
+        assert_eq!(compositor.clipboard(CLIPBOARD), None);
+    }
+
+    #[test]
+    fn walking_above_the_viewport_scrolls_into_history_instead_of_stopping() {
+        let mut compositor = compositor();
+        let rows = compositor
+            .panes
+            .get(&compositor.session.focus())
+            .map(|pane| pane.terminal.rows())
+            .expect("a pane");
+        for line in 0..rows * 2 {
+            compositor.inject(format!("line {line}\r\n").as_bytes());
+        }
+        copy_mode(&mut compositor);
+        for _ in 0..rows {
+            type_keys(&mut compositor, "k");
+        }
+        let pane = compositor.panes.get(&compositor.session.focus()).unwrap();
+        assert!(
+            pane.terminal.display_offset() > 0,
+            "the copy cursor stopped at the top of the screen"
+        );
+        // The viewport is following the cursor, so the cursor is still on
+        // screen at the end of the walk.
+        let copy = compositor.copy_mode().expect("copy mode");
+        assert_eq!(copy.scroll_to_show(pane.terminal.grid()), 0);
+        assert!(copy.display_cursor(pane.terminal.grid()).is_some());
+    }
+
+    #[test]
+    fn a_selection_dragged_up_through_history_copies_what_it_covered() {
+        let mut compositor = compositor();
+        compositor.inject(b"first\r\n");
+        let rows = compositor
+            .panes
+            .get(&compositor.session.focus())
+            .map(|pane| pane.terminal.rows())
+            .expect("a pane");
+        for line in 0..rows {
+            compositor.inject(format!("line {line}\r\n").as_bytes());
+        }
+        copy_mode(&mut compositor);
+        type_keys(&mut compositor, "v");
+        for _ in 0..rows * 2 {
+            type_keys(&mut compositor, "k");
+        }
+        type_keys(&mut compositor, "y");
+        let copied = compositor.clipboard(CLIPBOARD).expect("something copied");
+        let text = String::from_utf8_lossy(copied);
+        assert!(
+            text.starts_with("first"),
+            "the selection never reached history: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_mouse_press_takes_the_selection_back_from_copy_mode() {
+        // Two owners of one selection is one too many, and the press is about
+        // to start a selection of its own.
+        let mut compositor = compositor();
+        compositor.inject(b"alpha beta\r\n");
+        copy_mode(&mut compositor);
+        type_keys(&mut compositor, "kv");
+        compositor.handle_input(InputEvent::Mouse(MouseEvent {
+            button: Some(MouseButton::Left),
+            action: MouseAction::Press,
+            col: 2,
+            row: 0,
+            modifiers: tos_input::Modifiers::NONE,
+        }));
+        assert!(
+            compositor.copy_mode().is_none(),
+            "copy mode ignored the mouse"
+        );
+    }
+
+    #[test]
+    fn a_press_on_the_status_bar_ends_copy_mode_the_way_any_other_press_does() {
+        // The bar is answered before any pane is looked at and returns from
+        // there, so this press used to skip the rule entirely: the workspace
+        // switched, the highlight went off screen with it, and copy mode sat
+        // on a pane nobody could see swallowing every key until somebody
+        // guessed escape.
+        let mut compositor = compositor();
+        compositor.perform(Action::NewWorkspace);
+        compositor.inject(b"alpha beta\r\n");
+        copy_mode(&mut compositor);
+        type_keys(&mut compositor, "kv");
+        let left_behind = compositor.session.focus();
+
+        // The strip reads " 1  2 ", so the first workspace is cell one.
+        assert!(click_bar(&mut compositor, 1), "the click did nothing");
+        assert_eq!(compositor.session.active_index(), 0);
+        assert!(
+            compositor.copy_mode().is_none(),
+            "copy mode outlived the click and is eating the keyboard"
+        );
+        let pane = compositor
+            .panes
+            .get(&left_behind)
+            .expect("the pane it was in");
+        assert!(pane.selection.is_none(), "a highlight was left behind");
+        assert!(!pane.selection_in_progress);
+        // And the bindings answer again, which is what "the keyboard is back"
+        // means from the outside.
+        press_key(
+            &mut compositor,
+            KeyCode::Char('d'),
+            tos_input::Modifiers::SUPER,
+        );
+        assert_eq!(compositor.panes.len(), 3, "a binding was still swallowed");
+    }
+
+    #[test]
+    fn a_mouse_moved_with_nothing_held_down_does_not_drag_the_copy_highlight() {
+        let mut compositor = compositor();
+        compositor.inject(b"alpha beta\r\n");
+        copy_mode(&mut compositor);
+        type_keys(&mut compositor, "kve");
+        let focus = compositor.session.focus();
+        let highlighted = compositor.panes[&focus].selection.expect("a highlight");
+        assert_eq!(
+            compositor.panes[&focus].selected_text().as_deref(),
+            Some("alpha")
+        );
+
+        // A bare motion: the pointer crossing the pane with no button down,
+        // which is what a hand resting on a mouse produces. Copy mode's
+        // selection is one in progress, which is not the same claim as one
+        // the pointer is dragging, and only the second may move it.
+        compositor.handle_input(InputEvent::Mouse(MouseEvent {
+            button: None,
+            action: MouseAction::Motion,
+            col: 20,
+            row: 6,
+            modifiers: tos_input::Modifiers::NONE,
+        }));
+
+        assert_eq!(
+            compositor.panes[&focus].selection,
+            Some(highlighted),
+            "the pointer walked the highlight away from the copy cursor"
+        );
+        // The yank comes from the copy cursor either way, so the damage a
+        // moved highlight does is that the two stop agreeing.
+        type_keys(&mut compositor, "y");
+        assert_eq!(compositor.clipboard(CLIPBOARD), Some(&b"alpha"[..]));
+    }
+
+    #[test]
+    fn a_notification_raised_under_copy_mode_waits_for_the_slot_back() {
+        let mut compositor = compositor();
+        let focus = compositor.session.focus();
+        copy_mode(&mut compositor);
+        notify_from(&mut compositor, focus, "the build finished");
+        // Copy mode has the slot the message would be drawn in, so nothing of
+        // it is on screen; two ticks a long way apart are enough to retire it
+        // if the queue's clock is running, and it must not be.
+        let start = Instant::now();
+        compositor.tick_at(start);
+        compositor.tick_at(start + Duration::from_secs(10));
+        assert!(compositor.copy_mode().is_some());
+
+        press_key(&mut compositor, KeyCode::Escape, tos_input::Modifiers::NONE);
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("pane 1: the build finished"),
+            "the message spent its three seconds behind copy mode"
+        );
     }
 
     // ---- the lock -------------------------------------------------------
@@ -2732,7 +4182,7 @@ mod tests {
             pane.selection.is_none(),
             "the mouse selected under the lock"
         );
-        assert!(!pane.selecting);
+        assert!(!pane.selection_in_progress);
         assert!(compositor.mouse_grab.is_none());
     }
 
@@ -3181,6 +4631,67 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_with_no_sound_card_is_told_so_once() {
+        let mut compositor = compositor();
+        // The guard that makes the rest of this test safe to run: the config
+        // above points the machine at a root that does not exist, so there is
+        // nothing here that could turn the volume up on whoever is running
+        // `cargo test`. If this ever stops holding, it fails here rather than
+        // in the speakers.
+        assert!(
+            compositor.machine_mut().mixer().is_none(),
+            "the test machine found a sound card"
+        );
+
+        assert!(compositor.perform(Action::VolumeUp), "said nothing at all");
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("no sound card")
+        );
+
+        // Held down, or pressed again later: the answer has not changed, so
+        // it is not repeated, and nothing asks for a frame on its account.
+        for action in [Action::VolumeUp, Action::VolumeDown, Action::ToggleMute] {
+            assert!(
+                !compositor.perform(action.clone()),
+                "{action:?} said it twice"
+            );
+        }
+        assert_eq!(
+            compositor.notifications.history().count(),
+            1,
+            "the queue filled up with the same sentence"
+        );
+    }
+
+    #[test]
+    fn the_volume_a_card_reports_is_what_reaches_the_bar() {
+        // Muted wins over the level, because turning a muted card up is the
+        // case where showing a percentage would look like it had worked.
+        assert_eq!(
+            volume_status(Volume {
+                percent: 45,
+                muted: false
+            }),
+            "volume 45%"
+        );
+        assert_eq!(
+            volume_status(Volume {
+                percent: 45,
+                muted: true
+            }),
+            "muted"
+        );
+        assert_eq!(
+            volume_status(Volume {
+                percent: 0,
+                muted: false
+            }),
+            "volume 0%"
+        );
+    }
+
+    #[test]
     fn damage_is_cleared_after_a_frame() {
         let mut compositor = compositor();
         compositor.inject(b"hello");
@@ -3190,5 +4701,628 @@ mod tests {
             compositor.render_frame(&mut surface, true);
         }
         assert!(!compositor.needs_render());
+    }
+
+    // ---- bluetooth ------------------------------------------------------
+
+    /// Run `tick` until something lands, which is what the frame loop does.
+    ///
+    /// Bounded, because a broken channel should fail the test rather than hang
+    /// whoever is waiting for CI.
+    fn tick_until(compositor: &mut Compositor, what: impl Fn(&Compositor) -> bool) {
+        for _ in 0..1000 {
+            compositor.tick();
+            if what(compositor) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("it never arrived");
+    }
+
+    #[test]
+    fn the_bluetooth_binding_opens_the_controls() {
+        // The config every test here uses points at a root with no hardware
+        // under it, which is also the ordinary machine: most of them have no
+        // adapter, and the menu has to say that rather than open empty.
+        let mut compositor = compositor();
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            tos_input::Modifiers::SUPER,
+        )));
+        let overlay = compositor.overlay().expect("the controls should be open");
+        assert_eq!(overlay.title(), "bluetooth");
+        let labels: Vec<&str> = overlay.items().iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["this machine has no Bluetooth"]);
+    }
+
+    #[test]
+    fn choosing_a_row_that_is_only_there_to_be_read_does_nothing() {
+        let mut compositor = compositor();
+        assert!(compositor.perform(Action::ShowBluetooth));
+        compositor.handle_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            tos_input::Modifiers::NONE,
+        )));
+        assert!(compositor.overlay().is_none(), "enter should close it");
+        assert!(
+            compositor.notifications.status_line().is_none(),
+            "there was nothing to report"
+        );
+    }
+
+    // ---- the status bar ---------------------------------------------------
+
+    /// A session whose clock is in UT, so that a test asserting about what is
+    /// on the bar is not asserting about where the machine running it is.
+    fn compositor_showing(left: &[Segment], right: &[Segment]) -> Compositor {
+        compositor_with(Config {
+            status: status::Settings {
+                left: left.to_vec(),
+                right: right.to_vec(),
+                zone: crate::clock::Zone::Utc,
+                ..status::Settings::default()
+            },
+            ..Config::default()
+        })
+    }
+
+    /// A timestamp exactly on a minute, so that "thirty seconds later" is
+    /// unambiguously still the same one. 15:34 UT on the 4th of September
+    /// 2025, which is a Thursday and of no significance whatever.
+    const ON_THE_MINUTE: i64 = 1_757_000_040;
+
+    #[test]
+    fn a_minute_turning_over_puts_a_new_time_on_the_bar_and_asks_for_a_frame() {
+        let mut compositor = compositor_showing(&[Segment::Workspaces], &[Segment::Clock]);
+        compositor.tick_clock(ON_THE_MINUTE);
+        let before = compositor.status_bar().text();
+        assert!(before.contains("15:34"), "{before}");
+
+        // Half a minute later nothing on the bar has changed, so nothing asks
+        // for a frame: a clock showing minutes must not repaint every second.
+        assert!(
+            !compositor.tick_clock(ON_THE_MINUTE + 30),
+            "the same minute was treated as news"
+        );
+        assert_eq!(compositor.status_bar().text(), before);
+
+        // And on the minute it does both.
+        assert!(
+            compositor.tick_clock(ON_THE_MINUTE + 60),
+            "the minute turned over and nothing asked for a frame"
+        );
+        let after = compositor.status_bar().text();
+        assert!(after.contains("15:35"), "{after}");
+    }
+
+    #[test]
+    fn the_loop_wakes_up_often_enough_to_notice_the_minute() {
+        // The other half of a clock that ticks. The trigger above only fires
+        // if something calls `tick`, and what calls it is the frame loop
+        // coming back — which it does for the machine poll whether or not
+        // anything has happened, because that deadline is folded into the
+        // wait. A second is the coarsest this may be and still land a `%M`
+        // clock on the right side of a minute boundary.
+        let compositor = compositor_showing(&[Segment::Workspaces], &[Segment::Clock]);
+        let wait = compositor.frame_timeout_ms_at(Instant::now());
+        assert!(
+            wait > 0 && wait <= 1000,
+            "the loop would sleep for {wait}ms"
+        );
+    }
+
+    #[test]
+    fn what_a_scan_found_arrives_through_the_tick_and_into_the_open_menu() {
+        // The whole point of running the inquiry elsewhere: the answer has to
+        // find its way back on to the thread that draws, without that thread
+        // ever having waited for it.
+        let mut compositor = compositor();
+        assert!(compositor.perform(Action::ShowBluetooth));
+        compositor
+            .bluetooth
+            .begin(crate::bluetooth::scan_that_found(vec![
+                tos_system::bluetooth::Discovered {
+                    address: "11:22:33:44:55:66".into(),
+                    class: 0x240404,
+                },
+            ]));
+
+        tick_until(&mut compositor, |compositor| {
+            !compositor.bluetooth.is_scanning()
+        });
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("bluetooth: one device")
+        );
+        let overlay = compositor.overlay().expect("the menu should still be open");
+        assert!(
+            overlay
+                .items()
+                .iter()
+                .any(|item| item.label == "11:22:33:44:55:66"),
+            "the menu was not rebuilt: {:?}",
+            overlay.items()
+        );
+    }
+
+    // ---- the network menu -----------------------------------------------
+
+    /// The interface name every test below uses.
+    ///
+    /// Not `eth0`. The sysfs half of these tests is a directory of text files,
+    /// but the ioctls are not faked: [`crate::system::Machine`] holds a real
+    /// `SystemKernel`, so anything that asks the kernel to change a link asks
+    /// the kernel the test is running on. A name no machine has means those
+    /// calls fail with `ENODEV` before they touch anything, which is both what
+    /// makes the failure path assertable and what makes running the suite
+    /// safe on a machine with an `eth0` on it.
+    const FAKE_LINK: &str = "tosfake0";
+
+    /// A directory laid out like a machine with one wired interface in it,
+    /// which cleans up after itself.
+    struct FakeMachine {
+        root: std::path::PathBuf,
+    }
+
+    impl FakeMachine {
+        fn new(name: &str) -> FakeMachine {
+            let root = std::env::temp_dir().join(format!(
+                "tos-compositor-net-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("temp dir");
+            FakeMachine { root }
+        }
+
+        fn file(&self, path: &str, contents: &str) -> &FakeMachine {
+            let full = self.root.join(path.trim_start_matches('/'));
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("dirs");
+            std::fs::write(full, contents).expect("write");
+            self
+        }
+
+        /// A wired interface that is administratively down.
+        ///
+        /// The `device/uevent` file is what tells a real interface from a
+        /// bridge, and without it this is classified as virtual and never
+        /// reaches the menu at all.
+        fn with_wired_link(&self, mac: &str) -> &FakeMachine {
+            let dir = format!("/sys/class/net/{FAKE_LINK}");
+            self.file(&format!("{dir}/flags"), "0x1002\n")
+                .file(&format!("{dir}/type"), "1\n")
+                .file(&format!("{dir}/operstate"), "down\n")
+                .file(&format!("{dir}/carrier"), "0\n")
+                .file(&format!("{dir}/address"), &format!("{mac}\n"))
+                .file(&format!("{dir}/device/uevent"), "")
+        }
+
+        /// A compositor whose every reader is pointed at this directory.
+        ///
+        /// Not [`compositor_with`], which pins `system_root` at a path that
+        /// does not exist so that no other test can see the developer's own
+        /// hardware. That is exactly the right default and exactly wrong
+        /// here, so the rest of what it fills in is repeated rather than
+        /// loosened for everybody.
+        fn compositor(&self) -> Compositor {
+            let config = Config {
+                command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()]),
+                bitmap_scale: Some(1),
+                font: Some("/nonexistent-so-the-bitmap-font-is-used".into()),
+                system_root: self.root.clone(),
+                ..Config::default()
+            };
+            Compositor::new(config, (640, 360), None).expect("compositor")
+        }
+    }
+
+    impl Drop for FakeMachine {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn a_machine_with_no_interfaces_says_so_rather_than_opening_an_empty_menu() {
+        let mut compositor = compositor();
+        compositor.perform_action(Action::ShowNetworks);
+        assert!(compositor.overlay().is_none(), "an empty menu went up");
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("no wired or wireless interfaces")
+        );
+    }
+
+    #[test]
+    fn a_clock_behind_a_dark_screen_keeps_time_without_asking_for_frames() {
+        let mut compositor = compositor_showing(&[], &[Segment::Clock]);
+        compositor.tick_clock(ON_THE_MINUTE);
+        compositor.blanked = true;
+        assert!(
+            !compositor.tick_clock(ON_THE_MINUTE + 60),
+            "a minute nobody can see is not a reason to paint"
+        );
+        // But it is up to date for the frame the screen comes back on.
+        assert!(compositor.status_bar().text().contains("15:35"));
+    }
+
+    #[test]
+    fn a_bar_with_no_clock_on_it_never_wakes_up_for_one() {
+        let mut compositor = compositor_showing(&[Segment::Workspaces], &[Segment::Message]);
+        assert!(!compositor.tick_clock(ON_THE_MINUTE));
+        assert!(!compositor.tick_clock(ON_THE_MINUTE + 3600));
+    }
+
+    /// Press the left button on a cell of the status row.
+    fn click_bar(compositor: &mut Compositor, col: u32) -> bool {
+        let row = compositor.status_row().expect("a status row");
+        compositor.handle_input(InputEvent::Mouse(tos_input::MouseEvent {
+            button: Some(MouseButton::Left),
+            action: MouseAction::Press,
+            col: col as usize,
+            row: row as usize,
+            modifiers: tos_input::Modifiers::NONE,
+        }))
+    }
+
+    #[test]
+    fn clicking_a_workspace_on_the_bar_switches_to_it() {
+        let mut compositor = compositor();
+        compositor.perform(Action::NewWorkspace);
+        compositor.perform(Action::NewWorkspace);
+        assert_eq!(compositor.session.active_index(), 2);
+
+        // The strip reads " 1  2  3 ", so the first workspace is cell one.
+        assert!(click_bar(&mut compositor, 1), "the click did nothing");
+        assert_eq!(compositor.session.active_index(), 0);
+        // And the third is six cells along.
+        assert!(click_bar(&mut compositor, 7));
+        assert_eq!(compositor.session.active_index(), 2);
+    }
+
+    #[test]
+    fn clicking_the_workspace_already_active_is_not_a_change() {
+        // Every press used to be dropped here, so "nothing happened" is not
+        // evidence on its own; this is the one press that should still be it.
+        let mut compositor = compositor();
+        assert!(!click_bar(&mut compositor, 1));
+        assert_eq!(compositor.session.active_index(), 0);
+    }
+
+    #[test]
+    fn a_press_on_the_bar_never_reaches_a_pane() {
+        let mut compositor = compositor();
+        let focus = compositor.session.focus();
+        click_bar(&mut compositor, 1);
+        assert!(
+            compositor.panes[&focus].selection.is_none(),
+            "the bar started a selection in a pane"
+        );
+    }
+
+    #[test]
+    fn clicking_an_unfocused_pane_on_the_strip_focuses_it() {
+        // The pane strip is what gives an unfocused pane a name anywhere; this
+        // is what makes the name worth clicking on.
+        let mut compositor = compositor_showing(&[Segment::Panes], &[]);
+        compositor.perform(Action::Split(Axis::Columns));
+        let focus = compositor.session.focus();
+        let panes = compositor.session.active().panes();
+        let (index, other) = panes
+            .iter()
+            .enumerate()
+            .find(|(_, id)| **id != focus)
+            .map(|(index, id)| (index, *id))
+            .expect("a pane that is not focused");
+        // Every label is " n:shell ", which is nine cells.
+        assert!(
+            click_bar(&mut compositor, index as u32 * 9 + 1),
+            "the label was not clickable"
+        );
+        assert_eq!(compositor.session.focus(), other);
+    }
+
+    #[test]
+    fn an_unfocused_pane_is_named_on_the_strip_and_nowhere_else() {
+        let mut compositor = compositor_showing(&[Segment::Panes], &[Segment::Title]);
+        compositor.perform(Action::Split(Axis::Columns));
+        let focus = compositor.session.focus();
+        compositor.panes.get_mut(&focus).expect("a pane").title = "editing".to_string();
+        let text = compositor.status_bar().text();
+        // Both panes are on the strip, and the title segment says only one.
+        assert!(text.contains("1:shell"), "{text}");
+        assert!(text.contains("2:editing"), "{text}");
+    }
+
+    #[test]
+    fn the_bar_can_be_hidden_and_brought_back_and_the_panes_follow() {
+        let mut compositor = compositor();
+        let with_bar = compositor.grid_area().height;
+        let focus = compositor.session.focus();
+        let rows = compositor.panes[&focus].terminal.rows();
+
+        assert!(compositor.perform(Action::ToggleStatusBar));
+        assert_eq!(compositor.status_row(), None, "the bar is still there");
+        assert_eq!(compositor.grid_area().height, with_bar + 1);
+        assert_eq!(
+            compositor.panes[&focus].terminal.rows(),
+            rows + 1,
+            "the pane was not given the row back"
+        );
+
+        assert!(compositor.perform(Action::ToggleStatusBar));
+        assert_eq!(compositor.status_row(), Some(with_bar));
+        assert_eq!(compositor.panes[&focus].terminal.rows(), rows);
+    }
+
+    #[test]
+    fn a_machine_with_none_of_the_hardware_shows_empty_slots_rather_than_lies() {
+        // The test compositor's system root has no battery, no link, no card
+        // and no adapter, which is also a perfectly ordinary machine.
+        let compositor = compositor_showing(
+            &[Segment::Workspaces],
+            &[
+                Segment::Battery,
+                Segment::Network,
+                Segment::Volume,
+                Segment::Bluetooth,
+                Segment::Clock,
+            ],
+        );
+        let text = compositor.status_bar().text();
+        for word in ["bat", "vol", "bt", "unknown", "none"] {
+            assert!(!text.contains(word), "{text} claims {word}");
+        }
+        // And the rules that would have gone between them are not there
+        // either: four missing segments must not leave four separators.
+        let rules = compositor
+            .status_bar()
+            .pieces()
+            .iter()
+            .filter(|piece| piece.ink == status::Ink::Divider)
+            .count();
+        assert_eq!(rules, 0, "{text}");
+    }
+
+    #[test]
+    fn a_reading_from_the_machine_reaches_the_bar() {
+        let mut compositor = compositor_showing(&[], &[Segment::Battery, Segment::Volume]);
+        compositor
+            .machine_mut()
+            .set_reading(crate::system::Reading {
+                power: Some(tos_system::power::PowerState {
+                    batteries: vec![tos_system::power::Battery {
+                        name: "BAT0".into(),
+                        present: true,
+                        state: tos_system::power::ChargeState::Discharging,
+                        percent: Some(41),
+                        remaining: None,
+                        full: None,
+                        unit: None,
+                        time_remaining: None,
+                        power_watts: None,
+                    }],
+                    mains: Vec::new(),
+                }),
+                volume: Some(tos_system::audio::Volume {
+                    percent: 70,
+                    muted: false,
+                }),
+                ..crate::system::Reading::default()
+            });
+        let text = compositor.status_bar().text();
+        assert!(text.contains("41%"), "{text}");
+        assert!(text.contains("vol 70%"), "{text}");
+    }
+
+    #[test]
+    fn a_layout_with_no_message_segment_still_shows_what_went_wrong() {
+        // Otherwise arranging the bar to taste would be a way to make every
+        // failure the compositor reports disappear.
+        let mut compositor = compositor_showing(&[Segment::Workspaces], &[Segment::Clock]);
+        compositor.notifications.status("copied");
+        let mut framebuffer = tos_render::OwnedFramebuffer::new(640, 360);
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, false);
+        }
+        // The banner is drawn in the accent, over the top of the panes, which
+        // is what `--no-status-bar` already does.
+        let accent = compositor.chrome.accent.pack();
+        let (_, ch) = compositor.cell_size();
+        let first_row = (ch * 640) as usize;
+        assert!(
+            framebuffer.pixels()[..first_row].contains(&accent),
+            "the message was drawn nowhere"
+        );
+    }
+
+    #[test]
+    fn the_network_menu_lists_a_link_with_what_state_it_is_in() {
+        let fake = FakeMachine::new("list");
+        fake.with_wired_link("aa:bb:cc:dd:ee:01");
+        let mut compositor = fake.compositor();
+
+        compositor.perform_action(Action::ShowNetworks);
+        let overlay = compositor.overlay().expect("the network menu");
+        assert_eq!(overlay.title(), "network");
+        let row = overlay.items().first().expect("a row");
+        assert_eq!(row.label, FAKE_LINK);
+        assert!(row.detail.contains("wired"), "no kind: {}", row.detail);
+        assert!(row.detail.contains("down"), "no state: {}", row.detail);
+    }
+
+    #[test]
+    fn choosing_a_link_offers_what_can_be_done_to_it() {
+        let fake = FakeMachine::new("actions");
+        fake.with_wired_link("aa:bb:cc:dd:ee:01");
+        let mut compositor = fake.compositor();
+
+        compositor.choose(OverlayKind::Networks, Some(0), FAKE_LINK);
+        let overlay = compositor.overlay().expect("the link menu");
+        let labels: Vec<&str> = overlay
+            .items()
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        // Down, so bringing it up is offered and taking it down is not.
+        assert_eq!(labels, vec![BRING_UP, REQUEST_ADDRESS]);
+        assert_eq!(
+            compositor.network_target.as_deref(),
+            Some(FAKE_LINK),
+            "the menu forgot which link it is about"
+        );
+    }
+
+    #[test]
+    fn a_link_that_went_away_between_the_two_menus_is_said_rather_than_acted_on() {
+        let fake = FakeMachine::new("vanished");
+        let mut compositor = fake.compositor();
+        compositor.choose(OverlayKind::Networks, Some(0), FAKE_LINK);
+        assert!(compositor.overlay().is_none());
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("tosfake0 is no longer there")
+        );
+    }
+
+    #[test]
+    fn an_ioctl_the_kernel_refuses_is_put_on_the_status_line() {
+        // The live ISO's whole situation, and an ordinary user's: the menu
+        // opens, the row is there, and the kernel says no. What must not
+        // happen is that it silently does nothing.
+        let fake = FakeMachine::new("refused");
+        fake.with_wired_link("aa:bb:cc:dd:ee:01");
+        let mut compositor = fake.compositor();
+
+        compositor.network_target = Some(FAKE_LINK.to_string());
+        compositor.choose(OverlayKind::Link, Some(0), BRING_UP);
+
+        let said = compositor
+            .notifications
+            .status_line()
+            .expect("it said nothing at all");
+        assert!(said.starts_with("tosfake0 up failed:"), "unhelpful: {said}");
+    }
+
+    #[test]
+    fn a_link_with_no_hardware_address_is_not_asked_to_run_a_dhcp_client() {
+        let fake = FakeMachine::new("nomac");
+        fake.with_wired_link("00:00:00:00:00:00");
+        let mut compositor = fake.compositor();
+
+        compositor.network_target = Some(FAKE_LINK.to_string());
+        compositor.choose(OverlayKind::Link, Some(1), REQUEST_ADDRESS);
+
+        assert!(compositor.dhcp.is_none(), "a thread was started anyway");
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("tosfake0 has no hardware address to ask from")
+        );
+    }
+
+    #[test]
+    fn a_dhcp_request_that_cannot_even_open_a_socket_comes_back_saying_so() {
+        // The socket is bound to the device by name, so an interface that is
+        // not there fails at the bind whether or not this has CAP_NET_RAW —
+        // which is what makes the whole path, thread included, assertable
+        // without any privilege and without touching real networking.
+        let fake = FakeMachine::new("socket");
+        fake.with_wired_link("aa:bb:cc:dd:ee:01");
+        let mut compositor = fake.compositor();
+
+        compositor.network_target = Some(FAKE_LINK.to_string());
+        compositor.choose(OverlayKind::Link, Some(1), REQUEST_ADDRESS);
+        assert!(compositor.dhcp.is_some(), "nothing was started");
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("asking for an address on tosfake0")
+        );
+
+        // The answer is collected by the tick the frame loop already does.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while compositor.dhcp.is_some() && Instant::now() < deadline {
+            compositor.tick();
+        }
+        assert!(compositor.dhcp.is_none(), "the answer never arrived");
+        // The history rather than the status line: the line still holds the
+        // "asking" notification, which has not been on screen long enough to
+        // be retired, and the answer is queued behind it.
+        let said: Vec<String> = compositor
+            .notifications
+            .history()
+            .map(|notification| notification.text())
+            .collect();
+        assert!(
+            said.iter().any(|line| line.starts_with("tosfake0: ")),
+            "it never said what happened: {said:?}"
+        );
+    }
+
+    #[test]
+    fn the_bar_takes_its_colours_from_the_configuration() {
+        let bar = tos_term::Rgb::new(0x22, 0x00, 0x44);
+        let mut compositor = compositor_with(Config {
+            chrome: Chrome {
+                status_background: Some(bar),
+                ..Chrome::default()
+            },
+            ..Config::default()
+        });
+        let mut framebuffer = tos_render::OwnedFramebuffer::new(640, 360);
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, false);
+        }
+        let (_, ch) = compositor.cell_size();
+        let above = (compositor.grid_area().height * ch * 640) as usize;
+        assert!(
+            framebuffer.pixels()[above..].contains(&bar.pack()),
+            "the bar is not the colour it was asked to be"
+        );
+        // And nothing above it moved: this colour is the bar's alone.
+        assert!(!framebuffer.pixels()[..above].contains(&bar.pack()));
+    }
+
+    #[test]
+    fn a_link_detail_says_the_kind_then_the_network_then_the_address() {
+        let interface = Interface {
+            name: "wlan0".into(),
+            kind: Kind::Wireless,
+            state: tos_system::net::LinkState::Up,
+            carrier: true,
+            admin_up: true,
+            mac: None,
+            mtu: None,
+            speed_mbps: None,
+            addresses: vec![tos_system::net::Address::parse("192.168.1.5/24").expect("an address")],
+            is_default: true,
+            gateway: None,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            wireless: Some(tos_system::net::Wireless {
+                ssid: Some("kitchen-table".into()),
+                link_quality: None,
+                signal_dbm: None,
+            }),
+        };
+        assert_eq!(
+            link_detail(&interface),
+            "wireless  kitchen-table  192.168.1.5/24  default route"
+        );
+
+        // The same link with the cable out: the reason there is no address is
+        // more use than the absence of one.
+        let unplugged = Interface {
+            carrier: false,
+            addresses: Vec::new(),
+            is_default: false,
+            wireless: None,
+            kind: Kind::Wired,
+            ..interface
+        };
+        assert_eq!(link_detail(&unplugged), "wired  no carrier");
     }
 }

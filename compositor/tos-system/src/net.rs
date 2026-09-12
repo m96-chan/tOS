@@ -16,12 +16,23 @@
 //! `/sys`.
 //!
 //! Joining a wireless network is deliberately not here. Reading a wireless
-//! interface's state is; see [`Wireless`].
+//! interface's state is; see [`Wireless`]. `docs/design/network.md` records
+//! why, and what would have to exist first.
+//!
+//! Getting an address is here, in [`dhcp`]: there is no `dhclient` on this
+//! machine either, and a wired link that is up with nothing on it is not a
+//! machine that is on the network. [`Network::configure`] is what turns a
+//! lease into a configured link, through the same [`Kernel`] seam as
+//! everything else.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::sysfs::Sysfs;
+
+pub mod dhcp;
+
+pub use dhcp::Lease;
 
 /// What an interface is, which is mostly a question of what to show a person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,9 +266,10 @@ pub struct DefaultRoute {
 
 /// Everything in this module that is not a file read.
 ///
-/// Two libc calls live behind here, for the same reason the installer puts
+/// Every libc call lives behind here, for the same reason the installer puts
 /// every command behind `exec::Backend`: a test can assert that `eth0` was
-/// asked to come up without the developer's own networking flinching.
+/// asked to come up, and then given the address a DHCP server offered it,
+/// without the developer's own networking flinching.
 pub trait Kernel {
     /// Every address on every interface, from `getifaddrs(3)`.
     fn addresses(&self) -> Vec<InterfaceAddress>;
@@ -269,6 +281,31 @@ pub trait Kernel {
     /// Set or clear `IFF_UP` on an interface, with `SIOCSIFFLAGS`. Wants
     /// `CAP_NET_ADMIN`, so it fails with a permission error for anyone else.
     fn set_link_up(&mut self, interface: &str, up: bool) -> io::Result<()>;
+
+    /// Give an interface an address, with `SIOCSIFADDR` and `SIOCSIFNETMASK`.
+    ///
+    /// One method for two ioctls because they are one operation. An address
+    /// set without its mask is a `/32`: the kernel puts a host route in the
+    /// table, every neighbour on the subnet looks like it is somewhere else,
+    /// and the window in which that is true is a window in which the machine
+    /// is on the network and cannot reach anything on it. Nothing should be
+    /// able to do half of this.
+    fn set_address(
+        &mut self,
+        interface: &str,
+        address: Ipv4Addr,
+        netmask: Ipv4Addr,
+    ) -> io::Result<()>;
+
+    /// Make `gateway` the default route out of this interface, with
+    /// `SIOCADDRT`.
+    ///
+    /// "Make", not "add": an interface that already has a default route gets
+    /// the old one taken out first. `SIOCADDRT` will not replace a route, it
+    /// answers `EEXIST`, and a second lease on a link whose gateway moved
+    /// would otherwise be refused in favour of a route that no longer goes
+    /// anywhere.
+    fn set_default_route(&mut self, interface: &str, gateway: Ipv4Addr) -> io::Result<()>;
 }
 
 /// The real kernel.
@@ -287,18 +324,70 @@ impl Kernel for SystemKernel {
     fn set_link_up(&mut self, interface: &str, up: bool) -> io::Result<()> {
         set_interface_flags(interface, up)
     }
+
+    fn set_address(
+        &mut self,
+        interface: &str,
+        address: Ipv4Addr,
+        netmask: Ipv4Addr,
+    ) -> io::Result<()> {
+        set_interface_address(interface, address, netmask)
+    }
+
+    fn set_default_route(&mut self, interface: &str, gateway: Ipv4Addr) -> io::Result<()> {
+        set_interface_default_route(interface, gateway)
+    }
 }
 
-/// A link change somebody asked for.
+/// Something somebody asked the kernel to change about a link.
+///
+/// One enum rather than three lists, because the order matters and three
+/// lists cannot record it: an address has to be set before a route through it
+/// can be, and a test that could not see which came first would pass on code
+/// that did them the wrong way round.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinkChange {
-    pub interface: String,
-    pub up: bool,
+pub enum LinkChange {
+    /// `SIOCSIFFLAGS`.
+    Flags { interface: String, up: bool },
+    /// `SIOCSIFADDR` and `SIOCSIFNETMASK`.
+    Address {
+        interface: String,
+        address: Ipv4Addr,
+        netmask: Ipv4Addr,
+    },
+    /// `SIOCADDRT`.
+    DefaultRoute {
+        interface: String,
+        gateway: Ipv4Addr,
+    },
 }
 
 impl LinkChange {
+    /// One line, which is what a test asserts against: `eth0 up`,
+    /// `eth0 192.168.1.5/24`, `eth0 via 192.168.1.1`.
     pub fn describe(&self) -> String {
-        format!("{} {}", self.interface, if self.up { "up" } else { "down" })
+        match self {
+            LinkChange::Flags { interface, up } => {
+                format!("{} {}", interface, if *up { "up" } else { "down" })
+            }
+            LinkChange::Address {
+                interface,
+                address,
+                netmask,
+            } => format!("{interface} {address}/{}", u32::from(*netmask).count_ones()),
+            LinkChange::DefaultRoute { interface, gateway } => {
+                format!("{interface} via {gateway}")
+            }
+        }
+    }
+
+    /// The interface it was about, which is what the refusal list is keyed on.
+    fn interface(&self) -> &str {
+        match self {
+            LinkChange::Flags { interface, .. }
+            | LinkChange::Address { interface, .. }
+            | LinkChange::DefaultRoute { interface, .. } => interface,
+        }
     }
 }
 
@@ -344,13 +433,34 @@ impl RecordingKernel {
         self
     }
 
-    /// Everything it was asked to do, as text: `["eth0 up"]`.
+    /// Everything it was asked to do, in order, as text: `["eth0 up"]`.
     pub fn transcript(&self) -> Vec<String> {
         self.changes.iter().map(LinkChange::describe).collect()
     }
 
     pub fn did(&self, needle: &str) -> bool {
         self.transcript().iter().any(|line| line == needle)
+    }
+
+    /// Write the change down, then fail if this interface is on the refusal
+    /// list.
+    ///
+    /// That order is deliberate: the recorder exists to say what was *asked*
+    /// for, and a test of the permission path wants to see that the ioctl was
+    /// attempted as well as that it failed. A real kernel writes nothing down
+    /// when it refuses, which is exactly why a test cannot tell the
+    /// difference between "refused" and "never tried" without this.
+    fn record(&mut self, change: LinkChange) -> io::Result<()> {
+        let interface = change.interface().to_string();
+        let refused = self.refusing.contains(&interface);
+        self.changes.push(change);
+        if refused {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("not allowed to change {interface}"),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -367,17 +477,30 @@ impl Kernel for RecordingKernel {
     }
 
     fn set_link_up(&mut self, interface: &str, up: bool) -> io::Result<()> {
-        self.changes.push(LinkChange {
+        self.record(LinkChange::Flags {
             interface: interface.to_string(),
             up,
-        });
-        if self.refusing.iter().any(|name| name == interface) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("not allowed to change {interface}"),
-            ));
-        }
-        Ok(())
+        })
+    }
+
+    fn set_address(
+        &mut self,
+        interface: &str,
+        address: Ipv4Addr,
+        netmask: Ipv4Addr,
+    ) -> io::Result<()> {
+        self.record(LinkChange::Address {
+            interface: interface.to_string(),
+            address,
+            netmask,
+        })
+    }
+
+    fn set_default_route(&mut self, interface: &str, gateway: Ipv4Addr) -> io::Result<()> {
+        self.record(LinkChange::DefaultRoute {
+            interface: interface.to_string(),
+            gateway,
+        })
     }
 }
 
@@ -478,6 +601,56 @@ impl<K: Kernel> Network<K> {
     /// Ask the kernel to take a link down.
     pub fn take_down(&mut self, interface: &str) -> io::Result<()> {
         self.kernel.set_link_up(interface, false)
+    }
+
+    /// Put a lease on a link: address, netmask, default route, resolvers.
+    ///
+    /// The order is not a matter of taste. `SIOCADDRT` for a gateway on a
+    /// subnet this machine is not on yet answers `ENETUNREACH`, so the
+    /// address has to be in place before the route is asked for; and the
+    /// resolvers go last because they are the only part that is a file rather
+    /// than an ioctl, and the only part whose failure leaves a machine that
+    /// is genuinely on the network.
+    ///
+    /// That last point is why this returns on the first error rather than
+    /// carrying on: everything after a failed step depends on the step that
+    /// failed, and a half-configured link that reports success is worse than
+    /// one that says which half it got.
+    pub fn configure(&mut self, interface: &str, lease: &Lease) -> io::Result<()> {
+        self.kernel
+            .set_address(interface, lease.address, lease.netmask)?;
+        if let Some(gateway) = lease.router {
+            self.kernel.set_default_route(interface, gateway)?;
+        }
+        self.write_resolv_conf(interface, lease)
+    }
+
+    /// The MAC a DHCP client would send from, or `None` for an interface with
+    /// none — which is every interface that is not on a cable or a radio.
+    pub fn hardware_address(&self, interface: &str) -> Option<[u8; 6]> {
+        let text = self
+            .sysfs
+            .read(&format!("/sys/class/net/{interface}/address"))?;
+        dhcp::hardware_address(&text)
+    }
+
+    /// Overwrite `/etc/resolv.conf` with what the lease said.
+    ///
+    /// Overwrite, not merge. `resolv.conf` has no syntax for "these lines are
+    /// mine and those are yours", every other DHCP client on Linux replaces
+    /// the whole file, and a merge would mean parsing back a file that
+    /// anything at all may have written in order to decide which nameservers
+    /// were last week's. The header line at the top of what
+    /// [`Lease::resolv_conf`] builds is the compromise: whoever finds their
+    /// own resolver gone can at least see who took it and why.
+    ///
+    /// A lease with no resolvers in it still writes the file, because the
+    /// stale resolvers of the last network are worse than none: they are a
+    /// DNS server on a subnet this machine has just left, and every lookup
+    /// waits out a timeout against it.
+    fn write_resolv_conf(&self, interface: &str, lease: &Lease) -> io::Result<()> {
+        self.sysfs
+            .write("/etc/resolv.conf", &lease.resolv_conf(interface))
     }
 
     fn routes(&self) -> Vec<RouteEntry> {
@@ -882,10 +1055,62 @@ struct IfReq {
     padding: [u8; 22],
 }
 
+/// The same `ifreq`, with the union read as a `sockaddr_in` instead of as
+/// flags.
+///
+/// A second struct rather than a Rust `union`, because the two ioctls that
+/// use it never want both halves and a union would need an `unsafe` block at
+/// every read to say which one is live. The name field is byte for byte the
+/// same, which is the only part the kernel looks at to find the interface.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct IfReqAddr {
+    name: [libc::c_char; libc::IF_NAMESIZE],
+    address: libc::sockaddr_in,
+    /// `sockaddr_in` is 16 bytes and the union is 24, so the tail is padding
+    /// the kernel does not read but does copy.
+    padding: [u8; 8],
+}
+
+/// `rtentry`, from `linux/route.h`: what `SIOCADDRT` and `SIOCDELRT` take.
+///
+/// Written out for the same reason `IfReq` is. Note that this one names the
+/// interface with a *pointer* rather than an inline field, which is the one
+/// thing about it that has to be got right: `rt_dev` is a `char *` into the
+/// caller's memory, so the name has to outlive the ioctl and has to be NUL
+/// terminated by hand.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct RtEntry {
+    hash: libc::c_ulong,
+    destination: libc::sockaddr_in,
+    gateway: libc::sockaddr_in,
+    genmask: libc::sockaddr_in,
+    flags: libc::c_ushort,
+    pad2: libc::c_short,
+    pad3: libc::c_long,
+    tos: libc::c_uchar,
+    class: libc::c_uchar,
+    pad4: [libc::c_short; 3],
+    metric: libc::c_short,
+    dev: *mut libc::c_char,
+    mtu: libc::c_ulong,
+    window: libc::c_ulong,
+    irtt: libc::c_ushort,
+}
+
 #[cfg(target_os = "linux")]
 const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
 #[cfg(target_os = "linux")]
 const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
+#[cfg(target_os = "linux")]
+const SIOCSIFADDR: libc::c_ulong = 0x8916;
+#[cfg(target_os = "linux")]
+const SIOCSIFNETMASK: libc::c_ulong = 0x891C;
+#[cfg(target_os = "linux")]
+const SIOCADDRT: libc::c_ulong = 0x890B;
+#[cfg(target_os = "linux")]
+const SIOCDELRT: libc::c_ulong = 0x890C;
 #[cfg(target_os = "linux")]
 const SIOCGIWESSID: libc::c_ulong = 0x8B1B;
 /// `IW_ESSID_MAX_SIZE`.
@@ -980,6 +1205,119 @@ fn set_interface_flags(interface: &str, _up: bool) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         format!("SIOCSIFFLAGS on {interface} needs a Linux kernel"),
+    ))
+}
+
+/// An IPv4 address in the `sockaddr_in` the `ifreq` ioctls want.
+#[cfg(target_os = "linux")]
+fn sockaddr_in(address: Ipv4Addr) -> libc::sockaddr_in {
+    libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        // `s_addr` is network order, which is what the octets already are.
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(address.octets()),
+        },
+        sin_zero: [0; 8],
+    }
+}
+
+/// `SIOCSIFADDR` and then `SIOCSIFNETMASK`.
+///
+/// In that order, and both of them, because the kernel derives a mask from
+/// the address class the moment `SIOCSIFADDR` lands: setting 10.0.0.5 alone
+/// gives the interface a /8, and every machine on the 10.0.0.0/24 the lease
+/// actually described is then believed to be a local neighbour to ARP for.
+/// The window between the two ioctls is real but it is microseconds and the
+/// link is not routing yet, whereas leaving the mask off is permanent.
+#[cfg(target_os = "linux")]
+fn set_interface_address(interface: &str, address: Ipv4Addr, netmask: Ipv4Addr) -> io::Result<()> {
+    let socket = IoctlSocket::open()?;
+    let name = name_field(interface)?;
+
+    for (request, value) in [(SIOCSIFADDR, address), (SIOCSIFNETMASK, netmask)] {
+        let payload = IfReqAddr {
+            name,
+            address: sockaddr_in(value),
+            padding: [0; 8],
+        };
+        // SAFETY: payload is a correctly shaped ifreq and outlives the call.
+        if unsafe { libc::ioctl(socket.0, request as _, &payload) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_interface_address(
+    interface: &str,
+    _address: Ipv4Addr,
+    _netmask: Ipv4Addr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("SIOCSIFADDR on {interface} needs a Linux kernel"),
+    ))
+}
+
+/// `SIOCADDRT` for `0.0.0.0/0 via gateway dev interface`, replacing whatever
+/// default route that interface had.
+///
+/// `SIOCDELRT` runs first and its result is thrown away on purpose: the
+/// ordinary case is that there was no route to delete, which comes back as
+/// `ESRCH`, and treating that as a failure would mean the first lease on a
+/// fresh machine could never be applied. A delete that fails for any other
+/// reason shows up immediately as the add failing, with the kernel's own
+/// error on it, so nothing is hidden by ignoring this one.
+#[cfg(target_os = "linux")]
+fn set_interface_default_route(interface: &str, gateway: Ipv4Addr) -> io::Result<()> {
+    let socket = IoctlSocket::open()?;
+    // NUL terminated and owned by this frame, because `rt_dev` is a pointer
+    // the kernel follows rather than a field it copies.
+    let mut device = interface.as_bytes().to_vec();
+    if device.is_empty() || device.len() >= libc::IF_NAMESIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{interface:?} is not an interface name"),
+        ));
+    }
+    device.push(0);
+
+    let mut route = RtEntry {
+        hash: 0,
+        destination: sockaddr_in(Ipv4Addr::UNSPECIFIED),
+        gateway: sockaddr_in(gateway),
+        genmask: sockaddr_in(Ipv4Addr::UNSPECIFIED),
+        flags: (RTF_UP | RTF_GATEWAY) as libc::c_ushort,
+        pad2: 0,
+        pad3: 0,
+        tos: 0,
+        class: 0,
+        pad4: [0; 3],
+        metric: 0,
+        dev: device.as_mut_ptr().cast(),
+        mtu: 0,
+        window: 0,
+        irtt: 0,
+    };
+
+    // SAFETY: route is a correctly shaped rtentry whose `dev` points at a
+    // NUL terminated buffer that outlives both calls.
+    unsafe {
+        libc::ioctl(socket.0, SIOCDELRT as _, &route);
+        if libc::ioctl(socket.0, SIOCADDRT as _, &mut route) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_interface_default_route(interface: &str, _gateway: Ipv4Addr) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("SIOCADDRT on {interface} needs a Linux kernel"),
     ))
 }
 
@@ -1603,6 +1941,28 @@ Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE
         assert!(SystemKernel.essid("wlan0").is_none());
     }
 
+    /// The structures the ioctls copy are fixed size, and the kernel copies
+    /// exactly `sizeof` of each out of this process. Getting one wrong does
+    /// not fail to compile and does not fail loudly at run time: it reads a
+    /// field out of the wrong bytes, which is how an interface ends up with
+    /// an address nobody asked for.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_ioctl_structures_are_the_size_the_kernel_copies() {
+        use std::mem::size_of;
+
+        // Both are `struct ifreq`; they differ only in which half of the
+        // union on the end they name.
+        assert_eq!(size_of::<IfReqAddr>(), size_of::<IfReq>());
+
+        // `struct rtentry` on a 64 bit kernel, laid out by hand: a long, three
+        // sockaddrs, two shorts and four bytes of alignment, a long, two bytes
+        // and three shorts and a short, six bytes of alignment, a pointer, two
+        // longs, a short and its tail padding.
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(size_of::<RtEntry>(), 120);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn an_impossible_interface_name_never_reaches_the_ioctl() {
@@ -1614,6 +1974,126 @@ Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE
             field,
             name_field("eth1").unwrap(),
             "and the name itself really is copied in"
+        );
+    }
+
+    /// The lease a DHCP server on 192.168.1.1 would hand out.
+    fn lease() -> Lease {
+        Lease {
+            address: Ipv4Addr::new(192, 168, 1, 50),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            router: Some(Ipv4Addr::new(192, 168, 1, 1)),
+            resolvers: vec![Ipv4Addr::new(192, 168, 1, 1)],
+            domain: Some("example.lan".to_string()),
+            server: Ipv4Addr::new(192, 168, 1, 1),
+            seconds: Some(3600),
+            renewal_seconds: None,
+        }
+    }
+
+    #[test]
+    fn a_lease_becomes_an_address_a_route_and_a_resolver_in_that_order() {
+        let tree = Tree::new("configure");
+        add_interface(&tree, "eth0", true, true);
+        let mut network = Network::new(tree.sysfs(), RecordingKernel::new());
+        network.configure("eth0", &lease()).expect("configured");
+
+        // The order is the assertion: the route cannot be added before the
+        // address it goes through is on the interface.
+        assert_eq!(
+            network.kernel().transcript(),
+            vec!["eth0 192.168.1.50/24", "eth0 via 192.168.1.1"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(tree.sysfs().path("/etc/resolv.conf")).unwrap(),
+            "# written by tOS from the DHCP lease on eth0\n\
+             search example.lan\n\
+             nameserver 192.168.1.1\n"
+        );
+    }
+
+    #[test]
+    fn a_lease_with_no_gateway_in_it_asks_for_no_route() {
+        let tree = Tree::new("nogateway");
+        add_interface(&tree, "eth0", true, true);
+        let mut network = Network::new(tree.sysfs(), RecordingKernel::new());
+        let mut lease = lease();
+        lease.router = None;
+        network.configure("eth0", &lease).expect("configured");
+        assert_eq!(
+            network.kernel().transcript(),
+            vec!["eth0 192.168.1.50/24"],
+            "a route to nowhere is not a route"
+        );
+    }
+
+    #[test]
+    fn a_link_that_cannot_be_addressed_never_gets_a_route_through_it() {
+        let tree = Tree::new("noperm");
+        add_interface(&tree, "eth0", true, true);
+        let mut network = Network::new(tree.sysfs(), RecordingKernel::new().refusing("eth0"));
+        let error = network.configure("eth0", &lease()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        // The attempt is written down; the route that depends on it is not
+        // even asked for, and neither is resolv.conf written.
+        assert_eq!(network.kernel().transcript(), vec!["eth0 192.168.1.50/24"]);
+        assert!(!tree.sysfs().exists("/etc/resolv.conf"));
+    }
+
+    #[test]
+    fn resolvers_from_the_last_network_are_replaced_rather_than_added_to() {
+        let tree = Tree::new("resolvers");
+        add_interface(&tree, "eth0", true, true);
+        tree.file("/etc/resolv.conf", "nameserver 10.9.9.9\n");
+        let mut network = Network::new(tree.sysfs(), RecordingKernel::new());
+        network.configure("eth0", &lease()).expect("configured");
+        let written = std::fs::read_to_string(tree.sysfs().path("/etc/resolv.conf")).unwrap();
+        assert!(
+            !written.contains("10.9.9.9"),
+            "the old resolver survived: {written}"
+        );
+    }
+
+    #[test]
+    fn the_mac_a_dhcp_client_would_send_from_is_read_out_of_sysfs() {
+        let tree = Tree::new("mac");
+        add_interface(&tree, "eth0", true, true);
+        let network = Network::new(tree.sysfs(), RecordingKernel::new());
+        assert_eq!(
+            network.hardware_address("eth0"),
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01])
+        );
+        assert_eq!(network.hardware_address("nosuch0"), None);
+    }
+
+    #[test]
+    fn an_interface_with_no_hardware_address_cannot_ask_for_one() {
+        let tree = Tree::new("nomac");
+        add_interface(&tree, "eth0", true, true);
+        // What a tunnel or a bare bridge reads as. A DISCOVER sent from it is
+        // one no server can answer, so there is no point starting.
+        tree.file("/sys/class/net/eth0/address", "00:00:00:00:00:00\n");
+        let network = Network::new(tree.sysfs(), RecordingKernel::new());
+        assert_eq!(network.hardware_address("eth0"), None);
+    }
+
+    #[test]
+    fn a_whole_acquisition_configures_the_link_it_was_asked_about() {
+        // The two halves joined up: the handshake against a server that is
+        // not there, and the ioctls against a kernel that is not there.
+        let tree = Tree::new("endtoend");
+        add_interface(&tree, "eth0", true, true);
+        let mut network = Network::new(tree.sysfs(), RecordingKernel::new());
+        let mac = network.hardware_address("eth0").expect("a mac");
+
+        let mut server = dhcp::FakeServer::new();
+        let lease = dhcp::acquire(&mut server, mac, 0x1234).expect("a lease");
+        network.configure("eth0", &lease).expect("configured");
+
+        assert_eq!(server.transcript(), vec!["DISCOVER", "REQUEST"]);
+        assert_eq!(
+            network.kernel().transcript(),
+            vec!["eth0 192.168.1.50/24", "eth0 via 192.168.1.1"]
         );
     }
 }

@@ -3,6 +3,8 @@
 //! Everything a desktop calls "Bluetooth" — scanning, pairing, trusting,
 //! connecting a headset — is BlueZ, and BlueZ is reached over D-Bus. tOS has no
 //! D-Bus, so none of that is available here and none of it is pretended at.
+//! `docs/design/bluetooth.md` argues why there is no bus, what the refusal
+//! costs — no pairing, and so no headset — and what would change the answer.
 //!
 //! What the kernel offers on its own is an `AF_BLUETOOTH` socket and a handful
 //! of ioctls: which adapters exist, what their address is, whether they are up,
@@ -850,7 +852,10 @@ impl<C: Control> Bluetooth<C> {
     /// Pairing with anything found here is not possible from this module, and
     /// is not a small addition: it would need SMP or legacy pairing over an L2CAP
     /// channel and an agent to answer for the user, which is a piece of work in
-    /// its own right rather than a missing function.
+    /// its own right rather than a missing function. Connecting is the same
+    /// answer for a different reason — the link key is userspace's to keep, and
+    /// nothing on a tOS machine has ever kept one, so there is no paired device
+    /// to connect to. `docs/design/bluetooth.md` works both of those through.
     ///
     /// The call blocks for about `seconds` while the controller listens, so it
     /// does not belong on a thread that is drawing.

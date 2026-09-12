@@ -15,6 +15,9 @@ fn compositor(command: &[&str]) -> Compositor {
         // Force the built-in face so the tests do not depend on the host's
         // fonts, and turn off the fade so colours can be asserted exactly.
         font: Some("/nonexistent".into()),
+        // And a root with no machine under it, so the status bar says nothing
+        // about the battery or the network of whoever is running the tests.
+        system_root: "/nonexistent-so-this-machine-has-no-hardware".into(),
         inactive_fade: 0,
         ..Config::default()
     };

@@ -149,8 +149,32 @@ pub enum KeyCode {
     ModifierKey(ModifierKey),
     /// A conversion key from a Japanese keyboard.
     Ime(ImeKey),
+    /// A key that acts on the machine rather than on the focused program.
+    Media(MediaKey),
     /// Recognised by the driver but not mapped to anything.
     Unknown(u32),
+}
+
+/// The keys that address the sound card rather than whatever is in the pane.
+///
+/// These get their own variant for the reason [`ImeKey`] does: a scancode is
+/// the wrong thing for anything above the driver to match on, and none of the
+/// three is text, a modifier or a function key. The distinction that matters
+/// is not that they are unusual keys, it is who they are addressed to — the
+/// program in the focused pane has no more business seeing a volume key than
+/// it has seeing the brightness one, so naming them here is what lets the
+/// compositor claim them before the encoder is ever reached.
+///
+/// Only the three the compositor can act on are named. A `MediaKey::Play`
+/// that resolved to nothing would be a key the keymap swallowed on behalf of
+/// a feature that does not exist, which is worse than leaving those scancodes
+/// unmapped until something plays audio; adding one later is an arm here, an
+/// arm in the layout and an arm in the encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MediaKey {
+    VolumeUp,
+    VolumeDown,
+    Mute,
 }
 
 /// The conversion keys a JIS keyboard has and a US one does not.

@@ -339,7 +339,7 @@ Fonts        built-in bitmap face, plus TrueType
 Shaping      not yet; per cell glyph placement
 Rendering    CPU framebuffer
              GPU acceleration later
-Audio        not yet
+Audio        ALSA control interface via direct ioctls
 Rootfs       Debian
 ```
 
@@ -523,7 +523,20 @@ happens to expose, converts between that control's own range — rarely
 card's switch or, on a card that has none, by turning the level down and
 remembering where it was. Every ioctl goes through a trait, so all of it is
 tested against a card built out of structures in a test; none of it has been
-run against real hardware yet, and no part of the interface calls it so far.
+run against real hardware yet.
+
+The volume keys a keyboard already has — `KEY_VOLUMEUP`, `KEY_VOLUMEDOWN`,
+`KEY_MUTE` — reach it directly, with no modifier and no leader, and
+`super+>`, `super+<` and `super+shift+m` do the same on a keyboard that has
+none. Each press re-reads the card and puts what it found on the status bar,
+rather than the level that was asked for: a card whose whole range is four
+steps cannot be at 55%, and a muted card does not get louder when it is
+turned up. A machine with no sound card says so once and then stops saying
+it. Whether an installed system should get PipeWire instead is decided, with
+what was measured to decide it, in [`docs/design/audio.md`](docs/design/audio.md):
+it stays ALSA-only, because tOS sets the knob and never plays a sound, and
+because PipeWire from Debian is two systemd user units on a session that has
+no systemd.
 
 
 
@@ -578,9 +591,61 @@ Settings now come from a file as well as from flags. The format and the search
 order are under [Configuration](#configuration); what matters to the rest of
 this milestone is the shape. Every setting is a plain field on one `Config`
 struct, the file is applied to that struct before the flags are, and adding a
-setting is one arm of one match. The sections for key bindings, the status
-bar's segments and the font fallback list are named but not answered yet, and
-land with the code behind them.
+setting is one arm of one match. The sections for key bindings and the font
+fallback list are named but not answered yet, and land with the code behind
+them, the way `[status]` has.
+
+The status bar is a list of segments per side rather than a fixed strip. It
+ships showing the workspaces and the focused pane on the left, and the message
+slot, the link, the battery and a clock on the right; `[status] left` and
+`[status] right` name segments in the order they read on screen, out of
+`workspaces`, `panes`, `title`, `message`, `clock`, `battery`, `network`,
+`volume` and `bluetooth`. A segment whose machine cannot answer — a battery on
+a desktop, an adapter on a machine with no Bluetooth — draws nothing at all
+rather than a slot saying so, and the rule that would have gone beside it does
+not appear either. One segment on the bar is elastic, and by default it is the
+message: everything else is as wide as its words, the message takes what is
+left and is clipped with an ellipsis rather than dropped. A layout that leaves
+`message` out gets the banner `--no-status-bar` already gets, because
+rearranging the bar must not be a way to make every failure disappear.
+
+`panes` is the answer to an unfocused pane having no title anywhere: the
+compositor has tracked each pane's title all along and only ever drawn the
+focused one. It is not on by default, because on the one-pane session almost
+every session starts as it says what `title` says at three times the width, and
+a bar that grows with the pane count is one that eventually pushes the clock
+off the end.
+
+The clock is `%H:%M` in the machine's own zone unless told otherwise.
+`[status] clock` takes a `strftime` subset — `%Y %y %m %d %e %H %I %M %S %p %P
+%a %A %b %B %j %Z %z %F %T %R` and `%%`, with anything else copied out verbatim
+so a typo is visible rather than silent. `[status] timezone` takes `local`,
+`utc`, or a zone name such as `Asia/Tokyo`. `local` means `TZ` if it is set and
+`/etc/localtime` otherwise, both read as TZif, including the POSIX rule in the
+footer — `zic` has written files whose transition table stops a few years out
+since 2020, so a reader that stopped at the table would have the wrong hour for
+half of every year from about 2038. A zone that cannot be read falls back to UT
+rather than refusing to start. No dependency was taken for any of it; the civil
+arithmetic is fifteen lines of integer division and the rest is a file format.
+
+The bar repaints when the minute turns over, which needs a trigger as well as a
+source: nothing in a pane is damaged by time passing, so nothing would
+otherwise ask for the frame. The machine poll already wakes the loop once a
+second and its deadline is already folded into the wait, so the trigger is a
+comparison of what the clock would draw against what it drew last — which
+repaints once a minute for `%H:%M` and once a second for `%S` without the clock
+having to be asked how precise it is. A bar that is hidden or dark keeps its
+time current and asks for no frames for it.
+
+Clicking a workspace on the bar switches to it, and clicking a pane on the
+`panes` strip focuses it; the bar sits on the row `grid_area` takes away from
+the layout, so until now a press there matched no pane and was dropped.
+Clicking the message opens the notification history. `super+b`, or `ctrl+a`
+then `b`, shows and hides the whole bar — `--no-status-bar` decides what a
+session starts as, which is the wrong granularity for a row of the display you
+want back while reading a long file — and the panes are resized and told so
+either way.
+
 Notifications are a queue rather than a slot. The status bar shows one at a
 time — three seconds each, or one second while others are waiting, so a burst
 drains at a pace that can be read instead of one that has to be waited out —
@@ -901,7 +966,12 @@ bindings that grow a session are also where most people expect them:
 `ctrl+shift+enter` splits the focused pane and `ctrl+shift+t` opens a new
 workspace. `super+space` opens the launcher, `super+m` opens the notifications,
 `super+,` names the workspace and `super+shift+l` locks the screen on a machine
-that has a password to unlock with. From inside a session, `leader ?` puts the
+that has a password to unlock with. `super+[` takes the keyboard into copy
+mode, where vi's motions — `h j k l`, `w b e`, `0 $`, `g G` and a screenful on
+`ctrl+f` and `ctrl+b` — move a copy cursor through the pane and its history,
+`v` fixes one end of the selection and `y` copies it and leaves; the arrow,
+home, end and page keys do the same for anyone who does not think in vi. From
+inside a session, `leader ?` puts the
 binding list over the panes; both it and `--help` are generated from the keymap
 that is running, so neither can fall behind it.
 
@@ -972,6 +1042,27 @@ accent = #5f87d7
 accent-text = #101014
 divider = #2c2c34
 divider-focused = #5f87d7
+# The block behind selected text. Follows accent unless it is set here, which
+# is worth setting when the palette's own blue is close to the accent.
+selection = #5f87d7
+
+# What the status bar says, in the order it reads on screen, and what it says
+# it in. Segments: workspaces, panes, title, message, clock, battery, network,
+# volume, bluetooth. A segment this machine cannot answer draws nothing.
+[status]
+left = workspaces title
+right = message network battery clock
+# A strftime subset. %a %d %b %H:%M is the one with a date on it.
+clock = %H:%M
+# local, utc, or a zone name. local is $TZ, else /etc/localtime.
+timezone = local
+# The bar's own colours. Each falls back to the [chrome] colour above it, so
+# setting accent once still moves the bar's highlight with everything else.
+background = #18181c
+foreground = #70707c
+active = #5f87d7
+active-text = #101014
+divider = #2c2c34
 ```
 
 Colours are hex, with or without the `#`, in the three digit shorthand or the
@@ -983,11 +1074,13 @@ line number and then skipped — the rest of the file still applies, and tOS
 still boots into a usable terminal, the same way it degrades when a display
 backend is unavailable rather than refusing to start.
 
-Key bindings, the status bar's segments and the font fallback list each want a
-section of their own, and will get one as the code behind them lands. Until
-then a key the compositor does not know is reported rather than silently
-ignored, because a setting that quietly does nothing is indistinguishable from
-one that is broken.
+Key bindings and the font fallback list each want a section of their own, and
+will get one as the code behind them lands, the way `[status]` did. Until then
+a key the compositor does not know is reported rather than silently ignored,
+because a setting that quietly does nothing is indistinguishable from one that
+is broken. A `left` or `right` naming a segment that does not exist is reported
+the same way, with the list of the ones that do, and the side it names keeps
+what it had.
 
 ## Installing
 

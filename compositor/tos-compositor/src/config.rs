@@ -11,6 +11,7 @@ use tos_session::{describe, Keymap};
 use tos_term::Palette;
 
 use crate::chrome::Chrome;
+use crate::status;
 
 /// Which display backend to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +73,13 @@ pub struct Config {
     /// The program each pane runs.
     pub command: Option<Vec<String>>,
     /// Draw the status bar along the bottom.
+    ///
+    /// The starting state rather than a fixed one: `Action::ToggleStatusBar`
+    /// writes here at runtime, so that showing the bar again is the same code
+    /// path as having started with it.
     pub status_bar: bool,
+    /// What the status bar shows, in what order, and on which side.
+    pub status: status::Settings,
     /// Fade panes that do not have focus.
     pub inactive_fade: u8,
     /// Answer OSC 52 clipboard queries with the real selection. Off unless the
@@ -119,6 +126,16 @@ pub struct Config {
     /// default locks first and blanks afterwards, so that a passer-by who
     /// wakes the screen finds the prompt rather than the session.
     pub idle_blank: Option<Duration>,
+    /// Where the readers in [`crate::system`] look for the machine.
+    ///
+    /// `/` on a running machine, and a directory laid out like one in a test.
+    /// A seam for the same reason [`Config::credential`] is: everything the
+    /// compositor knows about batteries, links, cards and adapters comes from
+    /// files under here, and a test that could not move the root would be
+    /// asserting about the developer's laptop — or, worse, turning the volume
+    /// on it up. Deliberately not a flag and not a file setting: which `/sys`
+    /// a session reads is not a preference anybody has.
+    pub system_root: PathBuf,
 }
 
 impl Default for Config {
@@ -133,6 +150,7 @@ impl Default for Config {
             scrollback: 10_000,
             command: None,
             status_bar: true,
+            status: status::Settings::default(),
             inactive_fade: 40,
             allow_clipboard_read: false,
             size: (1280, 720),
@@ -148,6 +166,7 @@ impl Default for Config {
             // the keyboard shows the session to whoever is there.
             idle_lock: Some(Duration::from_secs(300)),
             idle_blank: Some(Duration::from_secs(600)),
+            system_root: PathBuf::from("/"),
         }
     }
 }
