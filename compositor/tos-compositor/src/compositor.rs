@@ -16,7 +16,9 @@ use tos_input::{
 };
 use tos_platform::Display;
 use tos_render::{render, Rect as PixelRect, RenderOptions, Surface};
-use tos_session::{describe, Action, Axis, DividerId, Keymap, PaneId, Rect, Resolution, Session};
+use tos_session::{
+    describe, Action, Arrangement, Axis, DividerId, Keymap, PaneId, Rect, Resolution, Session,
+};
 use tos_system::audio::Volume;
 use tos_system::bluetooth::{Adapter, Connection, SystemControl};
 use tos_system::net::{dhcp, Interface, Kind, Lease};
@@ -1421,7 +1423,16 @@ impl Compositor {
                 moved
             }
             Action::Resize(direction, amount) => {
-                if self.session.resize_focused(area, direction, amount) {
+                let arrangement = self.session.active().arrangement();
+                if arrangement != Arrangement::Splits {
+                    // A derived arrangement has no divider to move, and a key
+                    // that silently does nothing is indistinguishable from a
+                    // key that is broken — the same reason a split with no
+                    // room says so rather than shrugging.
+                    self.notifications
+                        .status(format!("no dividers in the {} layout", arrangement.name()));
+                    true
+                } else if self.session.resize_focused(area, direction, amount) {
                     self.sync_layout();
                     self.needs_full_redraw = true;
                     true
@@ -1438,11 +1449,18 @@ impl Compositor {
                 changed
             }
             Action::Balance => {
-                self.session.balance();
-                self.sync_layout();
-                self.needs_full_redraw = true;
+                if self.session.balance() {
+                    self.sync_layout();
+                    self.needs_full_redraw = true;
+                } else {
+                    let name = self.session.active().arrangement().name();
+                    self.notifications
+                        .status(format!("the {name} layout is already even"));
+                }
                 true
             }
+            Action::NextLayout => self.cycle_layout(true),
+            Action::PreviousLayout => self.cycle_layout(false),
             Action::NewWorkspace => {
                 let pane_id = self.session.new_workspace();
                 match self.spawn_pane(self.grid_area()) {
@@ -2356,6 +2374,25 @@ impl Compositor {
         }
     }
 
+    /// Arrange the active workspace the next way round, or the previous one.
+    ///
+    /// Nothing is said on the status line, and that is deliberate rather than
+    /// forgotten: the bar carries the arrangement's name for as long as it is
+    /// in force, which is the question worth answering, while a notification
+    /// answers it once and queues. Cycling three keys quickly would leave the
+    /// message slot showing the first arrangement with "(+2)" after it —
+    /// naming, at length, a layout the panes have already left.
+    fn cycle_layout(&mut self, forward: bool) -> bool {
+        if forward {
+            self.session.next_layout();
+        } else {
+            self.session.previous_layout();
+        }
+        self.sync_layout();
+        self.needs_full_redraw = true;
+        true
+    }
+
     fn split(&mut self, axis: Axis) -> bool {
         self.split_running(axis, None);
         true
@@ -2839,7 +2876,7 @@ impl Compositor {
                 .iter()
                 .find(|(id, _)| *id == focus)
                 .map(|(_, rect)| *rect);
-            for (axis, divider) in self.session.active().layout.dividers(area) {
+            for (axis, divider) in self.session.active().dividers(area) {
                 // Only draw dividers that the zoom state leaves visible.
                 if self.session.active().zoomed().is_some() {
                     break;
@@ -3098,6 +3135,15 @@ impl Compositor {
             Segment::Title => match self.focused_label() {
                 Some(label) => one(label),
                 None => Vec::new(),
+            },
+            Segment::Layout => match self.session.active().arrangement() {
+                // Splits is not announced. It is what every session starts in
+                // and where most of them stay, so naming it would spend a slot
+                // on a word that never changes; the segment appearing at all
+                // is itself the news that the panes are somewhere other than
+                // where the splits left them.
+                Arrangement::Splits => Vec::new(),
+                other => one(other.name().to_string()),
             },
             Segment::Message => match self.status_message() {
                 // The elastic one: it is the only thing on the bar whose
@@ -3660,6 +3706,66 @@ mod tests {
             .terminal
             .cols();
         assert!(after < before, "{after} should be narrower than {before}");
+    }
+
+    #[test]
+    fn the_layout_keys_rearrange_the_panes_and_tell_them_so() {
+        // Three panes in a row. A column split with a row split inside it is
+        // already exactly what `tall` derives, which is the two arithmetics
+        // agreeing rather than the key doing nothing — but it makes for a
+        // test that could not tell the two apart.
+        let mut compositor = compositor();
+        compositor.perform(Action::Split(Axis::Columns));
+        compositor.perform(Action::Split(Axis::Columns));
+        let area = compositor.grid_area();
+        let before = compositor.session.active().geometry(area);
+
+        assert!(compositor.perform(Action::NextLayout));
+        assert_eq!(compositor.session.active().arrangement(), Arrangement::Tall);
+        let after = compositor.session.active().geometry(area);
+        assert_ne!(after, before, "the panes did not move");
+        // A rearrangement that did not reach the terminals would leave three
+        // programs drawing into the rectangles they used to have.
+        for (id, rect) in &after {
+            let pane = compositor.pane(*id).expect("a live pane");
+            assert_eq!(pane.terminal.cols(), rect.width as usize);
+            assert_eq!(pane.terminal.rows(), rect.height as usize);
+        }
+
+        // Backwards from `tall` is where forwards would have ended up.
+        assert!(compositor.perform(Action::PreviousLayout));
+        assert_eq!(
+            compositor.session.active().arrangement(),
+            Arrangement::Splits
+        );
+        assert_eq!(compositor.session.active().geometry(area), before);
+    }
+
+    #[test]
+    fn a_divider_that_is_not_on_screen_refuses_to_move_and_says_which_layout_ate_it() {
+        let mut compositor = compositor();
+        compositor.perform(Action::Split(Axis::Columns));
+        compositor.perform(Action::NextLayout);
+
+        // Cycling itself says nothing, so the first thing in the queue is the
+        // refusal: a key that quietly did nothing would be indistinguishable
+        // from a key that is broken.
+        assert!(compositor.perform(Action::Resize(tos_session::Direction::Left, 2)));
+        let message = compositor
+            .notifications
+            .status_line()
+            .expect("a refusal worth reading");
+        assert!(message.contains("tall"), "{message}");
+        assert!(message.contains("divider"), "{message}");
+
+        assert!(compositor.perform(Action::Balance));
+        let latest = compositor
+            .notifications
+            .history()
+            .next()
+            .expect("a refusal worth reading")
+            .status_text();
+        assert!(latest.contains("tall"), "{latest}");
     }
 
     #[test]
@@ -5404,6 +5510,23 @@ mod tests {
     /// unambiguously still the same one. 15:34 UT on the 4th of September
     /// 2025, which is a Thursday and of no significance whatever.
     const ON_THE_MINUTE: i64 = 1_757_000_040;
+
+    #[test]
+    fn the_bar_names_the_arrangement_only_once_it_is_not_the_tree() {
+        let mut compositor = compositor_showing(&[Segment::Layout], &[]);
+        // Splits says nothing: a word that is on the bar in every session
+        // that ever runs tells nobody anything, and the segment appearing is
+        // itself the news.
+        assert_eq!(compositor.status_bar().text().trim(), "");
+
+        compositor.perform(Action::NextLayout);
+        assert_eq!(compositor.status_bar().text().trim(), "tall");
+        compositor.perform(Action::NextLayout);
+        assert_eq!(compositor.status_bar().text().trim(), "fat");
+        compositor.perform(Action::PreviousLayout);
+        compositor.perform(Action::PreviousLayout);
+        assert_eq!(compositor.status_bar().text().trim(), "");
+    }
 
     #[test]
     fn a_minute_turning_over_puts_a_new_time_on_the_bar_and_asks_for_a_frame() {

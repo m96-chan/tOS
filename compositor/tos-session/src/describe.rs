@@ -116,6 +116,8 @@ pub fn describe(action: &Action) -> String {
         Action::Resize(direction, _) => format!("move the divider {}", toward(*direction)),
         Action::ToggleZoom => "zoom the focused pane".into(),
         Action::Balance => "even out every split".into(),
+        Action::NextLayout => "next layout".into(),
+        Action::PreviousLayout => "previous layout".into(),
         Action::NewWorkspace => "new workspace".into(),
         Action::NextWorkspace => "next workspace".into(),
         Action::PreviousWorkspace => "previous workspace".into(),
@@ -250,6 +252,10 @@ fn rank(action: &Action) -> (u16, u16) {
         Action::FocusPrevious => (2, 5),
         Action::ToggleZoom => (3, 0),
         Action::Balance => (3, 1),
+        // With the zoom and the balance: all four are ways of rearranging the
+        // panes you already have, and the two layout keys are read as a pair.
+        Action::NextLayout => (3, 2),
+        Action::PreviousLayout => (3, 3),
         Action::Resize(direction, _) => (4, toward(*direction)),
         Action::NewWorkspace => (5, 0),
         Action::NextWorkspace => (5, 1),

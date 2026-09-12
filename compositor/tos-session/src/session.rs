@@ -4,7 +4,7 @@
 //! pane. Pane identifiers are unique across the whole session so that a pane
 //! can move between workspaces without being recreated.
 
-use crate::layout::{Axis, Direction, Layout, PaneId, Rect};
+use crate::layout::{self, Arrangement, Axis, Direction, Layout, PaneId, Rect};
 
 /// Identifies a workspace within a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -19,6 +19,13 @@ pub struct Workspace {
     focus: PaneId,
     /// A pane temporarily filling the whole workspace.
     zoomed: Option<PaneId>,
+    /// How the panes are arranged on screen, which is a different question
+    /// from how the tree holds them: every arrangement but
+    /// [`Arrangement::Splits`] derives geometry from the pane order and leaves
+    /// the tree alone. It lives beside `zoomed` because the two are the same
+    /// kind of thing — an override of what the tree would have drawn — and
+    /// because [`Workspace::geometry`] is the one place either is answered.
+    arrangement: Arrangement,
     /// Set once the user names the workspace, so renumbering leaves it alone.
     renamed: bool,
 }
@@ -31,6 +38,7 @@ impl Workspace {
             layout: Layout::new(root),
             focus: root,
             zoomed: None,
+            arrangement: Arrangement::Splits,
             renamed: false,
         }
     }
@@ -47,12 +55,62 @@ impl Workspace {
         self.layout.panes()
     }
 
-    /// Where each visible pane goes. A zoomed pane is the only one visible.
+    /// Where each visible pane goes. A zoomed pane is the only one visible,
+    /// and otherwise the arrangement in force decides — which for
+    /// [`Arrangement::Splits`] means asking the tree.
+    ///
+    /// The single place geometry is decided, and everything that draws, hit
+    /// tests or moves focus has to come through here. Asking `self.layout`
+    /// instead yields the tree's opinion, which under any other arrangement is
+    /// a picture of a workspace nobody is looking at.
     pub fn geometry(&self, area: Rect) -> Vec<(PaneId, Rect)> {
         match self.zoomed {
             Some(pane) if self.layout.contains(pane) => vec![(pane, area)],
-            _ => self.layout.geometry(area),
+            _ => self
+                .arrangement
+                .geometry(&self.layout.panes(), area, self.layout.gap)
+                .unwrap_or_else(|| self.layout.geometry(area)),
         }
+    }
+
+    pub fn arrangement(&self) -> Arrangement {
+        self.arrangement
+    }
+
+    /// Arrange the panes some other way.
+    ///
+    /// The zoom goes, for the reason splitting drops it: the point of asking
+    /// for an arrangement is to see it, and a zoomed workspace would answer
+    /// the key with a screen that does not change.
+    pub fn set_arrangement(&mut self, arrangement: Arrangement) {
+        self.arrangement = arrangement;
+        self.zoomed = None;
+    }
+
+    /// Which pane is at a cell, in the arrangement that is on screen.
+    pub fn pane_at(&self, area: Rect, x: u32, y: u32) -> Option<PaneId> {
+        layout::pane_at(&self.geometry(area), x, y)
+    }
+
+    /// The pane next to `from` in `direction`, in the arrangement that is on
+    /// screen. Under `Grid` that is a different pane from the one the tree
+    /// would name, and the visible one is the one the arrow key meant.
+    pub fn neighbour(&self, area: Rect, from: PaneId, direction: Direction) -> Option<PaneId> {
+        layout::neighbour(&self.geometry(area), from, direction)
+    }
+
+    /// The dividers to draw between the panes.
+    ///
+    /// A divider is a property of the split tree — it is the thing a drag
+    /// moves — so the derived arrangements have none, and drawing the tree's
+    /// would rule lines across the middle of panes. The gap between panes is
+    /// left showing the background instead, which is what a gap with no
+    /// divider in it already looks like.
+    pub fn dividers(&self, area: Rect) -> Vec<(Axis, Rect)> {
+        if self.arrangement != Arrangement::Splits {
+            return Vec::new();
+        }
+        self.layout.dividers(area)
     }
 
     pub fn set_focus(&mut self, pane: PaneId) -> bool {
@@ -177,6 +235,15 @@ impl Session {
         let workspace = self.active();
         // A zoomed pane is laid out as the whole workspace, so that is the
         // rectangle the split has to fit inside.
+        //
+        // The room for a split is judged against the tree even when some
+        // other arrangement is on screen, because the tree is where the new
+        // pane actually goes; the arrangement then places it wherever the
+        // pane order says. That can refuse a split the grid on screen looks
+        // roomy enough for, which is the honest answer: the split would be
+        // waiting in a tree that cannot hold it, and going back to `splits`
+        // is supposed to show what was left there rather than something the
+        // area never had space for.
         let target = workspace.focus;
         if workspace.zoomed.is_none() && !workspace.layout.can_split(area, target, axis) {
             return None;
@@ -248,7 +315,7 @@ impl Session {
             return false;
         }
         let focus = workspace.focus;
-        match workspace.layout.neighbour(area, focus, direction) {
+        match workspace.neighbour(area, focus, direction) {
             Some(pane) => {
                 workspace.focus = pane;
                 true
@@ -297,8 +364,18 @@ impl Session {
         true
     }
 
+    /// Move the divider next to the focused pane.
+    ///
+    /// Refuses outside [`Arrangement::Splits`], where there is no divider on
+    /// screen to move. Moving the tree's divider anyway would be the worse
+    /// answer twice over: nothing would happen now, and the splits the user
+    /// left behind would come back changed by a key that appeared to do
+    /// nothing. The caller is expected to say why it refused.
     pub fn resize_focused(&mut self, area: Rect, direction: Direction, amount: i32) -> bool {
         let workspace = self.active_mut();
+        if workspace.arrangement != Arrangement::Splits {
+            return false;
+        }
         let focus = workspace.focus;
         workspace.layout.resize(area, focus, direction, amount)
     }
@@ -317,8 +394,34 @@ impl Session {
         true
     }
 
-    pub fn balance(&mut self) {
-        self.active_mut().layout.balance();
+    /// Even out every split. Returns false when it refused.
+    ///
+    /// Refused outside [`Arrangement::Splits`] for the same reason as
+    /// [`Session::resize_focused`], and it is the restore promise that decides
+    /// it: a derived arrangement is already even, so balancing would change
+    /// nothing visible while quietly flattening the weights waiting in the
+    /// tree. Switching back to `splits` would then not give back what was
+    /// left there, which is the one thing this model promises.
+    pub fn balance(&mut self) -> bool {
+        let workspace = self.active_mut();
+        if workspace.arrangement != Arrangement::Splits {
+            return false;
+        }
+        workspace.layout.balance();
+        true
+    }
+
+    /// Arrange the active workspace the next way, wrapping around.
+    pub fn next_layout(&mut self) -> Arrangement {
+        let next = self.active().arrangement.next();
+        self.active_mut().set_arrangement(next);
+        next
+    }
+
+    pub fn previous_layout(&mut self) -> Arrangement {
+        let previous = self.active().arrangement.previous();
+        self.active_mut().set_arrangement(previous);
+        previous
     }
 
     /// Create a workspace with one new pane and switch to it.
@@ -672,5 +775,160 @@ mod tests {
         assert!(session.resize_focused(area(), Direction::Left, 6));
         let after = session.active().geometry(area())[0].1.width;
         assert_eq!(after, before - 6);
+    }
+
+    /// A session whose tree is one row of `count` panes, which is the shape
+    /// that disagrees with every derived arrangement and so is the one worth
+    /// testing them against.
+    fn row_of(count: usize) -> Session {
+        let mut session = Session::new();
+        for _ in 1..count {
+            session
+                .split_focused(area(), Axis::Columns)
+                .expect("room for another pane");
+        }
+        session
+    }
+
+    #[test]
+    fn leaving_the_split_tree_and_coming_back_restores_it_exactly() {
+        // The promise the whole model rests on, and the one Kitty does not
+        // make: a derived arrangement reads the tree and never writes to it,
+        // so every manual split and every dragged divider is still there.
+        let mut session = row_of(3);
+        assert!(session.resize_focused(area(), Direction::Left, 7));
+        let before = session.active().geometry(area());
+
+        for _ in 0..Arrangement::ALL.len() {
+            session.next_layout();
+        }
+        assert_eq!(session.active().arrangement(), Arrangement::Splits);
+        assert_eq!(session.active().geometry(area()), before);
+    }
+
+    #[test]
+    fn focus_follows_the_arrangement_on_screen_and_not_the_tree() {
+        // Four panes side by side in the tree; a grid puts two of them under
+        // the other two. Down from the first is nothing at all in the tree and
+        // the third pane on screen, and the arrow key meant the screen.
+        let mut session = row_of(4);
+        let panes = session.active().panes();
+        session.set_focus(panes[0]);
+        assert!(!session.focus_direction(area(), Direction::Down));
+
+        session.active_mut().set_arrangement(Arrangement::Grid);
+        assert!(session.focus_direction(area(), Direction::Down));
+        assert_eq!(session.focus(), panes[2]);
+        // And the tree, asked directly, still says what it always said.
+        assert_eq!(
+            session
+                .active()
+                .layout
+                .neighbour(area(), panes[0], Direction::Down),
+            None
+        );
+    }
+
+    #[test]
+    fn a_click_lands_on_the_pane_the_arrangement_put_under_it() {
+        let mut session = row_of(3);
+        let panes = session.active().panes();
+        session.active_mut().set_arrangement(Arrangement::Tall);
+
+        // Low and right of the middle: the last pane, because `tall` stacks
+        // everything but the master down the right hand side. The tree, whose
+        // three panes are columns, hands the same cell to the second pane —
+        // one the pointer is nowhere near on screen.
+        let cell = (50, 20);
+        assert_eq!(
+            session.active().pane_at(area(), cell.0, cell.1),
+            Some(panes[2])
+        );
+        assert_eq!(
+            session.active().layout.pane_at(area(), cell.0, cell.1),
+            Some(panes[1])
+        );
+    }
+
+    #[test]
+    fn a_derived_arrangement_has_no_dividers_to_draw() {
+        let mut session = row_of(3);
+        assert_eq!(session.active().dividers(area()).len(), 2);
+        session.active_mut().set_arrangement(Arrangement::Fat);
+        assert!(session.active().dividers(area()).is_empty());
+        // The tree still has them; it is the drawing that must not.
+        assert_eq!(session.active().layout.dividers(area()).len(), 2);
+    }
+
+    #[test]
+    fn the_divider_keys_refuse_outside_the_split_tree() {
+        let mut session = row_of(3);
+        assert!(session.resize_focused(area(), Direction::Left, 4));
+        assert!(session.balance());
+
+        for arrangement in [Arrangement::Tall, Arrangement::Fat, Arrangement::Grid] {
+            session.active_mut().set_arrangement(arrangement);
+            assert!(
+                !session.resize_focused(area(), Direction::Left, 4),
+                "{arrangement:?} has no divider to move"
+            );
+            assert!(
+                !session.balance(),
+                "{arrangement:?} is even already, and evening the tree would
+                 lose what going back to splits is supposed to give back"
+            );
+        }
+
+        // Refusing means refusing to touch the tree, not merely to redraw.
+        session.active_mut().set_arrangement(Arrangement::Splits);
+        let widths: Vec<u32> = session
+            .active()
+            .geometry(area())
+            .iter()
+            .map(|(_, rect)| rect.width)
+            .collect();
+        assert_eq!(widths[0], widths[1], "balance ran while splits was up");
+    }
+
+    #[test]
+    fn splitting_under_an_arrangement_adds_a_pane_the_arrangement_places() {
+        let mut session = Session::new();
+        session.active_mut().set_arrangement(Arrangement::Grid);
+        let new_pane = session
+            .split_focused(area(), Axis::Columns)
+            .expect("room for another pane");
+
+        assert_eq!(session.active().arrangement(), Arrangement::Grid);
+        let geometry = session.active().geometry(area());
+        assert_eq!(geometry.len(), 2);
+        // Two panes in a grid are a row, whatever axis the split named: the
+        // tree took the split, and the arrangement decided where it shows.
+        assert!(geometry.iter().any(|(pane, _)| *pane == new_pane));
+        assert!(geometry
+            .iter()
+            .all(|(_, rect)| rect.height == area().height));
+    }
+
+    #[test]
+    fn cycling_the_arrangement_gives_up_the_zoom() {
+        // Otherwise the key would answer with a screen that does not change:
+        // a zoomed workspace is one pane wherever the others would have gone.
+        let mut session = row_of(2);
+        assert!(session.toggle_zoom());
+        session.next_layout();
+        assert!(session.active().zoomed().is_none());
+        assert_eq!(session.active().geometry(area()).len(), 2);
+    }
+
+    #[test]
+    fn the_layout_keys_walk_the_active_workspace_only() {
+        let mut session = Session::new();
+        session.new_workspace();
+        session.next_layout();
+        assert_eq!(session.active().arrangement(), Arrangement::Tall);
+        session.select_workspace(1);
+        assert_eq!(session.active().arrangement(), Arrangement::Splits);
+        session.previous_layout();
+        assert_eq!(session.active().arrangement(), Arrangement::Grid);
     }
 }
