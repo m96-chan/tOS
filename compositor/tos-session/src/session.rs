@@ -235,6 +235,15 @@ impl Session {
         let workspace = self.active();
         // A zoomed pane is laid out as the whole workspace, so that is the
         // rectangle the split has to fit inside.
+        //
+        // The room for a split is judged against the tree even when some
+        // other arrangement is on screen, because the tree is where the new
+        // pane actually goes; the arrangement then places it wherever the
+        // pane order says. That can refuse a split the grid on screen looks
+        // roomy enough for, which is the honest answer: the split would be
+        // waiting in a tree that cannot hold it, and going back to `splits`
+        // is supposed to show what was left there rather than something the
+        // area never had space for.
         let target = workspace.focus;
         if workspace.zoomed.is_none() && !workspace.layout.can_split(area, target, axis) {
             return None;
