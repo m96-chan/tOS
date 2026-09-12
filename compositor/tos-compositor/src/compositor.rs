@@ -1274,7 +1274,12 @@ impl Compositor {
             MouseAction::Drag | MouseAction::Motion => {
                 Some(self.move_divider(grab, cell_x, cell_y))
             }
-            MouseAction::Release => {
+            // The left button only, for the same reason it is the only one
+            // that starts a drag: a right or middle button let go mid-drag is
+            // not the end of the drag, and ending it there would leave the
+            // divider behind while the hand that is still holding the left
+            // button goes on moving.
+            MouseAction::Release if button == Some(MouseButton::Left) => {
                 self.mouse_grab = None;
                 Some(false)
             }

@@ -394,6 +394,48 @@ fn a_wheel_notch_during_a_divider_drag_neither_drops_it_nor_moves_the_focus() {
 }
 
 #[test]
+fn another_button_let_go_during_a_divider_drag_neither_drops_it_nor_moves_the_focus() {
+    // A hand can have more than one button down, and the one that ends a
+    // divider drag is the one that started it. Letting go of any button was
+    // enough to drop the grab, and the drag that was still being made with
+    // the left button then went to the panes — which is nothing at all in the
+    // gap the pointer is in, so the divider simply stopped following it.
+    let mut c = quiet();
+    let (at, _) = split_columns(&mut c);
+    let panes = c.session().active().panes();
+    let (left, right) = (rect_of(&c, panes[0]), rect_of(&c, panes[1]));
+    let focus = c.session().focus();
+
+    pointer(&mut c, at, Some(MouseButton::Left), MouseAction::Press);
+    pointer(&mut c, at, Some(MouseButton::Right), MouseAction::Press);
+    pointer(&mut c, at, Some(MouseButton::Right), MouseAction::Release);
+    pointer(
+        &mut c,
+        (at.0 + 6, at.1),
+        Some(MouseButton::Left),
+        MouseAction::Drag,
+    );
+    pointer(
+        &mut c,
+        (at.0 + 6, at.1),
+        Some(MouseButton::Left),
+        MouseAction::Release,
+    );
+
+    assert_eq!(
+        rect_of(&c, panes[0]).width,
+        left.width + 6,
+        "the right button aborted the drag"
+    );
+    assert_eq!(rect_of(&c, panes[1]).width, right.width - 6);
+    assert_eq!(
+        c.session().focus(),
+        focus,
+        "the right button moved the focus out from under the drag"
+    );
+}
+
+#[test]
 fn a_divider_whose_split_was_freed_does_not_come_back_as_the_split_that_took_the_slot() {
     let mut c = quiet();
     assert!(c.perform(Action::NewWorkspace));
