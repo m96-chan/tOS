@@ -114,6 +114,31 @@ struct Node {
     kind: NodeKind,
 }
 
+/// Which divider, for as long as it exists.
+///
+/// The split it belongs to and the child it follows, which is the only thing
+/// about a divider that does not move: its rectangle changes with every cell
+/// it is dragged, and the panes either side of it are not enough to name it
+/// on their own. Opaque on purpose — a caller holds one between a press and
+/// the release that ends the drag and has no business taking it apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DividerId {
+    split: NodeId,
+    index: usize,
+}
+
+/// A gap between two panes: where it is, which way it runs, and which one it
+/// is.
+///
+/// [`Axis::Columns`] means the children sit side by side, so the divider
+/// between them is a vertical line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Divider {
+    pub axis: Axis,
+    pub rect: Rect,
+    pub id: DividerId,
+}
+
 /// The smallest a pane is allowed to become, in cells.
 const MIN_PANE: u32 = 2;
 
@@ -474,6 +499,126 @@ impl Layout {
             used += size;
             offset += size + self.gap;
         }
+    }
+
+    /// The dividers between panes, with enough of their identity to move one.
+    ///
+    /// The same gaps [`Layout::dividers`] reports, for the caller that has to
+    /// say *which* divider rather than only draw it. A drag is a series of
+    /// events about one divider, and the tree it lives in is being reshaped
+    /// underneath them, so naming it by where it was when the button went
+    /// down would mean chasing a rectangle that has moved.
+    pub fn placed_dividers(&self, area: Rect) -> Vec<Divider> {
+        let mut out = Vec::new();
+        self.collect_placed_dividers(self.root, area, &mut out);
+        out
+    }
+
+    /// The divider at a cell, if the cell is in one: the gaps are in no
+    /// pane's rectangle, so [`Layout::pane_at`] answers `None` for all of
+    /// them.
+    pub fn divider_at(&self, area: Rect, x: u32, y: u32) -> Option<Divider> {
+        self.placed_dividers(area)
+            .into_iter()
+            .find(|divider| divider.rect.contains(x, y))
+    }
+
+    /// Where a divider is now.
+    ///
+    /// `None` once it has stopped existing, which is what closing a pane on
+    /// either side of it does.
+    pub fn divider(&self, area: Rect, id: DividerId) -> Option<Divider> {
+        self.placed_dividers(area)
+            .into_iter()
+            .find(|divider| divider.id == id)
+    }
+
+    fn collect_placed_dividers(&self, id: NodeId, area: Rect, out: &mut Vec<Divider>) {
+        let NodeKind::Split {
+            axis,
+            children,
+            weights,
+        } = &self.node(id).kind
+        else {
+            return;
+        };
+        let count = children.len();
+        let total_gap = self.gap * count.saturating_sub(1) as u32;
+        let available = match axis {
+            Axis::Columns => area.width.saturating_sub(total_gap),
+            Axis::Rows => area.height.saturating_sub(total_gap),
+        };
+        let sum: f64 = weights.iter().sum();
+        let sum = if sum <= 0.0 { 1.0 } else { sum };
+
+        let mut used = 0u32;
+        let mut offset = 0u32;
+        for (i, (&child, &weight)) in children.iter().zip(weights).enumerate() {
+            let is_last = i + 1 == count;
+            let size = if is_last {
+                available.saturating_sub(used)
+            } else {
+                child_size(available, used, weight, sum, count - i)
+            };
+            let child_area = match axis {
+                Axis::Columns => Rect::new(area.x + offset, area.y, size, area.height),
+                Axis::Rows => Rect::new(area.x, area.y + offset, area.width, size),
+            };
+            self.collect_placed_dividers(child, child_area, out);
+            if !is_last && self.gap > 0 {
+                let rect = match axis {
+                    Axis::Columns => {
+                        Rect::new(area.x + offset + size, area.y, self.gap, area.height)
+                    }
+                    Axis::Rows => Rect::new(area.x, area.y + offset + size, area.width, self.gap),
+                };
+                out.push(Divider {
+                    axis: *axis,
+                    rect,
+                    id: DividerId {
+                        split: id,
+                        index: i,
+                    },
+                });
+            }
+            used += size;
+            offset += size + self.gap;
+        }
+    }
+
+    /// Move one named divider by `amount` cells, positive being right or
+    /// down.
+    ///
+    /// [`Layout::resize`] is keyed on a pane and a direction, which is what a
+    /// binding has: it walks up from the pane to the first ancestor split
+    /// along that axis with a sibling on that side. A pointer has neither —
+    /// it has a rectangle it is holding — and the walk is not an inverse of
+    /// that rectangle: the pane beside a divider can have a nearer ancestor
+    /// of the same axis, and the drag would silently move a divider somewhere
+    /// else in the tree. Naming the split and the child it follows is the
+    /// whole of the address, so there is nothing left to guess.
+    ///
+    /// Returns false when the divider has gone, or when either side would
+    /// drop below [`MIN_PANE`] — the same refusal the keyboard gets.
+    pub fn resize_at(&mut self, area: Rect, id: DividerId, amount: i32) -> bool {
+        let DividerId { split, index } = id;
+        // The node may have been freed, or its split collapsed into the leaf
+        // that survived it, while the button was held down.
+        let Some(Some(node)) = self.nodes.get(split.0) else {
+            return false;
+        };
+        let NodeKind::Split { children, .. } = &node.kind else {
+            return false;
+        };
+        if index + 1 >= children.len() {
+            return false;
+        }
+        let Some(&extent) = self.split_extents(area).get(&split) else {
+            return false;
+        };
+        // Moving the divider along the axis grows the child before it at the
+        // expense of the one after; there is no third party to a gap.
+        self.shift_weights(split, index, index + 1, amount, extent)
     }
 
     /// Which pane is at a cell, if any.
@@ -874,6 +1019,122 @@ mod tests {
         let mut layout = Layout::new(PaneId(1));
         layout.split(area(), PaneId(1), Axis::Columns, PaneId(2));
         assert!(!layout.resize(area(), PaneId(1), Direction::Left, 4));
+    }
+
+    /// A layout with a divider at two depths and on both axes: two rows, the
+    /// lower one split into columns.
+    fn nested() -> Layout {
+        let mut layout = Layout::new(PaneId(1));
+        layout.split(area(), PaneId(1), Axis::Rows, PaneId(2));
+        layout.split(area(), PaneId(2), Axis::Columns, PaneId(3));
+        layout
+    }
+
+    #[test]
+    fn the_dividers_that_can_be_grabbed_are_the_ones_that_are_drawn() {
+        // Two walks over the same tree, so this is what keeps them the same
+        // walk: a divider the pointer can find where none is painted is a
+        // strip of screen that resizes the session when nudged.
+        let layout = nested();
+        let drawn = layout.dividers(area());
+        let placed = layout.placed_dividers(area());
+        assert_eq!(drawn.len(), placed.len());
+        for ((axis, rect), divider) in drawn.iter().zip(&placed) {
+            assert_eq!((*axis, *rect), (divider.axis, divider.rect));
+        }
+    }
+
+    #[test]
+    fn the_divider_under_a_cell_is_the_one_in_no_pane() {
+        let layout = nested();
+        for divider in layout.placed_dividers(area()) {
+            let (x, y) = (divider.rect.x, divider.rect.y);
+            assert_eq!(layout.pane_at(area(), x, y), None);
+            assert_eq!(
+                layout.divider_at(area(), x, y).map(|d| d.id),
+                Some(divider.id)
+            );
+        }
+        // A cell in a pane is not in a divider.
+        assert!(layout.divider_at(area(), 0, 0).is_none());
+    }
+
+    #[test]
+    fn moving_a_named_divider_moves_the_panes_either_side_of_it() {
+        let mut layout = nested();
+        let divider = layout
+            .placed_dividers(area())
+            .into_iter()
+            .find(|d| d.axis == Axis::Columns)
+            .expect("the lower row is split into columns");
+        let before = layout.geometry(area());
+        let (left, right) = (layout_of(&before, PaneId(2)), layout_of(&before, PaneId(3)));
+
+        assert!(layout.resize_at(area(), divider.id, 6));
+        let after = layout.geometry(area());
+        assert_eq!(layout_of(&after, PaneId(2)).width, left.width + 6);
+        assert_eq!(layout_of(&after, PaneId(3)).width, right.width - 6);
+        // And the divider itself has followed, which is what the next event
+        // of a drag is measured from.
+        let moved = layout.divider(area(), divider.id).expect("still there");
+        assert_eq!(moved.rect.x, divider.rect.x + 6);
+    }
+
+    #[test]
+    fn moving_a_named_divider_stops_at_the_minimum_size() {
+        let mut layout = nested();
+        let divider = layout
+            .placed_dividers(area())
+            .into_iter()
+            .find(|d| d.axis == Axis::Columns)
+            .expect("a vertical divider");
+        let before = layout.geometry(area());
+        assert!(!layout.resize_at(area(), divider.id, 100));
+        assert_eq!(layout.geometry(area()), before, "nothing should have moved");
+    }
+
+    #[test]
+    fn two_dividers_a_pane_and_a_direction_confuse_are_moved_one_at_a_time() {
+        // Two rows, each split into columns: two vertical dividers that look
+        // alike to anything keyed on a direction, since which one
+        // `Layout::resize` moves depends on which pane it starts walking up
+        // from. The pointer is holding one of them and has to move that one.
+        let mut layout = Layout::new(PaneId(1));
+        layout.split(area(), PaneId(1), Axis::Rows, PaneId(2));
+        layout.split(area(), PaneId(1), Axis::Columns, PaneId(3));
+        layout.split(area(), PaneId(2), Axis::Columns, PaneId(4));
+
+        let vertical: Vec<Divider> = layout
+            .placed_dividers(area())
+            .into_iter()
+            .filter(|d| d.axis == Axis::Columns)
+            .collect();
+        assert_eq!(vertical.len(), 2);
+        assert!(layout.resize_at(area(), vertical[0].id, 5));
+
+        let after = layout.placed_dividers(area());
+        let moved = after.iter().find(|d| d.id == vertical[0].id).unwrap();
+        let other = after.iter().find(|d| d.id == vertical[1].id).unwrap();
+        assert_eq!(moved.rect.x, vertical[0].rect.x + 5);
+        assert_eq!(
+            other.rect.x, vertical[1].rect.x,
+            "the other half of the screen"
+        );
+    }
+
+    #[test]
+    fn a_divider_whose_split_has_gone_cannot_be_moved() {
+        // A pane can close while the button is still down, and the split it
+        // was half of collapses into the pane that survived it.
+        let mut layout = nested();
+        let divider = layout
+            .placed_dividers(area())
+            .into_iter()
+            .find(|d| d.axis == Axis::Columns)
+            .expect("a vertical divider");
+        layout.close(PaneId(3));
+        assert!(layout.divider(area(), divider.id).is_none());
+        assert!(!layout.resize_at(area(), divider.id, 2));
     }
 
     #[test]
