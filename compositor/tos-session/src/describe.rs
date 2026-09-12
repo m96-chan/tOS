@@ -18,12 +18,37 @@ use tos_input::{ImeKey, KeyCode, Keypad, MediaKey, ModifierKey, Modifiers};
 use crate::keys::{Action, Binding, Keymap};
 use crate::layout::{Axis, Direction};
 
-/// The widest the key column is allowed to get, in characters.
+/// How wide a row of the sheet can be, in characters.
 ///
-/// Every alias a binding has is true, but not all of them are worth the width.
-/// The overlay only draws the key column when it fits beside the description,
-/// so a row that lists four ways to do one thing ends up showing none of them.
-const MAX_KEYS_WIDTH: usize = 30;
+/// The overlay draws the sheet in a box of at most 64 columns, which leaves
+/// 62 inside the border, and it keeps a space between the description and the
+/// keys and two at the end.
+const ROW_WIDTH: usize = 62;
+
+/// What a row spends on something other than the keys: the space before them
+/// and the two after.
+const ROW_PADDING: usize = 3;
+
+/// How much of a row is left for the keys once the description has had its
+/// share.
+///
+/// Every alias a binding has is true, but not all of them are worth the
+/// width, and the overlay only draws the key column when it fits beside the
+/// description — so a row that lists four ways to do one thing ends up
+/// showing none of them.
+///
+/// The budget is per row rather than one number for the column because the
+/// descriptions are not all the same length, and a fixed cap is the wrong
+/// shape for the thing it is capping. A flat 30 was enough until the Kitty
+/// bindings arrived: `ctrl+shift+pagedown` is 19 characters on its own, so
+/// the page rows spent their whole allowance on the new alias and dropped
+/// `shift+pagedown` — advertising the longer key and hiding the one every
+/// other terminal on the machine uses. Short descriptions like "scroll back
+/// a page" have the room to spare; "move the pane to a workspace" does not,
+/// and only it should have to pay for that.
+fn keys_budget(action: &str) -> usize {
+    ROW_WIDTH.saturating_sub(action.chars().count() + ROW_PADDING)
+}
 
 /// The fewest bindings in a digit run before it is worth folding into a range.
 const MIN_RUN: usize = 3;
@@ -76,7 +101,7 @@ pub fn cheat_sheet(keymap: &Keymap) -> Vec<BindingHelp> {
             group.names.dedup();
             let names: Vec<String> = group.names.into_iter().map(|(_, name)| name).collect();
             BindingHelp {
-                keys: join(&collapse_digits(&names)),
+                keys: join(&collapse_digits(&names), keys_budget(&group.action)),
                 action: group.action,
             }
         })
@@ -351,16 +376,17 @@ fn split_digit(name: &str) -> (&str, Option<char>) {
     }
 }
 
-/// Join as many names as fit in the key column, keeping the first whatever
-/// happens: a row with no keys on it is not a row.
-fn join(names: &[String]) -> String {
+/// Join as many names as fit in `budget`, keeping the first whatever happens:
+/// a row with no keys on it is not a row, even when the description has eaten
+/// the width the keys wanted.
+fn join(names: &[String], budget: usize) -> String {
     let mut joined = String::new();
     for name in names {
         if joined.is_empty() {
             joined.push_str(name);
             continue;
         }
-        if joined.chars().count() + 3 + name.chars().count() > MAX_KEYS_WIDTH {
+        if joined.chars().count() + 3 + name.chars().count() > budget {
             break;
         }
         joined.push_str(" / ");
@@ -583,12 +609,34 @@ mod tests {
 
     #[test]
     fn the_key_column_stays_narrow() {
-        // It is drawn beside the description, and only when it fits.
+        // It is drawn beside the description, and only when it fits — so what
+        // has to hold is that the whole row fits, not that the keys fit some
+        // number of their own.
         for help in cheat_sheet(&Keymap::default_bindings()) {
+            let width = help.action.chars().count() + ROW_PADDING + help.keys.chars().count();
+            assert!(width <= ROW_WIDTH, "{help:?} needs {width} columns");
+        }
+    }
+
+    #[test]
+    fn a_row_with_room_to_spare_keeps_the_key_the_rest_of_the_world_uses() {
+        // The regression the per-row budget exists to stop: ctrl+shift+pageup
+        // is long enough to have spent a flat 30-character column by itself,
+        // which left the page rows advertising the Kitty key and hiding the
+        // bare shift combination every other terminal has.
+        let sheet = cheat_sheet(&Keymap::default_bindings());
+        for action in ["scroll back a page", "scroll forward a page"] {
+            let row = sheet
+                .iter()
+                .find(|help| help.action == action)
+                .unwrap_or_else(|| panic!("no {action:?} row"));
             assert!(
-                help.keys.chars().count() <= MAX_KEYS_WIDTH,
-                "{:?} is too wide",
-                help.keys
+                row.keys.contains("ctrl+shift+page"),
+                "{row:?} lost the Kitty key"
+            );
+            assert!(
+                row.keys.contains("/ shift+page"),
+                "{row:?} lost the key every other terminal uses"
             );
         }
     }

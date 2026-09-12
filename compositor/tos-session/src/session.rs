@@ -4,7 +4,7 @@
 //! pane. Pane identifiers are unique across the whole session so that a pane
 //! can move between workspaces without being recreated.
 
-use crate::layout::{self, Arrangement, Axis, Direction, Layout, PaneId, Rect};
+use crate::layout::{self, Arrangement, Axis, Direction, Divider, DividerId, Layout, PaneId, Rect};
 
 /// Identifies a workspace within a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -111,6 +111,34 @@ impl Workspace {
             return Vec::new();
         }
         self.layout.dividers(area)
+    }
+
+    /// The divider at a cell, if one is there to be grabbed.
+    ///
+    /// Gated on the arrangement for the same reason [`Workspace::dividers`]
+    /// is, and it has to be said twice because drawing and grabbing are
+    /// different questions asked by different code. A derived arrangement
+    /// draws no dividers, and a strip that resizes something invisible is
+    /// worse than one that does nothing: the weights it would move are the
+    /// ones that returning to [`Arrangement::Splits`] promises to hand back
+    /// exactly as they were left.
+    pub fn divider_at(&self, area: Rect, x: u32, y: u32) -> Option<Divider> {
+        if self.arrangement != Arrangement::Splits {
+            return None;
+        }
+        self.layout.divider_at(area, x, y)
+    }
+
+    /// Where a divider being dragged is now.
+    ///
+    /// Answers `None` once the arrangement stops being [`Arrangement::Splits`],
+    /// which drops the grab — cycling the layout is a binding, and the
+    /// keyboard still works while a button is held down.
+    pub fn divider(&self, area: Rect, id: DividerId) -> Option<Divider> {
+        if self.arrangement != Arrangement::Splits {
+            return None;
+        }
+        self.layout.divider(area, id)
     }
 
     pub fn set_focus(&mut self, pane: PaneId) -> bool {
@@ -827,6 +855,41 @@ mod tests {
                 .neighbour(area(), panes[0], Direction::Down),
             None
         );
+    }
+
+    #[test]
+    fn a_divider_nobody_can_see_is_a_divider_nobody_can_grab() {
+        let mut session = row_of(3);
+        let area = area();
+        // The tree has two gaps in it, and while it is what is on screen they
+        // can be both drawn and taken hold of.
+        let drawn = session.active().dividers(area);
+        assert_eq!(drawn.len(), 2);
+        let at = (drawn[0].1.x, drawn[0].1.y);
+        assert!(session.active().divider_at(area, at.0, at.1).is_some());
+        let held = session
+            .active()
+            .divider_at(area, at.0, at.1)
+            .expect("a divider to hold")
+            .id;
+
+        // Under a derived arrangement the same cell draws nothing, and so it
+        // must also grab nothing: the weights a drag would move are the ones
+        // coming back to `splits` promises to return untouched, and a pointer
+        // cannot be allowed to reshape a tree it is not being shown.
+        session.active_mut().set_arrangement(Arrangement::Tall);
+        assert!(session.active().dividers(area).is_empty());
+        assert_eq!(session.active().divider_at(area, at.0, at.1), None);
+        // The gate is doing the work, not the geometry: the tree asked
+        // directly still offers the divider at that very cell.
+        assert!(session
+            .active()
+            .layout
+            .divider_at(area, at.0, at.1)
+            .is_some());
+        // A drag already in flight when the layout changed asks this instead,
+        // and has to be told the same thing or it would keep moving one.
+        assert_eq!(session.active().divider(area, held), None);
     }
 
     #[test]

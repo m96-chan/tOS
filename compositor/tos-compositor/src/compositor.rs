@@ -1239,11 +1239,7 @@ impl Compositor {
                 return None;
             }
             let area = self.grid_area();
-            let divider = self
-                .session
-                .active()
-                .layout
-                .divider_at(area, cell_x, cell_y)?;
+            let divider = self.session.active().divider_at(area, cell_x, cell_y)?;
             // One grab, one owner: whatever the pane path thought it was
             // dragging, it is not dragging it now.
             self.release_grab();
@@ -1291,7 +1287,7 @@ impl Compositor {
             self.mouse_grab = None;
             return false;
         }
-        let Some(divider) = self.session.active().layout.divider(area, grab.id) else {
+        let Some(divider) = self.session.active().divider(area, grab.id) else {
             // The split went away under the drag, which is what closing a
             // pane beside it does.
             self.mouse_grab = None;
@@ -2928,8 +2924,14 @@ impl Compositor {
 
         // Last, and over everything: the overlay is modal, and the panes below
         // it have already painted whatever they wanted to this frame.
+        //
+        // The area is taken from `overlay_area` rather than worked out again
+        // here, because the mouse asks the same question to decide which row
+        // a click landed on: two copies of this arithmetic would be a click
+        // that lands one row off the row it was aimed at, and nothing would
+        // catch it until somebody resized a pane.
+        let over = self.overlay_area();
         if let Some((_, overlay)) = &mut self.overlay {
-            let over = PixelRect::new(0, 0, area.width * cw, area.height * ch);
             overlay.draw(surface, &mut self.fonts, over, &self.chrome);
         }
 
