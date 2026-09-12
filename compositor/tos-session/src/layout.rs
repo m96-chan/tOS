@@ -94,6 +94,253 @@ impl Direction {
     }
 }
 
+/// A named way of arranging the panes of a workspace.
+///
+/// For most of tOS's life the tree below has been the only arrangement there
+/// is: a pane sits wherever the split that made it put it, and there was
+/// nothing for a "next layout" key to advance through. These are the names it
+/// advances through now, chosen to be the ones a Kitty user arrives with.
+///
+/// Everything but [`Arrangement::Splits`] derives its geometry from the pane
+/// order alone — the order [`Layout::panes`] hands back, which is tree order —
+/// and ignores the shape of the tree and every weight in it. Nothing here
+/// mutates the tree. That is the whole model, and it is what makes leaving an
+/// arrangement free: switching to `Tall` and back gives the manual splits and
+/// the dragged dividers back exactly as they were, where Kitty discards them
+/// the moment the layout is cycled past. The tree stays the source of truth
+/// and an arrangement is a way of reading it.
+///
+/// Kitty's `stack` is deliberately not here. It shows the active window alone
+/// and full screen, which is exactly what the zoom already does — see
+/// `Workspace::zoomed`, which the same [`Workspace::geometry`] answers for.
+/// Two mechanisms for one behaviour would mean two ways to be full screen and
+/// a question about what happens when both are on, and no user would ever be
+/// able to say which of the two they were in. `horizontal` and `vertical` are
+/// missing for a duller reason: each is a `Grid` of one row or one column, and
+/// a tree of splits reaches either in a keystroke.
+///
+/// [`Workspace::geometry`]: crate::session::Workspace::geometry
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Arrangement {
+    /// The tree itself: panes where the splits left them.
+    #[default]
+    Splits,
+    /// One full-height pane on the left, the rest stacked in a column beside
+    /// it. Kitty's `tall`.
+    Tall,
+    /// One full-width pane on top, the rest side by side underneath. Kitty's
+    /// `fat`.
+    Fat,
+    /// As square a grid as the pane count allows, filled row by row. Kitty's
+    /// `grid`.
+    Grid,
+}
+
+impl Arrangement {
+    /// Every arrangement, in the order the layout keys walk them.
+    ///
+    /// `Splits` comes first because it is what every session starts in, so
+    /// cycling forward is a tour of the derived arrangements that ends back
+    /// home rather than a walk away from it.
+    pub const ALL: [Arrangement; 4] = [
+        Arrangement::Splits,
+        Arrangement::Tall,
+        Arrangement::Fat,
+        Arrangement::Grid,
+    ];
+
+    /// What to call this on the status bar.
+    pub fn name(self) -> &'static str {
+        match self {
+            Arrangement::Splits => "splits",
+            Arrangement::Tall => "tall",
+            Arrangement::Fat => "fat",
+            Arrangement::Grid => "grid",
+        }
+    }
+
+    pub fn next(self) -> Arrangement {
+        let index = self.position();
+        Arrangement::ALL[(index + 1) % Arrangement::ALL.len()]
+    }
+
+    pub fn previous(self) -> Arrangement {
+        let index = self.position();
+        Arrangement::ALL[(index + Arrangement::ALL.len() - 1) % Arrangement::ALL.len()]
+    }
+
+    fn position(self) -> usize {
+        Arrangement::ALL
+            .iter()
+            .position(|&a| a == self)
+            .expect("every arrangement is in ALL")
+    }
+
+    /// Where `panes` go inside `area`, in the order they are given, or `None`
+    /// for [`Arrangement::Splits`].
+    ///
+    /// `Splits` is not a function of the pane order at all — it is the tree,
+    /// and only the tree can answer for it. Saying so with `None` rather than
+    /// quietly returning a row of panes is what keeps the one caller that
+    /// matters honest: [`Workspace::geometry`] has to fall back to
+    /// [`Layout::geometry`], and a wrong answer here would be a screen that
+    /// disagreed with the tree it claims never to touch.
+    ///
+    /// [`Workspace::geometry`]: crate::session::Workspace::geometry
+    pub fn geometry(self, panes: &[PaneId], area: Rect, gap: u32) -> Option<Vec<(PaneId, Rect)>> {
+        if self == Arrangement::Splits {
+            return None;
+        }
+        let mut out = Vec::with_capacity(panes.len());
+        let Some((&master, rest)) = panes.split_first() else {
+            return Some(out);
+        };
+        // One pane fills the workspace whatever the arrangement, and the
+        // arrangements below all want a non-empty remainder to divide.
+        if rest.is_empty() {
+            out.push((master, area));
+            return Some(out);
+        }
+
+        match self {
+            Arrangement::Splits => unreachable!("returned above"),
+            Arrangement::Tall => {
+                let columns = spans(area.x, area.width, 2, gap);
+                out.push((
+                    master,
+                    Rect::new(columns[0].0, area.y, columns[0].1, area.height),
+                ));
+                let rows = spans(area.y, area.height, rest.len(), gap);
+                for (&pane, (y, height)) in rest.iter().zip(rows) {
+                    out.push((pane, Rect::new(columns[1].0, y, columns[1].1, height)));
+                }
+            }
+            Arrangement::Fat => {
+                let rows = spans(area.y, area.height, 2, gap);
+                out.push((master, Rect::new(area.x, rows[0].0, area.width, rows[0].1)));
+                let columns = spans(area.x, area.width, rest.len(), gap);
+                for (&pane, (x, width)) in rest.iter().zip(columns) {
+                    out.push((pane, Rect::new(x, rows[1].0, width, rows[1].1)));
+                }
+            }
+            Arrangement::Grid => {
+                let count = panes.len();
+                // The fewest columns that still fit the panes into as many
+                // rows: five panes want three columns and two rows, not five
+                // columns of nothing.
+                let columns = (1usize..).find(|c| c * c >= count).unwrap_or(1);
+                let rows = count.div_ceil(columns);
+                for (row, (y, height)) in spans(area.y, area.height, rows, gap)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let start = row * columns;
+                    let end = (start + columns).min(count);
+                    // A last row with fewer panes than the rest spreads them
+                    // across the full width rather than leaving a hole where
+                    // the missing pane would have been: a gap in the grid
+                    // reads as a pane that failed to draw.
+                    let across = spans(area.x, area.width, end - start, gap);
+                    for (&pane, (x, width)) in panes[start..end].iter().zip(across) {
+                        out.push((pane, Rect::new(x, y, width, height)));
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+}
+
+/// Cut `extent` cells from `start` into `count` even pieces with `gap` cells
+/// between each pair, as `(offset, size)`.
+///
+/// Deliberately the same arithmetic the tree divides a split with, down to
+/// [`child_size`] and the last piece taking whatever rounding left over: three
+/// panes in a row are the same three rectangles whether a `Grid` derived them
+/// or a pair of splits did, so switching between the two moves nothing by a
+/// cell.
+fn spans(start: u32, extent: u32, count: usize, gap: u32) -> Vec<(u32, u32)> {
+    let mut out = Vec::with_capacity(count);
+    if count == 0 {
+        return out;
+    }
+    let total_gap = gap * (count as u32).saturating_sub(1);
+    let available = extent.saturating_sub(total_gap);
+    let sum = count as f64;
+    let mut used = 0u32;
+    let mut offset = 0u32;
+    for index in 0..count {
+        let size = if index + 1 == count {
+            available.saturating_sub(used)
+        } else {
+            child_size(available, used, 1.0, sum, count - index)
+        };
+        out.push((start + offset, size));
+        used += size;
+        offset += size + gap;
+    }
+    out
+}
+
+/// Which pane of an already laid out geometry is at a cell, if any.
+///
+/// Free rather than a method on [`Layout`] because the geometry on screen is
+/// not always the tree's: a workspace in a derived [`Arrangement`] puts the
+/// same panes in different rectangles, and a hit test that asked the tree
+/// would answer for a picture nobody is looking at.
+pub fn pane_at(geometry: &[(PaneId, Rect)], x: u32, y: u32) -> Option<PaneId> {
+    geometry
+        .iter()
+        .find(|(_, rect)| rect.contains(x, y))
+        .map(|(pane, _)| *pane)
+}
+
+/// The pane nearest to `from` in `direction`, within an already laid out
+/// geometry.
+///
+/// Free for the same reason as [`pane_at`], and it matters more here: under
+/// `Grid` the tree and the screen disagree about what is to the right of what,
+/// and arrow keys that followed the tree would move focus to a pane that is
+/// not in the direction the user pressed.
+pub fn neighbour(
+    geometry: &[(PaneId, Rect)],
+    from: PaneId,
+    direction: Direction,
+) -> Option<PaneId> {
+    let current = geometry.iter().find(|(p, _)| *p == from)?.1;
+    let (cx, cy) = current.center();
+
+    geometry
+        .iter()
+        .filter(|(pane, _)| *pane != from)
+        .filter(|(_, rect)| match direction {
+            Direction::Left => rect.right() <= current.x,
+            Direction::Right => rect.x >= current.right(),
+            Direction::Up => rect.bottom() <= current.y,
+            Direction::Down => rect.y >= current.bottom(),
+        })
+        // Prefer the closest pane along the axis of travel, breaking ties
+        // by how well it lines up across that axis.
+        .min_by(|(_, a), (_, b)| {
+            let score = |rect: &Rect| {
+                let (x, y) = rect.center();
+                let (along, across) = match direction {
+                    Direction::Left => ((cx - x).abs(), (cy - y).abs()),
+                    Direction::Right => ((x - cx).abs(), (cy - y).abs()),
+                    Direction::Up => ((cy - y).abs(), (cx - x).abs()),
+                    Direction::Down => ((y - cy).abs(), (cx - x).abs()),
+                };
+                (along, across)
+            };
+            let (aa, ab) = score(a);
+            let (ba, bb) = score(b);
+            (aa, ab)
+                .partial_cmp(&(ba, bb))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(pane, _)| *pane)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct NodeId(usize);
 
@@ -476,49 +723,18 @@ impl Layout {
         }
     }
 
-    /// Which pane is at a cell, if any.
+    /// Which pane is at a cell, if any, according to the tree.
+    ///
+    /// A workspace answers this itself, because the tree is only what is on
+    /// screen while the arrangement is [`Arrangement::Splits`].
     pub fn pane_at(&self, area: Rect, x: u32, y: u32) -> Option<PaneId> {
-        self.geometry(area)
-            .into_iter()
-            .find(|(_, rect)| rect.contains(x, y))
-            .map(|(pane, _)| pane)
+        pane_at(&self.geometry(area), x, y)
     }
 
-    /// The pane nearest to `from` in `direction`.
+    /// The pane nearest to `from` in `direction`, according to the tree. Same
+    /// caveat as [`Layout::pane_at`].
     pub fn neighbour(&self, area: Rect, from: PaneId, direction: Direction) -> Option<PaneId> {
-        let geometry = self.geometry(area);
-        let current = geometry.iter().find(|(p, _)| *p == from)?.1;
-        let (cx, cy) = current.center();
-
-        geometry
-            .iter()
-            .filter(|(pane, _)| *pane != from)
-            .filter(|(_, rect)| match direction {
-                Direction::Left => rect.right() <= current.x,
-                Direction::Right => rect.x >= current.right(),
-                Direction::Up => rect.bottom() <= current.y,
-                Direction::Down => rect.y >= current.bottom(),
-            })
-            // Prefer the closest pane along the axis of travel, breaking ties
-            // by how well it lines up across that axis.
-            .min_by(|(_, a), (_, b)| {
-                let score = |rect: &Rect| {
-                    let (x, y) = rect.center();
-                    let (along, across) = match direction {
-                        Direction::Left => ((cx - x).abs(), (cy - y).abs()),
-                        Direction::Right => ((x - cx).abs(), (cy - y).abs()),
-                        Direction::Up => ((cy - y).abs(), (cx - x).abs()),
-                        Direction::Down => ((y - cy).abs(), (cx - x).abs()),
-                    };
-                    (along, across)
-                };
-                let (aa, ab) = score(a);
-                let (ba, bb) = score(b);
-                (aa, ab)
-                    .partial_cmp(&(ba, bb))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(pane, _)| *pane)
+        neighbour(&self.geometry(area), from, direction)
     }
 
     /// Move the divider next to `pane` in `direction` by `amount` cells.
@@ -924,6 +1140,214 @@ mod tests {
         }
         assert_eq!(layout.len(), 1);
         assert_eq!(layout.geometry(area), vec![(PaneId(0), area)]);
+    }
+
+    /// The panes an arrangement is asked to place, as a workspace would hand
+    /// them over: in tree order, which is the only thing the derived
+    /// arrangements read.
+    fn panes(count: u32) -> Vec<PaneId> {
+        (1..=count).map(PaneId).collect()
+    }
+
+    #[test]
+    fn one_pane_fills_the_area_whatever_the_arrangement() {
+        for arrangement in Arrangement::ALL {
+            if arrangement == Arrangement::Splits {
+                continue;
+            }
+            assert_eq!(
+                arrangement.geometry(&panes(1), area(), 1),
+                Some(vec![(PaneId(1), area())]),
+                "{arrangement:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tall_arrangement_gives_the_first_pane_the_left_and_stacks_the_rest() {
+        let tall = |count| {
+            Arrangement::Tall
+                .geometry(&panes(count), area(), 0)
+                .unwrap()
+        };
+
+        assert_eq!(
+            tall(2),
+            vec![
+                (PaneId(1), Rect::new(0, 0, 40, 24)),
+                (PaneId(2), Rect::new(40, 0, 40, 24)),
+            ]
+        );
+        assert_eq!(
+            tall(3),
+            vec![
+                (PaneId(1), Rect::new(0, 0, 40, 24)),
+                (PaneId(2), Rect::new(40, 0, 40, 12)),
+                (PaneId(3), Rect::new(40, 12, 40, 12)),
+            ]
+        );
+        // The master keeps the full height however many join the column.
+        let five = tall(5);
+        assert_eq!(five[0], (PaneId(1), Rect::new(0, 0, 40, 24)));
+        assert_eq!(
+            five[1..]
+                .iter()
+                .map(|(_, rect)| (rect.y, rect.height))
+                .collect::<Vec<_>>(),
+            vec![(0, 6), (6, 6), (12, 6), (18, 6)]
+        );
+    }
+
+    #[test]
+    fn the_fat_arrangement_gives_the_first_pane_the_top_and_lines_the_rest_up_underneath() {
+        let fat = |count| Arrangement::Fat.geometry(&panes(count), area(), 0).unwrap();
+
+        assert_eq!(
+            fat(2),
+            vec![
+                (PaneId(1), Rect::new(0, 0, 80, 12)),
+                (PaneId(2), Rect::new(0, 12, 80, 12)),
+            ]
+        );
+        assert_eq!(
+            fat(3),
+            vec![
+                (PaneId(1), Rect::new(0, 0, 80, 12)),
+                (PaneId(2), Rect::new(0, 12, 40, 12)),
+                (PaneId(3), Rect::new(40, 12, 40, 12)),
+            ]
+        );
+        let five = fat(5);
+        assert_eq!(five[0], (PaneId(1), Rect::new(0, 0, 80, 12)));
+        assert!(
+            five[1..]
+                .iter()
+                .all(|(_, rect)| rect.y == 12 && rect.height == 12),
+            "{five:?}"
+        );
+    }
+
+    #[test]
+    fn the_grid_arrangement_is_as_square_as_the_pane_count_allows() {
+        let grid = |count| {
+            Arrangement::Grid
+                .geometry(&panes(count), area(), 0)
+                .unwrap()
+        };
+
+        // Two panes are a row, not a column: a grid one pane deep is still a
+        // grid, and splitting the height would waste the width first.
+        assert_eq!(
+            grid(2),
+            vec![
+                (PaneId(1), Rect::new(0, 0, 40, 24)),
+                (PaneId(2), Rect::new(40, 0, 40, 24)),
+            ]
+        );
+        // Three panes are two columns and two rows, with the odd one spread
+        // across the bottom rather than leaving a hole beside it.
+        assert_eq!(
+            grid(3),
+            vec![
+                (PaneId(1), Rect::new(0, 0, 40, 12)),
+                (PaneId(2), Rect::new(40, 0, 40, 12)),
+                (PaneId(3), Rect::new(0, 12, 80, 12)),
+            ]
+        );
+        let five = grid(5);
+        assert_eq!(five.len(), 5);
+        assert_eq!(
+            five[..3]
+                .iter()
+                .map(|(_, rect)| (rect.x, rect.width, rect.y, rect.height))
+                .collect::<Vec<_>>(),
+            vec![(0, 27, 0, 12), (27, 27, 0, 12), (54, 26, 0, 12)]
+        );
+        assert_eq!(
+            five[3..]
+                .iter()
+                .map(|(_, rect)| (rect.x, rect.width, rect.y, rect.height))
+                .collect::<Vec<_>>(),
+            vec![(0, 40, 12, 12), (40, 40, 12, 12)]
+        );
+    }
+
+    #[test]
+    fn a_derived_arrangement_places_every_pane_inside_the_area_and_over_none_of_the_others() {
+        for arrangement in Arrangement::ALL {
+            let Some(_) = arrangement.geometry(&panes(1), area(), 1) else {
+                continue;
+            };
+            for count in 1..=8u32 {
+                let geometry = arrangement.geometry(&panes(count), area(), 1).unwrap();
+                assert_eq!(geometry.len(), count as usize, "{arrangement:?} {count}");
+                for (pane, rect) in &geometry {
+                    assert!(
+                        rect.right() <= area().right() && rect.bottom() <= area().bottom(),
+                        "{arrangement:?} {count}: {pane:?} at {rect:?} leaves the area"
+                    );
+                    assert!(
+                        rect.width >= MIN_PANE && rect.height >= MIN_PANE,
+                        "{arrangement:?} {count}: {pane:?} at {rect:?} is too small to use"
+                    );
+                }
+                for (i, (_, a)) in geometry.iter().enumerate() {
+                    for (_, b) in &geometry[i + 1..] {
+                        let overlaps = a.x < b.right()
+                            && b.x < a.right()
+                            && a.y < b.bottom()
+                            && b.y < a.bottom();
+                        assert!(!overlaps, "{arrangement:?} {count}: {a:?} over {b:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_derived_arrangements_use_the_same_arithmetic_as_a_split() {
+        // A row of two panes is the same two rectangles however it was
+        // arrived at, gap and rounding included. If these ever disagree,
+        // leaving `splits` for `grid` and coming back would shuffle every
+        // pane by a cell for no reason a user could name.
+        let mut layout = Layout::new(PaneId(1));
+        layout.gap = 1;
+        assert!(layout.split(area(), PaneId(1), Axis::Columns, PaneId(2)));
+        assert_eq!(
+            Arrangement::Grid.geometry(&layout.panes(), area(), layout.gap),
+            Some(layout.geometry(area()))
+        );
+    }
+
+    #[test]
+    fn cycling_the_arrangements_wraps_both_ways() {
+        let mut arrangement = Arrangement::Splits;
+        for expected in [
+            Arrangement::Tall,
+            Arrangement::Fat,
+            Arrangement::Grid,
+            Arrangement::Splits,
+        ] {
+            arrangement = arrangement.next();
+            assert_eq!(arrangement, expected);
+        }
+        for expected in [
+            Arrangement::Grid,
+            Arrangement::Fat,
+            Arrangement::Tall,
+            Arrangement::Splits,
+        ] {
+            arrangement = arrangement.previous();
+            assert_eq!(arrangement, expected);
+        }
+    }
+
+    #[test]
+    fn splits_is_the_one_arrangement_that_cannot_answer_from_the_pane_order() {
+        // The `None` is load-bearing: it is what sends `Workspace::geometry`
+        // to the tree, and a `Some` here would be a screen drawn from a pane
+        // list that knows nothing about the splits in it.
+        assert_eq!(Arrangement::Splits.geometry(&panes(3), area(), 1), None);
     }
 }
 
