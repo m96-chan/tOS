@@ -38,7 +38,7 @@ apt-get update
 # kernel package then skips generating its own initrd, which would fail in
 # a container anyway.
 apt-get install -y --no-install-recommends \
-    musl-tools busybox-static cpio kmod fonts-vlgothic \
+    musl-tools busybox-static cpio kmod fonts-vlgothic skkdic \
     "$KERNEL_PKG" \
     grub-common grub2-common $GRUB_PKGS xorriso mtools \
     fdisk dosfstools e2fsprogs
@@ -97,6 +97,38 @@ cp iso/profile "$ROOT/etc/profile"
 VLGOTHIC=usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf
 mkdir -p "$ROOT/$(dirname "$VLGOTHIC")"
 cp "/$VLGOTHIC" "$ROOT/$VLGOTHIC"
+
+# The dictionary. The font is what makes Japanese legible; this is what makes
+# it typable. SKK-JISYO.L is a sorted text file the IME binary searches, which
+# is why tOS needs no conversion daemon at all — see docs/design/ime.md.
+#
+# Converted here, once, rather than at run time: tOS is UTF-8 throughout and
+# is not going to learn a second encoding to read one file.
+#
+# Debian's skkdic (20230109-1) ships it in EUC-JP — checked, not assumed.
+# file(1) gets no further than "ISO-8859 text", but the dictionary's own first
+# line is `;; -*- mode: fundamental; coding: euc-jp -*-`, it is not valid UTF-8
+# (iconv stops at byte 1366), and `iconv -f EUC-JP` reads all 4,489,936 bytes
+# of it without a single illegal sequence. That first line still says euc-jp in
+# the converted copy: it is a comment inside the dictionary, not something tOS
+# reads.
+#
+# 4,489,936 bytes of EUC-JP become 6,156,948 of UTF-8 and cost 1,995,397 of
+# them once the initramfs is gzipped — measured the way the font's number was,
+# by regzipping the shipped archive with the file taken out: 25,880,398 with
+# it against 23,885,001 without. That is 3.7% of the image against VL Gothic's
+# 2,544,069, so the data that makes Japanese input possible is a quarter
+# cheaper than the face that makes it visible. The image goes from 52,379,648
+# bytes to 54,376,448.
+#
+# After #20 (the Debian rootfs) this copy goes away: the rootfs installs
+# skkdic itself, and its own /usr/share/skk/SKK-JISYO.L becomes the system
+# dictionary. The path below is the initramfs stand-in until then.
+#
+# Licence: GPL-2+ (skk-dev/dict), redistributable.
+SKKDIC=/usr/share/skk/SKK-JISYO.L
+mkdir -p "$ROOT/usr/share/tos"
+iconv -f EUC-JP -t UTF-8 "$SKKDIC" >"$ROOT/usr/share/tos/SKK-JISYO.L"
 
 # The tools the installer shells out to. Unlike the compositor these are
 # Debian binaries, so their libraries have to come along; the installer is
