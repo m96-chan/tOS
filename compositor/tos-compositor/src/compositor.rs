@@ -5936,13 +5936,25 @@ mod tests {
     fn click_bar(compositor: &mut Compositor, col: u32) -> bool {
         let row = compositor.status_row().expect("a status row");
         let (cw, ch) = compositor.cell_size();
-        compositor.handle_input(InputEvent::Pointer(tos_input::PointerEvent {
-            x: (col * cw + cw / 2) as f64,
-            y: (row * ch + ch / 2) as f64,
-            button: Some(MouseButton::Left),
-            action: MouseAction::Press,
-            modifiers: tos_input::Modifiers::NONE,
-        }))
+        let x = (col * cw + cw / 2) as f64;
+        let y = (row * ch + ch / 2) as f64;
+        let event = |button, action| {
+            InputEvent::Pointer(tos_input::PointerEvent {
+                x,
+                y,
+                button,
+                action,
+                modifiers: tos_input::Modifiers::NONE,
+            })
+        };
+        // The hand arrives before it presses. `handle_input` answers "a frame
+        // is owed", and bringing the arrow to a place it has not been owes one
+        // by itself — so a press sent cold reports `true` whatever the bar did
+        // with it, and every `assert!(click_bar(..))` below would hold just as
+        // well against a bar that dropped the click. The move spends that
+        // frame, and the press is then answering for itself.
+        compositor.handle_input(event(None, MouseAction::Motion));
+        compositor.handle_input(event(Some(MouseButton::Left), MouseAction::Press))
     }
 
     #[test]
@@ -5965,10 +5977,6 @@ mod tests {
         // Every press used to be dropped here, so "nothing happened" is not
         // evidence on its own; this is the one press that should still be it.
         let mut compositor = compositor();
-        // The first mouse event of a session asks for a frame whatever it
-        // does to the session, because it is the one that brings the pointer
-        // onto the screen. The press this test is about is the one after it.
-        click_bar(&mut compositor, 1);
         assert!(!click_bar(&mut compositor, 1));
         assert_eq!(compositor.session.active_index(), 0);
     }

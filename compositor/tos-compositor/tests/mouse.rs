@@ -460,8 +460,18 @@ fn a_divider_whose_split_was_freed_does_not_come_back_as_the_split_that_took_the
     pointer(&mut c, at, Some(MouseButton::Left), MouseAction::Press);
 
     // The pane under the divider leaves for another workspace, which collapses
-    // the split it was half of; the next split is handed the slot back.
-    assert!(c.perform(Action::MovePaneToWorkspace(2)));
+    // the split it was half of; the next split is handed the slot back. Asked
+    // of the tree rather than of `perform`, which reports whether a frame is
+    // owed and says `true` for a move it refused as readily as for one it
+    // made.
+    let moved = c.session().focus();
+    let from = c.session().workspace_of(moved);
+    c.perform(Action::MovePaneToWorkspace(2));
+    assert_ne!(
+        c.session().workspace_of(moved),
+        from,
+        "the pane never left the workspace this test collapses"
+    );
     assert!(c.perform(Action::Focus(Direction::Right)));
     assert!(c.perform(Action::Split(Axis::Rows)));
     let before = geometry(&c);
