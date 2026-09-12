@@ -27,6 +27,11 @@ pub enum Action {
     ToggleZoom,
     /// Even out every split.
     Balance,
+    /// Arrange the workspace the next way, wrapping around; see
+    /// [`crate::layout::Arrangement`].
+    NextLayout,
+    /// The same walk backwards.
+    PreviousLayout,
     NewWorkspace,
     NextWorkspace,
     PreviousWorkspace,
@@ -354,6 +359,29 @@ impl Keymap {
             Action::NewWorkspace,
         );
 
+        // Cycling the arrangement, on ctrl+shift and on nothing else. These
+        // two are not mirrored onto the leader or onto super, because both
+        // letters are already spoken for there: super+shift+l locks the
+        // screen, which every desktop does with an L and which nobody should
+        // lose to a layout, and super+b is the Bluetooth menu. They do not
+        // collide with these, because `Binding::matches` compares the whole
+        // modifier set for equality — ctrl+shift+l is not super+shift+l with
+        // something extra held down.
+        //
+        // ctrl+shift+l is Kitty's `next_layout`. ctrl+shift+b is a deliberate
+        // divergence: Kitty spends it on `move_window_backward` and has no
+        // previous-layout binding at all, and tOS would rather have the pair
+        // of keys than the match, since a cycle you can only walk forwards is
+        // a cycle you overshoot. Please do not "fix" this back.
+        keymap.bind(
+            Binding::new(KeyCode::Char('l'), Modifiers::CTRL.union(Modifiers::SHIFT)),
+            Action::NextLayout,
+        );
+        keymap.bind(
+            Binding::new(KeyCode::Char('b'), Modifiers::CTRL.union(Modifiers::SHIFT)),
+            Action::PreviousLayout,
+        );
+
         // Scrolling is useful without any prefix at all.
         keymap.bind(
             Binding::new(KeyCode::PageUp, Modifiers::SHIFT),
@@ -561,6 +589,72 @@ mod tests {
                 Resolution::Passthrough
             );
         }
+    }
+
+    #[test]
+    fn the_layout_keys_and_the_keys_they_share_a_letter_with_do_not_collide() {
+        let mut keymap = Keymap::default_bindings();
+        // `Binding::matches` compares the whole modifier set for equality, so
+        // ctrl+shift+l and super+shift+l are two bindings and not one binding
+        // pressed carelessly. This is the test that says so, because the two
+        // sat on separate modifiers only by argument until now.
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('l'),
+                Modifiers::CTRL.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::NextLayout)
+        );
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('l'),
+                Modifiers::SUPER.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::Lock)
+        );
+        // Holding both modifiers is neither of them rather than whichever was
+        // inserted last.
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('l'),
+                Modifiers::CTRL
+                    .union(Modifiers::SHIFT)
+                    .union(Modifiers::SUPER)
+            )),
+            Resolution::Passthrough
+        );
+        // Same shape on the B: previous layout takes ctrl+shift, Bluetooth
+        // keeps super.
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('b'),
+                Modifiers::CTRL.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::PreviousLayout)
+        );
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('b'), Modifiers::SUPER)),
+            Resolution::Action(Action::ShowBluetooth)
+        );
+    }
+
+    #[test]
+    fn the_layout_keys_are_not_mirrored_onto_the_leader() {
+        // Every other binding is reachable three ways; these two are not,
+        // because the letters are taken behind the leader — leader l moves
+        // focus right and leader b opens the Bluetooth menu — and a nested
+        // session losing the layout keys is a smaller loss than losing those.
+        let mut keymap = Keymap::default_bindings();
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('l'), Modifiers::NONE)),
+            Resolution::Action(Action::Focus(Direction::Right))
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('b'), Modifiers::NONE)),
+            Resolution::Action(Action::ShowBluetooth)
+        );
     }
 
     #[test]
