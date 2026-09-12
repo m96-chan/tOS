@@ -4,6 +4,7 @@
 //! session, pane and rendering behaviour can be driven from integration tests
 //! without a display.
 
+pub mod bluetooth;
 pub mod chrome;
 pub mod compositor;
 pub mod config;

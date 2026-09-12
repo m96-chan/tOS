@@ -133,6 +133,7 @@ pub fn describe(action: &Action) -> String {
         Action::Refresh => "redraw the screen".into(),
         Action::Lock => "lock the screen".into(),
         Action::CopyMode => "select with the keyboard".into(),
+        Action::ShowBluetooth => "Bluetooth adapter and devices".into(),
         Action::Quit => "quit tOS".into(),
     }
 }
@@ -249,6 +250,7 @@ fn rank(action: &Action) -> (u16, u16) {
         Action::Refresh => (9, 0),
         Action::Lock => (9, 1),
         Action::CopyMode => (7, 0),
+        Action::ShowBluetooth => (8, 3),
         Action::Quit => (9, 2),
     }
 }
