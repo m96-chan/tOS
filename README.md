@@ -874,9 +874,9 @@ grab is one thing at a time and is dropped by everything ordinary that
 interrupts it — a lock, a menu, a workspace change, the pane underneath
 closing — which is most of what the milestone's review was about.
 
-Four defects found after the merge are open against this milestone rather than
-fixed in it: nested mode reads a host terminal's cell numbers as compositor
-cells, so most clicks in a nested session land nowhere
+Four defects found after the merge were filed rather than fixed, and are
+carried into 0.0.8 below: nested mode reads a host terminal's cell numbers as
+compositor cells, so most clicks in a nested session land nowhere
 ([#88](https://github.com/m96-chan/tOS/issues/88)); clicking a pane on the
 status bar drops the zoom without resizing it
 ([#87](https://github.com/m96-chan/tOS/issues/87)); an expired notification
@@ -884,6 +884,28 @@ banner is never erased on a bar with no message segment
 ([#86](https://github.com/m96-chan/tOS/issues/86)); and a refused
 `MovePaneToWorkspace` orphans the pane
 ([#85](https://github.com/m96-chan/tOS/issues/85)).
+
+### 0.0.8 — More useful
+
+- [ ] the four defects 0.0.7 left open ([#85](https://github.com/m96-chan/tOS/issues/85), [#86](https://github.com/m96-chan/tOS/issues/86), [#87](https://github.com/m96-chan/tOS/issues/87), [#88](https://github.com/m96-chan/tOS/issues/88))
+- [ ] networking against a real interface ([#84](https://github.com/m96-chan/tOS/issues/84))
+- [ ] bash as the shell an installed machine gives you ([#82](https://github.com/m96-chan/tOS/issues/82))
+- [ ] a way to add anything to an installed machine ([#83](https://github.com/m96-chan/tOS/issues/83))
+- [ ] generic arm64 image ([#21](https://github.com/m96-chan/tOS/issues/21))
+- [ ] Debian rootfs tooling ([#20](https://github.com/m96-chan/tOS/issues/20))
+- [ ] hardware abstraction cleanup ([#22](https://github.com/m96-chan/tOS/issues/22))
+- [ ] images scanned out on DRM overlay planes ([#31](https://github.com/m96-chan/tOS/issues/31))
+
+The name is the test the round is held to: most of this list is about a
+machine somebody installed being one they can actually use — a shell they
+know, a way to add anything to it, a network that has run against real
+hardware — and the defects above are on it because a mouse that clicks
+nowhere is in the way of the same thing.
+
+This is where the work is tracked now, including everything 0.1 needs: the
+portability items below were moved here rather than waited for, because a
+version before 0.1 lands when its idea has been demonstrated and there is no
+reason to hold a round open for the name of the release it is aimed at.
 
 ### 0.1 — Portable tOS
 
@@ -896,7 +918,9 @@ banner is never erased on a bar with no message segment
 `iso/` builds a bootable x86_64 image, and `tos-install` puts it on a disk
 from inside a pane. What lands on the disk is still the busybox initramfs
 world rather than a Debian rootfs, so the two remaining userspace items are
-the same piece of work.
+the same piece of work. The unticked boxes here are the ones tracked under
+0.0.8 above; this section is the release they add up to, not a second pile of
+work.
 
 ### Later — Android devices
 
