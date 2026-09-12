@@ -24,12 +24,19 @@
 //! `[ime] dictionary`; the tests below hand over a [`BytesSource`] they wrote
 //! inline, or a file in a temporary directory they made and delete again.
 //!
-//! Three things this deliberately does not do, each because something else
+//! The file is two halves, and they are two indexes. [`Dictionary::lookup`]
+//! answers from the okuri-nasi half, where a reading is a whole word;
+//! [`Dictionary::lookup_okuri`] answers from the okuri-ari half, where a
+//! reading is a stem with a latin marker stuck to it — `かk /書/`. They could
+//! not share one index: the okuri-ari section is sorted descending in SKK's
+//! own encoding and every one of its readings ends in a letter no okuri-nasi
+//! reading has, so one merged index would leave each search answering for the
+//! other's entries. Which stem a reading should be cut into is not decided
+//! here — that is `okuri.rs`, and this module only knows how to find a key.
+//!
+//! Two things this deliberately does not do, each because something else
 //! owns them:
 //!
-//! - **Okurigana.** The okuri-ari half of the dictionary is skipped whole, so
-//!   「かきます」 finds nothing. See [`index`] for where it is dropped and
-//!   what [#63](https://github.com/m96-chan/tOS/issues/63) has to add there.
 //! - **EUC-JP.** The published dictionary is EUC-JP and tOS is UTF-8
 //!   throughout, so `mkiso.sh` converts it once with `iconv` at image build
 //!   time (#57). By the time this module sees bytes they are UTF-8, and a
@@ -134,6 +141,10 @@ pub struct Dictionary {
     /// their readings sort. See [`index`] for why that is not simply the
     /// order they appear in the file.
     entries: Vec<u32>,
+    /// The same for the okuri-ari half, whose readings are a stem and a
+    /// marker — `かk`. Separate because they sort into a different place and
+    /// answer a different question; see [`index`].
+    okuri: Vec<u32>,
 }
 
 impl Dictionary {
@@ -150,19 +161,29 @@ impl Dictionary {
 
     /// A dictionary from bytes already in hand.
     pub fn from_bytes(bytes: Vec<u8>) -> Dictionary {
-        let entries = index(&bytes);
-        Dictionary { bytes, entries }
+        let (entries, okuri) = index(&bytes);
+        Dictionary {
+            bytes,
+            entries,
+            okuri,
+        }
     }
 
-    /// How many readings can be looked up. Not how many candidates there are,
-    /// and not how many lines the file has: comment lines and the whole
-    /// okuri-ari half are not in here.
+    /// How many whole-word readings can be looked up. Not how many candidates
+    /// there are, and not how many lines the file has: comment lines and the
+    /// okuri-ari half are counted by [`Dictionary::okuri_len`] instead.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// How many okuri-ari keys can be looked up — 15,995 in Debian's `skkdic`
+    /// copy of `SKK-JISYO.L`, which is the one `mkiso.sh` converts.
+    pub fn okuri_len(&self) -> usize {
+        self.okuri.len()
     }
 
     /// What `reading` could mean, best guess first.
@@ -172,28 +193,53 @@ impl Dictionary {
     /// here reorders by use; the history file that would do that is deferred
     /// in `docs/design/ime.md` and changes no signature in this module.
     ///
-    /// Empty when the reading is absent, when its entry is malformed, and
-    /// when the reading has okurigana attached, because the half of the
-    /// dictionary holding those is not indexed yet.
+    /// Empty when the reading is absent and when its entry is malformed. Also
+    /// empty for anything inflected: 「かきます」 is not a reading in this
+    /// half and never will be. [`okuri::convert`](crate::okuri::convert) is
+    /// what answers those, by cutting the reading up and asking
+    /// [`Dictionary::lookup_okuri`] about the pieces.
     pub fn lookup(&self, reading: &str) -> Vec<Candidate> {
-        let key = reading.as_bytes();
-        // `partition_point` rather than `binary_search_by`, because the
-        // latter may land on any one of several equal elements. SKK's
-        // okuri-nasi half should have no duplicate readings, but a hand-merged
-        // file can, and answering with a different one of them depending on
-        // how big the dictionary happens to be is the kind of bug that is
-        // found years later.
-        let at = self
-            .entries
-            .partition_point(|&offset| reading_at(&self.bytes, offset) < key);
-        let Some(&offset) = self.entries.get(at) else {
-            return Vec::new();
-        };
-        if reading_at(&self.bytes, offset) != key {
-            return Vec::new();
-        }
-        candidates(line_at(&self.bytes, offset))
+        find(&self.bytes, &self.entries, reading.as_bytes())
     }
+
+    /// What an okuri-ari key could mean, best guess first.
+    ///
+    /// The key is the whole reading the file is keyed by, marker included —
+    /// `かk`, not `か` and `'k'` as two arguments. That is on purpose: this
+    /// module's job is to find a line in a file, and the marker is part of
+    /// what the line is called. Working out that 「かきます」 should be asked
+    /// about as `かk` needs a table of kana and a rule for where a word ends,
+    /// and both of those are Japanese rather than file format, so they live
+    /// in `okuri.rs`.
+    ///
+    /// The candidate is the stem alone — `かk /書/` answers `書`, not
+    /// `書きます`. Sticking the okurigana back on needs the reading that was
+    /// cut up, which the caller has and this does not.
+    pub fn lookup_okuri(&self, key: &str) -> Vec<Candidate> {
+        find(&self.bytes, &self.okuri, key.as_bytes())
+    }
+}
+
+/// Binary search one index for `key` and cut up the line it names.
+///
+/// Shared by both halves because the halves differ in what their keys mean
+/// and not at all in how they are found — the alternative, two searches, is
+/// two places for the `partition_point` subtlety below to be got wrong.
+///
+/// `partition_point` rather than `binary_search_by`, because the latter may
+/// land on any one of several equal elements. SKK's halves should each have
+/// no duplicate readings, but a hand-merged file can, and answering with a
+/// different one of them depending on how big the dictionary happens to be is
+/// the kind of bug that is found years later.
+fn find(bytes: &[u8], entries: &[u32], key: &[u8]) -> Vec<Candidate> {
+    let at = entries.partition_point(|&offset| reading_at(bytes, offset) < key);
+    let Some(&offset) = entries.get(at) else {
+        return Vec::new();
+    };
+    if reading_at(bytes, offset) != key {
+        return Vec::new();
+    }
+    candidates(line_at(bytes, offset))
 }
 
 /// Not derived: the first field is the entire dictionary, and a `{:?}` that
@@ -202,33 +248,38 @@ impl std::fmt::Debug for Dictionary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dictionary")
             .field("entries", &self.entries.len())
+            .field("okuri", &self.okuri.len())
             .field("bytes", &self.bytes.len())
             .finish()
     }
 }
 
-/// Find every okuri-nasi entry and put its offset in sorted order.
+/// Find every entry and put its offset in sorted order, in the index for the
+/// half it came from: okuri-nasi first, okuri-ari second.
 ///
 /// Two things here do not follow from the format.
 ///
-/// **The okuri-ari half is dropped.** A dictionary is two sections, each
+/// **The two halves get two indexes.** A dictionary is two sections, each
 /// announced by a comment: `;; okuri-ari entries.` and then
 /// `;; okuri-nasi entries.`. Entries in the first carry an okurigana marker —
-/// `わたしm /私/` — which means nothing to a converter that does not know
-/// where the stem ended, so
-/// [#63](https://github.com/m96-chan/tOS/issues/63) is where they start being
-/// useful. The seam it needs is exactly here: a second `Vec<u32>` built over
-/// the lines this loop currently walks past, and a lookup taking the reading
-/// and the okurigana separately. A second index rather than more entries in
-/// this one, on purpose — the okuri-ari section is sorted *descending* in
-/// SKK's own encoding, and its readings end in a latin letter that no
-/// okuri-nasi reading has, so mixing the two would leave both searches
-/// answering for the other's entries.
+/// `わたしm /私/`, `かk /書/` — and they are kept apart from the second for
+/// two reasons that are each sufficient. The okuri-ari section is sorted
+/// *descending* in SKK's own encoding, so merging it into an ascending index
+/// would mean re-sorting 176,000 entries instead of two runs of 16,000 and
+/// 160,000. And every okuri-ari reading ends in a latin letter that no
+/// okuri-nasi reading has, so a merged index would put `かk` among readings
+/// beginning `か…` and leave a search for a whole word stepping over stems it
+/// can never mean.
 ///
 /// A file with no section comments at all — a test's four lines, or a
 /// fragment somebody keeps of their own — is taken as all okuri-nasi, which
 /// is what such a file almost always is and the only assumption that makes
 /// the small case work without ceremony.
+///
+/// Lines beginning `>` — `>あk /飽/`, SKK's suffix entries — are indexed like
+/// any other, because they are well formed and nothing here has an opinion
+/// about what a reading means. No split `okuri.rs` makes produces a key
+/// starting with `>`, so they simply never match.
 ///
 /// **The index is sorted, and that is not redundant.** `SKK-JISYO.L` really
 /// is sorted, but it is sorted in EUC-JP, and `iconv` does not preserve that
@@ -245,8 +296,9 @@ impl std::fmt::Debug for Dictionary {
 /// n log n. Stable also means that if a reading really does appear twice, the
 /// one earlier in the file stays first, so the answer does not depend on the
 /// sort.
-fn index(bytes: &[u8]) -> Vec<u32> {
+fn index(bytes: &[u8]) -> (Vec<u32>, Vec<u32>) {
     let mut entries: Vec<u32> = Vec::new();
+    let mut okuri: Vec<u32> = Vec::new();
     // True until a section comment says otherwise; see the note above about
     // dictionaries that have no section comments.
     let mut okuri_nasi = true;
@@ -272,20 +324,25 @@ fn index(bytes: &[u8]) -> Vec<u32> {
             } else if text.starts_with(b"okuri-nasi") {
                 okuri_nasi = true;
             }
-        } else if okuri_nasi && pos <= u32::MAX as usize && is_entry(line) {
+        } else if pos <= u32::MAX as usize && is_entry(line) {
             // The offset is a u32 because 159,795 of them is 640 KB and
             // 1.2 MB would be waste. A dictionary over 4 GiB is not a
             // dictionary, and the rest of such a file is left unindexed
             // rather than widening every entry to pay for a case that does
             // not happen.
-            entries.push(pos as u32);
+            if okuri_nasi {
+                entries.push(pos as u32);
+            } else {
+                okuri.push(pos as u32);
+            }
         }
 
         pos = end + 1;
     }
 
     entries.sort_by(|&a, &b| reading_at(bytes, a).cmp(reading_at(bytes, b)));
-    entries
+    okuri.sort_by(|&a, &b| reading_at(bytes, a).cmp(reading_at(bytes, b)));
+    (entries, okuri)
 }
 
 /// Whether a line is an entry: a non-empty reading, a space, and a candidate
@@ -470,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn okuri_ari_entries_are_skipped_until_issue_63_knows_what_to_do_with_them() {
+    fn a_whole_word_lookup_never_answers_from_the_okuri_ari_half() {
         let dict = sample();
         assert!(dict.lookup("わたしm").is_empty());
         assert!(dict.lookup("わたし").is_empty());
@@ -480,9 +537,80 @@ mod tests {
     }
 
     #[test]
+    fn an_okuri_lookup_never_answers_from_the_okuri_nasi_half() {
+        let dict = sample();
+        assert!(dict.lookup_okuri("かんじ").is_empty());
+        assert!(dict.lookup_okuri("とうきょう").is_empty());
+    }
+
+    #[test]
+    fn an_okuri_ari_entry_is_found_by_the_key_the_file_gives_it_marker_and_all() {
+        let dict = sample();
+        assert_eq!(
+            dict.lookup_okuri("わたしm"),
+            vec![Candidate {
+                word: "私".to_string(),
+                annotation: None,
+            }]
+        );
+        // The stem alone, without the okurigana: putting きます back on is the
+        // caller's job, because the caller is the one holding the reading.
+        assert_eq!(
+            dict.lookup_okuri("かきr")
+                .into_iter()
+                .map(|candidate| candidate.word)
+                .collect::<Vec<_>>(),
+            vec!["書"]
+        );
+        assert!(dict.lookup_okuri("かき").is_empty());
+    }
+
+    #[test]
+    fn the_two_halves_are_counted_separately() {
+        let dict = sample();
+        assert_eq!(dict.len(), 4);
+        assert_eq!(dict.okuri_len(), 2);
+    }
+
+    #[test]
+    fn the_okuri_ari_half_is_searchable_although_the_file_holds_it_descending() {
+        // SKK writes this section largest reading first — the shipped file
+        // opens `をs`, `ゐr`, `われらg` — so a binary search over it as it
+        // lies finds nothing. These four are in the file's own order.
+        let dict = Dictionary::from_bytes(
+            concat!(
+                ";; okuri-ari entries.\n",
+                "をs /惜/\n",
+                "われw /我/\n",
+                "かk /書/掛/\n",
+                "あk /open/\n",
+                ";; okuri-nasi entries.\n",
+                "あい /愛/\n",
+            )
+            .as_bytes()
+            .to_vec(),
+        );
+        assert_eq!(dict.okuri_len(), 4);
+        for (key, first) in [
+            ("をs", "惜"),
+            ("われw", "我"),
+            ("かk", "書"),
+            ("あk", "open"),
+        ] {
+            assert_eq!(
+                dict.lookup_okuri(key).first().map(|c| c.word.as_str()),
+                Some(first),
+                "{key} should be findable wherever the file put it"
+            );
+        }
+        assert!(dict.lookup_okuri("んz").is_empty());
+    }
+
+    #[test]
     fn a_file_with_no_section_comments_is_read_as_all_okuri_nasi() {
         let dict = Dictionary::from_bytes("あい /愛/藍/\nうみ /海/\n".as_bytes().to_vec());
         assert_eq!(dict.len(), 2);
+        assert_eq!(dict.okuri_len(), 0);
         assert_eq!(words(&dict, "あい"), vec!["愛", "藍"]);
     }
 
