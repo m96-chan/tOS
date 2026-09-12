@@ -509,8 +509,8 @@ its idle timer, and repaints only the rows the moving image covers.
 
 `cargo run --example graphics_animation -- /tmp/tos-animation` transmits a
 thirty frame animation into a real pane and saves ten pictures of it
-playing. Composing between two frames that already exist (`a=c`) is still
-answered with an error, and frames carry the same raw formats images do.
+playing. Composing between two frames that already exist (`a=c`) works, and a
+frame may arrive as a PNG or a zlib payload rather than only as raw pixels.
 
 ### 0.0.5 — System UI
 
@@ -522,7 +522,7 @@ answered with an error, and frames carry the same raw formats images do.
 - [ ] Bluetooth controls
 - [x] audio controls
 - [x] configuration file
-- [ ] screen lock
+- [x] screen lock
 
 Sound is driven straight through the kernel's control interface. `tos-system`
 opens `/dev/snd/controlC<N>` and issues `SNDRV_CTL_IOCTL_CARD_INFO`,
