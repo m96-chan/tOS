@@ -62,11 +62,22 @@ VBoxManage createvm --name "$VM" --ostype Linux_64 --register >/dev/null
 # initramfs carries; the others are there for the hosts that hand out something
 # else. COM1 to a file is the same serial log CI greps, which is the only way
 # to read a boot that has not reached the compositor yet.
+#
+# The adapter is named rather than left to the default, because the default is
+# whatever VirtualBox picked for the guest type and a boot that gets an
+# adapter the initramfs has no driver for looks exactly like a boot with no
+# adapter at all: `lo` and nothing else. virtio is the one to ask for — it is
+# the fastest of the emulations and virtio_net is packed — and NAT is the mode
+# that needs nothing of the host: VirtualBox's own DHCP server answers on the
+# 10.0.2.0/24 it invents, which is enough to take the network menu all the way
+# to a lease. See docs/design/network.md for what that does and does not
+# prove.
 VBoxManage modifyvm "$VM" \
     --memory 1024 --vram 128 --cpus 2 \
     --graphicscontroller vmsvga --firmware bios \
     --boot1 dvd --boot2 none --boot3 none --boot4 none \
     --audio-driver none \
+    --nic1 nat --nictype1 virtio \
     --uart1 0x3F8 4 --uartmode1 file "$serial" >/dev/null
 VBoxManage storagectl "$VM" --name IDE --add ide --controller PIIX4 >/dev/null
 VBoxManage storageattach "$VM" --storagectl IDE --port 1 --device 0 \

@@ -189,10 +189,25 @@ mknod -m 666 "$ROOT/dev/null" c 1 3
 # Display and input, then the storage stack the installer needs: without a
 # disk driver it sees no disks, and without the filesystem modules it cannot
 # mount what it just created.
+#
+# Then the network cards. Everything tOS can do to a network — enumerating
+# /sys/class/net, SIOCSIFFLAGS, the DHCP client, the whole super+shift+n menu
+# — needs an interface to do it to, and until these were packed a tOS VM had
+# `lo` and nothing else: the adapter sat on the PCI bus with no driver bound
+# and the menu answered "no wired or wireless interfaces". virtio_net and
+# e1000 are the two emulations QEMU and VirtualBox actually hand out; e1000e,
+# r8169 and igb are the cards a desktop or laptop is likely to have. The list
+# stays a closure and not the tree: these five pull seven more between them —
+# libphy, realtek, mdio_devres, i2c-algo-bit, dca, failover, net_failover —
+# and the twelve together cost 618 KiB of the compressed initramfs, measured
+# at 25,925,814 bytes before and 26,558,126 after. Nothing here is firmware:
+# r8169 asks for rtl_nic blobs this image does not carry, so a Realtek card
+# that needs one gets whatever its PHY does by default, which is untested.
 MODULES="bochs virtio_gpu simpledrm cirrus vmwgfx vboxvideo \
     evdev atkbd i8042 psmouse virtio_input hid_generic usbhid virtio_pci \
     sd_mod sr_mod cdrom ata_piix ahci libahci virtio_blk virtio_scsi \
     nvme usb_storage uas xhci_pci ehci_pci ohci_pci sdhci_pci mmc_block \
+    virtio_net e1000 e1000e r8169 igb \
     isofs ext4 vfat nls_cp437 nls_iso8859_1 nls_ascii"
 for mod in $MODULES; do
     modprobe -S "$KVER" --show-depends "$mod" 2>/dev/null || true

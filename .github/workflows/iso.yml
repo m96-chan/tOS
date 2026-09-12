@@ -39,8 +39,16 @@ jobs:
           # Headless boot: success = the compositor announces itself on serial
           # within the timeout. GRUB's serial console is not configured, so we
           # wait through its menu timeout blindly.
+          #
+          # The virtio-net adapter matches the virtio_net the initramfs packs,
+          # so this boot has a link to find; user-mode networking needs no
+          # privilege on the runner and hands out 10.0.2.x the same way the
+          # VirtualBox NAT in iso/run.sh does. Nothing below greps for it yet —
+          # the interface arriving is not something /init says on serial — but
+          # a machine with no adapter could never have one.
           timeout 120 qemu-system-x86_64 \
             -m 1024 -cdrom dist/tos-x86_64.iso \
+            -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
             -vga std -display none -serial file:serial.log &
           qemu_pid=$!
           for _ in $(seq 60); do
