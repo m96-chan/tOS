@@ -11,6 +11,7 @@ use tos_session::{describe, Keymap};
 use tos_term::Palette;
 
 use crate::chrome::Chrome;
+use crate::status;
 
 /// Which display backend to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +73,13 @@ pub struct Config {
     /// The program each pane runs.
     pub command: Option<Vec<String>>,
     /// Draw the status bar along the bottom.
+    ///
+    /// The starting state rather than a fixed one: `Action::ToggleStatusBar`
+    /// writes here at runtime, so that showing the bar again is the same code
+    /// path as having started with it.
     pub status_bar: bool,
+    /// What the status bar shows, in what order, and on which side.
+    pub status: status::Settings,
     /// Fade panes that do not have focus.
     pub inactive_fade: u8,
     /// Answer OSC 52 clipboard queries with the real selection. Off unless the
@@ -143,6 +150,7 @@ impl Default for Config {
             scrollback: 10_000,
             command: None,
             status_bar: true,
+            status: status::Settings::default(),
             inactive_fade: 40,
             allow_clipboard_read: false,
             size: (1280, 720),

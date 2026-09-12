@@ -61,6 +61,14 @@ pub enum Action {
     Quit,
     /// Redraw everything.
     Refresh,
+    /// Show or hide the status bar.
+    ///
+    /// `--no-status-bar` decides what a session starts as, which is the wrong
+    /// granularity for the thing it decides: whether a row of the display is
+    /// worth spending is a question that has a different answer while reading
+    /// a long file than it does the rest of the time, and restarting the
+    /// compositor to change your mind means losing every pane.
+    ToggleStatusBar,
 }
 
 /// A key combination.
@@ -229,6 +237,9 @@ impl Keymap {
             // way vim does, and because every other desktop locks with an L.
             (KeyCode::Char('l'), Modifiers::SHIFT, Action::Lock),
             (KeyCode::Char('q'), Modifiers::NONE, Action::Quit),
+            // b for bar. Nothing else wants the key, and the thing it hides is
+            // the thing whose name begins with it.
+            (KeyCode::Char('b'), Modifiers::NONE, Action::ToggleStatusBar),
         ];
         for (code, modifiers, action) in bindings {
             keymap.bind_after_leader(Binding::new(*code, *modifiers), action.clone());
@@ -616,6 +627,27 @@ mod tests {
         // An unshifted slash is still a slash, which panes need for paths.
         assert_eq!(
             keymap.resolve(&press(KeyCode::Char('/'), Modifiers::NONE)),
+            Resolution::Passthrough
+        );
+    }
+
+    #[test]
+    fn the_status_bar_can_be_hidden_from_the_keyboard() {
+        // `--no-status-bar` is a decision taken before there is a session;
+        // this is the same decision taken while looking at one.
+        let mut keymap = Keymap::default_bindings();
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('b'), Modifiers::SUPER)),
+            Resolution::Action(Action::ToggleStatusBar)
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('b'), Modifiers::NONE)),
+            Resolution::Action(Action::ToggleStatusBar)
+        );
+        // A plain b is a b, which is most of what a pane gets.
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('b'), Modifiers::NONE)),
             Resolution::Passthrough
         );
     }

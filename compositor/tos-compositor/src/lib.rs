@@ -5,6 +5,7 @@
 //! without a display.
 
 pub mod chrome;
+pub mod clock;
 pub mod compositor;
 pub mod config;
 pub mod config_file;
@@ -14,6 +15,7 @@ pub mod notify;
 pub mod overlay;
 pub mod pane;
 pub mod selection;
+pub mod status;
 pub mod system;
 
 pub use compositor::{Compositor, OverlayKind};
@@ -24,3 +26,4 @@ pub use notify::{Notification, Notifications, Source};
 pub use overlay::{Overlay, OverlayItem, OverlayOutcome};
 pub use pane::Pane;
 pub use selection::{Anchor, Selection, SelectionMode};
+pub use status::{Bar, Hit, Segment};
