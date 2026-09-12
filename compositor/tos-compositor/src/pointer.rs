@@ -76,14 +76,20 @@ pub fn size(cell: (u32, u32)) -> (u32, u32) {
 }
 
 /// Paint the arrow with its hotspot — the tip, the top left pixel of
-/// [`ARROW`] — at `rect`'s corner.
+/// [`ARROW`] — at `at`, sized for cells of `cell`.
 ///
-/// `rect` is only read for that corner and for the scale; everything outside
-/// the surface's clip is dropped by [`Surface::fill`], which is what lets the
-/// arrow hang off the right and bottom edges the way a real one does instead of
-/// being pushed back on screen where it would stop tracking the hand.
-pub fn draw(surface: &mut Surface<'_>, rect: Rect, fill: Rgb, outline: Rgb) {
-    let scale = (rect.height / ARROW_HEIGHT).max(1) as i32;
+/// The corner and the cell rather than the rectangle [`Pointer::rect`] hands
+/// back, because that rectangle reaches here clipped to the panel and a clipped
+/// height is not a cell height. Deriving the scale from it drew a whole arrow
+/// at a third of its size in the band along the bottom edge where the clip bites
+/// — the pointer shrank as it approached the edge and snapped back when it left
+/// — instead of an arrow of the right size with its lower half cut off.
+/// Everything outside the surface's clip is dropped by [`Surface::fill`], which
+/// is what lets the arrow hang off the right and bottom edges the way a real one
+/// does instead of being pushed back on screen where it would stop tracking the
+/// hand.
+pub fn draw(surface: &mut Surface<'_>, at: (i32, i32), cell: (u32, u32), fill: Rgb, outline: Rgb) {
+    let scale = scale(cell.1) as i32;
     for (row, line) in ARROW.iter().enumerate() {
         for (col, ch) in line.bytes().enumerate() {
             let color = match ch {
@@ -91,8 +97,8 @@ pub fn draw(surface: &mut Surface<'_>, rect: Rect, fill: Rgb, outline: Rgb) {
                 b'#' => outline,
                 _ => continue,
             };
-            let x = rect.x + col as i32 * scale;
-            let y = rect.y + row as i32 * scale;
+            let x = at.0 + col as i32 * scale;
+            let y = at.1 + row as i32 * scale;
             surface.fill(Rect::new(x, y, scale as u32, scale as u32), color);
         }
     }
@@ -173,6 +179,7 @@ impl Pointer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tos_render::OwnedFramebuffer;
 
     #[test]
     fn the_arrow_is_rectangular_and_has_an_outline_all_the_way_round_its_fill() {
@@ -220,6 +227,40 @@ mod tests {
         // pointer is not a smaller pointer.
         assert_eq!(scale(8), 1);
         assert_eq!(scale(0), 1);
+    }
+
+    #[test]
+    fn an_arrow_the_edge_cuts_off_is_the_same_arrow_as_one_drawn_well_inside_it() {
+        // The size the arrow is drawn at is the cell's business and nothing
+        // else's. Working it out from what was left of the arrow after the
+        // clip made a pointer near the bottom of the panel shrink to a third
+        // of itself and snap back when it moved away, which on a HiDPI cell is
+        // a pointer that changes size in a band fifty pixels deep.
+        let cell = (24, 44);
+        let (width, height) = size(cell);
+        assert!(
+            height > ARROW_HEIGHT,
+            "this cell draws the arrow at one pixel per pixel, where the size \
+             it is drawn at cannot be told apart from the size of the mask"
+        );
+        let fill = Rgb::new(0xff, 0, 0);
+        let outline = Rgb::new(0, 0xff, 0);
+
+        let mut whole = OwnedFramebuffer::new(width, height);
+        draw(&mut whole.surface(), (0, 0), cell, fill, outline);
+        let cut_off = height / 3;
+        let mut cut = OwnedFramebuffer::new(width, cut_off);
+        draw(&mut cut.surface(), (0, 0), cell, fill, outline);
+
+        for y in 0..cut_off {
+            for x in 0..width {
+                assert_eq!(
+                    cut.pixel(x, y),
+                    whole.pixel(x, y),
+                    "the arrow was redrawn at another size at {x},{y}"
+                );
+            }
+        }
     }
 
     #[test]

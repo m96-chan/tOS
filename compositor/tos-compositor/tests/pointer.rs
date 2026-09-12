@@ -18,7 +18,17 @@ const SIZE: (u32, u32) = (800, 480);
 
 /// A pane that will sit still: nothing it prints can repaint the cells a test
 /// is watching for an arrow.
+///
+/// Twice the built-in face, which puts the cell at 22 pixels tall and the arrow
+/// at one display pixel per pixel of its mask.
 fn quiet() -> Compositor {
+    quiet_at(2)
+}
+
+/// The same pane on a panel whose cells are big enough that the arrow is drawn
+/// scaled up, which is every HiDPI machine and neither of the sizes the rest of
+/// this file uses.
+fn quiet_at(bitmap_scale: u32) -> Compositor {
     let config = Config {
         command: Some(
             ["/bin/sh", "-c", "sleep 30"]
@@ -26,7 +36,7 @@ fn quiet() -> Compositor {
                 .map(|s| s.to_string())
                 .collect(),
         ),
-        bitmap_scale: Some(2),
+        bitmap_scale: Some(bitmap_scale),
         // The built-in face, so the cell size does not depend on the host's
         // fonts and a test can turn cells into pixels itself.
         font: Some("/nonexistent".into()),
@@ -130,6 +140,46 @@ fn the_pointer_is_drawn_at_the_pixel_it_was_moved_to() {
         differences(&empty, &shown, whole),
         differences(&empty, &shown, at),
         "the frame changed outside the arrow"
+    );
+}
+
+#[test]
+fn an_arrow_against_the_bottom_edge_is_cut_off_rather_than_drawn_at_a_smaller_scale() {
+    // How big the arrow is drawn is the cell's business: it has to keep its
+    // proportion to the text it is pointing at. The rectangle the frame hands
+    // the drawing is clipped to the panel first, so taking the size from that
+    // instead built a whole, unclipped arrow a third of the size in the band
+    // along the bottom edge where the clip bites — a pointer that shrank as the
+    // hand approached the edge and snapped back when it left.
+    let mut compositor = quiet_at(4);
+    let mut screen = Screen::new();
+    let (width, height) = pointer::size(compositor.cell_size());
+    assert!(
+        height > 17,
+        "these cells draw the arrow at one pixel per pixel, which is the one \
+         size at which a scale taken from the wrong number still comes out right"
+    );
+
+    let empty = screen.frame(&mut compositor);
+    // Far enough down that most of the arrow hangs off the bottom, and nowhere
+    // near the right edge, which never clipped it because the width was never
+    // read.
+    let (x, y) = (SIZE.0 / 2, SIZE.1 - height / 2);
+    move_to(&mut compositor, x, y);
+    let shown = screen.frame(&mut compositor);
+
+    // The bottom right corner of where the arrow belongs. An arrow rebuilt at a
+    // third of its size fits entirely above and to the left of this, so one
+    // changed pixel inside it is the whole assertion.
+    let corner = Rect::new(
+        (x + width / 2) as i32,
+        (y + height / 3) as i32,
+        width / 2,
+        SIZE.1 - y - height / 3,
+    );
+    assert!(
+        differences(&empty, &shown, corner) > 0,
+        "the arrow was rebuilt smaller instead of being cut off by the edge"
     );
 }
 

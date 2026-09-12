@@ -2945,9 +2945,14 @@ impl Compositor {
         // is pointing at, it has to be on top of, or it is pointing from
         // underneath.
         if let Some(rect) = pointer {
+            // The corner, not the rectangle: `pointer_rect` clipped it to the
+            // panel so that what is remembered as painted is what was painted,
+            // and the arrow is sized by the cell rather than by whatever the
+            // clip left of it.
             pointer::draw(
                 surface,
-                rect,
+                (rect.x, rect.y),
+                (cw, ch),
                 self.chrome.foreground,
                 self.chrome.background,
             );
