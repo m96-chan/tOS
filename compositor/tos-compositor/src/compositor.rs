@@ -727,36 +727,35 @@ impl Compositor {
                 self.handle_key(key) || put_away
             }
             // A host terminal reports cells; a device reports pixels. The two
-            // are separate types so the conversion can never be skipped — and
-            // this arm deliberately does not make one, so there is no arrow
-            // here.
+            // are separate types so the conversion can never be skipped, and
+            // this is the conversion. The only thing that sends a `Mouse`
+            // event is the nested backend, whose framebuffer is one pixel per
+            // host column and two per host row, so a host cell names a pixel
+            // and the pixel names a cell of the grid tOS lays panes out in —
+            // two steps, neither of them the identity.
             //
-            // The obvious synthesis is the cell numbers multiplied by the
-            // compositor's own cell size, and it is wrong: the only thing that
-            // sends a `Mouse` event is the nested backend, whose framebuffer is
-            // one pixel per host column and two per host row. It put the arrow
-            // several cells from the hand and, for anything past the top left
-            // corner of the display, clipped it away entirely.
+            // Passing the host's cell numbers straight through skipped both,
+            // and they do not cancel: on a 200x50 host terminal with an 8x16
+            // font the framebuffer is 200x100 pixels and the grid is 25x6
+            // cells, so the middle of the terminal arrived as a cell well off
+            // the far corner of the grid and matched no pane at all. Almost
+            // every click in nested mode was dropped.
             //
-            // Multiplying by the right numbers is not this change to make.
-            // `route_mouse` below reads the same cell numbers as compositor
-            // grid cells, so the mapping that is wrong is the one the click and
-            // the arrow share: correcting it here alone would leave the arrow
-            // pointing somewhere the click does not land, which is worse than
-            // no arrow. It is a change to where clicks go, and belongs with the
-            // routing rather than with the drawing.
-            //
-            // Nothing is lost meanwhile. A nested session is running inside
-            // somebody's terminal window, which is drawing the host's own
-            // cursor under their hand already — it is the one backend that has
-            // a pointer without tOS painting one.
-            InputEvent::Mouse(mouse) => self.route_mouse(
-                mouse.col as u32,
-                mouse.row as u32,
-                mouse.button,
-                mouse.action,
-                mouse.modifiers,
-            ),
+            // Still no arrow, and now because there should not be one rather
+            // than for want of somewhere to put it. A nested session runs
+            // inside somebody's terminal window, which is drawing the host's
+            // own cursor under their hand already; this is the one backend
+            // whose pointer tOS does not have to paint, and painting a second
+            // one on top would not be subtle — the arrow is sized by the font
+            // cell, which is several host columns across and as many host rows
+            // tall, so it would sit over whatever it was pointing at.
+            InputEvent::Mouse(mouse) => {
+                let (cw, ch) = self.cell_size();
+                let (pw, ph) = tos_platform::nested::HOST_CELL_PIXELS;
+                let x = (mouse.col as u32).saturating_mul(pw);
+                let y = (mouse.row as u32).saturating_mul(ph);
+                self.route_mouse(x / cw, y / ch, mouse.button, mouse.action, mouse.modifiers)
+            }
             InputEvent::Pointer(pointer) => {
                 let (cw, ch) = self.cell_size();
                 let x = pointer.x.max(0.0) as u32;
@@ -1514,11 +1513,24 @@ impl Compositor {
             }
             Action::MovePaneToWorkspace(n) => {
                 let moved = self.session.move_focused_to_workspace(area, n);
-                if moved {
-                    self.sync_layout();
-                    self.needs_full_redraw = true;
+                if !moved {
+                    // A refusal with nothing said reads as a dropped
+                    // keystroke, which is why a refused split says so too.
+                    // Which of the reasons applied — no such workspace, the
+                    // one already on screen, the last pane of this one, or no
+                    // room over there — does not come back through a bool, so
+                    // the message says the one thing true of all of them.
+                    self.notifications.status("the pane cannot move there");
                 }
-                moved
+                // Resynced whether or not the pane went. The panes are sized
+                // from geometry this arm may have just changed, and a bool
+                // does not say how far the session got before it gave up;
+                // leaving the resync out is how a workspace ends up drawn in
+                // rectangles none of its programs have been told about.
+                // Resyncing a workspace that did not change costs nothing.
+                self.sync_layout();
+                self.needs_full_redraw = true;
+                true
             }
             Action::RenameWorkspace => {
                 // The prompt opens on the name the workspace has now, which is
@@ -2719,10 +2731,10 @@ impl Compositor {
             && self.copy.is_none()
             && self.notifications.advance(now)
         {
-            // Without a status bar the notification is a banner over the panes,
-            // and the cells it covered are only repainted on damage they have
-            // not got. Retiring it has to uncover them.
-            self.needs_full_redraw |= !self.config.status_bar;
+            // A banner is over the panes, and the cells it covered are only
+            // repainted on damage they have not got. Retiring it has to
+            // uncover them.
+            self.needs_full_redraw |= self.notification_is_a_banner();
             changed = true;
         }
         // The machine moves without anybody touching the session: a battery
@@ -2806,6 +2818,20 @@ impl Compositor {
     /// so a hand that has stopped moving stops asking.
     fn pointer_moved_since_it_was_drawn(&self) -> bool {
         self.pointer_rect() != self.pointer.painted()
+    }
+
+    /// Whether a notification on the queue is drawn as a banner over the panes
+    /// rather than in a slot on the status bar.
+    ///
+    /// Two places need this and they have to be the same question: the one
+    /// that draws the banner, and the one that asks for the repaint retiring
+    /// it owes the cells underneath. They were once `!status_bar` and
+    /// `!status_bar || !shows_message()`, and a bar whose layout leaves the
+    /// `message` segment out fell into the gap — the banner was drawn over
+    /// pane row 0, nothing damaged that row when its time was up, and it sat
+    /// there until something unrelated forced a full redraw.
+    fn notification_is_a_banner(&self) -> bool {
+        !self.config.status_bar || !self.config.status.shows_message()
     }
 
     /// Paint a frame.
@@ -2982,7 +3008,7 @@ impl Compositor {
         // whose layout leaves the `message` segment out is the same case
         // arrived at a different way, and gets the same banner rather than a
         // configuration that silently swallows every failure.
-        if !self.config.status_bar || !self.config.status.shows_message() {
+        if self.notification_is_a_banner() {
             if let Some(text) = self.notifications.status_line() {
                 let over = PixelRect::new(0, 0, area.width * cw, ch);
                 notify::draw_banner(surface, &mut self.fonts, over, &self.chrome, &text);
@@ -3397,6 +3423,16 @@ impl Compositor {
                 }
                 let previous = self.session.focus();
                 self.session.set_focus(id);
+                // The bar lists every pane in the workspace, including the
+                // ones a zoom is hiding, so this is the one focus change that
+                // can arrive for a pane nobody can see — and `set_focus`
+                // answers that by leaving the zoom, which hands every pane in
+                // the workspace a different rectangle. A pane only hears about
+                // its rectangle here, so without this the next frame would
+                // draw the splits back while the pane that had been zoomed,
+                // and the program inside it, were still sized to the whole
+                // workspace.
+                self.sync_layout();
                 self.clear_selection(previous);
                 self.needs_full_redraw = true;
                 true
@@ -5890,15 +5926,35 @@ mod tests {
     }
 
     /// Press the left button on a cell of the status row.
+    ///
+    /// Through the device pointer, because what these tests name is a cell of
+    /// the compositor's own grid and the pointer is the input that is one
+    /// multiplication away from it. A host terminal's cells are a different
+    /// grid — see the `Mouse` arm of `handle_input` — and saying `col` to a
+    /// `MouseEvent` here would have been asking about that conversion instead
+    /// of about the bar.
     fn click_bar(compositor: &mut Compositor, col: u32) -> bool {
         let row = compositor.status_row().expect("a status row");
-        compositor.handle_input(InputEvent::Mouse(tos_input::MouseEvent {
-            button: Some(MouseButton::Left),
-            action: MouseAction::Press,
-            col: col as usize,
-            row: row as usize,
-            modifiers: tos_input::Modifiers::NONE,
-        }))
+        let (cw, ch) = compositor.cell_size();
+        let x = (col * cw + cw / 2) as f64;
+        let y = (row * ch + ch / 2) as f64;
+        let event = |button, action| {
+            InputEvent::Pointer(tos_input::PointerEvent {
+                x,
+                y,
+                button,
+                action,
+                modifiers: tos_input::Modifiers::NONE,
+            })
+        };
+        // The hand arrives before it presses. `handle_input` answers "a frame
+        // is owed", and bringing the arrow to a place it has not been owes one
+        // by itself — so a press sent cold reports `true` whatever the bar did
+        // with it, and every `assert!(click_bar(..))` below would hold just as
+        // well against a bar that dropped the click. The move spends that
+        // frame, and the press is then answering for itself.
+        compositor.handle_input(event(None, MouseAction::Motion));
+        compositor.handle_input(event(Some(MouseButton::Left), MouseAction::Press))
     }
 
     #[test]
@@ -5921,10 +5977,6 @@ mod tests {
         // Every press used to be dropped here, so "nothing happened" is not
         // evidence on its own; this is the one press that should still be it.
         let mut compositor = compositor();
-        // The first mouse event of a session asks for a frame whatever it
-        // does to the session, because it is the one that brings the pointer
-        // onto the screen. The press this test is about is the one after it.
-        click_bar(&mut compositor, 1);
         assert!(!click_bar(&mut compositor, 1));
         assert_eq!(compositor.session.active_index(), 0);
     }
