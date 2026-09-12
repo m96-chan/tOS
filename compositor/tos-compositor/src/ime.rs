@@ -759,8 +759,15 @@ fn draw_candidates(
         .map(|label| tos_term::str_width(label))
         .max()
         .unwrap_or(0);
-    // Two borders, and never wider than the pane it belongs to.
-    let cols = (widest + 2).min(area.width as usize);
+    // Two borders, and never wider than the pane it belongs to — but also
+    // never so narrow that the reading in the top border is cut to something
+    // the user did not type. `draw_box` writes the title as `┌─ {title} ` and
+    // clips it to `cols - 6`, so a four kana reading over a two kana candidate
+    // used to come out as 「か」 above a list of 慣例/寒冷/管領/艦齢: a window
+    // saying the wrong word about the very thing it is offering to replace.
+    // The candidates decide the width until the reading needs more.
+    let title = tos_term::str_width(conversion.reading());
+    let cols = (widest + 2).max(title + 6).min(area.width as usize);
     let rows = (labels.len() + 2).min(area.height as usize);
     if cols < 3 || rows < 3 {
         // Nothing honest to draw in a pane this small. The preedit is still

@@ -512,6 +512,46 @@ fn a_commit_wider_than_the_pane_goes_to_the_program_whole_and_the_program_wraps_
 // ---- #60: the candidate window -----------------------------------------
 
 #[test]
+fn the_candidate_window_is_wide_enough_to_say_the_reading_it_is_converting() {
+    // Found on the booted ISO, not here: typing かんれい drew a list of
+    // 慣例/寒冷/管領/艦齢 under a title that read 「か」. The width came from
+    // the candidates alone, and `chrome::draw_box` then clipped the reading
+    // into the top border — so the window named the wrong word about the very
+    // text it was offering to replace. The candidates are narrower than the
+    // reading here, which is the case that breaks it.
+    let mut c = compositor();
+    let cell = c.cell_size();
+    let focus = c.session().focus();
+    let rect = rect_of(&c, focus);
+    kana_on(&mut c);
+    type_romaji(&mut c, "kanrei");
+    press(&mut c, KeyCode::Ime(ImeKey::Convert));
+    render(&mut c, false);
+    let fb = render(&mut c, true);
+
+    let (cw, ch) = cell;
+    let border = rows_painted(cell, &fb, rect, BORDER);
+    assert!(!border.is_empty(), "no candidate window was drawn");
+    // The widest cell column the border reaches, in cells.
+    let right = (0..rect.width * cw)
+        .filter(|x| {
+            border.iter().any(|row| {
+                let top = *row as u32 * ch;
+                (top..top + ch).any(|y| fb.pixel(*x, y) == BORDER.pack())
+            })
+        })
+        .max()
+        .expect("the box has a right edge");
+    let cols = right / cw + 1;
+    // `draw_box` gives the title `cols - 6` cells. かんれい is eight cells
+    // wide, so anything under fourteen cuts it.
+    assert!(
+        cols >= 14,
+        "the window is {cols} cells wide, which clips かんれい in the title"
+    );
+}
+
+#[test]
 fn the_candidate_window_is_drawn_below_the_cursor_and_not_centred() {
     let mut c = compositor();
     let cell = c.cell_size();
