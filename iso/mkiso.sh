@@ -45,9 +45,14 @@ apt-get install -y --no-install-recommends \
 
 # Fully static binaries: they run as PID 1's children with no libc on disk.
 rustup target add "$RUST_TARGET" 2>/dev/null || true
-cargo build --release --target "$RUST_TARGET" -p tos-compositor -p tos-install
+cargo build --release --target "$RUST_TARGET" \
+    -p tos-compositor -p tos-install -p tos-preview
 TOS_BIN="target/$RUST_TARGET/release/tos"
 INSTALLER_BIN="target/$RUST_TARGET/release/tos-install"
+# The one program on the image that can show a picture. Without it the
+# graphics protocol is something the compositor implements and nothing in a
+# session ever asks for.
+PREVIEW_BIN="target/$RUST_TARGET/release/tos-preview"
 
 KVER=$(basename /lib/modules/*)
 WORK=$(mktemp -d)
@@ -61,8 +66,10 @@ mkdir -p "$ROOT/bin" "$ROOT/sbin" "$ROOT/dev" "$ROOT/proc" "$ROOT/sys" \
 cp /bin/busybox "$ROOT/bin/busybox"
 cp "$TOS_BIN" "$ROOT/sbin/tos"
 cp "$INSTALLER_BIN" "$ROOT/sbin/tos-install"
+cp "$PREVIEW_BIN" "$ROOT/sbin/tos-preview"
 cp iso/init "$ROOT/init"
-chmod 755 "$ROOT/init" "$ROOT/sbin/tos" "$ROOT/sbin/tos-install"
+chmod 755 "$ROOT/init" "$ROOT/sbin/tos" "$ROOT/sbin/tos-install" \
+    "$ROOT/sbin/tos-preview"
 
 # The message of the day, which is where a person is told that this is a live
 # session and how to put it on a disk.

@@ -2,7 +2,8 @@
 
 use std::time::{Duration, Instant};
 
-use tos_term::graphics::encode_base64;
+use tos_term::graphics::{encode_base64, Medium};
+use tos_term::medium::MediumReader;
 use tos_term::{Color, CursorShape, Flags, MouseTracking, TermEvent, Terminal, TerminalConfig};
 
 fn term(cols: usize, rows: usize) -> Terminal {
@@ -454,6 +455,114 @@ fn kitty_graphics_reports_undecodable_payloads() {
     assert!(t.graphics().image(9).is_none());
 }
 
+/// A reader that holds one file in memory.
+///
+/// The terminal's half of a named transmission is all that is tested here:
+/// that the name is decoded, handed over whole, and answered either with an
+/// image or with the reader's own error. What tOS is willing to open on a
+/// program's say-so belongs to the compositor and is tested there, because
+/// this crate has no filesystem to be tested against.
+struct OneFile {
+    medium: Medium,
+    name: &'static str,
+    data: Vec<u8>,
+}
+
+impl MediumReader for OneFile {
+    fn read(
+        &mut self,
+        medium: Medium,
+        name: &[u8],
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, &'static str> {
+        if medium != self.medium || name != self.name.as_bytes() {
+            return Err("EBADF:no such file");
+        }
+        if self.data.len() > max_bytes {
+            return Err("EINVAL:file exceeds the image budget");
+        }
+        Ok(self.data.clone())
+    }
+}
+
+fn term_with_file(medium: Medium, name: &'static str, data: &[u8]) -> Terminal {
+    let mut t = term(10, 4);
+    t.set_medium_reader(Box::new(OneFile {
+        medium,
+        name,
+        data: data.to_vec(),
+    }));
+    t
+}
+
+#[test]
+fn kitty_graphics_transmits_a_file_by_name() {
+    let mut t = term_with_file(Medium::File, "/tmp/tos-preview.png", &PNG_2X2);
+    let payload = encode_base64(b"/tmp/tos-preview.png");
+    t.advance(format!("\x1b_Ga=t,f=100,t=f,i=7;{payload}\x1b\\").as_bytes());
+
+    let image = t
+        .graphics()
+        .image(7)
+        .expect("the named file should be stored");
+    assert_eq!((image.width, image.height), (2, 2));
+    assert_eq!(t.take_output(), b"\x1b_Gi=7;OK\x1b\\".to_vec());
+}
+
+#[test]
+fn kitty_graphics_reads_a_name_that_arrived_in_chunks() {
+    let mut t = term_with_file(Medium::TempFile, "/tmp/tos-preview.png", &PNG_2X2);
+    // A name is base64 like any other payload and can be split like one.
+    // Reading has to wait for the last chunk: opening the first half of a
+    // path is opening a file nobody named.
+    let whole = encode_base64(b"/tmp/tos-preview.png");
+    let (first, rest) = whole.split_at(8);
+    t.advance(format!("\x1b_Ga=t,f=100,t=t,i=8,m=1;{first}\x1b\\").as_bytes());
+    assert!(t.graphics().image(8).is_none());
+    t.advance(format!("\x1b_Gm=0;{rest}\x1b\\").as_bytes());
+    assert_eq!(t.graphics().image(8).unwrap().width, 2);
+}
+
+#[test]
+fn kitty_graphics_tells_the_reader_which_medium_asked() {
+    // The same name under another medium is a different request, because
+    // `t=t` is the one that also deletes what it read.
+    let mut t = term_with_file(Medium::TempFile, "/tmp/tos-preview.png", &PNG_2X2);
+    let payload = encode_base64(b"/tmp/tos-preview.png");
+    t.advance(format!("\x1b_Ga=t,f=100,t=f,i=9;{payload}\x1b\\").as_bytes());
+    assert_eq!(
+        t.take_output(),
+        b"\x1b_Gi=9;EBADF:no such file\x1b\\".to_vec()
+    );
+    assert!(t.graphics().image(9).is_none());
+}
+
+#[test]
+fn kitty_graphics_reads_an_animation_frame_from_a_file() {
+    let mut t = term_with_file(Medium::File, "/tmp/tos-frame.rgba", &[0, 255, 0, 255]);
+    let base = encode_base64(&[255, 0, 0, 255]);
+    t.advance(format!("\x1b_Ga=t,f=32,s=1,v=1,i=5;{base}\x1b\\").as_bytes());
+    t.take_output();
+
+    // A frame is transmitted the same way an image is, so it reaches a file
+    // the same way: the name is resolved once, before either is stored.
+    let payload = encode_base64(b"/tmp/tos-frame.rgba");
+    t.advance(format!("\x1b_Ga=f,f=32,t=f,s=1,v=1,i=5,z=40;{payload}\x1b\\").as_bytes());
+    assert_eq!(t.take_output(), b"\x1b_Gi=5;OK\x1b\\".to_vec());
+    assert_eq!(t.graphics().image(5).unwrap().frame_count(), 2);
+}
+
+#[test]
+fn kitty_graphics_refuses_a_file_when_nothing_can_read_one() {
+    let mut t = term(10, 4);
+    let payload = encode_base64(b"/tmp/tos-preview.png");
+    t.advance(format!("\x1b_Ga=T,f=100,t=f,i=3;{payload}\x1b\\").as_bytes());
+    assert_eq!(
+        t.take_output(),
+        b"\x1b_Gi=3;ENOSUP:this terminal cannot read files\x1b\\".to_vec()
+    );
+}
+
 #[test]
 fn damage_is_limited_to_touched_rows() {
     let mut t = term(10, 4);
@@ -627,6 +736,49 @@ fn kitty_graphics_plays_an_animation_and_damages_the_rows_it_covers() {
 }
 
 #[test]
+fn kitty_graphics_composes_one_frame_onto_another() {
+    let mut t = term(10, 4);
+    let red = encode_base64(&[255, 0, 0, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=T,f=32,s=8,v=16,i=5;{red}\x1b\\").as_bytes());
+    let green = encode_base64(&[0, 255, 0, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=f,f=32,s=8,v=16,i=5,z=40;{green}\x1b\\").as_bytes());
+    t.take_output();
+    t.clear_damage();
+
+    // The left half of frame two onto the left half of frame one, which is
+    // the frame on screen, so the row it covers has to repaint.
+    t.advance(b"\x1b_Ga=c,i=5,r=2,c=1,w=4,h=16\x1b\\");
+    let out = String::from_utf8(t.take_output()).unwrap();
+    assert!(
+        out.contains("i=5"),
+        "response should identify the image: {out}"
+    );
+    assert!(
+        out.contains("OK"),
+        "composition should have been accepted: {out}"
+    );
+    assert!(t.damage().is_row_dirty(0));
+
+    let image = t.graphics().image(5).unwrap();
+    assert_eq!(image.data[..4], [0, 255, 0, 255]);
+    // Past the rectangle the destination frame is untouched.
+    assert_eq!(image.data[16..20], [255, 0, 0, 255]);
+}
+
+#[test]
+fn kitty_graphics_rejects_composing_a_frame_that_was_never_sent() {
+    let mut t = term(10, 4);
+    let red = encode_base64(&[255, 0, 0, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=T,f=32,s=8,v=16,i=5;{red}\x1b\\").as_bytes());
+    t.take_output();
+
+    // The image is a still, so it has a frame one and nothing else.
+    t.advance(b"\x1b_Ga=c,i=5,r=2,c=1\x1b\\");
+    let out = String::from_utf8(t.take_output()).unwrap();
+    assert!(out.contains("EINVAL"), "response should be an error: {out}");
+}
+
+#[test]
 fn an_animation_scrolled_out_of_view_asks_for_no_repaint() {
     // A playing animation off the top of the viewport is still playing, but
     // nothing about the screen changes. Calling that a repaint would flip the
@@ -717,4 +869,26 @@ fn an_unplaced_animation_asks_for_no_repaint() {
     assert!(!t.damage().is_dirty());
     // The frame still moved on, so the next placement shows the right one.
     assert_eq!(t.graphics().image(6).unwrap().current_frame(), 2);
+}
+
+#[test]
+fn kitty_graphics_repaints_a_placement_whose_image_was_retransmitted() {
+    let mut t = term(10, 4);
+    let red = encode_base64(&[255, 0, 0, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=T,f=32,s=8,v=16,i=5;{red}\x1b\\").as_bytes());
+    t.take_output();
+    t.clear_damage();
+
+    // Sending the image again under the placement that is already showing it
+    // is how a program streams: place once, then transmit a frame at a time.
+    // The pixels on screen have changed, so the rows they cover have to
+    // repaint — nothing else in the session is going to notice that they did.
+    let green = encode_base64(&[0, 255, 0, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=t,f=32,s=8,v=16,i=5;{green}\x1b\\").as_bytes());
+
+    assert_eq!(t.graphics().image(5).unwrap().data[..4], [0, 255, 0, 255]);
+    assert!(
+        t.damage().is_row_dirty(0),
+        "retransmitting an image under a live placement must repaint it"
+    );
 }

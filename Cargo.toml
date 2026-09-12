@@ -12,6 +12,7 @@ members = [
     "compositor/tos-system",
     "compositor/tos-compositor",
     "installer",
+    "preview",
 ]
 
 [workspace.package]
@@ -31,7 +32,9 @@ tos-input = { path = "compositor/tos-input" }
 tos-session = { path = "compositor/tos-session" }
 tos-platform = { path = "compositor/tos-platform" }
 tos-system = { path = "compositor/tos-system" }
+tos-compositor = { path = "compositor/tos-compositor" }
 tos-install = { path = "installer" }
+tos-preview = { path = "preview" }
 libc = "0.2"
 
 [profile.release]
