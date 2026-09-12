@@ -133,6 +133,7 @@ pub fn describe(action: &Action) -> String {
         Action::ShowBindings => "show these bindings".into(),
         Action::Refresh => "redraw the screen".into(),
         Action::Lock => "lock the screen".into(),
+        Action::ShowNetworks => "network interfaces".into(),
         Action::Quit => "quit tOS".into(),
     }
 }
@@ -247,6 +248,7 @@ fn rank(action: &Action) -> (u16, u16) {
         Action::RenameWorkspace => (5, 5),
         Action::ShowNotifications => (8, 1),
         Action::ShowBindings => (8, 2),
+        Action::ShowNetworks => (8, 3),
         Action::Refresh => (9, 0),
         Action::Lock => (9, 1),
         Action::Quit => (9, 2),

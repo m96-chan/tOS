@@ -61,6 +61,9 @@ pub enum Action {
     Quit,
     /// Redraw everything.
     Refresh,
+    /// Open the network menu: the machine's interfaces, what state each is
+    /// in, and what can be done to one.
+    ShowNetworks,
 }
 
 /// A key combination.
@@ -229,6 +232,10 @@ impl Keymap {
             // way vim does, and because every other desktop locks with an L.
             (KeyCode::Char('l'), Modifiers::SHIFT, Action::Lock),
             (KeyCode::Char('q'), Modifiers::NONE, Action::Quit),
+            // n is the next workspace and w is not taken, but neither reads
+            // as "network"; shift and the n key does, and shift is where the
+            // bindings that open a system menu have started to live.
+            (KeyCode::Char('n'), Modifiers::SHIFT, Action::ShowNetworks),
         ];
         for (code, modifiers, action) in bindings {
             keymap.bind_after_leader(Binding::new(*code, *modifiers), action.clone());
