@@ -126,6 +126,15 @@ pub struct Config {
     /// default locks first and blanks afterwards, so that a passer-by who
     /// wakes the screen finds the prompt rather than the session.
     pub idle_blank: Option<Duration>,
+    /// The dictionary the input method converts through, or `None` to search
+    /// the paths in [`crate::ime::search_path`].
+    ///
+    /// A setting rather than only a search, because somebody who has curated
+    /// an SKK dictionary for years should be able to point tOS at it. Not
+    /// finding one is never fatal: kana still type, conversion just finds
+    /// nothing, and a compositor that refused to start because a data file
+    /// was missing could not be booted from `/init` on a trimmed image.
+    pub ime_dictionary: Option<PathBuf>,
     /// Where the readers in [`crate::system`] look for the machine.
     ///
     /// `/` on a running machine, and a directory laid out like one in a test.
@@ -167,6 +176,7 @@ impl Default for Config {
             idle_lock: Some(Duration::from_secs(300)),
             idle_blank: Some(Duration::from_secs(600)),
             system_root: PathBuf::from("/"),
+            ime_dictionary: None,
         }
     }
 }

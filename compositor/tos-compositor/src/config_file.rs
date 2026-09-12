@@ -213,6 +213,11 @@ fn set(config: &mut Config, section: &str, key: &str, value: &str) -> Result<(),
         ("idle", "lock-after") => config.idle_lock = parse_interval(value)?,
         ("idle", "blank-after") => config.idle_blank = parse_interval(value)?,
         ("idle", other) => return Err(format!("unknown setting: [idle] {other}")),
+        // Japanese input. One setting, because there is one question a person
+        // has about it: which dictionary. Everything else about the IME is a
+        // key binding, and bindings are `[keys]`, which is still to come.
+        ("ime", "dictionary") => config.ime_dictionary = Some(PathBuf::from(value)),
+        ("ime", other) => return Err(format!("unknown setting: [ime] {other}")),
         ("colors", key) => set_palette(&mut config.palette, key, value)?,
         ("chrome", key) => set_chrome(&mut config.chrome, key, value)?,
         // The status bar is two subjects that belong together: what it says,
@@ -430,6 +435,26 @@ mod tests {
         let problems = apply(&mut config, "[idle]\nlock-after = soon\nsleep = 10\n");
         assert_eq!(problems.len(), 2, "{problems:?}");
         assert!(problems[1].contains("[idle] sleep"), "{:?}", problems[1]);
+    }
+
+    #[test]
+    fn the_dictionary_comes_from_the_file_and_a_typo_in_the_section_is_reported() {
+        let mut config = Config::default();
+        assert_eq!(config.ime_dictionary, None, "the default is to search");
+        apply_to(&mut config, "[ime]\ndictionary = /srv/SKK-JISYO.mine\n");
+        assert_eq!(
+            config.ime_dictionary,
+            Some(PathBuf::from("/srv/SKK-JISYO.mine"))
+        );
+        // Reported rather than ignored, because a setting that silently does
+        // nothing looks exactly like one that is broken.
+        let problems = apply(&mut config, "[ime]\ndictionery = /srv/typo\n");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("[ime] dictionery"),
+            "{:?}",
+            problems[0]
+        );
     }
 
     #[test]

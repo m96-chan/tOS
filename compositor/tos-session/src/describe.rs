@@ -140,6 +140,7 @@ pub fn describe(action: &Action) -> String {
         Action::ToggleMute => "mute".into(),
         Action::ToggleStatusBar => "show or hide the status bar".into(),
         Action::ShowNetworks => "network interfaces".into(),
+        Action::ImeToggle => "Japanese input on or off".into(),
         Action::Quit => "quit tOS".into(),
     }
 }
@@ -263,6 +264,9 @@ fn rank(action: &Action) -> (u16, u16) {
         // is in the session, not with the things that end one.
         Action::ToggleStatusBar => (8, 5),
         Action::ShowNetworks => (8, 4),
+        // With the things that change how the session is typed at rather than
+        // what it shows: it is nearer copy mode than it is the status bar.
+        Action::ImeToggle => (7, 3),
         Action::Refresh => (9, 0),
         Action::Lock => (9, 1),
         Action::CopyMode => (7, 0),
@@ -381,8 +385,9 @@ fn code_name(code: KeyCode) -> String {
             MediaKey::VolumeDown => "volumedown".into(),
             MediaKey::Mute => "mute".into(),
         },
-        // The conversion keys a Japanese keyboard has. Nothing binds them
-        // today; an input method is what will.
+        // The conversion keys a Japanese keyboard has. The かな key is bound
+        // to the input method's toggle; the other two are the preedit's and
+        // reach it through the pane rather than through a binding.
         KeyCode::Ime(key) => match key {
             ImeKey::Convert => "henkan".into(),
             ImeKey::NonConvert => "muhenkan".into(),

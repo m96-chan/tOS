@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use tos_input::{KeyCode, KeyEvent, KeyState, MediaKey, Modifiers};
+use tos_input::{ImeKey, KeyCode, KeyEvent, KeyState, MediaKey, Modifiers};
 
 use crate::layout::{Axis, Direction};
 
@@ -95,6 +95,16 @@ pub enum Action {
     /// Open the network menu: the machine's interfaces, what state each is
     /// in, and what can be done to one.
     ShowNetworks,
+    /// Turn Japanese input on or off for the focused pane.
+    ///
+    /// A binding rather than a key, and that is not a preference: the key a
+    /// Japanese user actually presses is 半角/全角, which on a USB JIS
+    /// keyboard is HID usage 0x35 — the position HID calls "Grave Accent and
+    /// Tilde" — and `hid-input` maps 0x35 to `KEY_GRAVE` without asking what
+    /// layout the keyboard claims to be. So on the hardware that most needs
+    /// the toggle, the toggle is indistinguishable from a backtick, and a
+    /// default bound to it would be a default that types `\``.
+    ImeToggle,
 }
 
 /// A key combination.
@@ -296,6 +306,12 @@ impl Keymap {
             // as "network"; shift and the n key does, and shift is where the
             // bindings that open a system menu have started to live.
             (KeyCode::Char('n'), Modifiers::SHIFT, Action::ShowNetworks),
+            // i for input method. It is the letter the thing is named after
+            // in every language it has a name in, and it is one of the few
+            // still free — the obvious alternative, ctrl+space, is NUL to a
+            // terminal and set-mark to emacs, so binding it would take a key
+            // away from the program the IME exists to type into.
+            (KeyCode::Char('i'), Modifiers::NONE, Action::ImeToggle),
         ];
         for (code, modifiers, action) in bindings {
             keymap.bind_after_leader(Binding::new(*code, *modifiers), action.clone());
@@ -375,6 +391,16 @@ impl Keymap {
         ] {
             keymap.bind(Binding::new(KeyCode::Media(code), Modifiers::NONE), action);
         }
+        // The かな key, for the same reason and with the same caveat: a key
+        // labelled カタカナひらがな has nothing else it could mean, and
+        // `encode_key` gives it no bytes, so no program is owed it. It is the
+        // one of the three JIS conversion keys whose meaning is not in
+        // question — 半角/全角 never arrives at all, and what 変換 and 無変換
+        // do belongs to the preedit rather than to the keymap.
+        keymap.bind(
+            Binding::new(KeyCode::Ime(ImeKey::KanaMode), Modifiers::NONE),
+            Action::ImeToggle,
+        );
         keymap
     }
 
@@ -506,6 +532,35 @@ mod tests {
             keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL)),
             Resolution::Passthrough
         );
+    }
+
+    #[test]
+    fn the_ime_toggle_is_a_binding_and_not_the_key_a_jis_keyboard_sends_as_a_backtick() {
+        let mut keymap = Keymap::default_bindings();
+        // 半角/全角 arrives as `KEY_GRAVE`, so a backtick has to stay a
+        // backtick: a default bound to that key would be a default that types
+        // one every time somebody tried to turn the IME on.
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('`'), Modifiers::NONE)),
+            Resolution::Passthrough
+        );
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('i'), Modifiers::SUPER)),
+            Resolution::Action(Action::ImeToggle)
+        );
+        // And the かな key, which has nothing else it could mean.
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Ime(ImeKey::KanaMode), Modifiers::NONE)),
+            Resolution::Action(Action::ImeToggle)
+        );
+        // The other two conversion keys belong to the preedit rather than to
+        // the keymap, so they go on through to the compositor's IME arm.
+        for code in [ImeKey::Convert, ImeKey::NonConvert] {
+            assert_eq!(
+                keymap.resolve(&press(KeyCode::Ime(code), Modifiers::NONE)),
+                Resolution::Passthrough
+            );
+        }
     }
 
     #[test]

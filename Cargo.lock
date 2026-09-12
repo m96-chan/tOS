@@ -39,6 +39,7 @@ dependencies = [
  "libc",
  "tos-crypt",
  "tos-font",
+ "tos-ime",
  "tos-input",
  "tos-platform",
  "tos-pty",

@@ -1037,6 +1037,14 @@ size = 1280x720
 lock-after = 300
 blank-after = 600
 
+# Japanese input. The dictionary it converts through; kana still type without
+# one and conversion simply finds nothing. Left out, it is searched for at
+# $XDG_DATA_HOME/tos/SKK-JISYO and then /usr/share/tos/SKK-JISYO.L. Turning it
+# on is a binding, super+i, and not the 半角/全角 key: on a JIS keyboard that
+# key arrives as KEY_GRAVE and is indistinguishable from a backtick.
+[ime]
+dictionary = /usr/share/skk/SKK-JISYO.L
+
 # What applications paint with. color0 to color255 set the palette itself.
 [colors]
 background = #101012
