@@ -221,7 +221,19 @@ fn a_file_that_is_not_a_png_is_named_in_the_complaint() {
     let mut text = String::new();
     while Instant::now() < deadline {
         compositor.pump_panes();
-        text = compositor.pane(focus).unwrap().terminal.grid().to_text();
+        text.clear();
+        for row in compositor
+            .pane(focus)
+            .unwrap()
+            .terminal
+            .grid()
+            .display_rows()
+        {
+            text.push_str(&row.to_text());
+            if !row.wrapped {
+                text.push('\n');
+            }
+        }
         if text.contains("not a PNG") {
             break;
         }
