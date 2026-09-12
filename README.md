@@ -472,9 +472,11 @@ interlacing, which is the shape an image preview arrives in. A payload that
 cannot be decoded is still answered with the protocol's error response rather
 than being silently dropped, so applications can fall back instead of hanging.
 
-Only inline transmission is read, though. `t=f` and `t=t`, where the
-application hands over a path instead of the bytes, are still refused, and
-that is the route some file managers take for a large image.
+Bytes need not arrive inline. `t=f` names a file, `t=t` names one to read and
+then delete, and `t=s` names a shared memory object — the route a file manager
+takes for a large image rather than base64-ing megabytes through the PTY. What
+a compositor that owns the machine will open on a program's say-so is its own
+question, answered in `docs/design/graphics-file-transmission.md`.
 
 `tos-preview` is the program that uses all of this, and it ships on the ISO
 next to `tos` and `tos-install`. It reads a PNG, sizes it to the pane from the

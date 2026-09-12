@@ -78,7 +78,7 @@ fn main() {
         bench.fb.height(),
     );
 
-    silent_retransmission(&mut bench);
+    retransmission_repaints(&mut bench);
     transport();
     routes(&mut bench);
     capacity();
@@ -317,21 +317,20 @@ fn kib(bytes: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// A route that does not work at all
+// The route this harness found broken
 // ---------------------------------------------------------------------------
 
 /// The obvious way to stream by retransmission is to place the image once and
 /// then send `a=t` for every frame after it, since the placement already says
-/// where the picture goes. It does not work, and the reason is one missing
-/// call: `Terminal::handle_graphics` damages rows after `a=f`
-/// (`tos-term/src/term.rs:1801`) and after `a=a` (`:1836`), but the `a=t` arm
-/// (`:1808`) stores the new pixels and returns. Nothing marks the rows the
-/// existing placement covers, so the old frame stays on screen until something
-/// unrelated repaints it.
+/// where the picture goes. When this harness was first written it did not
+/// work: `Terminal::handle_graphics` damaged rows after `a=f` and after `a=a`,
+/// but the `a=t` arm stored the new pixels and returned, so the old frame
+/// stayed on screen until something unrelated repainted it. That is fixed, and
+/// this stays behind as the check that it is still fixed.
 ///
-/// This is checked rather than argued, because it is a claim about behaviour
-/// and the harness is standing right next to the behaviour.
-fn silent_retransmission(bench: &mut Bench) {
+/// Checked rather than argued, because it is a claim about behaviour and the
+/// harness is standing right next to the behaviour.
+fn retransmission_repaints(bench: &mut Bench) {
     let size = (320u32, 180u32);
     let (cols, rows) = bench.cells_for(size);
     bench.reset();
@@ -365,9 +364,17 @@ fn silent_retransmission(bench: &mut Bench) {
         .count();
 
     println!();
-    println!("a=t under a live placement — new pixels, no repaint");
+    println!("a=t under a live placement — repaints, as it must");
     println!("  damage after the retransmission: {dirty}");
     println!("  pixels the retained render changed: {changed}");
+    assert!(
+        dirty,
+        "a=t under a live placement must damage the rows it covers"
+    );
+    assert!(
+        changed > 0,
+        "a=t under a live placement must change the picture"
+    );
 }
 
 // ---------------------------------------------------------------------------

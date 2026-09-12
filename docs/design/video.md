@@ -231,12 +231,12 @@ why the whole-image-rect column exists in the first place, and with `rect =
 whole image` every advantage `a=f` has evaporates and only its memory ceiling
 is left.
 
-### The route that does not work at all
+### The route that did not work at all, and now does
 
 The obvious way to stream by retransmission is to place the image once and then
 send `a=t` for each frame after it, since the placement already says where the
-picture goes. **It does not repaint.** The harness checks this rather than
-claiming it, and prints the result on every run:
+picture goes. When this document was first drafted it did not repaint, and the
+harness caught it:
 
 ```text
 a=t under a live placement — new pixels, no repaint
@@ -244,17 +244,20 @@ a=t under a live placement — new pixels, no repaint
   pixels the retained render changed: 0
 ```
 
-The cause is one missing call. `Terminal::handle_graphics` damages the rows an
-image covers after `a=f` (`term.rs:1801`) and after `a=a` (`:1836`), but the
-arm that handles a completed `a=t` (`:1808`) stores the new pixels and returns.
-Nothing marks the rows that the existing placement covers, so the old frame
-stays on screen until something unrelated happens to repaint it. The new pixels
-are in the store, the generation has moved, and the screen does not know.
+The cause was one missing call. `Terminal::handle_graphics` damaged the rows an
+image covers after `a=f` and after `a=a`, but the arm that handled a completed
+`a=t` stored the new pixels and returned. Nothing marked the rows the existing
+placement covered, so the old frame stayed on screen until something unrelated
+happened to repaint it: the new pixels were in the store, the generation had
+moved, and the screen did not know.
 
-`a=T` avoids it by accident, because transmit-and-display re-places the image
-and placing damages rows. That is the only reason the recommendation above can
-be written as "`a=T`, or `a=t` followed by `a=p`" — the second form works only
-because of the `a=p`. This is a protocol gap and is listed as one below.
+`a=T` hid it, because transmit-and-display re-places the image and placing
+damages rows — which is why the bug survived as long as it did, the recommended
+route being the one that never tripped over it.
+
+It is fixed, and the harness now asserts the fix rather than reporting the bug.
+Both halves of the recommendation above therefore work on their own merits, and
+`a=t` followed by `a=p` is no longer carried by the `a=p`.
 
 ---
 
@@ -453,8 +456,5 @@ Written down and deliberately not done:
   its render leg and can never repay it.
 - **No clipping of an image blit to its damaged rows**, although the blit is
   all-or-nothing and that is now a number rather than a suspicion.
-- **No repaint after `a=t`**, which is a bug rather than a design choice, and
-  is left alone here only because this document is a measurement and somebody
-  else should fix it deliberately.
 - **No GPU work**, and #12's abandonment is confirmed as costing video almost
   nothing.

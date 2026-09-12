@@ -2,3 +2,10 @@
 /dist
 **/*.rs.bk
 *.ppm
+
+# Scratch build directories. `target/` in this checkout is root-owned, left by
+# the containerised ISO build, so cargo here gets pointed somewhere else with
+# CARGO_TARGET_DIR — and whatever that somewhere is called must not be
+# committed. Agent worktrees under .claude/ are checkouts of this same repo.
+/target-*
+/.claude

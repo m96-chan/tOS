@@ -967,11 +967,15 @@ impl GraphicsStore {
             image.frames[index].gap_ms = gap_ms(gap, previous);
             if index == image.current {
                 image.data = pixels;
-                self.generations += 1;
-                image.generation = self.generations;
             } else {
                 image.frames[index].data = pixels;
             }
+            // Rewriting any frame moves the generation, for the reason given
+            // in `compose_frames`: a cache keyed on generation and frame number
+            // is still holding a texture for the frame that was just replaced,
+            // and will serve it the moment the animation comes back round.
+            self.generations += 1;
+            image.generation = self.generations;
         }
         self.evict_to_budget(id);
         Ok(id)
@@ -1040,7 +1044,6 @@ impl GraphicsStore {
             patch.extend_from_slice(pixels);
         }
 
-        let visible = dest == image.current;
         let target = image.pixels_mut(dest).ok_or("EINVAL:no such frame")?;
         compose(
             target,
@@ -1050,12 +1053,13 @@ impl GraphicsStore {
             cmd.compose_overwrites(),
         );
 
-        // Only the frame on screen is pixels a renderer is holding a copy of;
-        // rewriting one of the others changes nothing it has cached.
-        if visible {
-            self.generations += 1;
-            image.generation = self.generations;
-        }
+        // Any frame's pixels changing moves the generation, not just the one
+        // on screen. A renderer's cache is keyed on the generation *and* the
+        // frame number, so a texture built for a frame that is not showing now
+        // is still held against the moment the animation reaches it; leaving
+        // the generation alone would hand that stale texture back then.
+        self.generations += 1;
+        image.generation = self.generations;
         Ok(id)
     }
 
@@ -1253,7 +1257,31 @@ fn decode_frame(
 ) -> Result<Vec<u8>, &'static str> {
     match cmd.format {
         Format::Png => {
-            let (png_w, png_h, data) = decode_payload(cmd, payload, budget)?;
+            // A frame has to come out exactly the size of the rectangle it is
+            // filling, so what the decoder is allowed to spend follows from
+            // that rectangle rather than from the whole store's allowance.
+            // Handing it the budget instead would let a two-pixel rectangle
+            // expand a quarter-gigabyte PNG before anything compared the
+            // dimensions and refused it.
+            //
+            // The number is what `png::decode` measures against: the
+            // scanlines and the RGBA they become, both held at once. Sixteen
+            // bits a sample is the widest a PNG goes, so eight bytes a pixel
+            // plus a filter byte a row is the most an honest `w` by `h` file
+            // can cost, and anything dearer than that is not one.
+            let pixels = (w as usize)
+                .checked_mul(h as usize)
+                .ok_or("EINVAL:frame too large")?;
+            let scanlines = (w as usize)
+                .checked_mul(8)
+                .and_then(|row| row.checked_add(1))
+                .and_then(|row| row.checked_mul(h as usize))
+                .ok_or("EINVAL:frame too large")?;
+            let cap = pixels
+                .checked_mul(4)
+                .and_then(|rgba| rgba.checked_add(scanlines))
+                .ok_or("EINVAL:frame too large")?;
+            let (png_w, png_h, data) = decode_payload(cmd, payload, cap)?;
             if (png_w, png_h) != (w, h) {
                 return Err("EINVAL:PNG is not the size of the frame");
             }
@@ -1850,6 +1878,24 @@ mod tests {
     }
 
     #[test]
+    fn a_png_frame_is_not_allowed_to_expand_past_its_rectangle() {
+        // The store has room for a large picture, but this command asked for a
+        // two-pixel rectangle. What it is allowed to spend decoding follows
+        // from the rectangle, so a file far bigger than that is refused while
+        // it is still compressed — not expanded first and measured after.
+        let mut store = GraphicsStore::new(64 << 20);
+        let base = command("a=t,f=32,s=4,v=4,i=1", &[0u8; 4 * 4 * 4]);
+        store.store(&base, &base.payload).unwrap();
+
+        let big = crate::png::tests::rgba_png(512, 512, &[7u8; 512 * 512 * 4]);
+        let frame = command("a=f,f=100,s=2,v=2,i=1,z=40", &big);
+        assert_eq!(
+            store.store_frame(&frame, &frame.payload),
+            Err("EINVAL:PNG exceeds the image budget")
+        );
+    }
+
+    #[test]
     fn a_png_frame_that_is_not_the_size_of_the_rectangle_is_refused() {
         let mut store = GraphicsStore::new(1 << 20);
         let base = command("a=t,f=32,s=4,v=4,i=1", &[0u8; 4 * 4 * 4]);
@@ -2007,7 +2053,7 @@ mod tests {
     }
 
     #[test]
-    fn composing_onto_the_visible_frame_moves_the_generation() {
+    fn composing_onto_any_frame_moves_the_generation() {
         let mut store = GraphicsStore::new(1 << 20);
         two_frame_image(&mut store);
         assert_eq!(store.image(1).unwrap().current_frame(), 1);
@@ -2021,11 +2067,13 @@ mod tests {
         assert!(after > before);
         assert_eq!(store.image(1).unwrap().data, vec![0, 255, 0, 255]);
 
-        // Frame two is not, so nothing a renderer has cached went stale.
+        // Frame two is not on screen, but a cache keyed on the generation and
+        // the frame number is holding a texture for it against the moment the
+        // animation reaches it. That texture is now wrong.
         store
             .compose_frames(&command("a=c,i=1,r=1,c=2", &[]))
             .unwrap();
-        assert_eq!(store.image(1).unwrap().generation(), after);
+        assert!(store.image(1).unwrap().generation() > after);
     }
 
     #[test]

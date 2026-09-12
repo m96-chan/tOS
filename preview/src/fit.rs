@@ -77,8 +77,15 @@ impl Metrics {
     }
 
     /// The rectangle a picture may occupy, in pixels.
+    ///
+    /// Saturating, because the cell size can come from `--cell` on the command
+    /// line: a pane is never big enough to overflow this, but a number a
+    /// person typed is not a pane.
     pub fn usable_pixels(self) -> (u32, u32) {
-        (self.cols * self.cell.0, self.usable_rows() * self.cell.1)
+        (
+            self.cols.saturating_mul(self.cell.0),
+            self.usable_rows().saturating_mul(self.cell.1),
+        )
     }
 }
 

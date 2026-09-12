@@ -196,6 +196,11 @@ fn a_pipe_is_refused_rather_than_filled_with_escape_sequences() {
     assert!(stderr.contains("not a terminal"), "stderr said: {stderr}");
 }
 
+/// A file that is not a picture has to be refused by name, and it has to be
+/// refused *in a pane* — run down a pipe it never reaches the decoder, because
+/// the "not a terminal" guard turns it away first. That is why this one goes
+/// through the compositor rather than `Command::output` like the pipe test
+/// above: the two look alike and only this one reaches the PNG reader.
 #[test]
 fn a_file_that_is_not_a_png_is_named_in_the_complaint() {
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("tos-preview");
@@ -203,12 +208,43 @@ fn a_file_that_is_not_a_png_is_named_in_the_complaint() {
     let source = dir.join("not-a.png");
     std::fs::write(&source, b"GIF89a").expect("write fixture");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tos-preview"))
-        .arg(&source)
-        .output()
-        .expect("run tos-preview");
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    let mut compositor = compositor(&format!(
+        "{} {}; sleep 30",
+        env!("CARGO_BIN_EXE_tos-preview"),
+        source.display()
+    ));
+
+    // Wait for the complaint to be on the screen rather than for a fixed time,
+    // so a loaded machine does not read the pane before the shell has run.
+    let focus = compositor.session().focus();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut text = String::new();
+    while Instant::now() < deadline {
+        compositor.pump_panes();
+        text = compositor.pane(focus).unwrap().terminal.grid().to_text();
+        if text.contains("not a PNG") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(
+        text.contains("not a PNG"),
+        "tos-preview should have said what was wrong; pane held:\n{text}"
+    );
+    assert!(
+        text.contains("not-a.png"),
+        "the complaint should name the file; pane held:\n{text}"
+    );
+    assert!(
+        compositor
+            .pane(focus)
+            .unwrap()
+            .terminal
+            .graphics()
+            .is_empty(),
+        "nothing should have been transmitted for a file that is not a picture"
+    );
 }
 
 fn compositor(command: &str) -> Compositor {
