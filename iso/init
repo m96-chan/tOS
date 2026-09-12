@@ -5,6 +5,11 @@
 
 /bin/busybox --install -s /bin
 
+# Set before anything is looked up: mounting a root filesystem by label needs
+# the util-linux mount in /sbin rather than busybox's, which cannot resolve
+# one, and /sbin has to come first for that to be the one found.
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
 # /init's own stdout is whichever console= came last on the kernel command
 # line, and the machine may have several. Anything a person needs to read
 # goes to all of them: a screen is the usual one, a serial line is what CI
@@ -44,17 +49,84 @@ done
 [ -e /dev/dri/card0 ] ||
     say "tOS: no display driver claimed this machine's graphics"
 
-# The kernel and initramfs live on the medium, not in the initramfs, so the
-# installer needs the medium mounted to copy them onto a disk. Look for the
-# partition that carries /boot/vmlinuz.
-mkdir -p /run/live/medium
-# Storage nodes appear a moment after their driver loads.
+# Storage nodes appear a moment after their driver loads. Both the root
+# filesystem and the live medium are on one, so wait here, once, for whichever
+# of them this machine has.
 for _ in 1 2 3 4 5 6 7 8 9 10; do
     if [ -b /dev/sr0 ] || [ -b /dev/sda ] || [ -b /dev/vda ]; then
         break
     fi
     sleep 0.2
 done
+
+# An installed machine has a root filesystem, and everything tos-install wrote
+# is inside it: the host name, the /etc/inittab that starts the compositor, and
+# the password the screen lock checks. Hand the machine over to it. Running the
+# session out of this initramfs instead leaves all of that on a disk nothing
+# reads, which is what used to happen.
+#
+# The live ISO names no root= — the grub.cfg in iso/mkiso.sh deliberately does
+# not — so a machine booted from the medium falls through to the live session
+# below, which is what it has always done.
+root_device=
+if [ -r /proc/cmdline ]; then
+    read -r cmdline </proc/cmdline
+    for word in $cmdline; do
+        case "$word" in
+        root=*) root_device="${word#root=}" ;;
+        esac
+    done
+fi
+
+if [ -n "$root_device" ]; then
+    mkdir -p /newroot
+    mounted=
+    # The label may name a partition whose device node is still settling.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if mount "$root_device" /newroot 2>/dev/null; then
+            mounted=1
+            break
+        fi
+        sleep 0.2
+    done
+
+    # busybox init is what reads the inittab, and it arrives on the disk as
+    # /bin/init when the installer copies /bin. Look before leaping: switching
+    # into a root with no init leaves the machine running nothing at all,
+    # where staying here at least puts a session on the screen.
+    init=
+    if [ -n "$mounted" ]; then
+        for candidate in /sbin/init /bin/init; do
+            if [ -x "/newroot$candidate" ]; then
+                init=$candidate
+                break
+            fi
+        done
+    fi
+
+    if [ -n "$init" ]; then
+        say "tOS: booting $root_device"
+        # Carry the kernel's own filesystems over rather than leaving them on
+        # a root that is about to be deleted. /etc/rc mounts each of them
+        # again, so a move that does not take is not fatal.
+        for fs in /dev /proc /sys; do
+            mount --move "$fs" "/newroot$fs" 2>/dev/null || true
+        done
+        exec switch_root /newroot "$init"
+    fi
+
+    if [ -n "$mounted" ]; then
+        say "tOS: $root_device has no init; staying in the initramfs"
+        umount /newroot 2>/dev/null
+    else
+        say "tOS: cannot mount $root_device; staying in the initramfs"
+    fi
+fi
+
+# The kernel and initramfs live on the medium, not in the initramfs, so the
+# installer needs the medium mounted to copy them onto a disk. Look for the
+# partition that carries /boot/vmlinuz.
+mkdir -p /run/live/medium
 for dev in /dev/sr* /dev/sd?? /dev/sd? /dev/vd?? /dev/vd? /dev/nvme*n*p* /dev/nvme*n*; do
     [ -b "$dev" ] || continue
     if mount -o ro "$dev" /run/live/medium 2>/dev/null; then
@@ -69,7 +141,6 @@ if [ ! -f /run/live/medium/boot/vmlinuz ]; then
     say "tOS: no live medium found; the installer cannot copy a kernel"
 fi
 
-export PATH=/sbin:/bin:/usr/sbin:/usr/bin
 export HOME=/root
 export SHELL=/bin/sh
 export TERM=xterm-256color

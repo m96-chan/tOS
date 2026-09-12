@@ -6,6 +6,7 @@
 //! about than one that carried on after `mkfs` failed.
 
 use crate::exec::{Backend, Output};
+use crate::motd;
 use crate::plan::{Firmware, Plan, Settings, Step};
 
 /// Where tOS keeps its own files on an installed system.
@@ -290,11 +291,29 @@ impl<'a> Installer<'a> {
         // The console starts tOS, which is the whole point of the machine.
         self.write(
             &format!("{root}/etc/inittab"),
-            "::sysinit:/etc/rc\n::respawn:/sbin/tos\n::ctrlaltdel:/sbin/reboot\n",
+            &format!(
+                "::sysinit:/etc/rc\n::respawn:{SESSION_SCRIPT_PATH}\n::ctrlaltdel:/sbin/reboot\n"
+            ),
         )?;
         self.write(&format!("{root}/etc/rc"), RC_SCRIPT)?;
         let rc = format!("{root}/etc/rc");
         let _ = self.backend.run("chmod", &["755", &rc]);
+        let session = format!("{root}{SESSION_SCRIPT_PATH}");
+        self.write(&session, SESSION_SCRIPT)?;
+        let _ = self.backend.run("chmod", &["755", &session]);
+
+        // Say that this disk was installed. /etc is copied from the live
+        // system, message of the day and all, so without a mark left here
+        // every shell on the finished machine would go on announcing a live
+        // session and offering to install the disk it is already on.
+        let directory = format!("{root}{CREDENTIAL_DIRECTORY}");
+        self.backend
+            .create_dir(&directory)
+            .map_err(|e| format!("cannot create {directory}: {e}"))?;
+        self.write(
+            &format!("{root}{}", motd::INSTALLED_PATH),
+            &format!("tOS {}\n", env!("CARGO_PKG_VERSION")),
+        )?;
         Ok(())
     }
 
@@ -519,7 +538,13 @@ const PARTITION_WAIT_ATTEMPTS: usize = 20;
 /// The live image is an initramfs, so this is the whole of it: the compositor,
 /// busybox and the kernel modules. `/boot` is not among them, because it is
 /// on the medium rather than in the initramfs.
-pub const COPIED_DIRECTORIES: &[&str] = &["/bin", "/sbin", "/lib", "/etc", "/root"];
+///
+/// `/usr` is here for the font. Every path the compositor searches is under
+/// `/usr/share/fonts`, so a machine installed without it finds no face at all
+/// and falls back to the built-in ASCII one, which draws every kana as a
+/// hollow box. `/usr/lib/grub` rides along, which is what an installed machine
+/// would need to put its bootloader back.
+pub const COPIED_DIRECTORIES: &[&str] = &["/bin", "/sbin", "/lib", "/usr", "/etc", "/root"];
 
 /// The files GRUB loads, taken from the live medium.
 pub const BOOT_FILES: &[&str] = &["vmlinuz", "initramfs.gz"];
@@ -566,6 +591,25 @@ pub fn planning_backend() -> crate::exec::Recorder {
     }
     backend
 }
+
+/// Where the session's environment is written, and what /etc/inittab respawns.
+pub const SESSION_SCRIPT_PATH: &str = "/etc/tos-session";
+
+/// The environment the session runs in, and then the compositor.
+///
+/// busybox init hands a program it respawns almost nothing, and none of what a
+/// tOS session needs: `ENV`, which is how each pane's shell comes to read
+/// `/etc/profile` and print the message of the day, nor `HOME`, nor `SHELL`.
+/// The live image exports these in `/init` and nothing carries an environment
+/// across `switch_root`, so an installed machine writes them down here
+/// instead. `iso/init` is the live counterpart and the two have to agree.
+const SESSION_SCRIPT: &str = "#!/bin/sh\n\
+                              # Written by the tOS installer.\n\
+                              export HOME=/root\n\
+                              export SHELL=/bin/sh\n\
+                              export TOS=1\n\
+                              export ENV=/etc/profile\n\
+                              exec /sbin/tos\n";
 
 /// The installed system's startup script.
 const RC_SCRIPT: &str = "#!/bin/sh\n\
@@ -922,8 +966,46 @@ mod tests {
             })
             .expect("no inittab");
         assert!(
-            inittab.contains("/sbin/tos"),
+            inittab.contains(SESSION_SCRIPT_PATH),
             "the machine has to boot into tOS: {inittab}"
+        );
+        let session = written(&backend, &format!("/mnt/target{SESSION_SCRIPT_PATH}"));
+        assert!(
+            session.contains("exec /sbin/tos"),
+            "the session script has to end at the compositor: {session}"
+        );
+    }
+
+    #[test]
+    fn the_session_carries_the_environment_init_does_not() {
+        // busybox init respawns with almost nothing set. Without ENV no pane's
+        // shell reads /etc/profile, which is where the message of the day
+        // comes from; /init exports the same set on the live image.
+        let backend = install(Firmware::Bios);
+        let session = written(&backend, &format!("/mnt/target{SESSION_SCRIPT_PATH}"));
+        for variable in ["HOME=/root", "SHELL=/bin/sh", "TOS=1", "ENV=/etc/profile"] {
+            assert!(
+                session.contains(variable),
+                "the session should export {variable}: {session}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_font_comes_along_so_an_installed_machine_can_draw_japanese() {
+        // Every path tos-font searches is under /usr/share/fonts. Without it
+        // the machine falls back to the ASCII face and every kana is a box.
+        let backend = install(Firmware::Bios);
+        assert!(backend.did("copy /usr -> /mnt/target/usr"));
+    }
+
+    #[test]
+    fn an_installed_disk_says_that_it_was_installed() {
+        let backend = install(Firmware::Bios);
+        let marker = written(&backend, "/mnt/target/etc/tos/installed");
+        assert!(
+            marker.starts_with("tOS "),
+            "the marker should name what put it there: {marker}"
         );
     }
 
