@@ -129,6 +129,20 @@ impl Pane {
         let _ = self.pty.resize(winsize_for(area, cell_size));
     }
 
+    /// Whether this pane is owed a frame right now.
+    ///
+    /// Damage is usually the whole of the answer, but a pane holding a
+    /// synchronized update open has asked not to be drawn, and `render_frame`
+    /// obliges and leaves its damage standing so that the update is not lost.
+    /// Standing damage on such a pane is therefore not "there is a frame to
+    /// draw" but "there is one owed once the program lets go". Every place
+    /// that decides whether to compose a frame asks this rather than the
+    /// damage, because one caller reading it the other way is enough to make
+    /// the frame the others skipped get drawn anyway.
+    pub fn wants_frame(&self) -> bool {
+        !self.terminal.modes.synchronized_output && self.terminal.damage().is_dirty()
+    }
+
     /// Read from the PTY into the terminal. Returns false at end of file.
     pub fn pump(&mut self, buf: &mut [u8]) -> bool {
         loop {

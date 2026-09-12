@@ -676,6 +676,47 @@ fn a_synchronized_update_is_painted_once_it_ends() {
 }
 
 #[test]
+fn a_pane_holding_a_synchronized_update_open_asks_for_no_frame() {
+    // The damage left standing on a skipped pane is not a frame to draw but a
+    // frame owed once the program lets go, and DECSET 2026 has no timeout
+    // anywhere in tOS: reading it as a frame to draw costs one composed frame
+    // per pass of the loop for as long as the update stays open.
+    // `needs_render` declines to ask for that frame — and `pump_panes`, which
+    // the loop ors into the same decision, has to decline as well or the
+    // decline means nothing.
+    let mut c = compositor(&["/bin/sh", "-c", "sleep 30"]);
+    let focus = c.session().focus();
+    let mut framebuffer = OwnedFramebuffer::new(SIZE.0, SIZE.1);
+    // The first frame is the full redraw every session starts owing.
+    {
+        let mut surface = framebuffer.surface();
+        c.render_frame(&mut surface, true);
+    }
+
+    c.inject(b"\x1b[?2026h");
+    c.inject(b"\x1b[41m          \x1b[0m");
+    {
+        let mut surface = framebuffer.surface();
+        c.render_frame(&mut surface, true);
+    }
+    assert!(
+        c.pane(focus).unwrap().terminal.damage().is_dirty(),
+        "damage must survive a frame that skipped the pane"
+    );
+    assert!(!c.needs_render(), "a skipped pane asked to be drawn again");
+    assert!(
+        !c.pump_panes(),
+        "the pump reported the damage the frame deliberately left standing"
+    );
+
+    c.inject(b"\x1b[?2026l");
+    assert!(
+        c.needs_render(),
+        "the frame owed by the finished update never came"
+    );
+}
+
+#[test]
 fn a_host_terminal_mouse_click_lands_in_the_right_pane() {
     // A host terminal reports cells, a device reports pixels. Treating the
     // first as the second divided every coordinate by the cell size, so every

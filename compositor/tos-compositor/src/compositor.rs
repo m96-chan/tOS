@@ -546,12 +546,18 @@ impl Compositor {
         let mut buf = vec![0u8; 64 * 1024];
 
         for (&id, pane) in self.panes.iter_mut() {
-            let before = pane.terminal.damage().is_dirty();
+            // `wants_frame` and not the damage, because the damage a pane
+            // holding a synchronized update open is sitting on is the damage
+            // `render_frame` deliberately left standing. Counting it here
+            // would report a change on every pass of the loop for as long as
+            // the program kept the update open, which is exactly the frame
+            // [`Compositor::needs_render`] declines to ask for.
+            let before = pane.wants_frame();
             let alive = pane.pump(&mut buf);
             if !alive && !pane.pty.is_alive() {
                 finished.push(id);
             }
-            if pane.terminal.damage().is_dirty() || before {
+            if pane.wants_frame() || before {
                 changed = true;
             }
         }
@@ -2761,9 +2767,7 @@ impl Compositor {
     pub fn needs_render(&self) -> bool {
         self.needs_full_redraw
             || self.pointer_moved_since_it_was_drawn()
-            || self.panes.values().any(|pane| {
-                !pane.terminal.modes.synchronized_output && pane.terminal.damage().is_dirty()
-            })
+            || self.panes.values().any(|pane| pane.wants_frame())
     }
 
     /// Where the arrow belongs this frame, or `None` for no arrow at all.
