@@ -3,8 +3,14 @@
 Bootable image where the compositor **is** userspace:
 
 ```text
-GRUB -> Linux (Debian linux-image) -> initramfs /init -> tos (DRM backend)
+live       GRUB -> Linux -> initramfs /init -> tos (DRM backend)
+installed  GRUB -> Linux -> initramfs /init -> switch_root -> init -> tos
 ```
+
+`/init` takes the second path when the kernel command line names a `root=`,
+which is what the installer writes and what the live image deliberately does
+not. On an installed machine busybox init then reads the `/etc/inittab` the
+installer left, runs `/etc/rc` and respawns the session.
 
 Per the top-level README, tOS targets a **Debian** userspace; this image
 is the Debian-based kernel/compositor half of that. The initramfs holds
@@ -90,7 +96,7 @@ emergency busybox shell on the console.
 |-------------|---------------------------------------------------------------|
 | `build.sh`  | host entry point: runs `mkiso.sh` in a container               |
 | `mkiso.sh`  | container-side build: static binaries, initramfs, `grub-mkrescue` |
-| `init`      | initramfs PID 1: mounts, modprobe, find the medium, exec `tos` |
+| `init`      | initramfs PID 1: mounts, modprobe, `switch_root` into `root=`, or find the medium and exec `tos` |
 | `profile`   | sourced by every shell; prints the banner and the install hint |
 | `run.sh`    | boots `dist/tos-<arch>.iso` in QEMU                           |
 
@@ -106,9 +112,11 @@ emergency busybox shell on the console.
   owning the screen.
 - No real rootfs yet: the installer copies the busybox initramfs world
   onto the disk, so an installed machine is the same small system the ISO
-  boots. The next step per the top-level README is a Debian rootfs
-  (mmdebstrap → squashfs) that `/init` mounts and pivots into; the
-  installer is what will put that on disk once it exists.
+  boots — it is a root filesystem of its own, and `/init` switches into it,
+  but the contents are busybox rather than Debian. The next step per the
+  top-level README is a Debian rootfs (mmdebstrap → squashfs); the installer
+  is what will put that on disk once it exists, and `/init` already knows how
+  to hand a machine over to whatever is there.
 - The installer has not been run against real hardware. Its logic is
   covered by tests, including the whole sequence against a recorded
   backend, but the commands it drives have only been checked for what they
