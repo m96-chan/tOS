@@ -339,7 +339,7 @@ Fonts        built-in bitmap face, plus TrueType
 Shaping      not yet; per cell glyph placement
 Rendering    CPU framebuffer
              GPU acceleration later
-Audio        not yet
+Audio        ALSA control interface via direct ioctls
 Rootfs       Debian
 ```
 
@@ -523,7 +523,20 @@ happens to expose, converts between that control's own range — rarely
 card's switch or, on a card that has none, by turning the level down and
 remembering where it was. Every ioctl goes through a trait, so all of it is
 tested against a card built out of structures in a test; none of it has been
-run against real hardware yet, and no part of the interface calls it so far.
+run against real hardware yet.
+
+The volume keys a keyboard already has — `KEY_VOLUMEUP`, `KEY_VOLUMEDOWN`,
+`KEY_MUTE` — reach it directly, with no modifier and no leader, and
+`super+>`, `super+<` and `super+shift+m` do the same on a keyboard that has
+none. Each press re-reads the card and puts what it found on the status bar,
+rather than the level that was asked for: a card whose whole range is four
+steps cannot be at 55%, and a muted card does not get louder when it is
+turned up. A machine with no sound card says so once and then stops saying
+it. Whether an installed system should get PipeWire instead is decided, with
+what was measured to decide it, in [`docs/design/audio.md`](docs/design/audio.md):
+it stays ALSA-only, because tOS sets the knob and never plays a sound, and
+because PipeWire from Debian is two systemd user units on a session that has
+no systemd.
 
 
 
