@@ -152,7 +152,15 @@ impl Placement {
         if !self.contains(col, row) {
             return None;
         }
-        let ch = self.cell.1;
+        let (cw, ch) = self.cell;
+        // The two columns the frame is drawn in are inside the box, which is
+        // all `contains` is asked, and they are not the row beside them: the
+        // item's text starts one column in. Pressing the `│` at the edge of a
+        // row launched what that row named, which is a click nobody aimed.
+        let column = (((col * cw) as i32 - self.x) / cw as i32) as usize;
+        if column == 0 || column + 1 >= self.cols {
+            return None;
+        }
         let within = (((row * ch) as i32 - self.y) / ch as i32) as usize;
         let list = within.checked_sub(FIRST_LIST_ROW)?;
         (list < self.list_rows).then_some(self.scroll + list)
@@ -497,7 +505,11 @@ impl Overlay {
         }
         let box_rows = list_rows + chrome_rows;
 
-        // Keep the cursor on screen now that the row count is known.
+        // Keep the cursor on screen now that the row count is known, and the
+        // list itself with it. Pulling back is not enough on its own: a box
+        // that grew — a console that gained rows, a host terminal resized —
+        // keeps a scroll taken at the bottom of a shorter window and draws
+        // the tail of the list against a full height of blank rows.
         let scroll = if self.cursor < self.scroll {
             self.cursor
         } else if list_rows > 0 && self.cursor >= self.scroll + list_rows {
@@ -505,6 +517,9 @@ impl Overlay {
         } else {
             self.scroll
         };
+        // The last window that still ends on the last match. Clamping to it
+        // cannot hide the cursor, because that window covers the whole tail.
+        let scroll = scroll.min(self.matches.len().saturating_sub(list_rows));
 
         Some(Placement {
             x: area.x + (((cols - box_cols) / 2) * cw as usize) as i32,
@@ -1180,6 +1195,17 @@ mod tests {
                 "row {row} of the box is not a list row"
             );
         }
+        // And the columns the border is drawn in, on a row that does hold an
+        // item: they are inside the box, which is all `contains` asks, and
+        // they are not the row beside them.
+        let list_row = placement.row_y(FIRST_LIST_ROW) as u32 / ch;
+        for col in [left, left + placement.cols as u32 - 1] {
+            assert_eq!(
+                press(&mut overlay, (col, list_row), area, cell),
+                OverlayOutcome::Consumed,
+                "column {col} of the box is a border, not the row it runs beside"
+            );
+        }
     }
 
     #[test]
@@ -1279,6 +1305,36 @@ mod tests {
             OverlayOutcome::Consumed
         );
         assert_eq!(short.scroll(), 0);
+    }
+
+    #[test]
+    fn a_list_scrolled_to_its_end_does_not_stay_there_when_the_box_grows_taller() {
+        // The window a list is read through is worked out afresh every frame,
+        // from a display size that changes: a host terminal is resized, a
+        // console gains rows on a mode set. Keeping the cursor on screen is
+        // only half of staying in range — a scroll left behind by a box that
+        // grew draws a full height frame with three items in it.
+        let mut fonts = fonts();
+        let cell = cell(&mut fonts);
+        let names: Vec<String> = (0..20).map(|i| format!("program-{i}")).collect();
+        let items = names.iter().map(OverlayItem::new).collect();
+        let mut overlay = Overlay::new("many", items);
+
+        let small = Rect::new(0, 0, cell.0 * 60, cell.1 * 9);
+        let placement = overlay.placement(small, cell).unwrap();
+        assert_eq!(placement.list_rows, 3, "a window worth scrolling");
+        for _ in 0..20 {
+            wheel(&mut overlay, MouseButton::WheelDown, small, cell);
+        }
+        assert_eq!(overlay.scroll(), 20 - 3, "the wheel should reach the end");
+
+        let grown = Rect::new(0, 0, cell.0 * 60, cell.1 * 24);
+        let placement = overlay.placement(grown, cell).unwrap();
+        assert_eq!(
+            placement.scroll + placement.list_rows,
+            20,
+            "the taller box drew blank rows under the end of the list"
+        );
     }
 
     #[test]

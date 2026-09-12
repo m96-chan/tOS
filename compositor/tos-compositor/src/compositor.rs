@@ -990,14 +990,11 @@ impl Compositor {
         // workspace that left. Above the panes for the plainer reason that a
         // press on one would start selecting text through the box.
         if self.overlay.is_some() {
-            // A drag can still be in progress: an overlay opens on a binding,
-            // and the keyboard works while a button is held. Whoever is
-            // holding it will get their release here, where the overlay eats
-            // it, so the pane it started in would be left believing it is
-            // still making a selection.
-            if action == MouseAction::Press {
-                self.release_grab();
-            }
+            // Nothing is let go of here. A grab cannot be taken while a menu
+            // is up, since this is where the press that would take one stops,
+            // and one taken before the menu opened was dropped by
+            // [`Compositor::open_overlay`] — which is the only end of the
+            // gesture that can be relied on to arrive.
             return self.overlay_mouse(cell_x, cell_y, button, action) || changed;
         }
 
@@ -1038,7 +1035,7 @@ impl Compositor {
                 .map(|(pane, rect)| (*pane, *rect))
         });
         if self.grabbed_pane().is_some() && grabbed.is_none() {
-            self.mouse_grab = None;
+            self.release_grab();
         }
 
         let hit = geometry
@@ -1222,16 +1219,17 @@ impl Compositor {
         button: Option<MouseButton>,
         action: MouseAction,
     ) -> Option<bool> {
-        if action == MouseAction::Press {
+        // The left button only, because it is the only one that starts a drag.
+        // A wheel notch arrives here as a press too — it is how the device
+        // reports one — and it is not the beginning of anything, so it falls
+        // through to the arm below that swallows it while a divider is held.
+        if action == MouseAction::Press && button == Some(MouseButton::Left) {
             // A press starts a new interaction whatever the last one was, so
             // a release that never arrived — a button let go over another
             // virtual terminal, a device that stopped reporting — cannot wedge
             // a divider to the pointer forever.
             if matches!(self.mouse_grab, Some(Grab::Divider(_))) {
                 self.mouse_grab = None;
-            }
-            if button != Some(MouseButton::Left) {
-                return None;
             }
             // A zoomed workspace draws no dividers, and a strip that resizes
             // a layout nobody can see is worse than one that does nothing.
@@ -1922,7 +1920,14 @@ impl Compositor {
                 // that was never off.
                 Ok(()) => {
                     self.blanked = dark;
-                    if !dark {
+                    if dark {
+                        // A dark screen gives everything it is sent to
+                        // nobody, the release that would have ended a drag
+                        // included, so the drag ends here instead — the same
+                        // thing [`Compositor::engage_lock`] does about the
+                        // same hole, for the same reason.
+                        self.release_grab();
+                    } else {
                         // A backend that put the panel to sleep decides for
                         // itself what is on it when it wakes, and painting all
                         // of it is the only thing the session can do about
@@ -1978,6 +1983,14 @@ impl Compositor {
 
     /// Put a menu up over the panes.
     pub fn open_overlay(&mut self, kind: OverlayKind, overlay: Overlay) {
+        // Whatever the mouse was holding, it has stopped holding it. An
+        // overlay opens on a binding and the keyboard works while a button is
+        // down, so a drag can still be in progress — and the release that
+        // would have ended it is an event the menu eats, while escape, which
+        // is how a menu is usually closed, is not a mouse event at all. Doing
+        // it here rather than at either of those is what makes it one place
+        // instead of a list of them.
+        self.release_grab();
         self.overlay = Some((kind, overlay));
         // The overlay covers cells the panes are not going to repaint, and
         // closing it uncovers them again, so both ends need a full frame.
@@ -5129,6 +5142,42 @@ mod tests {
             compositor.overlay().is_none(),
             "the key that woke the screen also ran a binding"
         );
+    }
+
+    #[test]
+    fn a_screen_that_goes_dark_mid_drag_lets_go_of_what_the_mouse_was_holding() {
+        // Everything a dark screen is sent, it gives to nobody — including
+        // the release that would have ended a drag. A hand resting on the
+        // button for the whole idle period is all it takes, and a grab that
+        // survives the dark follows the pointer with no button held once the
+        // screen comes back.
+        let mut compositor = idling(
+            Config {
+                credential: credential("idle-grab", None),
+                ..Config::default()
+            },
+            None,
+            Some(60),
+        );
+        compositor.handle_input(InputEvent::Pointer(tos_input::PointerEvent {
+            x: 20.0,
+            y: 20.0,
+            button: Some(MouseButton::Left),
+            action: MouseAction::Press,
+            modifiers: tos_input::Modifiers::NONE,
+        }));
+        assert!(compositor.mouse_grab.is_some(), "the press grabbed nothing");
+        let start = started(&compositor);
+        let mut panel = Panel::new();
+
+        compositor.apply_idle(start + Duration::from_secs(60), &mut panel);
+        assert!(compositor.is_blanked());
+        assert!(
+            compositor.mouse_grab.is_none(),
+            "the dark screen swallowed the release and kept the grab"
+        );
+        let focus = compositor.session.focus();
+        assert!(!compositor.pane(focus).unwrap().selection_in_progress);
     }
 
     #[test]

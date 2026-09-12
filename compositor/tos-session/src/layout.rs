@@ -6,6 +6,7 @@
 //! the unit of everything else in the system.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Identifies a pane for the lifetime of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -409,6 +410,16 @@ struct Node {
     kind: NodeKind,
 }
 
+/// The shape a tree is in, as a number no other tree in this process has.
+///
+/// Handed out by [`next_shape`] and stamped into every [`DividerId`] a layout
+/// mints, so that an id can say which tree it came from and when.
+static NEXT_SHAPE: AtomicU64 = AtomicU64::new(0);
+
+fn next_shape() -> u64 {
+    NEXT_SHAPE.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Which divider, for as long as it exists.
 ///
 /// The split it belongs to and the child it follows, which is the only thing
@@ -416,8 +427,21 @@ struct Node {
 /// it is dragged, and the panes either side of it are not enough to name it
 /// on their own. Opaque on purpose — a caller holds one between a press and
 /// the release that ends the drag and has no business taking it apart.
+///
+/// Neither half of that address means anything on its own for longer than the
+/// tree keeps its shape, which is why the shape is carried too. A `NodeId` is
+/// a slot in one layout's own slab: every workspace has a slab of its own
+/// starting at zero, so `NodeId(0)` is the root of all of them at once, and a
+/// closed pane hands its slot straight back to the next split that asks for
+/// one. The index is only a child's position among its siblings, which a
+/// split beside it moves along. A held id is held across keystrokes — a
+/// workspace is switched, a pane is split or sent somewhere else, all with
+/// the button still down — so it has to be able to say that the tree it named
+/// is no longer the tree in front of it. It cannot be asked to guess which
+/// divider the user *meant*; there is no answer to that, only the refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DividerId {
+    shape: u64,
     split: NodeId,
     index: usize,
 }
@@ -460,6 +484,11 @@ pub struct Layout {
     free: Vec<usize>,
     root: NodeId,
     leaves: HashMap<PaneId, NodeId>,
+    /// What every [`DividerId`] this tree hands out is stamped with. Renewed
+    /// whenever the tree gains or loses a node, and deliberately left alone
+    /// by a resize: the weights move under a drag on every event, and an id
+    /// that expired the first time it was used would be no id at all.
+    shape: u64,
     /// Cells left between panes, where dividers are drawn.
     pub gap: u32,
 }
@@ -472,6 +501,7 @@ impl Layout {
             free: Vec::new(),
             root: NodeId(0),
             leaves: HashMap::new(),
+            shape: next_shape(),
             gap: 1,
         };
         let root = layout.alloc(Node {
@@ -499,6 +529,12 @@ impl Layout {
     fn free_node(&mut self, id: NodeId) {
         self.nodes[id.0] = None;
         self.free.push(id.0);
+    }
+
+    /// The tree is no longer the tree it was, so nothing holding a
+    /// [`DividerId`] from before now is holding anything.
+    fn reshape(&mut self) {
+        self.shape = next_shape();
     }
 
     fn node(&self, id: NodeId) -> &Node {
@@ -637,6 +673,7 @@ impl Layout {
         }
 
         self.leaves.insert(new_pane, new_leaf);
+        self.reshape();
         true
     }
 
@@ -692,6 +729,7 @@ impl Layout {
             }
             self.free_node(survivor);
         }
+        self.reshape();
         true
     }
 
@@ -871,6 +909,7 @@ impl Layout {
                     axis: *axis,
                     rect,
                     id: DividerId {
+                        shape: self.shape,
                         split: id,
                         index: i,
                     },
@@ -896,7 +935,19 @@ impl Layout {
     /// Returns false when the divider has gone, or when either side would
     /// drop below [`MIN_PANE`] — the same refusal the keyboard gets.
     pub fn resize_at(&mut self, area: Rect, id: DividerId, amount: i32) -> bool {
-        let DividerId { split, index } = id;
+        let DividerId {
+            shape,
+            split,
+            index,
+        } = id;
+        // An id from another tree, or from this one before it was last cut
+        // about. Checking the slot is live and holds a split is not enough:
+        // the slot a closed pane gave back is the slot the next split is
+        // handed, and it answers both questions exactly as the divider that
+        // was grabbed would have.
+        if shape != self.shape {
+            return false;
+        }
         // The node may have been freed, or its split collapsed into the leaf
         // that survived it, while the button was held down.
         let Some(Some(node)) = self.nodes.get(split.0) else {
@@ -1462,6 +1513,34 @@ mod tests {
         layout.close(PaneId(3));
         assert!(layout.divider(area(), divider.id).is_none());
         assert!(!layout.resize_at(area(), divider.id, 2));
+    }
+
+    #[test]
+    fn a_held_divider_names_nothing_in_another_tree_or_in_one_that_has_been_recut() {
+        // Two workspaces, each with a slab of its own starting at zero: the
+        // id one tree mints is bit for bit an id the other would have minted,
+        // and every check `resize_at` can make about a node — that the slot
+        // is live, that it holds a split, that the index is in range — says
+        // yes to both.
+        let mut one = Layout::new(PaneId(1));
+        one.split(area(), PaneId(1), Axis::Columns, PaneId(2));
+        let mut two = Layout::new(PaneId(3));
+        two.split(area(), PaneId(3), Axis::Columns, PaneId(4));
+        let held = one.placed_dividers(area())[0].id;
+
+        assert!(two.divider(area(), held).is_none());
+        let elsewhere = two.geometry(area());
+        assert!(!two.resize_at(area(), held, 6));
+        assert_eq!(two.geometry(area()), elsewhere, "another workspace moved");
+
+        // And the tree it did come from, once a pane has closed and a split
+        // has been handed the slot back.
+        one.close(PaneId(2));
+        one.split(area(), PaneId(1), Axis::Columns, PaneId(5));
+        let recut = one.geometry(area());
+        assert!(one.divider(area(), held).is_none());
+        assert!(!one.resize_at(area(), held, 6));
+        assert_eq!(one.geometry(area()), recut, "a split built after the grab");
     }
 
     #[test]

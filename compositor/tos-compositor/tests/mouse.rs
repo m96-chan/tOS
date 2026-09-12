@@ -3,8 +3,8 @@
 //! display anywhere.
 
 use tos_compositor::{Compositor, Config, Overlay, OverlayItem, OverlayKind, Placement};
-use tos_input::{InputEvent, Modifiers, MouseAction, MouseButton, PointerEvent};
-use tos_session::{Action, Axis, PaneId, Rect};
+use tos_input::{InputEvent, KeyCode, KeyEvent, Modifiers, MouseAction, MouseButton, PointerEvent};
+use tos_session::{Action, Axis, Direction, PaneId, Rect};
 
 const SIZE: (u32, u32) = (800, 480);
 
@@ -262,5 +262,206 @@ fn a_press_in_a_pane_still_selects_once_the_divider_has_been_let_go() {
     assert!(
         c.pane(focus).unwrap().selection.is_some(),
         "the divider drag held on to the mouse"
+    );
+}
+
+// ---- grabs that outlive what they were holding ---------------------------
+
+/// Escape, which is how a menu is closed by anybody who did not want it.
+fn escape(c: &mut Compositor) {
+    c.handle_input(InputEvent::Key(KeyEvent::new(
+        KeyCode::Escape,
+        Modifiers::NONE,
+    )));
+}
+
+#[test]
+fn a_divider_held_while_the_workspace_changes_does_not_resize_the_one_that_arrives() {
+    let mut c = quiet();
+    assert!(c.perform(Action::NewWorkspace));
+    let (_, _) = split_columns(&mut c);
+    assert!(c.perform(Action::SelectWorkspace(1)));
+    // The same two columns on both, so the id a press on this one hands over
+    // names a live split on the other as well.
+    let (at, _) = split_columns(&mut c);
+
+    pointer(&mut c, at, Some(MouseButton::Left), MouseAction::Press);
+    assert!(c.perform(Action::SelectWorkspace(2)));
+    let before = geometry(&c);
+
+    pointer(
+        &mut c,
+        (at.0 + 12, at.1),
+        Some(MouseButton::Left),
+        MouseAction::Drag,
+    );
+    assert_eq!(
+        geometry(&c),
+        before,
+        "a grab from one workspace resized another"
+    );
+}
+
+#[test]
+fn a_menu_that_eats_the_release_leaves_no_divider_stuck_to_the_pointer() {
+    let mut c = quiet();
+    let (at, _) = split_columns(&mut c);
+    pointer(&mut c, at, Some(MouseButton::Left), MouseAction::Press);
+    // A binding still works while a button is held, and the menu it puts up
+    // takes the release that would have ended the drag.
+    open_menu(&mut c, &["ls"]);
+    pointer(&mut c, at, Some(MouseButton::Left), MouseAction::Release);
+    escape(&mut c);
+    assert!(c.overlay().is_none(), "escape should have closed the menu");
+    let before = geometry(&c);
+
+    pointer(&mut c, (at.0 + 8, at.1), None, MouseAction::Motion);
+    assert_eq!(
+        geometry(&c),
+        before,
+        "a divider followed a pointer with no button held"
+    );
+}
+
+#[test]
+fn a_menu_that_eats_the_release_leaves_no_selection_following_the_pointer() {
+    let mut c = quiet();
+    let focus = c.session().focus();
+    let rect = rect_of(&c, focus);
+    pointer(
+        &mut c,
+        (rect.x, rect.y),
+        Some(MouseButton::Left),
+        MouseAction::Press,
+    );
+    open_menu(&mut c, &["ls"]);
+    pointer(
+        &mut c,
+        (rect.x + 4, rect.y),
+        Some(MouseButton::Left),
+        MouseAction::Release,
+    );
+    escape(&mut c);
+
+    let anchored = c.pane(focus).unwrap().selection;
+    pointer(&mut c, (rect.x + 12, rect.y + 2), None, MouseAction::Motion);
+    let pane = c.pane(focus).unwrap();
+    assert_eq!(
+        pane.selection, anchored,
+        "a motion with no button held dragged the selection"
+    );
+    assert!(
+        !pane.selection_in_progress,
+        "the pane still believes it is being selected in"
+    );
+}
+
+#[test]
+fn a_wheel_notch_during_a_divider_drag_neither_drops_it_nor_moves_the_focus() {
+    let mut c = quiet();
+    let (at, _) = split_columns(&mut c);
+    let panes = c.session().active().panes();
+    let (left, right) = (rect_of(&c, panes[0]), rect_of(&c, panes[1]));
+    let focus = c.session().focus();
+
+    pointer(&mut c, at, Some(MouseButton::Left), MouseAction::Press);
+    // Over the pane beside the divider, which is where the focus would go.
+    wheel(&mut c, (at.0 - 4, at.1), MouseButton::WheelDown);
+    pointer(
+        &mut c,
+        (at.0 + 6, at.1),
+        Some(MouseButton::Left),
+        MouseAction::Drag,
+    );
+    pointer(
+        &mut c,
+        (at.0 + 6, at.1),
+        Some(MouseButton::Left),
+        MouseAction::Release,
+    );
+
+    assert_eq!(
+        rect_of(&c, panes[0]).width,
+        left.width + 6,
+        "a wheel notch aborted the drag"
+    );
+    assert_eq!(rect_of(&c, panes[1]).width, right.width - 6);
+    assert_eq!(
+        c.session().focus(),
+        focus,
+        "the wheel moved the focus out from under the drag"
+    );
+}
+
+#[test]
+fn a_divider_whose_split_was_freed_does_not_come_back_as_the_split_that_took_the_slot() {
+    let mut c = quiet();
+    assert!(c.perform(Action::NewWorkspace));
+    assert!(c.perform(Action::SelectWorkspace(1)));
+    assert!(c.perform(Action::Split(Axis::Columns)));
+    assert!(c.perform(Action::Split(Axis::Rows)));
+
+    let area = c.grid_area();
+    let held = c
+        .session()
+        .active()
+        .layout
+        .placed_dividers(area)
+        .into_iter()
+        .find(|divider| divider.axis == Axis::Rows)
+        .expect("the right column is split into rows");
+    let at = (held.rect.x + held.rect.width / 2, held.rect.y);
+    pointer(&mut c, at, Some(MouseButton::Left), MouseAction::Press);
+
+    // The pane under the divider leaves for another workspace, which collapses
+    // the split it was half of; the next split is handed the slot back.
+    assert!(c.perform(Action::MovePaneToWorkspace(2)));
+    assert!(c.perform(Action::Focus(Direction::Right)));
+    assert!(c.perform(Action::Split(Axis::Rows)));
+    let before = geometry(&c);
+
+    pointer(
+        &mut c,
+        (at.0, at.1 + 3),
+        Some(MouseButton::Left),
+        MouseAction::Drag,
+    );
+    assert_eq!(
+        geometry(&c),
+        before,
+        "a drag resized a split that was built after the grab"
+    );
+}
+
+#[test]
+fn a_divider_held_while_a_pane_is_split_beside_it_does_not_become_the_next_gap_along() {
+    let mut c = quiet();
+    assert!(c.perform(Action::Split(Axis::Columns)));
+    assert!(c.perform(Action::Split(Axis::Columns)));
+    let area = c.grid_area();
+    let dividers = c.session().active().layout.placed_dividers(area);
+    assert_eq!(dividers.len(), 2, "three columns have two gaps");
+    let held = dividers[1];
+    let at = (held.rect.x, held.rect.y + held.rect.height / 2);
+    pointer(&mut c, at, Some(MouseButton::Left), MouseAction::Press);
+
+    // Two keystrokes with the button still down. The split inserts a child
+    // before the one the grab names, so the position it holds moves on.
+    assert!(c.perform(Action::Focus(Direction::Left)));
+    assert!(c.perform(Action::Split(Axis::Columns)));
+    let before = geometry(&c);
+
+    // Back the way it came, which is the hand asking for the gap it grabbed
+    // to move left and nothing else.
+    pointer(
+        &mut c,
+        (at.0 - 6, at.1),
+        Some(MouseButton::Left),
+        MouseAction::Drag,
+    );
+    assert_eq!(
+        geometry(&c),
+        before,
+        "the drag moved a divider nobody was holding"
     );
 }
