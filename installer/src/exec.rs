@@ -50,6 +50,16 @@ pub trait Backend {
         mode: Option<u32>,
     ) -> io::Result<()>;
 
+    /// Add to the end of a file, creating it if it is not there.
+    ///
+    /// Wanted because a Debian root already has an `/etc/passwd`, and it is
+    /// full of the system accounts Debian's own packages run as — `_apt` is
+    /// the one apt drops to before it touches the network, and a machine
+    /// without it cannot download anything. Replacing that file with the two
+    /// lines tOS cares about, which is what the installer did when the disk
+    /// held nothing but busybox, would take apt apart on the way in.
+    fn append_file(&mut self, path: &str, contents: &str) -> io::Result<()>;
+
     /// Copy a directory tree.
     fn copy_tree(&mut self, from: &str, to: &str) -> io::Result<()>;
 
@@ -128,6 +138,19 @@ impl Backend for System {
         file.write_all(contents.as_bytes())
     }
 
+    fn append_file(&mut self, path: &str, contents: &str) -> io::Result<()> {
+        use std::io::Write;
+
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        file.write_all(contents.as_bytes())
+    }
+
     fn copy_tree(&mut self, from: &str, to: &str) -> io::Result<()> {
         copy_tree(std::path::Path::new(from), std::path::Path::new(to))
     }
@@ -187,6 +210,10 @@ pub enum Action {
         /// The permissions the file was asked for, if any were.
         mode: Option<u32>,
     },
+    AppendFile {
+        path: String,
+        contents: String,
+    },
     CopyTree {
         from: String,
         to: String,
@@ -227,6 +254,7 @@ impl Action {
                 ..
             } => format!("write {path} (mode {mode:04o})"),
             Action::WriteFile { path, .. } => format!("write {path}"),
+            Action::AppendFile { path, .. } => format!("append to {path}"),
             Action::CopyTree { from, to } => format!("copy {from} -> {to}"),
             Action::CreateDir { path } => format!("mkdir -p {path}"),
         }
@@ -328,6 +356,14 @@ impl Backend for Recorder {
             path: path.to_string(),
             contents: contents.to_string(),
             mode,
+        });
+        Ok(())
+    }
+
+    fn append_file(&mut self, path: &str, contents: &str) -> io::Result<()> {
+        self.actions.push(Action::AppendFile {
+            path: path.to_string(),
+            contents: contents.to_string(),
         });
         Ok(())
     }

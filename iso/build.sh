@@ -31,7 +31,7 @@ esac
 # The container runs as root and writes dist/ into the checkout. Passing the
 # invoking user in lets mkiso.sh hand it back, which matters on a host with no
 # passwordless sudo — see the note beside the chown there.
-exec "$engine" run --rm --platform "$platform" \
+"$engine" run --rm --platform "$platform" \
     -e HOST_UID="$(id -u)" \
     -e HOST_GID="$(id -g)" \
     -v "$PWD":/src \
@@ -40,3 +40,14 @@ exec "$engine" run --rm --platform "$platform" \
     -w /src \
     rust:1-bookworm \
     sh iso/mkiso.sh
+
+# target/ is the one directory mkiso.sh cannot hand back itself. Docker creates
+# it in the checkout so it has somewhere to mount the named volume over, which
+# means the host ends up with a root-owned target/ that the container can no
+# longer see past its own mount. A `cargo build` on the host then fails on a
+# directory it cannot write, and `git worktree remove` fails on one it cannot
+# delete, and neither says why. Nothing here may use sudo: the hosts this is
+# run from have no passwordless one, which is the whole reason the build is in
+# a container. So the fix is another container, which is already root.
+"$engine" run --rm -v "$PWD":/src alpine \
+    chown "$(id -u):$(id -g)" /src/target

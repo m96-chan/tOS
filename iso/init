@@ -1,7 +1,12 @@
 #!/bin/busybox sh
 # shellcheck shell=dash
-# PID 1 inside the tOS initramfs: bring up /dev and drivers, then hand the
-# machine to the compositor.
+# PID 1 inside the tOS initramfs: bring up /dev and drivers, find the root this
+# machine is supposed to run, and hand itself over to it.
+#
+# There are three roots it can find, tried in this order: the ext4 one an
+# installed machine names with root=, the Debian squashfs on a live medium, and
+# — when neither is there — this initramfs, which is a rescue session rather
+# than a system. Only the last of the three leaves this script running.
 
 /bin/busybox --install -s /bin
 
@@ -30,13 +35,25 @@ mount -t devpts none /dev/pts
 mount -t tmpfs none /dev/shm
 mount -t tmpfs none /tmp
 
+# Everything the live session is assembled out of goes under /run: the medium,
+# the squashfs read off it, and the tmpfs the overlay writes into. /run is a
+# mount of its own so that one `mount --move` carries the whole lot across the
+# pivot. An overlay whose layers were left behind in an initramfs that
+# switch_root then deleted is a root filesystem that stops working the first
+# time anything reads a file out of it.
+mkdir -p /run
+mount -t tmpfs none /run
+mkdir -p /run/live
+
 # The kernel ships these as modules. Load whatever the machine has; missing
-# hardware just means a harmless failure.
+# hardware just means a harmless failure. The last three are not hardware at
+# all: they are how the squashfs on the medium becomes a writable root.
 for mod in bochs virtio_gpu simpledrm cirrus vmwgfx vboxvideo \
     evdev atkbd i8042 psmouse virtio_input hid_generic usbhid \
     sd_mod sr_mod cdrom ata_piix ahci virtio_blk virtio_scsi \
     nvme usb_storage uas xhci_pci ehci_pci ohci_pci sdhci_pci mmc_block \
-    isofs ext4 vfat; do
+    isofs ext4 vfat \
+    loop squashfs overlay; do
     modprobe "$mod" 2>/dev/null
 done
 # Give /dev/dri/card0 a moment to appear before tos probes for it.
@@ -141,42 +158,63 @@ if [ ! -f /run/live/medium/boot/vmlinuz ]; then
     say "tOS: no live medium found; the installer cannot copy a kernel"
 fi
 
-export HOME=/root
-export SHELL=/bin/sh
-export TERM=xterm-256color
-export TOS=1
-# busybox ash reads ENV for every interactive shell, which is how the message
-# of the day reaches each pane the compositor opens.
-export ENV=/etc/profile
-
-# The emergency shell is a rescue tool, and a rescue tool on a machine that
-# somebody else is standing at is an unauthenticated root shell on the screen
-# they were locked out of. An installed system and the live image run this
-# same script — nothing pivots to the installed root yet — so the command
-# line is the only thing that can tell them apart. The live image asks for the
-# shell by name; an installed machine that needs one adds the word at the GRUB
-# prompt. See docs/design/lock-other-doors.md.
-rescue=
-if [ -r /proc/cmdline ]; then
-    read -r cmdline </proc/cmdline
-    case " $cmdline " in
-    *" tos.rescue "*) rescue=1 ;;
-    esac
+# The medium also carries a whole Debian, as one read-only squashfs file.
+# Mounting it and stacking a tmpfs in front of it with overlayfs is what turns
+# it into a root filesystem that can be written to, and that is the difference
+# between a live session somebody can install a package into and the busybox
+# museum piece this image used to boot (#20, #83).
+#
+# Every step below is allowed to fail. What is at the bottom of this file is a
+# working tOS with a smaller world behind it, and a machine that gets that is
+# far better off than one that gets a panic.
+mkdir -p /run/live/rootfs /run/live/overlay /newroot
+squashfs=/run/live/medium/live/filesystem.squashfs
+pivot=
+if [ ! -f "$squashfs" ]; then
+    say "tOS: no rootfs image on the medium; using the initramfs session"
+elif ! mount -t squashfs -o ro,loop "$squashfs" /run/live/rootfs 2>/dev/null; then
+    say "tOS: cannot mount the rootfs image; using the initramfs session"
+elif ! mount -t tmpfs none /run/live/overlay 2>/dev/null; then
+    say "tOS: cannot make the rootfs writable; using the initramfs session"
+else
+    mkdir -p /run/live/overlay/upper /run/live/overlay/work
+    if mount -t overlay overlay \
+        -o "lowerdir=/run/live/rootfs,upperdir=/run/live/overlay/upper,workdir=/run/live/overlay/work" \
+        /newroot 2>/dev/null; then
+        pivot=1
+    else
+        say "tOS: cannot stack a writable layer on the rootfs"
+    fi
 fi
 
-say "tOS: starting compositor"
-restarts=0
-while :; do
-    /sbin/tos
-    status=$?
-    if [ -n "$rescue" ]; then
-        say "tOS: compositor exited ($status), dropping to emergency shell"
-        exec sh
+# switch_root panics if it cannot exec what it was handed, and a panic here is
+# a blank screen with no way back. Look before leaping, the same way the
+# installed-root path above does.
+if [ -n "$pivot" ] && [ ! -x /newroot/sbin/tos-session ]; then
+    say "tOS: the rootfs carries no session; using the initramfs session"
+    pivot=
+fi
+
+if [ -n "$pivot" ]; then
+    # /run goes first because it is the move that can plausibly fail — it
+    # carries the medium, the squashfs and the overlay's own upper layer — and
+    # until it succeeds nothing has been taken away from the session below.
+    # Private first: --move refuses a mount that shares its propagation, and
+    # nothing wants the root we are about to delete keeping a view of these.
+    mount --make-rprivate /run 2>/dev/null || true
+    mkdir -p /newroot/run
+    if mount --move /run /newroot/run 2>/dev/null; then
+        say "tOS: booting the Debian rootfs"
+        for fs in /dev /proc /sys; do
+            mount --move "$fs" "/newroot$fs" 2>/dev/null || true
+        done
+        exec switch_root /newroot /sbin/tos-session
     fi
-    if [ "$restarts" -eq 0 ]; then
-        say "tOS: add tos.rescue to the kernel command line for a shell"
-    fi
-    restarts=$((restarts + 1))
-    say "tOS: compositor exited ($status), restarting"
-    sleep 1
-done
+    say "tOS: cannot carry the live mounts across; using the initramfs session"
+fi
+
+# No rootfs, so this initramfs is the system after all. It has the compositor
+# and busybox and nothing else — no dpkg, no apt, and the compositor's built-in
+# ASCII face instead of a Japanese one. It is a rescue path, and it is still a
+# tOS a person can install from.
+exec /sbin/tos-session

@@ -179,6 +179,16 @@ fn name_problem(name: &str, what: &str) -> Option<String> {
 /// Where `/init` mounts the medium the live session booted from.
 pub const LIVE_MEDIUM_BOOT: &str = "/run/live/medium/boot";
 
+/// The Debian rootfs on the medium, which is what an installed machine is
+/// made of. `iso/mkiso.sh` puts it here and `iso/init` mounts it from here.
+///
+/// Unpacked from the medium rather than copied out of the running session:
+/// the live root is this same image with a tmpfs overlay in front of it, so
+/// copying it would carry across every file the session happened to write —
+/// the resolver a DHCP lease left, a half-finished `apt install`, a password
+/// somebody typed into a file. The image is the same bytes every time.
+pub const LIVE_ROOTFS_IMAGE: &str = "/run/live/medium/live/filesystem.squashfs";
+
 /// Sizes of the partitions the installer creates.
 pub const ESP_MIB: u64 = 512;
 /// The BIOS boot partition GRUB embeds its core image into.
@@ -195,7 +205,8 @@ pub enum Step {
     FormatRoot,
     /// Mount root, and the ESP beneath it.
     Mount,
-    /// Put the system onto the root filesystem.
+    /// Put the system onto the root filesystem: unpack the Debian rootfs, or
+    /// copy the running one when the medium carries no rootfs image.
     CopySystem,
     /// Write `/etc` for the installed system.
     Configure,
@@ -213,7 +224,7 @@ impl Step {
             Step::FormatEsp => "Create the EFI system partition",
             Step::FormatRoot => "Create the root filesystem",
             Step::Mount => "Mount the new system",
-            Step::CopySystem => "Copy tOS onto the disk",
+            Step::CopySystem => "Unpack the system onto the disk",
             Step::Configure => "Write the system configuration",
             Step::Bootloader => "Install the bootloader",
             Step::Finish => "Flush and unmount",
@@ -235,6 +246,10 @@ pub struct Plan {
     /// rather than the running filesystem: an initramfs does not contain the
     /// kernel that loaded it.
     pub boot_source: String,
+    /// The Debian rootfs image to unpack onto the disk. When it is not on the
+    /// medium the installer falls back to copying the running system, which
+    /// is what an image built before the rootfs existed leaves it with.
+    pub rootfs_image: String,
 }
 
 impl Plan {
@@ -246,6 +261,7 @@ impl Plan {
             mount_point: "/mnt/target".to_string(),
             source_root: "/".to_string(),
             boot_source: LIVE_MEDIUM_BOOT.to_string(),
+            rootfs_image: LIVE_ROOTFS_IMAGE.to_string(),
         }
     }
 

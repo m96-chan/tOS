@@ -1,0 +1,71 @@
+#!/bin/sh
+# shellcheck shell=dash
+# The tOS session: the environment the compositor runs in, and the loop that
+# keeps it running.
+#
+# This file is on the image twice and in the tree once. /init execs it as PID 1
+# after pivoting into the Debian rootfs, and execs the initramfs copy when
+# there was no rootfs to pivot into. Both sides need the same environment and
+# the same rescue rule; leaving the loop in /init and writing it out again for
+# the rootfs is how the two would come to disagree about which one locks.
+#
+# An installed machine does not run this: busybox init reads the inittab the
+# installer wrote and respawns /etc/tos-session, which the installer writes
+# from installer/src/install.rs. The restart loop below is init's job there.
+
+# PID 1's own stdout is whichever console= came last on the kernel command
+# line, and the machine may have several. Anything a person needs to read goes
+# to all of them: a screen is the usual one, a serial line is what CI and
+# anyone debugging a headless boot captures.
+say() {
+    said=
+    for tty in /dev/tty0 /dev/ttyS0; do
+        [ -c "$tty" ] && echo "$@" >"$tty" 2>/dev/null && said=1
+    done
+    [ -n "$said" ] || echo "$@"
+}
+
+export HOME=/root
+export SHELL=/bin/sh
+export TERM=xterm-256color
+export TOS=1
+# dash and busybox ash both read ENV for every interactive shell, which is how
+# the message of the day reaches each pane the compositor opens. In the Debian
+# rootfs /etc/profile is Debian's own and sources /etc/profile.d/*.sh, where
+# iso/profile is installed; in the initramfs it is iso/profile itself.
+export ENV=/etc/profile
+# Debian's own order, and /sbin before /bin matters on both sides of the pivot:
+# the initramfs has util-linux's mount in /sbin and busybox's in /bin, and only
+# the first of those can mount a filesystem by label.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# The emergency shell is a rescue tool, and a rescue tool on a machine that
+# somebody else is standing at is an unauthenticated root shell on the screen
+# they were locked out of. The live image asks for it by name, because it has
+# no credential and so by the rule in docs/design/screen-lock.md never locks;
+# an installed machine that needs one adds the word at the GRUB prompt. See
+# docs/design/lock-other-doors.md.
+rescue=
+if [ -r /proc/cmdline ]; then
+    read -r cmdline </proc/cmdline
+    case " $cmdline " in
+    *" tos.rescue "*) rescue=1 ;;
+    esac
+fi
+
+say "tOS: starting compositor"
+restarts=0
+while :; do
+    /sbin/tos
+    status=$?
+    if [ -n "$rescue" ]; then
+        say "tOS: compositor exited ($status), dropping to emergency shell"
+        exec sh
+    fi
+    if [ "$restarts" -eq 0 ]; then
+        say "tOS: add tos.rescue to the kernel command line for a shell"
+    fi
+    restarts=$((restarts + 1))
+    say "tOS: compositor exited ($status), restarting"
+    sleep 1
+done
