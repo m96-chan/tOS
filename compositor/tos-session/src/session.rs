@@ -261,9 +261,6 @@ impl Session {
     /// too small to divide.
     pub fn split_focused(&mut self, area: Rect, axis: Axis) -> Option<PaneId> {
         let workspace = self.active();
-        // A zoomed pane is laid out as the whole workspace, so that is the
-        // rectangle the split has to fit inside.
-        //
         // The room for a split is judged against the tree even when some
         // other arrangement is on screen, because the tree is where the new
         // pane actually goes; the arrangement then places it wherever the
@@ -272,8 +269,15 @@ impl Session {
         // waiting in a tree that cannot hold it, and going back to `splits`
         // is supposed to show what was left there rather than something the
         // area never had space for.
+        // Zoom is no exemption from that, whatever it looks like on screen.
+        // The test used to be skipped while a pane was zoomed, on the reading
+        // that a zoomed pane is laid out as the whole workspace and so has
+        // the whole workspace to divide. It does not: the pane goes into the
+        // tree, where it is as narrow as it ever was, and `Layout::split`
+        // asks `can_split` again and refuses. All the exemption bought was a
+        // pane id spent on a split that was going to fail anyway.
         let target = workspace.focus;
-        if workspace.zoomed.is_none() && !workspace.layout.can_split(area, target, axis) {
+        if !workspace.layout.can_split(area, target, axis) {
             return None;
         }
         let new_pane = self.allocate_pane();

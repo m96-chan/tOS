@@ -255,17 +255,65 @@ impl Arrangement {
 /// between each pair, as `(offset, size)`.
 ///
 /// Deliberately the same arithmetic the tree divides a split with, down to
-/// [`child_size`] and the last piece taking whatever rounding left over: three
-/// panes in a row are the same three rectangles whether a `Grid` derived them
-/// or a pair of splits did, so switching between the two moves nothing by a
-/// cell.
+/// [`child_size`] and the last piece taking whatever rounding left over, so
+/// that an even split and a derived arrangement of the same panes agree to
+/// the cell.
+///
+/// "Agree" means against a split whose children are even, which is what one
+/// split of one pane gives. It is not a claim about any tree of the same
+/// shape: splitting a pane twice leaves weights of a half and two quarters,
+/// because each split halves its sibling rather than redealing the row, so
+/// three panes made that way are 39/20/19 of eighty columns where `Grid`
+/// gives 26/26/26. The arrangement is an even row by definition; the tree is
+/// whatever the user made it.
 fn spans(start: u32, extent: u32, count: usize, gap: u32) -> Vec<(u32, u32)> {
     let mut out = Vec::with_capacity(count);
     if count == 0 {
         return out;
     }
-    let total_gap = gap * (count as u32).saturating_sub(1);
+    let mut gap = gap;
+    let mut total_gap = gap * (count as u32).saturating_sub(1);
+    // A gap is decoration, and decoration does not get to take the last row a
+    // pane has. When the gaps alone are what push a pane below a single cell,
+    // spend them on the panes instead: panes touching is a worse picture than
+    // panes separated, and both are better pictures than a pane that is not
+    // there.
+    if extent.saturating_sub(total_gap) < count as u32 {
+        gap = 0;
+        total_gap = 0;
+    }
     let available = extent.saturating_sub(total_gap);
+
+    // Not enough room to give everyone the floor: share the shortfall out
+    // evenly instead of letting [`child_size`] apply it.
+    //
+    // That function reserves `MIN_PANE` for each child still to come, which
+    // is right for a tree — a split that cannot afford its children is one
+    // `can_split` refused to make, so the reserve only ever settles rounding.
+    // A derived arrangement has no such gate: it places every pane in the
+    // workspace, however many there are. Ask `child_size` for nine rows out
+    // of sixteen and the reserve for the eight after it exceeds what is left,
+    // so the ceiling comes out zero and the *first* panes vanish while the
+    // last ones keep their full two rows. Ten panes on an 80x24 console is an
+    // ordinary thing to have, and one press of ctrl+shift+l should not make
+    // one of them disappear.
+    //
+    // Below the floor there is no arrangement that is not a compromise, so
+    // the compromise is the even one: every pane the same size to within a
+    // cell, the remainder going to the earliest. Above it nothing changes,
+    // which is what keeps a derived row identical to the splits it mirrors.
+    if (available as u64) < MIN_PANE as u64 * count as u64 {
+        let base = available / count as u32;
+        let extra = available % count as u32;
+        let mut offset = 0u32;
+        for index in 0..count {
+            let size = base + u32::from((index as u32) < extra);
+            out.push((start + offset, size));
+            offset += size + gap;
+        }
+        return out;
+    }
+
     let sum = count as f64;
     let mut used = 0u32;
     let mut offset = 0u32;
@@ -1024,6 +1072,68 @@ impl Layout {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_arrangement_hides_a_pane_it_was_asked_to_place() {
+        use super::*;
+        // The tree can never put a pane in no rows at all, because
+        // `can_split` refuses the split that would. A derived arrangement has
+        // no such gate — it lays out every pane there is — so the floor has
+        // to hold here instead, all the way past the point where the floor
+        // itself stops fitting.
+        // Up to the point where the rows run out: `tall` stacks every pane
+        // but the master down one column, so twenty-five is what an
+        // eighty-by-twenty-four console can physically show. Past that a
+        // pane with no rows is the honest answer, not a bug.
+        let area = Rect::new(0, 0, 80, 24);
+        for count in 1..=25usize {
+            let panes: Vec<PaneId> = (0..count as u32).map(PaneId).collect();
+            for arrangement in [Arrangement::Tall, Arrangement::Fat, Arrangement::Grid] {
+                let geometry = arrangement
+                    .geometry(&panes, area, 1)
+                    .expect("a derived arrangement lays out");
+                assert_eq!(geometry.len(), count, "{arrangement:?} dropped a pane");
+                for (pane, rect) in &geometry {
+                    assert!(
+                        rect.width > 0 && rect.height > 0,
+                        "{arrangement:?} with {count} panes gave {pane:?} {rect:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_shortfall_is_shared_rather_than_spent_on_the_first_panes() {
+        use super::*;
+        // Sixteen rows between nine panes cannot give each the floor of two.
+        // What must not happen is the earliest taking nothing so the last can
+        // have their full share: every pane comes out within one cell of
+        // every other.
+        let sizes: Vec<u32> = spans(0, 24, 9, 1).into_iter().map(|(_, s)| s).collect();
+        let smallest = *sizes.iter().min().expect("nine sizes");
+        let largest = *sizes.iter().max().expect("nine sizes");
+        assert!(smallest > 0, "a pane was given no rows at all: {sizes:?}");
+        assert!(largest - smallest <= 1, "shared unevenly: {sizes:?}");
+    }
+
+    #[test]
+    fn with_room_to_spare_a_derived_row_is_still_the_even_split_it_mirrors() {
+        use super::*;
+        // The even-shares path must not reach the ordinary case, or a `Grid`
+        // of two would stop being rect-for-rect the `Columns` split it is
+        // supposed to be indistinguishable from. Two panes, because that is
+        // the split that is even: a third made by splitting again is 39/20/19
+        // and was never what the arrangement promised to match.
+        let area = Rect::new(0, 0, 80, 24);
+        let mut layout = Layout::new(PaneId(0));
+        layout.split(area, PaneId(0), Axis::Columns, PaneId(1));
+        let widths: Vec<(u32, u32)> = layout
+            .geometry(area)
+            .into_iter()
+            .map(|(_, rect)| (rect.x, rect.width))
+            .collect();
+        assert_eq!(spans(0, 80, 2, 1), widths);
+    }
     use super::*;
 
     fn area() -> Rect {
