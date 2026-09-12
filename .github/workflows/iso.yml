@@ -74,31 +74,11 @@ jobs:
         # ever be added to one. The installer's CopySystem step is an
         # `unsquashfs` of this exact file onto the new root — the test in
         # installer/src/install.rs is what pins that — so what is inside it is
-        # what an installed machine has.
+        # what an installed machine has. The script is shared with the release
+        # workflow, which used to make none of these assertions.
         run: |
           sudo apt-get install -y --no-install-recommends squashfs-tools
-          sudo mkdir -p /mnt/tos-iso
-          sudo mount -o loop,ro dist/tos-x86_64.iso /mnt/tos-iso
-          unsquashfs -l /mnt/tos-iso/live/filesystem.squashfs > rootfs.list
-          sudo umount /mnt/tos-iso
-          # Debian is usr-merged, so /usr/bin is where /bin/apt really lives.
-          # tos-session is what /init execs after the pivot and init is what
-          # an installed machine's inittab is read by; without either, the
-          # disk boots to nothing.
-          for path in usr/bin/dpkg usr/bin/apt usr/bin/bash usr/bin/mount \
-              usr/sbin/init usr/sbin/tos usr/sbin/tos-install \
-              usr/sbin/tos-session var/lib/dpkg/status; do
-            grep -qx "squashfs-root/$path" rootfs.list || {
-              echo "the rootfs has no /$path"; exit 1; }
-          done
-          # The Japanese face, which nothing else here would miss: the
-          # compositor falls back to its built-in bitmap and every kana turns
-          # into a hollow box, with the boot and every assertion above still
-          # green. It moved out of the initramfs and into the rootfs, so this
-          # is the only place left that can say it is on the image.
-          grep -q "^squashfs-root/usr/share/fonts/truetype/vlgothic/" rootfs.list || {
-            echo "the rootfs carries no Japanese face"; exit 1; }
-          echo "rootfs entries: $(wc -l < rootfs.list)"
+          iso/check-rootfs.sh dist/tos-x86_64.iso
       - uses: actions/upload-artifact@v4
         with:
           name: tos-iso-x86_64

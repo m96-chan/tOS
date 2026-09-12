@@ -9,7 +9,10 @@ Three decisions, in the order they have to be made.
 
 **Wireless links will be joined through `wpa_supplicant`, driven over its
 UNIX control socket, not through iwd and not through D-Bus.** Nothing is
-built for it yet; it is gated on [#20](https://github.com/m96-chan/tOS/issues/20).
+built for it yet. It was gated on [#20](https://github.com/m96-chan/tOS/issues/20),
+which has landed: the rootfs is a Debian squashfs now, so there is somewhere to
+put a supplicant and something to install one with. What is left is the client
+and the firmware, not the place to keep them.
 
 **Nothing scans for access points until the supplicant is there.**
 `SIOCGIWSCAN` is not being used, and the reason is measured rather than
@@ -36,10 +39,12 @@ would notice. The rest of this document is about closing that gap.
 
 ## Wired: why a DHCP client rather than a DHCP client package
 
-There is no `dhclient` on a tOS machine and there is nowhere obvious to put
-one. The live ISO is a busybox initramfs; the installed system is the same
-initramfs copied onto a disk. Even after #20 lands and both become a Debian
-rootfs, adding `isc-dhcp-client` means adding a daemon, a configuration
+There is no `dhclient` on a tOS machine, and the argument for keeping it that
+way outlived the reason it started. When this was written the live ISO was a
+busybox initramfs and the installed system was that same initramfs copied onto
+a disk, so there was nowhere to put one; since #20 both are a Debian rootfs and
+`apt install isc-dhcp-client` would work. It is still not wanted, for the
+second reason rather than the first: adding it means adding a daemon, a configuration
 language, a hook directory and a supervision story for something the
 compositor has to be able to start and stop from a menu.
 
@@ -267,10 +272,12 @@ with the standard library and a seam, and the other cannot.
 
 ### What would have to be true before any of it is written
 
-#20 has to land. Until the rootfs is a Debian squashfs there is nowhere to put
-a supplicant binary, nowhere to put `/etc/wpa_supplicant`, and no firmware for
-the radio either. A supplicant client written before then would be untested
-against a real supplicant and unrunnable on either image.
+#20 has landed, which was the first condition: the rootfs is a Debian squashfs,
+so there is somewhere to put a supplicant binary and `/etc/wpa_supplicant`, and
+apt to put them there with. What is still missing is the firmware for the radio
+— the image packs no firmware at all — and a machine with a real wireless
+adapter to write the client against. A supplicant client written without one
+would be untested against a real supplicant.
 
 ---
 
@@ -418,7 +425,7 @@ status line.
 | Wired: DHCP on link-up | acquisition, address, netmask, route, `resolv.conf` |
 | Wired: lease renewal | **not built** — see above for what it takes |
 | Wi-Fi: supplicant decision | wpa_supplicant, recorded above |
-| Wi-Fi: scan / join | **not built**, gated on #20; scan reasoned against above |
+| Wi-Fi: scan / join | **not built**; #20 landed, so what is left is firmware and a radio to test against |
 | TUI control surface | `super+shift+n`, two overlays |
 | Live ISO needs only status | every privileged step reports its refusal |
 

@@ -44,7 +44,7 @@ apt-get update
 # kernel package then skips generating its own initrd, which would fail in
 # a container anyway.
 apt-get install -y --no-install-recommends \
-    musl-tools busybox-static cpio kmod fonts-vlgothic skkdic \
+    musl-tools busybox-static cpio kmod skkdic \
     mmdebstrap squashfs-tools \
     "$KERNEL_PKG" \
     grub-common grub2-common $GRUB_PKGS xorriso mtools \
@@ -294,6 +294,28 @@ for program in /usr/bin/apt /usr/bin/dpkg /bin/bash /bin/busybox \
     /usr/sbin/mkfs.ext4 /usr/sbin/grub-install; do
     if [ ! -x "$ROOTFS$program" ]; then
         echo "mkiso: the rootfs has no $program" >&2
+        exit 1
+    fi
+done
+
+# The face the compositor loads is a package in here now rather than a file
+# copied past dpkg, which means nothing in the tree fails if it goes missing:
+# the compositor falls back to its built-in ASCII face and every kana becomes
+# a hollow box, with the boot and every other assertion still green.
+if [ ! -f "$ROOTFS/usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf" ]; then
+    echo "mkiso: the rootfs carries no Japanese face" >&2
+    exit 1
+fi
+
+# And that this busybox can be PID 1 and can reboot. The initramfs uses
+# busybox-static and an installed machine uses the rootfs's `busybox` package,
+# which is a different build with a different configuration — so "there is a
+# busybox" is not the question. An applet-less /sbin/init is a disk that
+# panics on every boot while the live image, which never execs init, stays
+# green through both workflows.
+for applet in init reboot poweroff; do
+    if ! "$ROOTFS/bin/busybox" --list | grep -qx "$applet"; then
+        echo "mkiso: the rootfs busybox has no $applet applet" >&2
         exit 1
     fi
 done

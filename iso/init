@@ -22,9 +22,32 @@ export PATH=/sbin:/bin:/usr/sbin:/usr/bin
 say() {
     said=
     for tty in /dev/tty0 /dev/ttyS0; do
-        [ -c "$tty" ] && echo "$@" >"$tty" 2>/dev/null && said=1
+        [ -c "$tty" ] && { echo "$@" >"$tty"; } 2>/dev/null && said=1
     done
     [ -n "$said" ] || echo "$@"
+}
+
+# Whether a path inside the root about to be switched into can be executed.
+#
+# `[ -x /newroot/sbin/init ]` is not that question. /sbin/init in a Debian root
+# is a symlink to /bin/busybox, and an absolute symlink is resolved against the
+# root this shell is running in — the initramfs, which has a busybox of its own
+# and always will. So the check passed for a target root whose busybox had been
+# removed, and switch_root then deleted the initramfs, chrooted, failed to exec
+# and panicked: exactly what looking before leaping is for. Follow the link by
+# hand instead, re-rooting every absolute target as we go.
+executable_in_root() {
+    target=$1
+    hops=0
+    while [ -L "/newroot$target" ] && [ "$hops" -lt 8 ]; do
+        link=$(readlink "/newroot$target")
+        case "$link" in
+            /*) target=$link ;;
+            *) target="${target%/*}/$link" ;;
+        esac
+        hops=$((hops + 1))
+    done
+    [ -x "/newroot$target" ]
 }
 
 mount -t proc none /proc
@@ -130,7 +153,7 @@ if [ -n "$root_device" ]; then
     init=
     if [ -n "$mounted" ]; then
         for candidate in /sbin/init /bin/init; do
-            if [ -x "/newroot$candidate" ]; then
+            if executable_in_root "$candidate"; then
                 init=$candidate
                 break
             fi
@@ -159,18 +182,29 @@ fi
 # The kernel and initramfs live on the medium, not in the initramfs, so the
 # installer needs the medium mounted to copy them onto a disk. Look for the
 # partition that carries /boot/vmlinuz.
+#
+# The rootfs image is the mark, and /boot/vmlinuz only if nothing carries one:
+# an installed tOS root has a /boot/vmlinuz of its own, because the installer
+# put it there. Taking that as the medium mounts the very disk the machine was
+# booted to repair, finds no squashfs on it, boots the rescue session for want
+# of one — and then the installer refuses that disk for being the live medium.
 mkdir -p /run/live/medium
-for dev in /dev/sr* /dev/sd?? /dev/sd? /dev/vd?? /dev/vd? /dev/nvme*n*p* /dev/nvme*n*; do
-    [ -b "$dev" ] || continue
-    if mount -o ro "$dev" /run/live/medium 2>/dev/null; then
-        if [ -f /run/live/medium/boot/vmlinuz ]; then
-            say "tOS: live medium is $dev"
-            break
+medium=
+for mark in live/filesystem.squashfs boot/vmlinuz; do
+    for dev in /dev/sr* /dev/sd?? /dev/sd? /dev/vd?? /dev/vd? /dev/nvme*n*p* /dev/nvme*n*; do
+        [ -b "$dev" ] || continue
+        if mount -o ro "$dev" /run/live/medium 2>/dev/null; then
+            if [ -f "/run/live/medium/$mark" ]; then
+                say "tOS: live medium is $dev"
+                medium=$dev
+                break
+            fi
+            umount /run/live/medium 2>/dev/null
         fi
-        umount /run/live/medium 2>/dev/null
-    fi
+    done
+    [ -n "$medium" ] && break
 done
-if [ ! -f /run/live/medium/boot/vmlinuz ]; then
+if [ -z "$medium" ]; then
     say "tOS: no live medium found; the installer cannot copy a kernel"
 fi
 
@@ -206,7 +240,7 @@ fi
 # switch_root panics if it cannot exec what it was handed, and a panic here is
 # a blank screen with no way back. Look before leaping, the same way the
 # installed-root path above does.
-if [ -n "$pivot" ] && [ ! -x /newroot/sbin/tos-session ]; then
+if [ -n "$pivot" ] && ! executable_in_root /sbin/tos-session; then
     say "tOS: the rootfs carries no session; using the initramfs session"
     pivot=
 fi
@@ -220,10 +254,25 @@ if [ -n "$pivot" ]; then
     mount --make-rprivate /run 2>/dev/null || true
     mkdir -p /newroot/run
     if mount --move /run /newroot/run 2>/dev/null; then
-        say "tOS: booting the Debian rootfs"
+        # The kernel's own filesystems next. Unlike the installed root above,
+        # nothing on the other side mounts them again — iso/live-session
+        # mounts nothing — so a move that does not take is not the harmless
+        # thing it is there: without /proc the session cannot read the command
+        # line and `tos.rescue` is silently ignored, without /sys the
+        # compositor sees no disk and no interface, without /dev no screen and
+        # no keyboard.
+        carried=1
         for fs in /dev /proc /sys; do
-            mount --move "$fs" "/newroot$fs" 2>/dev/null || true
+            mount --move "$fs" "/newroot$fs" 2>/dev/null ||
+                { say "tOS: $fs did not come across"; carried=; }
         done
+        # Said after the moves and not before them. This is the line both CI
+        # workflows grep for, and printed first it called a half-carried pivot
+        # a good boot — the machine on the other side had no keyboard and the
+        # gate was green. Going through with switch_root anyway is still
+        # right: /run has already moved, so the session below no longer has
+        # the medium it would fall back to.
+        [ -n "$carried" ] && say "tOS: booting the Debian rootfs"
         exec switch_root /newroot /sbin/tos-session
     fi
     say "tOS: cannot carry the live mounts across; using the initramfs session"

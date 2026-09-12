@@ -41,18 +41,22 @@ artifact.
 
 ### What Debian costs
 
-Measured on x86_64, bookworm, against the last image built without a rootfs:
+Measured on x86_64, bookworm. The `before` column is the last image built
+without a rootfs *and with* the network drivers, which landed first — measuring
+against the image before both would credit the rootfs with 618 KiB of NIC
+modules; `docs/design/network.md` has that measurement separately.
 
 | | before | after |
 |---|---|---|
-| ISO | 54,423,552 | 108,115,968 |
-| initramfs (gzip) | 25,925,648 | 21,539,919 |
+| ISO | 55,054,336 | 108,115,968 |
+| initramfs (gzip) | 26,558,126 | 21,539,919 |
 | rootfs, unpacked | — | 203,123,805 |
 | rootfs, squashed (zstd-19) | — | 58,073,088 |
 
 The image roughly doubles. Debian itself is the 58 MB squashfs; the initramfs
-gets 4.4 MB *smaller*, because the font and the SKK dictionary are in the
-rootfs now and were previously carried in both places.
+gets 5.0 MB *smaller*, because the font and the SKK dictionary are in the
+rootfs now and were previously carried in both places — `mkiso.sh` puts the
+pair at 4,539,466 bytes uncompressed.
 
 203 MB unpacked against 58 MB squashed is the ratio worth knowing: an
 installed machine spends the unpacked figure on its disk, a live one only the
@@ -128,14 +132,19 @@ tos-install --dry-run    # the whole interface, writing nothing
 ```
 
 The kernel and initramfs are copied from the medium rather than from the
-running filesystem, because a live session *is* an initramfs and does not
-contain the kernel that unpacked it. `/init` mounts the medium at
+running filesystem, because neither is in the running filesystem: the live
+session is a squashfs of a Debian rootfs, and the kernel that unpacked the
+initramfs is on the medium beside it. `/init` mounts the medium at
 `/run/live/medium` for exactly that reason; if it is not mounted the
 installer stops rather than leaving a disk that cannot boot.
 
 Pick "tOS (verbose)" in GRUB to keep kernel messages visible while
-debugging boot problems. If the compositor exits, `/init` drops to an
-emergency busybox shell on the console.
+debugging boot problems. If the compositor exits, `live-session` restarts it —
+and drops to a shell on the console instead when `tos.rescue` is on the kernel
+command line, which the live image's own GRUB entry puts there. After the pivot
+that shell is the rootfs's `sh`, which is dash; in a rescue session it is
+busybox. An installed machine has no `tos.rescue` on its command line, by the
+argument in the installer beside `CMDLINE`.
 
 ## Files
 
@@ -144,7 +153,7 @@ emergency busybox shell on the console.
 | `build.sh`  | host entry point: runs `mkiso.sh` in a container               |
 | `mkiso.sh`  | container-side build: static binaries, initramfs, Debian rootfs, `grub-mkrescue` |
 | `init`      | initramfs PID 1: mounts, modprobe, then `switch_root` into `root=`, into the squashfs overlay, or into neither |
-| `live-session` | PID 1 after the pivot: the session's environment and the loop that restarts the compositor |
+| `live-session` | PID 1 of a live session either way: `/init` execs the copy inside the rootfs after pivoting, and the initramfs copy when there was no rootfs to pivot into. The session's environment and the loop that restarts the compositor |
 | `profile`   | sourced by every shell; prints the banner and the install hint |
 | `run.sh`    | boots `dist/tos-<arch>.iso` in VirtualBox, and cleans up after |
 
@@ -167,8 +176,11 @@ emergency busybox shell on the console.
   without its `rtl_nic` firmware. `docs/design/network.md` records what was
   actually observed.
 - The session still runs `/bin/sh`, which in the rootfs is dash. `bash` is
-  installed and `SHELL` in `iso/live-session` is the one line that chooses
-  between them (#82).
+  installed, and switching to it is two lines rather than one (#82): `SHELL` in
+  `iso/live-session` for a live session, and the same export in the installer's
+  `SESSION_SCRIPT` for an installed machine, which runs what the installer
+  wrote and never reads `iso/live-session`. #82 is about the second of those.
+  The `shell =` key in `tos.conf` outranks both.
 - An installed machine's PID 1 is busybox `init`, symlinked over the rootfs's
   empty `/sbin`. Debian's essential set contains no init at all — an init
   system is a package, and tOS installs none.

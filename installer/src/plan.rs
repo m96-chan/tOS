@@ -130,8 +130,8 @@ impl Settings {
         if let Some(problem) = name_problem(&self.username, "User name") {
             return Some(problem);
         }
-        if self.username == "root" {
-            return Some("User name cannot be root".to_string());
+        if let Some(taken) = DEBIAN_ACCOUNTS.iter().find(|name| **name == self.username) {
+            return Some(format!("User name {taken} is Debian's already"));
         }
         None
     }
@@ -153,6 +153,43 @@ impl Settings {
         }
     }
 }
+
+/// The accounts a Debian base system already has.
+///
+/// The installer adds its user by appending one line to the `/etc/passwd` the
+/// rootfs brought with it, which is right — `_apt` and the rest are Debian's
+/// to keep — but it means a name can now collide, where writing the whole file
+/// made that impossible. `getpwnam` answers with the first line that matches,
+/// so a person who called themselves `games` would be handed uid 5, a home of
+/// `/usr/games` and a shell of `nologin`: an account that cannot log in, with
+/// their password hash and their home directory sitting beside it belonging to
+/// nobody. Refused at the screen where the name is typed, which is before the
+/// disk has been touched.
+///
+/// `root` is in the list rather than beside it, because it was only ever the
+/// first name of this kind.
+const DEBIAN_ACCOUNTS: [&str; 20] = [
+    "root",
+    "daemon",
+    "bin",
+    "sys",
+    "sync",
+    "games",
+    "man",
+    "lp",
+    "mail",
+    "news",
+    "uucp",
+    "proxy",
+    "www-data",
+    "backup",
+    "list",
+    "irc",
+    "nobody",
+    "systemd-network",
+    "sshd",
+    "messagebus",
+];
 
 /// Names have to survive being written into `/etc/passwd` and a host file.
 fn name_problem(name: &str, what: &str) -> Option<String> {
@@ -189,13 +226,13 @@ pub const LIVE_MEDIUM_BOOT: &str = "/run/live/medium/boot";
 /// somebody typed into a file. The image is the same bytes every time.
 pub const LIVE_ROOTFS_IMAGE: &str = "/run/live/medium/live/filesystem.squashfs";
 
-/// Sizes of the partitions the installer creates.
 /// Where the target root is mounted while it is being installed to.
 ///
 /// Named because more than the plan needs it: what `--plan` prints has to be
 /// able to talk about files under the new root before there is a `Plan` to ask.
 pub const MOUNT_POINT: &str = "/mnt/target";
 
+/// Sizes of the partitions the installer creates.
 pub const ESP_MIB: u64 = 512;
 /// The BIOS boot partition GRUB embeds its core image into.
 pub const BIOS_BOOT_MIB: u64 = 1;
@@ -387,6 +424,32 @@ mod tests {
             in_use: false,
             is_boot_medium: false,
         }
+    }
+
+    #[test]
+    fn a_name_debian_already_uses_is_refused_before_the_disk_is_touched() {
+        // The installer appends its line to the passwd the rootfs brought,
+        // so a name that is already in it produces a second entry that
+        // getpwnam never returns: the person's home, their credential and
+        // their uid all belong to an account nothing can reach. Writing the
+        // whole file used to make that impossible.
+        for taken in ["root", "games", "www-data", "backup", "nobody"] {
+            let settings = Settings {
+                username: taken.to_string(),
+                ..Settings::default()
+            };
+            let problem = settings.problem();
+            assert!(
+                problem.is_some_and(|p| p.contains(taken)),
+                "{taken} was accepted as a user name"
+            );
+        }
+        // And an ordinary name still is one.
+        let settings = Settings {
+            username: "yusuke".into(),
+            ..Settings::default()
+        };
+        assert_eq!(settings.problem(), None);
     }
 
     fn plan(firmware: Firmware) -> Plan {

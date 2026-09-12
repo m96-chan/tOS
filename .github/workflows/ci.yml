@@ -106,7 +106,7 @@ jobs:
           for script in iso/mkiso.sh iso/init iso/live-session iso/profile; do
             sh -n "$script" || exit 1
           done
-          for script in iso/build.sh iso/run.sh; do
+          for script in iso/build.sh iso/run.sh iso/check-rootfs.sh; do
             bash -n "$script" || exit 1
           done
       - name: Shellcheck
@@ -116,5 +116,5 @@ jobs:
           # Each script's own shebang says which shell it is, except the
           # profile, which is sourced and so has none.
           shellcheck --severity=warning iso/build.sh iso/run.sh iso/mkiso.sh \
-            iso/init iso/live-session
+            iso/init iso/live-session iso/check-rootfs.sh
           shellcheck --shell=sh --severity=warning iso/profile

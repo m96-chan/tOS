@@ -20,7 +20,7 @@
 say() {
     said=
     for tty in /dev/tty0 /dev/ttyS0; do
-        [ -c "$tty" ] && echo "$@" >"$tty" 2>/dev/null && said=1
+        [ -c "$tty" ] && { echo "$@" >"$tty"; } 2>/dev/null && said=1
     done
     [ -n "$said" ] || echo "$@"
 }
