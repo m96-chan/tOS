@@ -593,6 +593,16 @@ nor the other bindings see a key. `$PATH` is read once when it opens, and a
 directory that is missing, unreadable or enormous costs the launcher nothing
 worse than the names it would have contributed.
 
+The mouse reaches the box as well. A pointer moving over a row highlights it, a
+left press on one chooses it — the same answer enter gives — the wheel scrolls a
+list too long to fit, and a press outside closes it the way escape does. A
+prompt is the exception: a click away from it keeps what has been typed, because
+a list can be reopened unchanged and a half-typed name cannot be got back. The
+gaps between panes are draggable in the same spirit: a press on a divider takes
+hold of that divider and no other, moving the pointer moves it, and letting go
+drops it. What the mouse is holding is one thing at a time, so a drag along a
+divider never leaves a selection highlighted in the pane it crossed.
+
 The box itself is not the launcher. It is a list-and-filter surface that takes
 a title, a list of labels and their details, and reports which one was chosen —
 which is exactly the shape the four remaining items need. Power, network,

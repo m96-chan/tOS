@@ -31,7 +31,7 @@ pub use imagefile::ImageFiles;
 pub use ime::{Ime, ImeContext};
 pub use lock::{LockOutcome, LockScreen, NoCredential};
 pub use notify::{Notification, Notifications, Source};
-pub use overlay::{Overlay, OverlayItem, OverlayOutcome};
+pub use overlay::{Overlay, OverlayItem, OverlayOutcome, Placement};
 pub use pane::Pane;
 pub use selection::{Anchor, Selection, SelectionMode};
 pub use status::{Bar, Hit, Segment};
