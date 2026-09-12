@@ -923,6 +923,26 @@ impl Compositor {
             changed = true;
         }
 
+        // An open overlay owns the mouse, exactly as `handle_key` gives it the
+        // keyboard and for the same reason: it is modal, and nothing under it
+        // is what anybody is aiming at while it is up. Above the bar rather
+        // than below it, because the bar returns without ever looking at a
+        // pane — a press there with the launcher open would switch workspaces
+        // underneath a menu that stayed on screen listing the programs of the
+        // workspace that left. Above the panes for the plainer reason that a
+        // press on one would start selecting text through the box.
+        if self.overlay.is_some() {
+            // A drag can still be in progress: an overlay opens on a binding,
+            // and the keyboard works while a button is held. Whoever is
+            // holding it will get their release here, where the overlay eats
+            // it, so the pane it started in would be left believing it is
+            // still making a selection.
+            if action == MouseAction::Press {
+                self.release_grab();
+            }
+            return self.overlay_mouse(cell_x, cell_y, button, action) || changed;
+        }
+
         // The bar next, because it is nowhere in the geometry below: the row
         // it occupies is the row `grid_area` took away, so a press there
         // matches no pane and would be dropped. Only a press, and only the
@@ -1751,33 +1771,72 @@ impl Compositor {
         self.needs_full_redraw = true;
     }
 
+    /// Where the open overlay is drawn: the grid, in pixels.
+    ///
+    /// A method because the box is centred in it, so the frame that draws the
+    /// box and the press that hits it have to be centring in the same
+    /// rectangle — the bar's row is not part of it, and a hit test that
+    /// included the row the panes do not get would put every row of the menu
+    /// half a cell out.
+    fn overlay_area(&self) -> PixelRect {
+        let (cw, ch) = self.cell_size();
+        let area = self.grid_area();
+        PixelRect::new(0, 0, area.width * cw, area.height * ch)
+    }
+
     /// Give a key to the open overlay. Returns true when a repaint is needed.
     fn overlay_key(&mut self, key: &KeyEvent) -> bool {
-        let Some((kind, overlay)) = &mut self.overlay else {
+        let Some((_, overlay)) = &mut self.overlay else {
+            return false;
+        };
+        let outcome = overlay.handle_key(key);
+        self.overlay_outcome(outcome)
+    }
+
+    /// Give a mouse event to the open overlay, in display cells.
+    ///
+    /// Separate from [`Compositor::overlay_key`] only as far as the outcome:
+    /// a click on a row and an enter on the same row are the same answer, and
+    /// they come back here to be acted on by the same code.
+    fn overlay_mouse(
+        &mut self,
+        cell_x: u32,
+        cell_y: u32,
+        button: Option<MouseButton>,
+        action: MouseAction,
+    ) -> bool {
+        let area = self.overlay_area();
+        let cell = self.cell_size();
+        let Some((_, overlay)) = &mut self.overlay else {
+            return false;
+        };
+        let outcome = overlay.handle_mouse(cell_x, cell_y, button, action, area, cell);
+        self.overlay_outcome(outcome)
+    }
+
+    /// Act on what the open overlay reported, however it was asked.
+    fn overlay_outcome(&mut self, outcome: OverlayOutcome) -> bool {
+        let Some((kind, overlay)) = &self.overlay else {
             return false;
         };
         let kind = *kind;
-        match overlay.handle_key(key) {
-            OverlayOutcome::Consumed => false,
-            OverlayOutcome::Changed => true,
-            OverlayOutcome::Cancelled => {
-                // Cancelling changes nothing but the screen.
-                self.close_overlay();
-                true
-            }
+        // Read out of the overlay before it is closed, since closing drops it
+        // along with the row that was chosen and the line that was typed.
+        let answer = match outcome {
+            OverlayOutcome::Consumed => return false,
+            OverlayOutcome::Changed => return true,
+            // Cancelling changes nothing but the screen.
+            OverlayOutcome::Cancelled => None,
             OverlayOutcome::Chosen(index) => {
-                let label = overlay.items()[index].label.clone();
-                self.close_overlay();
-                self.choose(kind, Some(index), &label);
-                true
+                Some((Some(index), overlay.items()[index].label.clone()))
             }
-            OverlayOutcome::Accepted => {
-                let text = overlay.query().to_string();
-                self.close_overlay();
-                self.choose(kind, None, &text);
-                true
-            }
+            OverlayOutcome::Accepted => Some((None, overlay.query().to_string())),
+        };
+        self.close_overlay();
+        if let Some((row, label)) = answer {
+            self.choose(kind, row, &label);
         }
+        true
     }
 
     /// Act on what an overlay reported: the row that was chosen, or the line
