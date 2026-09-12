@@ -1824,10 +1824,22 @@ impl Terminal {
                         .media
                         .read(full.medium, &payload, self.config.graphics_budget)
                     {
-                        Ok(bytes) => {
-                            payload = bytes;
-                            full.medium = Medium::Direct;
-                        }
+                        // `O=` and `S=` name a part of the file rather than all
+                        // of it, and a sender that used them is describing
+                        // where its picture actually starts. Honoured here,
+                        // beside the read, because ignoring them does not
+                        // refuse anything — it answers `OK` over the wrong
+                        // pixels.
+                        Ok(bytes) => match full.slice_named_payload(bytes) {
+                            Ok(bytes) => {
+                                payload = bytes;
+                                full.medium = Medium::Direct;
+                            }
+                            Err(err) => {
+                                self.graphics_response(&full, Err(err));
+                                return;
+                            }
+                        },
                         Err(err) => {
                             self.graphics_response(&full, Err(err));
                             return;
@@ -1840,8 +1852,16 @@ impl Terminal {
                 if full.action == Action::TransmitFrame {
                     match self.graphics.store_frame(&full, &payload) {
                         Ok(id) => {
-                            // The frame just written may be the one on screen.
-                            self.damage_image(id);
+                            // Only when the frame just written is the one on
+                            // screen. An appended frame (`r=0`, which is never
+                            // a frame number) and a rewrite of one waiting its
+                            // turn change no pixel anybody can see, and the
+                            // repaint they would ask for is a rescale of the
+                            // whole placement: the generation moved, so the
+                            // visible frame's cached texture is gone with it.
+                            if self.frame_is_on_screen(id, full.frame_number()) {
+                                self.damage_image(id);
+                            }
                             self.graphics_response(&full, Ok(id));
                         }
                         Err(err) => self.graphics_response(&full, Err(err)),
@@ -1891,13 +1911,28 @@ impl Terminal {
             },
             Action::ComposeFrames => match self.graphics.compose_frames(&cmd) {
                 Ok(id) => {
-                    // The frame just rewritten may be the one on screen.
-                    self.damage_image(id);
+                    // Same rule as `a=f`: a composition onto a frame that is
+                    // not showing has changed nothing on screen, and building
+                    // later frames out of earlier ones is exactly what `a=c`
+                    // is for, so this is the common case rather than the odd
+                    // one.
+                    if self.frame_is_on_screen(id, cmd.compose_dest_frame()) {
+                        self.damage_image(id);
+                    }
                     self.graphics_response(&cmd, Ok(id));
                 }
                 Err(err) => self.graphics_response(&cmd, Err(err)),
             },
         }
+    }
+
+    /// Whether the 1-based `frame` of `image_id` is the one being shown.
+    ///
+    /// Zero is never a frame number — `a=f` spells "append" that way — so a
+    /// command that named no frame answers false, which is right: what it
+    /// wrote went somewhere nobody is looking.
+    fn frame_is_on_screen(&self, image_id: u32, frame: u32) -> bool {
+        frame != 0 && self.graphics.image(image_id).map(|i| i.current_frame()) == Some(frame)
     }
 
     /// Mark the rows every placement of an image covers. Returns true when the

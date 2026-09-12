@@ -553,6 +553,32 @@ fn kitty_graphics_reads_an_animation_frame_from_a_file() {
 }
 
 #[test]
+fn kitty_graphics_reads_the_part_of_a_file_that_o_and_s_name() {
+    // A shared memory object is sized in pages, so the picture inside one is
+    // rarely the whole of it: `O=` says where it starts and `S=` how long it
+    // is. Ignoring either does not refuse anything — it answers OK over the
+    // wrong bytes.
+    let mut blob = vec![0xaau8; 16];
+    blob.extend_from_slice(&[255, 0, 0, 255]);
+    blob.extend_from_slice(&[0u8; 108]);
+
+    let mut t = term_with_file(Medium::SharedMemory, "/tos-image", &blob);
+    let payload = encode_base64(b"/tos-image");
+    t.advance(format!("\x1b_Ga=t,f=32,t=s,s=1,v=1,O=16,S=4,i=1;{payload}\x1b\\").as_bytes());
+    assert_eq!(t.take_output(), b"\x1b_Gi=1;OK\x1b\\".to_vec());
+    assert_eq!(t.graphics().image(1).unwrap().data, vec![255, 0, 0, 255]);
+
+    // A start past the end named bytes that are not there, and is owed the
+    // error rather than a success over an empty picture.
+    t.advance(format!("\x1b_Ga=t,f=32,t=s,s=1,v=1,O=4096,i=2;{payload}\x1b\\").as_bytes());
+    assert_eq!(
+        String::from_utf8(t.take_output()).unwrap(),
+        "\x1b_Gi=2;EINVAL:the offset is past the end of the file\x1b\\"
+    );
+    assert!(t.graphics().image(2).is_none());
+}
+
+#[test]
 fn kitty_graphics_refuses_a_file_when_nothing_can_read_one() {
     let mut t = term(10, 4);
     let payload = encode_base64(b"/tmp/tos-preview.png");
@@ -763,6 +789,36 @@ fn kitty_graphics_composes_one_frame_onto_another() {
     assert_eq!(image.data[..4], [0, 255, 0, 255]);
     // Past the rectangle the destination frame is untouched.
     assert_eq!(image.data[16..20], [255, 0, 0, 255]);
+}
+
+#[test]
+fn kitty_graphics_does_not_repaint_for_a_frame_nobody_is_looking_at() {
+    let mut t = term(10, 4);
+    let red = encode_base64(&[255, 0, 0, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=T,f=32,s=8,v=16,i=5;{red}\x1b\\").as_bytes());
+    let green = encode_base64(&[0, 255, 0, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=f,f=32,s=8,v=16,i=5,z=40;{green}\x1b\\").as_bytes());
+    t.take_output();
+    t.clear_damage();
+
+    // Frame one is on screen. Building frame two out of frame one, which is
+    // what `a=c` is for, changes no pixel anybody can see — and the repaint it
+    // would otherwise ask for is a rescale of the whole placement, because the
+    // generation moved with the write.
+    t.advance(b"\x1b_Ga=c,i=5,r=1,c=2\x1b\\");
+    assert!(t.take_output().ends_with(b"OK\x1b\\"));
+    assert!(!t.damage().is_dirty(), "a hidden frame must not repaint");
+
+    // The same for `a=f`: an appended frame is not the one showing.
+    let blue = encode_base64(&[0, 0, 255, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=f,f=32,s=8,v=16,i=5,z=40;{blue}\x1b\\").as_bytes());
+    t.take_output();
+    assert!(!t.damage().is_dirty(), "an appended frame must not repaint");
+
+    // Rewriting the frame that *is* on screen still does.
+    t.advance(format!("\x1b_Ga=f,f=32,s=8,v=16,i=5,r=1,z=40;{blue}\x1b\\").as_bytes());
+    t.take_output();
+    assert!(t.damage().is_row_dirty(0));
 }
 
 #[test]
