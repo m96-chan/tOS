@@ -3424,6 +3424,16 @@ impl Compositor {
                 }
                 let previous = self.session.focus();
                 self.session.set_focus(id);
+                // The bar lists every pane in the workspace, including the
+                // ones a zoom is hiding, so this is the one focus change that
+                // can arrive for a pane nobody can see — and `set_focus`
+                // answers that by leaving the zoom, which hands every pane in
+                // the workspace a different rectangle. A pane only hears about
+                // its rectangle here, so without this the next frame would
+                // draw the splits back while the pane that had been zoomed,
+                // and the program inside it, were still sized to the whole
+                // workspace.
+                self.sync_layout();
                 self.clear_selection(previous);
                 self.needs_full_redraw = true;
                 true
