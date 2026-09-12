@@ -34,7 +34,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "tos-compositor"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "libc",
  "tos-crypt",
@@ -51,22 +51,22 @@ dependencies = [
 
 [[package]]
 name = "tos-crypt"
-version = "0.0.5"
+version = "0.0.7"
 
 [[package]]
 name = "tos-font"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "fontdue",
 ]
 
 [[package]]
 name = "tos-ime"
-version = "0.0.5"
+version = "0.0.7"
 
 [[package]]
 name = "tos-input"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "libc",
  "tos-term",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "tos-install"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "libc",
  "tos-crypt",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "tos-platform"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "libc",
  "tos-render",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "tos-preview"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "libc",
  "tos-compositor",
@@ -106,14 +106,14 @@ dependencies = [
 
 [[package]]
 name = "tos-pty"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "tos-render"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "tos-font",
  "tos-term",
@@ -121,21 +121,21 @@ dependencies = [
 
 [[package]]
 name = "tos-session"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "tos-input",
 ]
 
 [[package]]
 name = "tos-system"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "tos-term"
-version = "0.0.5"
+version = "0.0.7"
 
 [[package]]
 name = "ttf-parser"
