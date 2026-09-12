@@ -16,7 +16,7 @@ use tos_input::{
 };
 use tos_platform::Display;
 use tos_render::{render, Rect as PixelRect, RenderOptions, Surface};
-use tos_session::{describe, Action, Axis, Keymap, PaneId, Rect, Resolution, Session};
+use tos_session::{describe, Action, Axis, DividerId, Keymap, PaneId, Rect, Resolution, Session};
 use tos_system::audio::Volume;
 use tos_system::bluetooth::{Adapter, Connection, SystemControl};
 use tos_system::net::{dhcp, Interface, Kind, Lease};
@@ -33,7 +33,7 @@ use crate::ime::{self, Ime, ImeOutcome};
 use crate::launcher;
 use crate::lock::{self, LockOutcome, LockScreen};
 use crate::notify::{self, Chosen, Notifications};
-use crate::overlay::{Overlay, OverlayItem, OverlayOutcome};
+use crate::overlay::{Overlay, OverlayItem, OverlayOutcome, Placement};
 use crate::pane::Pane;
 use crate::power;
 use crate::selection::{Selection, SelectionMode};
@@ -79,6 +79,32 @@ struct Click {
     row: usize,
     at: Instant,
     count: u32,
+}
+
+/// What the mouse is holding on to between a press and the release that ends
+/// it.
+///
+/// One value rather than a field each, because there is one pointer: a drag
+/// that started on a divider must not also be dragging a selection out of the
+/// pane beside it, and two `Option`s would be two states that can both be
+/// `Some` and a rule written down in comments to say they must not be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grab {
+    /// A selection being dragged out of this pane.
+    Pane(PaneId),
+    /// A divider being dragged.
+    Divider(DividerGrab),
+}
+
+/// A divider under the pointer, and where in it the press landed.
+///
+/// The offset matters once the gap is more than one cell wide: without it,
+/// grabbing a thick divider anywhere but its leading edge would snap it under
+/// the pointer on the first cell of movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DividerGrab {
+    id: DividerId,
+    offset: u32,
 }
 
 /// Which menu an open overlay is, and so what choosing a row means.
@@ -236,8 +262,8 @@ pub struct Compositor {
     running: bool,
     /// Pointer position in pixels, for mouse routing.
     pointer: (u32, u32),
-    /// The pane a mouse button went down on.
-    mouse_grab: Option<PaneId>,
+    /// What a mouse button went down on, while it is still down.
+    mouse_grab: Option<Grab>,
     /// The previous left press, for double and triple click.
     last_click: Option<Click>,
     /// Some pane still has input queued, so the loop must not idle.
@@ -957,18 +983,29 @@ impl Compositor {
             return self.click_status(cell_x) || changed;
         }
 
+        // Then the dividers, which are in the gaps between panes and so in no
+        // pane's rectangle: the hit test below finds nothing there, exactly
+        // as it found nothing on the bar, and until now a press on the line
+        // between two panes did nothing at all. Above the panes rather than
+        // below them because a drag that has hold of a divider has to keep it
+        // while the pointer is over a pane, which is where a divider spends
+        // every cell of its travel.
+        if let Some(moved) = self.drag_divider(cell_x, cell_y, button, action) {
+            return moved || changed;
+        }
+
         let geometry = self.session.active().geometry(area);
 
         // A drag that started in a pane keeps going there even once the
         // pointer leaves it, which is what makes selection usable. A grab on a
         // pane that has since closed is dropped rather than wedging the mouse.
-        let grabbed = self.mouse_grab.and_then(|id| {
+        let grabbed = self.grabbed_pane().and_then(|id| {
             geometry
                 .iter()
                 .find(|(pane, _)| *pane == id)
                 .map(|(pane, rect)| (*pane, *rect))
         });
-        if self.mouse_grab.is_some() && grabbed.is_none() {
+        if self.grabbed_pane().is_some() && grabbed.is_none() {
             self.mouse_grab = None;
         }
 
@@ -982,7 +1019,7 @@ impl Compositor {
         // the grab, so a drag can leave the pane it started in.
         let target = if action == MouseAction::Press {
             if let Some((pane, _)) = hit {
-                if self.mouse_grab.is_some_and(|grabbed| grabbed != pane) {
+                if self.grabbed_pane().is_some_and(|grabbed| grabbed != pane) {
                     self.release_grab();
                 }
             }
@@ -1057,14 +1094,14 @@ impl Compositor {
         // mode is making one with the keyboard while the mouse hangs idle, so
         // a bare motion across the pane would walk the highlight away from the
         // copy cursor and `y` would yank text nobody saw highlighted.
-        let dragging = self.mouse_grab == Some(pane_id);
+        let dragging = self.mouse_grab == Some(Grab::Pane(pane_id));
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             let at = pane.anchor_at(local.col, local.row);
             match action {
                 MouseAction::Press if button == Some(MouseButton::Left) => {
                     pane.selection_in_progress = true;
                     pane.set_selection(Some(Selection::new(at, modifiers.alt(), mode)));
-                    self.mouse_grab = Some(pane_id);
+                    self.mouse_grab = Some(Grab::Pane(pane_id));
                     changed = true;
                 }
                 MouseAction::Drag | MouseAction::Motion if dragging => {
@@ -1140,9 +1177,127 @@ impl Compositor {
         }
     }
 
+    /// The divider part of the mouse: grab one on a press, move it while it
+    /// is held, drop it on the release.
+    ///
+    /// `None` means this event has nothing to do with a divider and the pane
+    /// routing below should have it. Anything else is `Some`, including the
+    /// press that grabs — which moves nothing and so asks for no frame.
+    fn drag_divider(
+        &mut self,
+        cell_x: u32,
+        cell_y: u32,
+        button: Option<MouseButton>,
+        action: MouseAction,
+    ) -> Option<bool> {
+        if action == MouseAction::Press {
+            // A press starts a new interaction whatever the last one was, so
+            // a release that never arrived — a button let go over another
+            // virtual terminal, a device that stopped reporting — cannot wedge
+            // a divider to the pointer forever.
+            if matches!(self.mouse_grab, Some(Grab::Divider(_))) {
+                self.mouse_grab = None;
+            }
+            if button != Some(MouseButton::Left) {
+                return None;
+            }
+            // A zoomed workspace draws no dividers, and a strip that resizes
+            // a layout nobody can see is worse than one that does nothing.
+            if self.session.active().zoomed().is_some() {
+                return None;
+            }
+            let area = self.grid_area();
+            let divider = self
+                .session
+                .active()
+                .layout
+                .divider_at(area, cell_x, cell_y)?;
+            // One grab, one owner: whatever the pane path thought it was
+            // dragging, it is not dragging it now.
+            self.release_grab();
+            let offset = match divider.axis {
+                Axis::Columns => cell_x - divider.rect.x,
+                Axis::Rows => cell_y - divider.rect.y,
+            };
+            self.mouse_grab = Some(Grab::Divider(DividerGrab {
+                id: divider.id,
+                offset,
+            }));
+            return Some(false);
+        }
+
+        let Some(Grab::Divider(grab)) = self.mouse_grab else {
+            return None;
+        };
+        match action {
+            MouseAction::Drag | MouseAction::Motion => {
+                Some(self.move_divider(grab, cell_x, cell_y))
+            }
+            MouseAction::Release => {
+                self.mouse_grab = None;
+                Some(false)
+            }
+            // The wheel, or another button, while a divider is held: taken,
+            // because the pointer is in the middle of saying something else.
+            _ => Some(false),
+        }
+    }
+
+    /// Put the divider being dragged where the pointer is.
+    ///
+    /// Measured from where the divider is now rather than accumulated from
+    /// where the drag began: the weights are shares of a split and a cell of
+    /// travel is not always a cell of movement, so the only honest target is
+    /// the distance still to go. A move the layout refuses leaves the divider
+    /// where it is and the pointer running ahead of it, and it is picked up
+    /// again as soon as the pointer comes back.
+    fn move_divider(&mut self, grab: DividerGrab, cell_x: u32, cell_y: u32) -> bool {
+        let area = self.grid_area();
+        // Zoom is a binding, and the keyboard still works while a button is
+        // down.
+        if self.session.active().zoomed().is_some() {
+            self.mouse_grab = None;
+            return false;
+        }
+        let Some(divider) = self.session.active().layout.divider(area, grab.id) else {
+            // The split went away under the drag, which is what closing a
+            // pane beside it does.
+            self.mouse_grab = None;
+            return false;
+        };
+        let (at, from) = match divider.axis {
+            Axis::Columns => (cell_x as i32, divider.rect.x as i32),
+            Axis::Rows => (cell_y as i32, divider.rect.y as i32),
+        };
+        let amount = at - grab.offset as i32 - from;
+        if amount == 0 {
+            return false;
+        }
+        if !self
+            .session
+            .active_mut()
+            .layout
+            .resize_at(area, grab.id, amount)
+        {
+            return false;
+        }
+        self.sync_layout();
+        self.needs_full_redraw = true;
+        true
+    }
+
+    /// The pane a selection is being dragged out of, if that is what the
+    /// mouse is holding.
+    fn grabbed_pane(&self) -> Option<PaneId> {
+        match self.mouse_grab {
+            Some(Grab::Pane(pane)) => Some(pane),
+            _ => None,
+        }
+    }
+
     /// Abandon an interaction that was still in progress in another pane.
     fn release_grab(&mut self) {
-        if let Some(pane) = self.mouse_grab.take() {
+        if let Some(Grab::Pane(pane)) = self.mouse_grab.take() {
             if let Some(pane) = self.panes.get_mut(&pane) {
                 pane.selection_in_progress = false;
             }
@@ -1766,6 +1921,20 @@ impl Compositor {
         self.overlay.as_ref().map(|(_, overlay)| overlay)
     }
 
+    /// Where the open menu's box is on screen, if one is open and the display
+    /// is big enough to have drawn it.
+    ///
+    /// The frame and the mouse both go through here, so anything else that
+    /// wants to know where a row is — a test aiming at one — is asking the
+    /// same question rather than working it out again.
+    pub fn overlay_placement(&self) -> Option<Placement> {
+        let area = self.overlay_area();
+        let cell = self.cell_size();
+        self.overlay
+            .as_ref()
+            .and_then(|(_, overlay)| overlay.placement(area, cell))
+    }
+
     fn close_overlay(&mut self) {
         self.overlay = None;
         self.needs_full_redraw = true;
@@ -2202,7 +2371,7 @@ impl Compositor {
         }
         for pane in closed {
             self.panes.remove(&pane);
-            if self.mouse_grab == Some(pane) {
+            if self.mouse_grab == Some(Grab::Pane(pane)) {
                 self.mouse_grab = None;
             }
             // A copy mode whose pane has gone has nothing left to select in,
