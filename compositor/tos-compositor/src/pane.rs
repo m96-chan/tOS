@@ -9,6 +9,7 @@ use tos_session::Rect;
 use tos_term::{Palette, Terminal, TerminalConfig};
 
 use crate::imagefile::ImageFiles;
+use crate::ime::ImeContext;
 use crate::selection::{Anchor, Selection};
 
 /// A running pane.
@@ -31,6 +32,16 @@ pub struct Pane {
     /// the cache has to live with the thing it belongs to, which is the pane
     /// whose images they are.
     pub textures: TextureCache,
+    /// What this pane is half-typing, and whether kana mode is on for it.
+    ///
+    /// Per pane, beside the selection and the textures, because that is what
+    /// the user thinks it belongs to: someone with vim in one pane and a chat
+    /// client in another wants kana off in the first and on in the second,
+    /// and a preedit is text destined for one particular PTY. It dies with
+    /// the pane, which is the whole of what happens when a pane dies holding
+    /// one — the bytes were never sent, so there is nothing to flush and
+    /// nothing to lose.
+    pub ime: ImeContext,
     /// Whether the selection is still being made, rather than finished and
     /// sitting there. A button held down says so, and so does copy mode
     /// driving one from the keyboard; what the two have in common is a person
@@ -94,6 +105,7 @@ impl Pane {
             exited: false,
             selection: None,
             textures: TextureCache::default(),
+            ime: ImeContext::default(),
             selection_in_progress: false,
             pending_input: Vec::new(),
             input_overflowed: false,

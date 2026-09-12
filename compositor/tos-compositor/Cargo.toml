@@ -25,6 +25,7 @@ tos-input = { workspace = true }
 tos-session = { workspace = true }
 tos-platform = { workspace = true }
 tos-system = { workspace = true }
+tos-ime = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]

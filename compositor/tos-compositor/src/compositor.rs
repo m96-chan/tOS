@@ -29,6 +29,7 @@ use crate::chrome::{self, Chrome};
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::copymode::{CopyMode, CopyOutcome};
+use crate::ime::{self, Ime, ImeOutcome};
 use crate::launcher;
 use crate::lock::{self, LockOutcome, LockScreen};
 use crate::notify::{self, Chosen, Notifications};
@@ -192,6 +193,13 @@ pub struct Compositor {
     panes: HashMap<PaneId, Pane>,
     fonts: FontStack,
     keymap: Keymap,
+    /// Japanese input: the romaji table and the dictionary, one per session.
+    ///
+    /// Beside `fonts` and `keymap` because it is the same kind of thing — a
+    /// megabyte of data read once and consulted by whichever pane has the
+    /// focus. What a person is half-way through typing is not here; that is
+    /// on the pane, in [`crate::ime::ImeContext`].
+    ime: Ime,
     chrome: Chrome,
     /// Display size in pixels.
     size: (u32, u32),
@@ -325,11 +333,16 @@ impl Compositor {
         // Before the config is moved into the struct, and once rather than per
         // frame: this reads the time zone database off the disk.
         let clock = Clock::new(&config.status.clock_format, &config.status.zone);
+        // Before the struct, and allowed to fail: a machine with no
+        // dictionary types kana and converts nothing, which is a far better
+        // session than no session.
+        let (ime, dictionary_problem) = Ime::open(config.ime_dictionary.as_deref());
         let mut compositor = Compositor {
             session: Session::new(),
             panes: HashMap::new(),
             fonts,
             keymap: Keymap::default_bindings(),
+            ime,
             chrome: config.chrome,
             size,
             clipboard: HashMap::new(),
@@ -364,6 +377,15 @@ impl Compositor {
             dhcp: None,
             config,
         };
+
+        // A configured dictionary that would not open is worth saying, for
+        // the reason `config_file` reports an unknown key: a setting that
+        // silently does nothing looks exactly like one that is broken.
+        if let Some(problem) = dictionary_problem {
+            compositor
+                .notifications
+                .status(format!("no dictionary: {problem}"));
+        }
 
         // The first pane exists in the session already; give it a process.
         let root = compositor.session.root_pane();
@@ -437,6 +459,19 @@ impl Compositor {
 
     pub fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
         self.panes.get_mut(&id)
+    }
+
+    /// The input method, for a caller that wants to hand it a dictionary.
+    ///
+    /// The seam a test reaches through: `Ime::load` takes a `&dyn Source`, so
+    /// four entries written inline are a dictionary and nothing has to be on
+    /// the machine running the tests.
+    pub fn ime(&self) -> &Ime {
+        &self.ime
+    }
+
+    pub fn ime_mut(&mut self) -> &mut Ime {
+        &mut self.ime
     }
 
     pub fn clipboard(&self, selector: char) -> Option<&[u8]> {
@@ -736,6 +771,14 @@ impl Compositor {
             Resolution::Action(action) => self.perform(action),
             Resolution::Pending => true,
             Resolution::Passthrough => {
+                // The IME answers first, and only for keys the bindings did
+                // not want. `resolve` has already computed exactly the set of
+                // keys that belong to the focused pane, which is exactly the
+                // IME's input; consulted ahead of it, kana mode would turn
+                // `super+h` into へ and the leader into a character.
+                if let Some(changed) = self.ime_key(&key) {
+                    return changed;
+                }
                 let focus = self.session.focus();
                 let Some(pane) = self.panes.get_mut(&focus) else {
                     return false;
@@ -754,6 +797,105 @@ impl Compositor {
             }
         };
         changed || was_armed != self.keymap.is_pending()
+    }
+
+    // ---- Japanese input -------------------------------------------------
+
+    /// Offer a key to the input method, and say what it did with it.
+    ///
+    /// `None` means the key is still the pane's and the path below
+    /// [`Compositor::handle_key`]'s `Passthrough` arm runs untouched — which
+    /// in Direct mode is every key, and is why Direct mode costs nothing and
+    /// is byte for byte what it was before any of this existed.
+    fn ime_key(&mut self, key: &KeyEvent) -> Option<bool> {
+        // `Keymap::resolve` returns `Passthrough` for releases as well as
+        // presses. Without this guard every character would be typed twice,
+        // which is the same guard `Overlay::handle_key` keeps and for the
+        // same reason.
+        if !key.is_press() {
+            return None;
+        }
+        let focus = self.session.focus();
+        let pane = self.panes.get_mut(&focus)?;
+        let outcome = ime::handle_key(&mut self.ime, &mut pane.ime, focus, key);
+        if outcome == ImeOutcome::Passthrough {
+            return None;
+        }
+        // Typing returns the view to the live screen for the same reason it
+        // does below: what is being typed is going to a program that is
+        // drawing there, and a preedit painted over scrolled-back history
+        // would be sitting nowhere near where its text will land.
+        if pane.terminal.display_offset() != 0 {
+            pane.terminal.reset_display_offset();
+        }
+        if let ImeOutcome::Commit(text) = outcome {
+            // The UTF-8 bytes, straight to the child — deliberately not
+            // `encode_paste`. A commit is typing, and bracketing it would put
+            // the program into paste mode for text the user typed one
+            // character at a time: no autoindent in vim, no history expansion
+            // in a shell, and no way for them to see why.
+            //
+            // Control characters are filtered for the reason `encode_paste`
+            // filters them: a candidate comes out of a file on disk and must
+            // not be able to be an escape sequence.
+            let bytes: Vec<u8> = text
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect::<String>()
+                .into();
+            if !bytes.is_empty() {
+                pane.write(&bytes);
+            }
+        }
+        Some(true)
+    }
+
+    /// Turn Japanese input on or off for the focused pane.
+    fn toggle_ime(&mut self) -> bool {
+        let focus = self.session.focus();
+        // A candidate list is a proposal about a preedit that is about to be
+        // thrown away, so it goes first.
+        self.ime.end_conversion(focus);
+        let Some(pane) = self.panes.get_mut(&focus) else {
+            return false;
+        };
+        let on = pane.ime.toggle();
+        // Said out loud, because with nothing typed yet the mode is otherwise
+        // invisible: the only other evidence of it is what the next keystroke
+        // does, which is a bad way to find out.
+        self.notifications.status(if on {
+            "kana input on"
+        } else {
+            "kana input off"
+        });
+        true
+    }
+
+    /// Paint every pane's preedit, and the candidate window over the one pane
+    /// that is converting.
+    ///
+    /// Every pane, not just the focused one: a preedit belongs to the pane it
+    /// is destined for, so moving the focus leaves it where it was rather
+    /// than carrying it or committing it.
+    fn draw_ime(&mut self, surface: &mut Surface<'_>, geometry: &[(PaneId, Rect)]) {
+        for (id, rect) in geometry {
+            let conversion = self.ime.conversion(*id);
+            let Some(pane) = self.panes.get(id) else {
+                continue;
+            };
+            let painted = ime::draw(
+                surface,
+                &mut self.fonts,
+                &self.chrome,
+                *rect,
+                &pane.terminal,
+                &pane.ime,
+                conversion,
+            );
+            if let Some(pane) = self.panes.get_mut(id) {
+                pane.ime.set_painted(painted);
+            }
+        }
     }
 
     /// Route a mouse event that is already in display cell coordinates.
@@ -1209,6 +1351,7 @@ impl Compositor {
                 self.open_networks();
                 true
             }
+            Action::ImeToggle => self.toggle_ime(),
             Action::Quit => {
                 self.running = false;
                 true
@@ -2009,6 +2152,11 @@ impl Compositor {
             if self.copy.as_ref().is_some_and(|(id, _)| *id == pane) {
                 self.copy = None;
             }
+            // The preedit died with the pane's context, which is the whole of
+            // what happens: nothing was ever sent, so there is nothing to
+            // flush and nothing to lose. The candidate list is the one piece
+            // that is not on the pane, so it is dropped here by hand.
+            self.ime.end_conversion(pane);
         }
         self.sync_layout();
         self.needs_full_redraw = true;
@@ -2276,6 +2424,21 @@ impl Compositor {
         let focus = self.session.focus();
         let geometry = self.session.active().geometry(area);
 
+        // The preedit is in nobody's grid, so nothing marks the rows it
+        // covered as needing another look: `render()` skips a row that is not
+        // dirty, and the frame after a commit would leave the committed
+        // glyphs on screen twice. Marking what the IME painted last frame is
+        // the same trick the graphics code uses to repaint only the rows a
+        // moving image covers. Deliberately not `needs_full_redraw`, which is
+        // what an overlay does: an overlay opens once, and a full screen
+        // repaint per keystroke is the exact cost the retained path exists to
+        // avoid.
+        for pane in self.panes.values_mut() {
+            if let Some((from, to)) = pane.ime.take_painted() {
+                pane.terminal.damage_mut().mark_range(from, to);
+            }
+        }
+
         if force {
             surface.clear(self.chrome.background);
         }
@@ -2389,6 +2552,11 @@ impl Compositor {
             let over = PixelRect::new(0, 0, area.width * cw, area.height * ch);
             overlay.draw(surface, &mut self.fonts, over, &self.chrome);
         }
+
+        // And the preedit over the pane it is being typed into. Never open at
+        // the same time as an overlay, so the order between the two is not a
+        // decision anybody has to make.
+        self.draw_ime(surface, &geometry);
 
         for (id, pane) in self.panes.iter_mut() {
             // A pane skipped for synchronized output was not painted, so its
