@@ -2726,13 +2726,22 @@ impl Compositor {
     }
 
     /// Whether anything has changed since the last frame.
+    ///
+    /// A pane holding a synchronized update open is not asked. `render_frame`
+    /// skips it and deliberately leaves its damage standing, so that the update
+    /// is not lost — which means the damage is not an answer to "is there a
+    /// frame to draw" but to "is there one owed once the program lets go".
+    /// Counting it asked for a frame that could not draw a single row of that
+    /// pane, and DECSET 2026 has no timeout anywhere in tOS, so that was not
+    /// one wasted frame but one per pass of the loop for as long as the program
+    /// kept the update open. A full redraw draws the pane anyway, which is why
+    /// that is still asked first.
     pub fn needs_render(&self) -> bool {
         self.needs_full_redraw
             || self.pointer_moved_since_it_was_drawn()
-            || self
-                .panes
-                .values()
-                .any(|pane| pane.terminal.damage().is_dirty())
+            || self.panes.values().any(|pane| {
+                !pane.terminal.modes.synchronized_output && pane.terminal.damage().is_dirty()
+            })
     }
 
     /// Where the arrow belongs this frame, or `None` for no arrow at all.
@@ -2808,6 +2817,24 @@ impl Compositor {
             }
         }
 
+        // Which panes asked not to be drawn mid-update. Worked out before the
+        // pane loop rather than inside it because the uncovering above has to
+        // know as well, and two copies of the question is two answers waiting
+        // to disagree.
+        let skipped: Vec<PaneId> = if force {
+            Vec::new()
+        } else {
+            geometry
+                .iter()
+                .filter(|(id, _)| {
+                    self.panes
+                        .get(id)
+                        .is_some_and(|pane| pane.terminal.modes.synchronized_output)
+                })
+                .map(|(id, _)| *id)
+                .collect()
+        };
+
         if force {
             surface.clear(self.chrome.background);
         } else if let Some(was) = uncover.filter(|_| repaint_chrome) {
@@ -2815,8 +2842,17 @@ impl Compositor {
             // and the arrow would stay where it was. Painting the background
             // back is safe over the panes this rectangle also touches, because
             // it happens before they draw and their damaged rows cover the
-            // whole of the part that overlaps.
-            surface.fill(was, self.chrome.background);
+            // whole of the part that overlaps — but only over the panes that
+            // are going to draw. A pane holding a synchronized update open is
+            // not, and DECSET 2026 has no timeout, so background painted across
+            // it is a hole in the picture for as long as the program keeps the
+            // update open rather than for the single frame this trick is costed
+            // at. Its rows are marked and it repaints them the moment it comes
+            // back; until then the old arrow sits on it, which is the whole of
+            // what "the previous frame stays on screen" already means.
+            for piece in self.outside_the_skipped_panes(was, &geometry, &skipped) {
+                surface.fill(piece, self.chrome.background);
+            }
         }
 
         let mut drawn: Vec<PaneId> = Vec::with_capacity(geometry.len());
@@ -2828,7 +2864,7 @@ impl Compositor {
             };
             // A pane that is synchronising its output asked not to be drawn
             // mid-update, so the previous frame stays on screen.
-            if pane.terminal.modes.synchronized_output && !force {
+            if skipped.contains(id) {
                 continue;
             }
             drawn.push(*id);
@@ -2969,6 +3005,74 @@ impl Compositor {
             }
         }
         self.needs_full_redraw = false;
+    }
+
+    /// The pieces of `was` that no pane skipped this frame is sitting under —
+    /// what the frame is free to paint the background over.
+    ///
+    /// Rectangles rather than a mask because there are at most a handful of
+    /// them and the only thing that will ever be asked to draw them is
+    /// `Surface::fill`. Only the skipped panes are cut out, not every pane: the
+    /// background over a pane that is about to draw is painted over again by
+    /// the rows the uncovering just marked, and leaving that alone keeps this to
+    /// one rectangle in the case that is not about synchronized output at all.
+    fn outside_the_skipped_panes(
+        &self,
+        was: PixelRect,
+        geometry: &[(PaneId, Rect)],
+        skipped: &[PaneId],
+    ) -> Vec<PixelRect> {
+        /// One rectangle with another cut out of it: a band above, a band
+        /// below, and the two sides of what is left between them.
+        fn cut_out(rect: PixelRect, hole: PixelRect) -> Vec<PixelRect> {
+            let overlap = rect.intersect(&hole);
+            if overlap.is_empty() {
+                return vec![rect];
+            }
+            let mut pieces = Vec::new();
+            if overlap.y > rect.y {
+                let height = (overlap.y - rect.y) as u32;
+                pieces.push(PixelRect::new(rect.x, rect.y, rect.width, height));
+            }
+            if overlap.bottom() < rect.bottom() {
+                let height = (rect.bottom() - overlap.bottom()) as u32;
+                pieces.push(PixelRect::new(rect.x, overlap.bottom(), rect.width, height));
+            }
+            if overlap.x > rect.x {
+                let width = (overlap.x - rect.x) as u32;
+                pieces.push(PixelRect::new(rect.x, overlap.y, width, overlap.height));
+            }
+            if overlap.right() < rect.right() {
+                let width = (rect.right() - overlap.right()) as u32;
+                pieces.push(PixelRect::new(
+                    overlap.right(),
+                    overlap.y,
+                    width,
+                    overlap.height,
+                ));
+            }
+            pieces
+        }
+
+        let (cw, ch) = self.cell_size();
+        let mut pieces = vec![was];
+        for rect in geometry
+            .iter()
+            .filter(|(id, _)| skipped.contains(id))
+            .map(|(_, rect)| rect)
+        {
+            let hole = PixelRect::new(
+                (rect.x * cw) as i32,
+                (rect.y * ch) as i32,
+                rect.width * cw,
+                rect.height * ch,
+            );
+            pieces = pieces
+                .iter()
+                .flat_map(|piece| cut_out(*piece, hole))
+                .collect();
+        }
+        pieces
     }
 
     /// Mark what the arrow covered last frame as needing another look, and say

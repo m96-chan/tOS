@@ -12,7 +12,7 @@ use tos_compositor::pointer;
 use tos_compositor::{Compositor, Config};
 use tos_input::{InputEvent, KeyCode, KeyEvent, Modifiers, MouseAction, PointerEvent};
 use tos_render::{OwnedFramebuffer, Rect};
-use tos_session::{Action, Axis};
+use tos_session::{Action, Axis, PaneId};
 
 const SIZE: (u32, u32) = (800, 480);
 
@@ -94,6 +94,50 @@ fn type_a_letter(compositor: &mut Compositor) -> bool {
         KeyCode::Char('x'),
         Modifiers::NONE,
     )))
+}
+
+/// Two columns with the right one filled in a colour nothing else on screen is
+/// painted in, so a hole punched in it is unmistakable.
+///
+/// Returns the compositor, the right pane, and the display pixel its first
+/// column starts at.
+fn two_columns_with_a_coloured_right_pane() -> (Compositor, PaneId, u32) {
+    let mut compositor = quiet();
+    compositor.perform(Action::Split(Axis::Columns));
+    let geometry = compositor
+        .session()
+        .active()
+        .geometry(compositor.grid_area());
+    assert_eq!(geometry.len(), 2, "the split did not happen");
+    let (id, rect) = *geometry.iter().max_by_key(|(_, r)| r.x).expect("a pane");
+    let pane = compositor
+        .pane_mut(id)
+        .expect("the pane that was split off");
+    let cells = pane.terminal.cols() * pane.terminal.rows();
+    pane.terminal.advance(b"\x1b[41m");
+    pane.terminal.advance(" ".repeat(cells).as_bytes());
+    let edge = rect.x * compositor.cell_size().0;
+    (compositor, id, edge)
+}
+
+/// Put the arrow half on the divider and half in the right pane's first
+/// column. The half on the divider is what makes a frame paint the background
+/// back at all; the half on the pane is where that fill lands.
+fn straddle_the_divider(compositor: &mut Compositor, edge: u32, y: u32) -> u32 {
+    let x = edge - pointer::size(compositor.cell_size()).0 / 2;
+    move_to(compositor, x, y);
+    x
+}
+
+/// The part of an arrow drawn at `(x, y)` that falls inside the right pane.
+fn over_the_pane(compositor: &Compositor, x: u32, y: u32, edge: u32) -> Rect {
+    let inside =
+        arrow(compositor, x, y).intersect(&Rect::new(edge as i32, 0, SIZE.0 - edge, SIZE.1));
+    assert!(
+        !inside.is_empty(),
+        "the arrow did not reach across the divider into the pane"
+    );
+    inside
 }
 
 /// Where the arrow lands when its hotspot is at `(x, y)`.
@@ -332,6 +376,84 @@ fn a_pointer_over_a_divider_is_uncovered_without_repainting_the_panel() {
         ),
         0,
         "the divider was left with an arrow painted over it"
+    );
+}
+
+#[test]
+fn uncovering_the_arrow_leaves_a_pane_holding_a_synchronized_update_alone() {
+    // A program that has opened DECSET 2026 has asked for the frame it is
+    // halfway through not to be shown, and nothing anywhere puts a timeout on
+    // that: the pane is skipped on every retained frame until the program says
+    // otherwise. Painting the background back over the old arrow used to reach
+    // across into it, which is not the one frame that trick was costed at but a
+    // hole in the picture for as long as the program keeps the update open.
+    let (mut compositor, right, edge) = two_columns_with_a_coloured_right_pane();
+    let mut screen = Screen::new();
+    let y = compositor.cell_size().1 * 4;
+    let coloured = screen.frame(&mut compositor);
+
+    let x = straddle_the_divider(&mut compositor, edge, y);
+    let shown = screen.frame(&mut compositor);
+    let inside = over_the_pane(&compositor, x, y, edge);
+    assert!(
+        differences(&coloured, &shown, inside) > 0,
+        "no arrow was drawn on the pane to uncover"
+    );
+
+    compositor
+        .pane_mut(right)
+        .expect("the pane")
+        .terminal
+        .advance(b"\x1b[?2026h");
+    move_to(&mut compositor, 40, y);
+    let moved = screen.frame(&mut compositor);
+    assert_eq!(
+        differences(&shown, &moved, inside),
+        0,
+        "a pane that asked not to be drawn was painted over to uncover the arrow"
+    );
+
+    // What it is owed instead is the rows the arrow was marked over, redeemed
+    // the moment it draws again: the arrow goes with them.
+    compositor
+        .pane_mut(right)
+        .expect("the pane")
+        .terminal
+        .advance(b"\x1b[?2026l");
+    let closed = screen.frame(&mut compositor);
+    assert_eq!(
+        differences(&coloured, &closed, inside),
+        0,
+        "the arrow outlived the synchronized update that was drawn under it"
+    );
+}
+
+#[test]
+fn a_pane_holding_a_synchronized_update_open_does_not_hold_the_render_loop_awake() {
+    // The other half of the same skip. A pane that is not drawn keeps its
+    // damage on purpose, so that the update is not lost — but answering yes to
+    // `needs_render` on the strength of it asks for a frame that is guaranteed
+    // to draw nothing of that pane, once per pass of the loop, for as long as
+    // the program keeps the update open. With no timeout on 2026 that is as
+    // long as it likes.
+    let (mut compositor, right, edge) = two_columns_with_a_coloured_right_pane();
+    let mut screen = Screen::new();
+    let y = compositor.cell_size().1 * 4;
+    screen.frame(&mut compositor);
+    assert!(!compositor.needs_render());
+
+    straddle_the_divider(&mut compositor, edge, y);
+    screen.frame(&mut compositor);
+    compositor
+        .pane_mut(right)
+        .expect("the pane")
+        .terminal
+        .advance(b"\x1b[?2026h");
+    move_to(&mut compositor, 40, y);
+    screen.frame(&mut compositor);
+    assert!(
+        !compositor.needs_render(),
+        "a pane that asked not to be drawn asks for a frame on every pass"
     );
 }
 
