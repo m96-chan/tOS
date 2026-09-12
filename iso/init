@@ -15,13 +15,19 @@
 # one, and /sbin has to come first for that to be the one found.
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin
 
+# Where the console nodes are. Everything in /dev here is devtmpfs: the
+# initramfs's own /dev carries nothing but the console and null that mkiso.sh
+# mknods, so once the pivot below moves devtmpfs into the new root, this is the
+# only way back to a tty. Nothing else needs to know.
+devdir=/dev
+
 # /init's own stdout is whichever console= came last on the kernel command
 # line, and the machine may have several. Anything a person needs to read
 # goes to all of them: a screen is the usual one, a serial line is what CI
 # and anyone debugging a headless boot captures.
 say() {
     said=
-    for tty in /dev/tty0 /dev/ttyS0; do
+    for tty in "$devdir/tty0" "$devdir/ttyS0"; do
         [ -c "$tty" ] && { echo "$@" >"$tty"; } 2>/dev/null && said=1
     done
     [ -n "$said" ] || echo "$@"
@@ -263,8 +269,23 @@ if [ -n "$pivot" ]; then
         # no keyboard.
         carried=1
         for fs in /dev /proc /sys; do
-            mount --move "$fs" "/newroot$fs" 2>/dev/null ||
-                { say "tOS: $fs did not come across"; carried=; }
+            if mount --move "$fs" "/newroot$fs" 2>/dev/null; then
+                # devtmpfs is on the other side now, and it was the only thing
+                # here with a tty0 or a ttyS0 in it. Everything said from this
+                # point has to be said through the new root's nodes: say()
+                # falls back to its own stdout when it finds neither, and that
+                # is /dev/console, the last console= on the command line, which
+                # is tty0 — the screen. The line below is the one both CI
+                # workflows grep out of the serial log, and said through a /dev
+                # that has moved away it reaches the screen and nothing else: a
+                # boot that is entirely correct and that no gate can see.
+                case $fs in
+                /dev) devdir=/newroot/dev ;;
+                esac
+            else
+                say "tOS: $fs did not come across"
+                carried=
+            fi
         done
         # Said after the moves and not before them. This is the line both CI
         # workflows grep for, and printed first it called a half-carried pivot
