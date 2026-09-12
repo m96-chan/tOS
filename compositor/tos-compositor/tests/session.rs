@@ -717,11 +717,22 @@ fn a_pane_holding_a_synchronized_update_open_asks_for_no_frame() {
 }
 
 #[test]
-fn a_host_terminal_mouse_click_lands_in_the_right_pane() {
-    // A host terminal reports cells, a device reports pixels. Treating the
-    // first as the second divided every coordinate by the cell size, so every
-    // click in nested mode landed near the top left of the screen.
-    use tos_input::{InputEvent, Modifiers, MouseAction, MouseButton, MouseEvent};
+fn a_host_terminal_mouse_click_lands_where_a_device_pointer_at_the_same_spot_does() {
+    // This test used to build its click out of `geometry`, which is already
+    // in compositor cells, and assert it landed on the pane it came from. It
+    // pinned `route_mouse` and never touched the step in front of it, which
+    // is the step that was missing: a host terminal reports its own cells,
+    // and the nested backend gives each of those one framebuffer pixel of
+    // width and two of height, so a host column is a pixel column and a host
+    // row is half of one — and only then is it a cell of the grid panes are
+    // laid out in. Handing the host's numbers straight to `route_mouse`
+    // pointed at somewhere several times off the far edge of that grid, which
+    // matched no pane and dropped the click.
+    //
+    // Pointing at one place twice, once the way a host terminal says it and
+    // once the way a device does, is the assertion. The two arrive in
+    // different units and have to agree about where the hand is.
+    use tos_input::{InputEvent, Modifiers, MouseAction, MouseButton, MouseEvent, PointerEvent};
 
     let mut c = compositor(&["/bin/sh", "-c", "sleep 30"]);
     c.perform(Action::Split(Axis::Columns));
@@ -736,28 +747,45 @@ fn a_host_terminal_mouse_click_lands_in_the_right_pane() {
     let area = c.grid_area();
     let geometry = c.session().active().geometry(area);
     let rect_of = |pane| geometry.iter().find(|(p, _)| *p == pane).unwrap().1;
+    let (cw, ch) = c.cell_size();
+    // The framebuffer pixel in the middle of a pane, which is the spot both
+    // kinds of report are going to name.
+    let middle = |rect: tos_session::Rect| {
+        (
+            (rect.x + rect.width / 2) * cw + cw / 2,
+            (rect.y + rect.height / 2) * ch + ch / 2,
+        )
+    };
 
-    // Click in the middle of the left pane, in cells.
-    let target = rect_of(left);
-    c.handle_input(InputEvent::Mouse(MouseEvent {
-        button: Some(MouseButton::Left),
-        action: MouseAction::Press,
-        col: (target.x + target.width / 2) as usize,
-        row: (target.y + target.height / 2) as usize,
-        modifiers: Modifiers::NONE,
-    }));
-    assert_eq!(c.session().focus(), left);
+    for (pane, other) in [(left, right), (right, left)] {
+        // Put the focus on the other pane first, through the path that is
+        // already in pixels, so the press being tested has somewhere to move
+        // the focus from.
+        let (x, y) = middle(rect_of(other));
+        c.handle_input(InputEvent::Pointer(PointerEvent {
+            x: x as f64,
+            y: y as f64,
+            button: Some(MouseButton::Left),
+            action: MouseAction::Press,
+            modifiers: Modifiers::NONE,
+        }));
+        assert_eq!(c.session().focus(), other, "the device pointer missed");
 
-    // And in the right pane.
-    let target = rect_of(right);
-    c.handle_input(InputEvent::Mouse(MouseEvent {
-        button: Some(MouseButton::Left),
-        action: MouseAction::Press,
-        col: (target.x + target.width / 2) as usize,
-        row: (target.y + target.height / 2) as usize,
-        modifiers: Modifiers::NONE,
-    }));
-    assert_eq!(c.session().focus(), right);
+        let (x, y) = middle(rect_of(pane));
+        c.handle_input(InputEvent::Mouse(MouseEvent {
+            button: Some(MouseButton::Left),
+            action: MouseAction::Press,
+            col: x as usize,
+            row: (y / 2) as usize,
+            modifiers: Modifiers::NONE,
+        }));
+        assert_eq!(
+            c.session().focus(),
+            pane,
+            "the host terminal's cells and the device's pixels disagree about \
+             where the hand is"
+        );
+    }
 }
 
 #[test]

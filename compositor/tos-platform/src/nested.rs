@@ -17,6 +17,24 @@ use crate::tty::{terminal_size, RawMode};
 /// the bottom one, so one host cell carries two framebuffer rows.
 const HALF_BLOCK: &str = "\u{2580}";
 
+/// Framebuffer pixels per host terminal cell, which is that encoding stated
+/// as a number: one column of pixels per host column, two rows per host row.
+///
+/// Public because the ratio is not private to the drawing. A host terminal
+/// reports the mouse in its own cells, and the compositor has to multiply by
+/// exactly this to get back to the framebuffer pixel — and from there to the
+/// cell of its own grid — that the hand is over. A second copy of the number
+/// on that side would be a second thing to get wrong.
+pub const HOST_CELL_PIXELS: (u32, u32) = (1, 2);
+
+/// The framebuffer a host terminal of `cols` by `rows` cells needs.
+fn framebuffer_size(cols: u16, rows: u16) -> (u32, u32) {
+    (
+        cols as u32 * HOST_CELL_PIXELS.0,
+        rows as u32 * HOST_CELL_PIXELS.1,
+    )
+}
+
 /// A display that lives inside a host terminal.
 pub struct NestedDisplay {
     framebuffer: OwnedFramebuffer,
@@ -47,8 +65,9 @@ impl NestedDisplay {
         // raw mode sets VMIN to 1, so they return promptly.
         let raw = RawMode::acquire(input)?;
 
+        let (width, height) = framebuffer_size(size.cols, size.rows);
         let mut display = NestedDisplay {
-            framebuffer: OwnedFramebuffer::new(size.cols as u32, size.rows as u32 * 2),
+            framebuffer: OwnedFramebuffer::new(width, height),
             previous: Vec::new(),
             output,
             input,
@@ -120,8 +139,8 @@ impl NestedDisplay {
         }
         self.cols = size.cols.max(1);
         self.rows = size.rows.max(1);
-        self.framebuffer
-            .resize(self.cols as u32, self.rows as u32 * 2);
+        let (width, height) = framebuffer_size(self.cols, self.rows);
+        self.framebuffer.resize(width, height);
         self.previous.clear();
         self.force_redraw = true;
         Ok(true)
