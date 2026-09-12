@@ -119,6 +119,26 @@ fn a_drag_copies_the_text_it_covered() {
 }
 
 #[test]
+fn a_wrapped_line_keeps_the_space_it_wrapped_on() {
+    // A row that wrapped is the same line as the next one, so the two are
+    // joined with no newline between them — and the space the line wrapped on
+    // sat in the last column, where trimming trailing blanks took it. The two
+    // words either side of it came out of the clipboard run together, which
+    // for a pasted command line is the difference between one argument and
+    // two.
+    let mut c = quiet();
+    let focus = c.session().focus();
+    let cols = c.pane(focus).unwrap().terminal.grid().cols();
+    // The space lands in the last column, so `b` begins the next row and the
+    // two rows are one wrapped line.
+    let first = "a".repeat(cols - 1);
+    c.inject(format!("{first} b\r\n").as_bytes());
+
+    drag(&mut c, (0, 0), (0, 1));
+    assert_eq!(primary(&c), format!("{first} b"));
+}
+
+#[test]
 fn a_drag_across_rows_takes_both_lines() {
     let mut c = quiet();
     c.inject(b"alpha beta\r\ngamma\r\n");

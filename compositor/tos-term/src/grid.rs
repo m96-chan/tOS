@@ -74,10 +74,20 @@ impl Row {
     }
 
     /// Text content with trailing blanks removed, used for selection and tests.
+    ///
+    /// Not removed from a row that wrapped. A row is marked wrapped because
+    /// the text ran past its last column, so a space sitting in that column is
+    /// one somebody typed between two words rather than the emptiness at the
+    /// end of a line — and trimming it ran the words together when the two
+    /// halves were put back. Which words that happened to, and so whether
+    /// anyone noticed, depended on where the wrap landed: it surfaced as a
+    /// test that passed or failed on the length of a path.
     pub fn to_text(&self) -> String {
         let mut s = String::new();
         for cell in &self.cells {
-            if cell.attrs.flags.contains(Flags::WIDE_SPACER) {
+            if cell.attrs.flags.contains(Flags::WIDE_SPACER)
+                || cell.attrs.flags.contains(Flags::WRAP_PAD)
+            {
                 continue;
             }
             s.push(cell.ch);
@@ -85,8 +95,10 @@ impl Row {
                 s.extend(zw.iter());
             }
         }
-        while s.ends_with(' ') {
-            s.pop();
+        if !self.wrapped {
+            while s.ends_with(' ') {
+                s.pop();
+            }
         }
         s
     }

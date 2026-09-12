@@ -153,7 +153,9 @@ impl Selection {
             let mut text = String::new();
             for x in from..=to.min(row.len().saturating_sub(1)) {
                 let cell = &row.cells()[x];
-                if cell.attrs.flags.contains(Flags::WIDE_SPACER) {
+                if cell.attrs.flags.contains(Flags::WIDE_SPACER)
+                    || cell.attrs.flags.contains(Flags::WRAP_PAD)
+                {
                     continue;
                 }
                 text.push(cell.ch);
@@ -161,7 +163,18 @@ impl Selection {
                     text.extend(marks.iter());
                 }
             }
-            let trimmed = text.trim_end();
+            // A row that wrapped ran out of columns rather than ending, so a
+            // blank in its last cell is a space somebody typed between two
+            // words — and the next row is the same line, joined with no
+            // newline below. Trimming it ran the two words together in
+            // whatever was pasted. A block selection is a rectangle and every
+            // row of it is its own line, so there the trailing blanks are the
+            // emptiness they look like.
+            let trimmed = if row.wrapped && !self.block {
+                text.as_str()
+            } else {
+                text.trim_end()
+            };
             if trimmed.is_empty() && out.is_empty() {
                 // Blank lines before anything else are not worth copying.
                 continue;
