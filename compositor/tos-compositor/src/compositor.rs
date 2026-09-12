@@ -727,36 +727,35 @@ impl Compositor {
                 self.handle_key(key) || put_away
             }
             // A host terminal reports cells; a device reports pixels. The two
-            // are separate types so the conversion can never be skipped — and
-            // this arm deliberately does not make one, so there is no arrow
-            // here.
+            // are separate types so the conversion can never be skipped, and
+            // this is the conversion. The only thing that sends a `Mouse`
+            // event is the nested backend, whose framebuffer is one pixel per
+            // host column and two per host row, so a host cell names a pixel
+            // and the pixel names a cell of the grid tOS lays panes out in —
+            // two steps, neither of them the identity.
             //
-            // The obvious synthesis is the cell numbers multiplied by the
-            // compositor's own cell size, and it is wrong: the only thing that
-            // sends a `Mouse` event is the nested backend, whose framebuffer is
-            // one pixel per host column and two per host row. It put the arrow
-            // several cells from the hand and, for anything past the top left
-            // corner of the display, clipped it away entirely.
+            // Passing the host's cell numbers straight through skipped both,
+            // and they do not cancel: on a 200x50 host terminal with an 8x16
+            // font the framebuffer is 200x100 pixels and the grid is 25x6
+            // cells, so the middle of the terminal arrived as a cell well off
+            // the far corner of the grid and matched no pane at all. Almost
+            // every click in nested mode was dropped.
             //
-            // Multiplying by the right numbers is not this change to make.
-            // `route_mouse` below reads the same cell numbers as compositor
-            // grid cells, so the mapping that is wrong is the one the click and
-            // the arrow share: correcting it here alone would leave the arrow
-            // pointing somewhere the click does not land, which is worse than
-            // no arrow. It is a change to where clicks go, and belongs with the
-            // routing rather than with the drawing.
-            //
-            // Nothing is lost meanwhile. A nested session is running inside
-            // somebody's terminal window, which is drawing the host's own
-            // cursor under their hand already — it is the one backend that has
-            // a pointer without tOS painting one.
-            InputEvent::Mouse(mouse) => self.route_mouse(
-                mouse.col as u32,
-                mouse.row as u32,
-                mouse.button,
-                mouse.action,
-                mouse.modifiers,
-            ),
+            // Still no arrow, and now because there should not be one rather
+            // than for want of somewhere to put it. A nested session runs
+            // inside somebody's terminal window, which is drawing the host's
+            // own cursor under their hand already; this is the one backend
+            // whose pointer tOS does not have to paint, and painting a second
+            // one on top would not be subtle — the arrow is sized by the font
+            // cell, which is several host columns across and as many host rows
+            // tall, so it would sit over whatever it was pointing at.
+            InputEvent::Mouse(mouse) => {
+                let (cw, ch) = self.cell_size();
+                let (pw, ph) = tos_platform::nested::HOST_CELL_PIXELS;
+                let x = (mouse.col as u32).saturating_mul(pw);
+                let y = (mouse.row as u32).saturating_mul(ph);
+                self.route_mouse(x / cw, y / ch, mouse.button, mouse.action, mouse.modifiers)
+            }
             InputEvent::Pointer(pointer) => {
                 let (cw, ch) = self.cell_size();
                 let x = pointer.x.max(0.0) as u32;
@@ -5890,13 +5889,21 @@ mod tests {
     }
 
     /// Press the left button on a cell of the status row.
+    ///
+    /// Through the device pointer, because what these tests name is a cell of
+    /// the compositor's own grid and the pointer is the input that is one
+    /// multiplication away from it. A host terminal's cells are a different
+    /// grid — see the `Mouse` arm of `handle_input` — and saying `col` to a
+    /// `MouseEvent` here would have been asking about that conversion instead
+    /// of about the bar.
     fn click_bar(compositor: &mut Compositor, col: u32) -> bool {
         let row = compositor.status_row().expect("a status row");
-        compositor.handle_input(InputEvent::Mouse(tos_input::MouseEvent {
+        let (cw, ch) = compositor.cell_size();
+        compositor.handle_input(InputEvent::Pointer(tos_input::PointerEvent {
+            x: (col * cw + cw / 2) as f64,
+            y: (row * ch + ch / 2) as f64,
             button: Some(MouseButton::Left),
             action: MouseAction::Press,
-            col: col as usize,
-            row: row as usize,
             modifiers: tos_input::Modifiers::NONE,
         }))
     }

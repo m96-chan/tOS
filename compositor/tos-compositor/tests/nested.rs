@@ -137,3 +137,94 @@ fn the_compositor_exits_when_its_shell_does() {
     }
     assert_eq!(status, Some(0), "tos did not exit cleanly");
 }
+
+// The rest of this file drives the compositor directly rather than the binary.
+// Turning a host terminal's mouse reports into cells of the grid panes are
+// laid out in is the compositor's arithmetic, not something the escape
+// sequences the backend writes can be read for.
+use tos_compositor::{Compositor, Config};
+use tos_input::{InputEvent, Modifiers, MouseAction, MouseButton, MouseEvent};
+use tos_session::{Action, Axis, Rect};
+
+/// A host terminal to size a compositor for. 200x50 is an ordinary window, and
+/// small enough in framebuffer pixels that a grid built on it is nothing like
+/// it — which is the whole difficulty the mouse has in nested mode.
+const HOST: (u32, u32) = (200, 50);
+
+/// A compositor shaped the way the nested backend shapes one.
+///
+/// The backend hands the compositor a framebuffer of the host's columns by
+/// twice its rows, because the half block puts two pixels in every host cell,
+/// and the compositor divides that by the font cell to get its own grid. At
+/// 200x50 host cells that is a 200x100 pixel framebuffer and, on the built-in
+/// face unscaled, a grid of 33 by 9.
+fn nested_compositor() -> Compositor {
+    let config = Config {
+        command: Some(
+            ["/bin/sh", "-c", "sleep 30"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        ),
+        // The built-in face at the scale nested mode runs it, so the grid does
+        // not depend on the fonts the machine running the tests happens to
+        // have.
+        bitmap_scale: Some(1),
+        font: Some("/nonexistent".into()),
+        system_root: "/nonexistent-so-this-machine-has-no-hardware".into(),
+        ..Config::default()
+    };
+    Compositor::new(config, (HOST.0, HOST.1 * 2), None).expect("compositor")
+}
+
+#[test]
+fn a_click_reported_in_host_terminal_cells_lands_on_the_pane_under_the_hand() {
+    // The host's cell numbers used to be read as the compositor's own, and on
+    // a display this shape the two grids barely overlap: a report for the
+    // middle of the terminal, host cell (100, 25), arrived as compositor cell
+    // (100, 25) on a grid 33 wide and 9 tall. It matched no pane and was
+    // dropped, and so was every other click outside the top left corner —
+    // which in nested mode is very nearly all of them.
+    let mut c = nested_compositor();
+    c.perform(Action::Split(Axis::Columns));
+    let right = c.session().focus();
+    let left = c
+        .session()
+        .all_panes()
+        .into_iter()
+        .find(|p| *p != right)
+        .unwrap();
+
+    let geometry = c.session().active().geometry(c.grid_area());
+    let rect_of = |pane| geometry.iter().find(|(p, _)| *p == pane).unwrap().1;
+    let (cw, ch) = c.cell_size();
+
+    // Point at the middle of a pane and say where that is the way the host
+    // terminal would: its column is the framebuffer pixel column, and its row
+    // is half the pixel row, because the half block stacks two rows in one
+    // cell.
+    let press = |c: &mut Compositor, rect: Rect| {
+        let x = (rect.x + rect.width / 2) * cw + cw / 2;
+        let y = (rect.y + rect.height / 2) * ch + ch / 2;
+        c.handle_input(InputEvent::Mouse(MouseEvent {
+            button: Some(MouseButton::Left),
+            action: MouseAction::Press,
+            col: x as usize,
+            row: (y / 2) as usize,
+            modifiers: Modifiers::NONE,
+        }));
+    };
+
+    press(&mut c, rect_of(left));
+    assert_eq!(
+        c.session().focus(),
+        left,
+        "a press in the left pane went somewhere else"
+    );
+    press(&mut c, rect_of(right));
+    assert_eq!(
+        c.session().focus(),
+        right,
+        "a press in the right pane went somewhere else"
+    );
+}
