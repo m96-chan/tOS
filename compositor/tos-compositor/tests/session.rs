@@ -288,6 +288,31 @@ fn a_split_layout_renders_every_pane() {
 }
 
 #[test]
+fn cycling_focus_reaches_every_pane_and_gives_a_zoom_back() {
+    // The directions stop at the edge of the workspace and refuse to move at
+    // all while a pane is zoomed, which is what the cycle is for: it is the
+    // way to the pane you cannot see from the one you are in.
+    let mut c = compositor(&["/bin/sh", "-c", "sleep 5"]);
+    let first = c.session().focus();
+    c.perform(Action::Split(Axis::Columns));
+    let second = c.session().focus();
+
+    assert!(c.perform(Action::FocusNext));
+    assert_eq!(c.session().focus(), first);
+    assert!(c.perform(Action::FocusPrevious));
+    assert_eq!(c.session().focus(), second);
+
+    // Zoomed, the direction keys have nowhere to go and the cycle takes the
+    // zoom off on its way out, so the pane it lands on is one that is drawn.
+    assert!(c.perform(Action::ToggleZoom));
+    assert!(!c.perform(Action::Focus(Direction::Left)));
+    assert!(c.perform(Action::FocusNext));
+    assert_eq!(c.session().focus(), first);
+    let area = c.grid_area();
+    assert_eq!(c.session().active().geometry(area).len(), 2);
+}
+
+#[test]
 fn a_zoomed_pane_fills_the_workspace() {
     let mut c = compositor(&["/bin/sh", "-c", "sleep 5"]);
     c.perform(Action::Split(Axis::Columns));

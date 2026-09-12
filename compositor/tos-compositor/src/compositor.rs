@@ -1192,6 +1192,29 @@ impl Compositor {
                 self.needs_full_redraw |= moved;
                 moved
             }
+            // Cycling resyncs the layout where moving in a direction does not,
+            // because cycling can land on a pane the zoom was hiding: focusing
+            // one gives every other pane on the workspace its geometry back.
+            // A workspace with one pane cycles to itself and has changed
+            // nothing, which is the false.
+            Action::FocusNext => {
+                let before = self.session.focus();
+                let moved = self.session.focus_next() != before;
+                if moved {
+                    self.sync_layout();
+                    self.needs_full_redraw = true;
+                }
+                moved
+            }
+            Action::FocusPrevious => {
+                let before = self.session.focus();
+                let moved = self.session.focus_previous() != before;
+                if moved {
+                    self.sync_layout();
+                    self.needs_full_redraw = true;
+                }
+                moved
+            }
             Action::Resize(direction, amount) => {
                 if self.session.resize_focused(area, direction, amount) {
                     self.sync_layout();

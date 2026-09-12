@@ -111,6 +111,8 @@ pub fn describe(action: &Action) -> String {
         Action::Split(Axis::Rows) => "split into rows".into(),
         Action::ClosePane => "close the focused pane".into(),
         Action::Focus(direction) => format!("move focus {}", toward(*direction)),
+        Action::FocusNext => "focus the next pane".into(),
+        Action::FocusPrevious => "focus the previous pane".into(),
         Action::Resize(direction, _) => format!("move the divider {}", toward(*direction)),
         Action::ToggleZoom => "zoom the focused pane".into(),
         Action::Balance => "even out every split".into(),
@@ -156,7 +158,14 @@ pub fn key_name(binding: &Binding) -> String {
     // binding is known as "?", and "shift+/" is the same thing said the long
     // way round. Letters and digits keep their shift, because "ctrl+shift+t"
     // is how that one is written and nobody calls shift+3 "#".
-    if modifiers.contains(Modifiers::SHIFT) {
+    //
+    // Only when shift is doing the shifting on its own, though. Holding ctrl
+    // or alt as well means the key types nothing at all, so naming it after a
+    // character it cannot produce would be naming it after something that does
+    // not happen — and "ctrl+}" is not what the terminal these combinations
+    // come from calls ctrl+shift+].
+    let typed = !modifiers.contains(Modifiers::CTRL) && !modifiers.contains(Modifiers::ALT);
+    if typed && modifiers.contains(Modifiers::SHIFT) {
         if let KeyCode::Char(c) = binding.code {
             if !c.is_alphanumeric() && !c.is_whitespace() {
                 if let Some(shifted) = tos_input::keymap::shifted(c) {
@@ -235,6 +244,10 @@ fn rank(action: &Action) -> (u16, u16) {
         Action::Split(Axis::Rows) => (0, 1),
         Action::ClosePane => (1, 0),
         Action::Focus(direction) => (2, toward(*direction)),
+        // After the four directions, because they are the same question asked
+        // without having to know where the answer is on screen.
+        Action::FocusNext => (2, 4),
+        Action::FocusPrevious => (2, 5),
         Action::ToggleZoom => (3, 0),
         Action::Balance => (3, 1),
         Action::Resize(direction, _) => (4, toward(*direction)),
@@ -494,6 +507,9 @@ mod tests {
             "split into rows",
             "close the focused pane",
             "move focus left",
+            "focus the next pane",
+            "focus the previous pane",
+            "scroll back",
             "move the divider up",
             "zoom the focused pane",
             "even out every split",
@@ -592,6 +608,16 @@ mod tests {
                 Modifiers::SUPER.union(Modifiers::SHIFT)
             )),
             "super+shift+3"
+        );
+        // And punctuation keeps its shift once ctrl is holding it down,
+        // because then the key types nothing at all: the combination Kitty
+        // calls ctrl+shift+] is not a way of typing a brace.
+        assert_eq!(
+            key_name(&Binding::new(
+                KeyCode::Char(']'),
+                Modifiers::CTRL.union(Modifiers::SHIFT)
+            )),
+            "ctrl+shift+]"
         );
     }
 

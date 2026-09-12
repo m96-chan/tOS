@@ -270,6 +270,23 @@ impl Session {
         next
     }
 
+    /// Focus the previous pane in layout order, wrapping around.
+    ///
+    /// The step back is `len - 1` forward rather than a subtraction, because
+    /// the position of the focused pane is where the wrap has to happen and
+    /// `0 - 1` is the case that would have to be written out anyway.
+    pub fn focus_previous(&mut self) -> PaneId {
+        let workspace = self.active_mut();
+        let panes = workspace.layout.panes();
+        let current = panes
+            .iter()
+            .position(|&p| p == workspace.focus)
+            .unwrap_or(0);
+        let previous = panes[(current + panes.len() - 1) % panes.len()];
+        workspace.set_focus(previous);
+        previous
+    }
+
     pub fn set_focus(&mut self, pane: PaneId) -> bool {
         // Focusing a pane on another workspace switches to that workspace.
         let Some(index) = self.workspaces.iter().position(|w| w.layout.contains(pane)) else {
@@ -482,6 +499,36 @@ mod tests {
         session.split_focused(area(), Axis::Columns);
         assert_eq!(session.focus_next(), PaneId(0));
         assert_eq!(session.focus_next(), PaneId(1));
+    }
+
+    #[test]
+    fn focus_previous_goes_the_other_way_round_the_workspace() {
+        let mut session = Session::new();
+        session.split_focused(area(), Axis::Columns);
+        session.split_focused(area(), Axis::Rows);
+        let panes = session.active().panes();
+        assert_eq!(panes.len(), 3);
+        // Forward and then back arrives where it started, which a cycle that
+        // wrapped in only one direction would not.
+        let start = session.focus();
+        session.focus_next();
+        assert_eq!(session.focus_previous(), start);
+        // And the step back off the first pane is the last one, not the first
+        // one again.
+        assert!(session.set_focus(panes[0]));
+        assert_eq!(session.focus_previous(), panes[2]);
+    }
+
+    #[test]
+    fn cycling_focus_leaves_a_zoom_that_was_hiding_where_it_went() {
+        // Both directions go through `set_focus`, which is where that is
+        // decided; a cycle that did not would move focus to a pane the zoom
+        // keeps off the screen.
+        let mut session = Session::new();
+        session.split_focused(area(), Axis::Columns);
+        assert!(session.toggle_zoom());
+        session.focus_next();
+        assert!(session.active().zoomed().is_none());
     }
 
     #[test]

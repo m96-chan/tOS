@@ -973,20 +973,50 @@ To render a frame without a display at all:
     -e /bin/sh -c 'ls; sleep 1'
 ```
 
-`tos --help` lists the options and the default key bindings. The leader key is
-`ctrl+a`; on hardware the same bindings work directly with `super`. The two
-bindings that grow a session are also where most people expect them:
-`ctrl+shift+enter` splits the focused pane and `ctrl+shift+t` opens a new
-workspace. `super+space` opens the launcher, `super+m` opens the notifications,
-`super+,` names the workspace and `super+shift+l` locks the screen on a machine
-that has a password to unlock with. `super+[` takes the keyboard into copy
-mode, where vi's motions — `h j k l`, `w b e`, `0 $`, `g G` and a screenful on
-`ctrl+f` and `ctrl+b` — move a copy cursor through the pane and its history,
-`v` fixes one end of the selection and `y` copies it and leaves; the arrow,
-home, end and page keys do the same for anyone who does not think in vi. From
-inside a session, `leader ?` puts the
-binding list over the panes; both it and `--help` are generated from the keymap
-that is running, so neither can fall behind it.
+`tos --help` lists the options and the default key bindings.
+
+Panes and workspaces answer to the combinations Kitty uses, because a pane is
+Kitty's window and a workspace is its tab, and tOS agrees with Kitty on every
+other protocol it speaks. These need nothing pressed first:
+
+| Key | Does |
+| --- | --- |
+| `ctrl+shift+enter` | split the focused pane |
+| `ctrl+shift+w` | close it |
+| `ctrl+shift+]` / `ctrl+shift+[` | focus the next or the previous pane |
+| `ctrl+shift+t` | open a workspace |
+| `ctrl+shift+right` / `ctrl+shift+left` | the next or the previous workspace |
+| `ctrl+shift+1` … `ctrl+shift+9` | a workspace by number |
+| `ctrl+shift+alt+t` | name the workspace |
+| `ctrl+shift+up` / `ctrl+shift+down` | scroll a line |
+| `ctrl+shift+page_up` / `ctrl+shift+page_down` | scroll a page |
+| `ctrl+shift+end` | jump back to the live screen |
+
+Kitty's `ctrl+shift+c` and `ctrl+shift+v` are deliberately left alone. tOS
+sends the Kitty keyboard protocol *into* its panes, so a program running in one
+can legitimately be handed `ctrl+shift+c`; claiming it at the compositor would
+take the combination away from every program in tOS at once. `ctrl+shift+q`
+closes a tab in Kitty and tOS has no close-workspace action to give it — only
+`Quit`, which leaves the compositor entirely — so it is left alone too.
+
+Everything else is on a leader key, `ctrl+a`, pressed and released before the
+key it prefixes. On hardware the same table works directly with `super`, which
+only a compositor that owns the keyboard can claim; the leader is what a nested
+development session has instead. So `leader x` and `super+x` close a pane,
+`leader h j k l` and the arrows move focus the way vim does, `super+space`
+opens the launcher, `super+m` opens the notifications, `super+,` names the
+workspace and `super+shift+l` locks the screen on a machine that has a password
+to unlock with.
+
+`super+[` takes the keyboard into copy mode, where vi's motions — `h j k l`,
+`w b e`, `0 $`, `g G` and a screenful on `ctrl+f` and `ctrl+b` — move a copy
+cursor through the pane and its history, `v` fixes one end of the selection and
+`y` copies it and leaves; the arrow, home, end and page keys do the same for
+anyone who does not think in vi. Copy and paste are `leader y` and `leader ]`.
+
+From inside a session, `leader ?` puts the binding list over the panes; both it
+and `--help` are generated from the keymap that is running, so neither can fall
+behind it.
 
 ## Configuration
 
