@@ -130,7 +130,7 @@ impl Settings {
         if let Some(problem) = name_problem(&self.username, "User name") {
             return Some(problem);
         }
-        if let Some(taken) = DEBIAN_ACCOUNTS.iter().find(|name| **name == self.username) {
+        if let Some(taken) = DEBIAN_NAMES.iter().find(|name| **name == self.username) {
             return Some(format!("User name {taken} is Debian's already"));
         }
         None
@@ -154,21 +154,27 @@ impl Settings {
     }
 }
 
-/// The accounts a Debian base system already has.
+/// The names a Debian base system has already taken.
 ///
-/// The installer adds its user by appending one line to the `/etc/passwd` the
-/// rootfs brought with it, which is right — `_apt` and the rest are Debian's
-/// to keep — but it means a name can now collide, where writing the whole file
-/// made that impossible. `getpwnam` answers with the first line that matches,
-/// so a person who called themselves `games` would be handed uid 5, a home of
-/// `/usr/games` and a shell of `nologin`: an account that cannot log in, with
-/// their password hash and their home directory sitting beside it belonging to
-/// nobody. Refused at the screen where the name is typed, which is before the
-/// disk has been touched.
+/// The installer adds its user by appending one line to the `/etc/passwd` and
+/// one to the `/etc/group` the rootfs brought with it, which is right — `_apt`
+/// and the rest are Debian's to keep — but it means a name can now collide,
+/// where writing both files whole made that impossible. `getpwnam` and
+/// `getgrnam` answer with the first line that matches, so a person who called
+/// themselves `games` would be handed uid 5, a home of `/usr/games` and a
+/// shell of `nologin`, with their password hash and their home directory
+/// sitting beside it belonging to nobody.
 ///
-/// `root` is in the list rather than beside it, because it was only ever the
-/// first name of this kind.
-const DEBIAN_ACCOUNTS: [&str; 20] = [
+/// The group names are here for the same reason and are the longer half of the
+/// list: `disk`, `video` and `sudo` are nobody's user name but all three are
+/// group names Debian ships, and a duplicate there gives the person a primary
+/// gid of 1000 while `chgrp disk` moves a file to gid 6.
+///
+/// Refused at the screen where the name is typed, which is before the disk has
+/// been touched. `root` is in the list rather than beside it, because it was
+/// only ever the first name of this kind.
+const DEBIAN_NAMES: [&str; 37] = [
+    // /etc/passwd
     "root",
     "daemon",
     "bin",
@@ -189,6 +195,24 @@ const DEBIAN_ACCOUNTS: [&str; 20] = [
     "systemd-network",
     "sshd",
     "messagebus",
+    // /etc/group, which the same append writes to
+    "disk",
+    "tty",
+    "dialout",
+    "fax",
+    "voice",
+    "cdrom",
+    "floppy",
+    "tape",
+    "audio",
+    "video",
+    "plugdev",
+    "staff",
+    "users",
+    "nogroup",
+    "sudo",
+    "src",
+    "shadow",
 ];
 
 /// Names have to survive being written into `/etc/passwd` and a host file.
@@ -433,7 +457,11 @@ mod tests {
         // getpwnam never returns: the person's home, their credential and
         // their uid all belong to an account nothing can reach. Writing the
         // whole file used to make that impossible.
-        for taken in ["root", "games", "www-data", "backup", "nobody"] {
+        // Both halves: a user name Debian's passwd has, and a name that is
+        // only ever a group — the same append writes to /etc/group too.
+        for taken in [
+            "root", "games", "www-data", "nobody", "disk", "sudo", "video",
+        ] {
             let settings = Settings {
                 username: taken.to_string(),
                 ..Settings::default()

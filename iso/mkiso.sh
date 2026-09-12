@@ -67,6 +67,23 @@ ROOT="$WORK/root"
 ISODIR="$WORK/iso"
 mkdir -p "$ROOT" "$ISODIR/boot/grub" dist
 
+# dist/ is written by this container, which is root, into a directory bind
+# mounted from the host — so everything in it comes out owned by root. The host
+# has no passwordless sudo, so a root-owned dist/ cannot be deleted and
+# `git worktree remove` fails on the worktree the image was built in, until
+# somebody works out why.
+#
+# On EXIT rather than at the end, because a build that failed is the one that
+# leaves it that way most often: the mirror was unreachable, an assertion about
+# the rootfs fired, cargo did not compile. build.sh says who invoked it; a
+# build run some other way skips this and keeps what it had.
+hand_dist_back() {
+    if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
+        chown -R "$HOST_UID:$HOST_GID" dist 2>/dev/null || true
+    fi
+}
+trap hand_dist_back EXIT
+
 # --- initramfs ---------------------------------------------------------
 mkdir -p "$ROOT/bin" "$ROOT/sbin" "$ROOT/dev" "$ROOT/proc" "$ROOT/sys" \
     "$ROOT/tmp" "$ROOT/root" "$ROOT/etc" "$ROOT/lib/modules/$KVER"
@@ -467,12 +484,6 @@ grub-mkrescue -o "$ISO" "$ISODIR" --quiet
 rm -rf "$WORK"
 
 # Everything above ran as root inside the container, so dist/ and the image in
-# it come out owned by root on the host. That is not a cosmetic problem: the
-# host has no passwordless sudo, so a root-owned dist/ cannot be deleted, and
-# `git worktree remove` on a worktree an image was built in fails until
-# somebody works out why. Hand it back to whoever invoked the build; build.sh
-# says who that is, and a build run some other way just skips this.
-if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
-    chown -R "$HOST_UID:$HOST_GID" dist
-fi
+# it come out owned by root on the host — handed back by the EXIT trap set at
+# the top of this file, which runs whether the build got this far or not.
 ls -lh "$ISO"

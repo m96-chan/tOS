@@ -726,6 +726,22 @@ fn planning_backend_for(world: &dyn crate::exec::Backend) -> crate::exec::Record
     backend
 }
 
+/// A recorder for a session that has a medium with a rootfs on it.
+///
+/// `pub(crate)` because `app.rs`'s tests drive the dry run and have to describe
+/// a live medium without being run on one — and since [`planning_backend`]
+/// started asking the machine, a helper that called it was describing whatever
+/// machine `cargo test` happened to be on.
+#[cfg(test)]
+pub(crate) fn live_planning_backend() -> crate::exec::Recorder {
+    let mut world = crate::exec::Recorder::new();
+    world
+        .existing
+        .push(crate::plan::LIVE_ROOTFS_IMAGE.to_string());
+    world.existing.push(UNSQUASHFS[0].to_string());
+    planning_backend_for(&world)
+}
+
 /// Where the session's environment is written, and what /etc/inittab respawns.
 pub const SESSION_SCRIPT_PATH: &str = "/etc/tos-session";
 
@@ -812,12 +828,7 @@ mod tests {
     /// derived from what the session has, so a test says what is on the
     /// machine and reads back the installation that follows from it.
     fn live_backend() -> Recorder {
-        let mut world = Recorder::new();
-        world
-            .existing
-            .push(crate::plan::LIVE_ROOTFS_IMAGE.to_string());
-        world.existing.push(UNSQUASHFS[0].to_string());
-        planning_backend_for(&world)
+        live_planning_backend()
     }
 
     /// The same, on a medium that carries no Debian rootfs: an image built
@@ -1322,19 +1333,26 @@ mod tests {
         // the installer wrote. So the exports are compared to the file rather
         // than to a memory of it: they drifted by a TERM and a PATH the first
         // time this was left to a comment.
-        let live = include_str!("../../iso/live-session");
-        let exports: Vec<&str> = live
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with("export "))
-            .collect();
-        assert!(exports.len() >= 5, "no exports found in iso/live-session");
-        for export in exports {
-            assert!(
-                SESSION_SCRIPT.contains(export),
-                "the installed session is missing `{export}`, which iso/live-session has"
-            );
+        fn exports(script: &str) -> Vec<String> {
+            let mut found: Vec<String> = script
+                .lines()
+                .map(|line| line.trim().trim_end_matches('\\').trim().to_string())
+                .filter(|line| line.starts_with("export "))
+                .collect();
+            found.sort();
+            found
         }
+
+        let live = exports(include_str!("../../iso/live-session"));
+        let installed = exports(SESSION_SCRIPT);
+        assert!(live.len() >= 5, "no exports found in iso/live-session");
+        // Both directions, and whole lines: a `contains` would have passed a
+        // TOS=10 against a TOS=1, and an export added to this file alone —
+        // the one edited by hand — is the drift that is likelier of the two.
+        assert_eq!(
+            live, installed,
+            "iso/live-session and the installed session export different things"
+        );
     }
 
     #[test]

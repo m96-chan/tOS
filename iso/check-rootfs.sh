@@ -9,9 +9,11 @@
 # the same commit was green on every other gate — the release boots, and a boot
 # cannot tell you what is missing from a filesystem it does not read.
 #
-# mkiso.sh makes the same assertions against the tree before it is squashed,
+# mkiso.sh asserts the same programs against the tree before it is squashed,
 # where a failure is cheaper and names the file. This is the other half of the
 # question: that what it checked is what mksquashfs actually put on the medium.
+# The two lists are kept in step by hand; where they differ, this one is the
+# one that has been shipped.
 set -euo pipefail
 
 iso=${1:?usage: iso/check-rootfs.sh <iso>}
@@ -31,7 +33,13 @@ sudo umount "$mount_point"
 # Debian is usr-merged, so /usr/bin is where /bin/apt really lives. tos-session
 # is what /init execs after the pivot, and init is what an installed machine's
 # inittab is read by; without either, the disk boots to nothing.
+# The installer's own tools are in this list for a reason of their own: the
+# installer runs from inside this rootfs, and a missing unsquashfs sends it
+# down the copy path — after Partition, FormatEsp and FormatRoot have already
+# run over somebody's disk. mkiso.sh asserts them against the tree; these lines
+# are the other half, that mksquashfs put on the medium what it was given.
 for path in usr/bin/dpkg usr/bin/apt usr/bin/bash usr/bin/mount \
+    usr/bin/unsquashfs usr/sbin/sfdisk usr/sbin/mkfs.ext4 usr/sbin/grub-install \
     usr/sbin/init usr/sbin/tos usr/sbin/tos-install \
     usr/sbin/tos-session var/lib/dpkg/status; do
     grep -qx "squashfs-root/$path" "$list" || {
