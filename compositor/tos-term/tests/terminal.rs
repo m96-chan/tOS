@@ -20,6 +20,27 @@ fn screen(t: &Terminal) -> Vec<String> {
 }
 
 #[test]
+fn a_wrapped_row_keeps_the_space_it_ends_on() {
+    // Trailing blanks are the empty end of a line — except on a row that
+    // wrapped, which ran out of columns, so a space in its last cell is one
+    // somebody typed between two words. Trimming it joined the words back
+    // together when the halves were reassembled, and which words that hit
+    // depended on where the wrap landed: it showed up as a test that passed or
+    // failed on the length of a path.
+    let mut t = term(10, 2);
+    t.advance(b"not a PNG file");
+
+    let mut text = String::new();
+    for row in t.grid().display_rows() {
+        text.push_str(&row.to_text());
+        if !row.wrapped {
+            break;
+        }
+    }
+    assert_eq!(text, "not a PNG file");
+}
+
+#[test]
 fn prints_plain_text() {
     let mut t = term(10, 2);
     t.advance(b"hello");

@@ -23,6 +23,12 @@ impl Flags {
     pub const WIDE: Flags = Flags(1 << 8);
     /// Placeholder cell that follows a `WIDE` cell.
     pub const WIDE_SPACER: Flags = Flags(1 << 9);
+    /// Blank left at the right margin because a double width glyph would not
+    /// fit beside it and moved to the next line whole. It is padding rather
+    /// than a space anybody typed, so anything reading the row back as text
+    /// leaves it out — the row is marked wrapped, and on a wrapped row the
+    /// trailing blanks are otherwise content.
+    pub const WRAP_PAD: Flags = Flags(1 << 10);
 
     pub const fn contains(self, other: Flags) -> bool {
         self.0 & other.0 == other.0

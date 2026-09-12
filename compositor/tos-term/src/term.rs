@@ -641,9 +641,14 @@ impl Terminal {
         if width == 2 && self.cursor.x + 1 >= cols {
             if self.modes.wraparound {
                 // A double width glyph never straddles the right margin.
+                // The cell it would have started in is left blank and marked
+                // as the padding it is: the row is about to be marked wrapped,
+                // and a wrapped row's trailing blank is ordinarily a space
+                // somebody typed between two words.
                 let (x, y) = (self.cursor.x, self.cursor.y);
                 if let Some(cell) = self.screen.cell_mut(x, y) {
                     cell.clear(&self.cursor.attrs);
+                    cell.attrs.flags.insert(Flags::WRAP_PAD);
                 }
                 self.wrap_line();
             } else {
