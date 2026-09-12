@@ -152,6 +152,11 @@ fn run_headless(config: Config) -> io::Result<()> {
         // Give the shell a moment to draw its prompt before the picture.
         for _ in 0..warmup {
             compositor.pump_panes();
+            // And the machine a chance to be read. The status bar's battery,
+            // network and volume come from a poll on a timer rather than from
+            // anything a pane does, so a picture taken without one is a
+            // picture of a bar that has not been told what machine it is on.
+            compositor.tick();
             let retained = display.retains_contents();
             display.frame(&mut |surface| compositor.render_frame(surface, retained))?;
             std::thread::sleep(std::time::Duration::from_millis(60));

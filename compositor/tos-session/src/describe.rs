@@ -256,13 +256,13 @@ fn rank(action: &Action) -> (u16, u16) {
         // Beside the launcher and the notification list rather than beside
         // quitting: all three are things done to the machine the session is
         // sitting on, not to the session.
-        Action::VolumeUp => (8, 3),
-        Action::VolumeDown => (8, 4),
-        Action::ToggleMute => (8, 5),
+        Action::VolumeUp => (8, 6),
+        Action::VolumeDown => (8, 7),
+        Action::ToggleMute => (8, 8),
         // With the other things that change what is on screen rather than what
         // is in the session, not with the things that end one.
-        Action::ToggleStatusBar => (8, 6),
-        Action::ShowNetworks => (8, 7),
+        Action::ToggleStatusBar => (8, 5),
+        Action::ShowNetworks => (8, 4),
         Action::Refresh => (9, 0),
         Action::Lock => (9, 1),
         Action::CopyMode => (7, 0),
