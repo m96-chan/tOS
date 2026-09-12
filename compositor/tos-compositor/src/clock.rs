@@ -422,19 +422,21 @@ impl TimeZone {
 
     /// Parse a TZif file.
     ///
-    /// Every length in the header is read before it is used to index anything,
-    /// and every slice is taken with a checked range: this file comes from the
-    /// filesystem of a machine that boots straight into the compositor, and a
-    /// truncated or hostile one has to end in `None` rather than in a panic
-    /// with no shell behind it.
+    /// The header is judged before any of it is believed. Taking every slice
+    /// with a checked range is not enough on its own: a count is also a vector
+    /// to reserve and a stride to multiply, and both of those go wrong a step
+    /// before the first `get` that would have returned `None`. This file comes
+    /// off the filesystem of a machine that boots straight into the
+    /// compositor, so a truncated or hostile one has to end in `None`, and so
+    /// in UT, rather than in a panic with no shell behind it.
     pub fn from_tzif(bytes: &[u8]) -> Option<TimeZone> {
-        let header = Header::parse(bytes)?;
+        let header = Header::parse(bytes, 4)?;
         // Version 2 and later repeat the whole thing with 64 bit timestamps,
         // and it is the second copy that is worth having: the first cannot
         // express a transition past 2038, and every zone has some.
         if header.version >= b'2' {
-            let rest = bytes.get(header.end_of_data()..)?;
-            let wide = Header::parse(rest)?;
+            let rest = bytes.get(header.end_of_data()?..)?;
+            let wide = Header::parse(rest, 8)?;
             let (zone, used) = TimeZone::read_block(rest, &wide, 8)?;
             let footer = rest.get(used..)?;
             return Some(TimeZone {
@@ -448,6 +450,12 @@ impl TimeZone {
     /// Read one data block, whose transition times are `width` bytes each.
     /// Returns the zone and how far into `bytes` the block reached.
     fn read_block(bytes: &[u8], header: &Header, width: usize) -> Option<(TimeZone, usize)> {
+        // The block cut to the length its own counts add up to. `Header::parse`
+        // has already measured that against the file, so this cannot fail;
+        // taking it anyway is what makes every offset below an index into
+        // something bounded rather than a sum that has to be trusted.
+        let end = Header::SIZE.checked_add(header.block_size(width)?)?;
+        let bytes = bytes.get(..end)?;
         let mut at = Header::SIZE;
         let mut transitions = Vec::with_capacity(header.transition_count);
         for index in 0..header.transition_count {
@@ -481,20 +489,18 @@ impl TimeZone {
                 abbreviation: read_name(names, name_at)?,
             });
         }
-        at += header.char_count;
         // The leap second table and the two flag arrays are skipped rather
         // than read: nothing on a status bar is measured in TAI, and the flags
         // only matter to code resolving a POSIX rule against the file, which
-        // is not what the footer rule is for here.
-        at += header.leap_count * (width + 4);
-        at += header.is_std_count + header.is_ut_count;
+        // is not what the footer rule is for here. They are the tail of the
+        // block, so the end of it is where the caller carries on from.
         Some((
             TimeZone {
                 transitions,
                 types,
                 rule: None,
             },
-            at,
+            end,
         ))
     }
 }
@@ -518,39 +524,86 @@ struct Header {
 impl Header {
     const SIZE: usize = 44;
 
-    fn parse(bytes: &[u8]) -> Option<Header> {
+    /// Read a header, and refuse one the file behind it could not be.
+    ///
+    /// `width` is how many bytes a transition time takes in the block this
+    /// header introduces — four in a version 1 block, eight in the version 2
+    /// one — because the only honest question to ask of a count is whether the
+    /// bytes it claims are actually present, and that cannot be asked without
+    /// knowing the stride.
+    ///
+    /// Judging the counts here, rather than leaving each later read to defend
+    /// itself, is the whole point. A count is not only an index: `read_block`
+    /// reserves a vector from the transition count and `end_of_data`
+    /// multiplies it, and both of those happen a step before the `get` that
+    /// would have caught the bad range. A `timecnt` of `FF FF FF FF` reads as
+    /// -1, casts to every address there is, and takes the compositor down in
+    /// `Vec::with_capacity` — on a machine where the compositor is `/init` and
+    /// the file came from `TZ` or a line of config, which is to say from
+    /// anywhere. One rule at the door leaves every read behind it able to
+    /// trust the numbers it was handed.
+    fn parse(bytes: &[u8], width: usize) -> Option<Header> {
         let head = bytes.get(..Header::SIZE)?;
         if &head[..4] != b"TZif" {
             return None;
         }
-        let count = |at: usize| read_int(&head[at..at + 4]) as usize;
+        // The counts are written as signed integers and none of them can be
+        // negative, so a set sign bit is corruption rather than a big number,
+        // and `as usize` would have quietly agreed that it was a big number.
+        let count = |at: usize| usize::try_from(read_int(&head[at..at + 4])).ok();
         let header = Header {
             version: head[4],
-            is_ut_count: count(20),
-            is_std_count: count(24),
-            leap_count: count(28),
-            transition_count: count(32),
-            type_count: count(36),
-            char_count: count(40),
+            is_ut_count: count(20)?,
+            is_std_count: count(24)?,
+            leap_count: count(28)?,
+            transition_count: count(32)?,
+            type_count: count(36)?,
+            char_count: count(40)?,
         };
         // A file with no local time types cannot say what any instant is, and
         // every other read here assumes there is at least one.
         if header.type_count == 0 {
             return None;
         }
+        // A count of more than the file has room for is not a count. This is
+        // deliberately the weakest form of the test — it says the bytes could
+        // be there, not that they are what they claim — because that is enough
+        // to bound every length by the size of a file that was read into
+        // memory, and anything stricter would start refusing zones over
+        // padding that `zic` is entitled to write.
+        if header.block_size(width)? > bytes.len() - Header::SIZE {
+            return None;
+        }
         Some(header)
     }
 
+    /// How many bytes of data block these counts describe, at `width` bytes a
+    /// transition time, or `None` when that is past being a number at all.
+    ///
+    /// Checked all the way through because it is the one piece of arithmetic
+    /// that runs before the counts have been believed: everything downstream
+    /// gets to multiply freely precisely because this returned a length that
+    /// fitted in the file.
+    fn block_size(&self, width: usize) -> Option<usize> {
+        // A transition costs its timestamp plus the one byte saying which
+        // offset it moves to; a leap second costs its timestamp plus a four
+        // byte running total.
+        let transitions = self.transition_count.checked_mul(width.checked_add(1)?)?;
+        let leaps = self.leap_count.checked_mul(width.checked_add(4)?)?;
+        transitions
+            .checked_add(self.type_count.checked_mul(6)?)?
+            .checked_add(self.char_count)?
+            .checked_add(leaps)?
+            .checked_add(self.is_std_count)?
+            .checked_add(self.is_ut_count)
+    }
+
     /// How far the version 1 block this header describes reaches, which is
-    /// where the version 2 header begins.
-    fn end_of_data(&self) -> usize {
-        Header::SIZE
-            + self.transition_count * 5
-            + self.type_count * 6
-            + self.char_count
-            + self.leap_count * 8
-            + self.is_std_count
-            + self.is_ut_count
+    /// where the version 2 header begins. Four bytes a transition time
+    /// whatever version the file turns out to be: the first block is always
+    /// the narrow one.
+    fn end_of_data(&self) -> Option<usize> {
+        Header::SIZE.checked_add(self.block_size(4)?)
     }
 }
 
@@ -991,6 +1044,87 @@ mod tests {
         truncated[4] = b'2';
         truncated[39] = 1; // one local time type, so the header itself is sane
         assert!(TimeZone::from_tzif(&truncated).is_none());
+    }
+
+    /// A bare header with the six counts written into it and nothing behind
+    /// it, which is all a length check needs to be given a chance to run.
+    /// Order is the file's own: `isut`, `isstd`, `leap`, `time`, `type`,
+    /// `char`.
+    fn tzif_header(version: u8, counts: [u32; 6]) -> Vec<u8> {
+        let mut bytes = vec![0u8; Header::SIZE];
+        bytes[..4].copy_from_slice(b"TZif");
+        bytes[4] = version;
+        for (index, count) in counts.iter().enumerate() {
+            let at = 20 + index * 4;
+            bytes[at..at + 4].copy_from_slice(&count.to_be_bytes());
+        }
+        bytes
+    }
+
+    /// The smallest version 1 file that is still an answer: one transition,
+    /// one local time type, one abbreviation.
+    fn tzif_v1() -> Vec<u8> {
+        let mut bytes = tzif_header(b'\0', [0, 0, 0, 1, 1, 4]);
+        bytes.extend_from_slice(&0i32.to_be_bytes()); // a transition at the epoch
+        bytes.push(0); // to the only type there is
+        bytes.extend_from_slice(&(9 * 3600i32).to_be_bytes());
+        bytes.push(0); // not summer time
+        bytes.push(0); // whose abbreviation starts at the first byte
+        bytes.extend_from_slice(b"JST\0");
+        bytes
+    }
+
+    #[test]
+    fn a_count_of_minus_one_is_not_a_count_of_everything() {
+        // `FF FF FF FF` is how a corrupt or hostile file says -1, and the cast
+        // to `usize` used to turn that into every address there is. Both
+        // versions are tried because they fall over in different places: the
+        // version 1 reader reserves a vector from the count, and the version 2
+        // path multiplies it to find where the second header starts. A version
+        // 1 file writes a NUL in the version byte rather than a '1'.
+        for version in [0u8, b'2'] {
+            let bytes = tzif_header(version, [0, 0, 0, 0xFFFF_FFFF, 1, 0]);
+            assert!(TimeZone::from_tzif(&bytes).is_none());
+        }
+    }
+
+    #[test]
+    fn a_transition_count_no_file_could_hold_is_not_read_as_one() {
+        // Positive, and still a lie: forty four bytes do not carry a million
+        // transitions, and a reader that took the header's word for it would
+        // reserve sixteen megabytes before finding that out.
+        let bytes = tzif_header(b'\0', [0, 0, 0, 1_000_000, 1, 0]);
+        assert!(TimeZone::from_tzif(&bytes).is_none());
+    }
+
+    #[test]
+    fn every_count_in_the_header_is_measured_against_the_file() {
+        // `type_count` was once the only one looked at, which left the other
+        // five as five routes to the same crash.
+        for field in 0..6 {
+            let mut counts = [0, 0, 0, 0, 1, 0];
+            counts[field] = 0xFFFF_FFFF;
+            let bytes = tzif_header(b'\0', counts);
+            assert!(
+                TimeZone::from_tzif(&bytes).is_none(),
+                "count {field} was believed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_cut_short_of_what_its_header_promised_is_refused() {
+        let whole = tzif_v1();
+        // Whole, it is a zone: the check has to say yes to this before any of
+        // its refusals mean anything.
+        let zone = TimeZone::from_tzif(&whole).expect("a zone");
+        assert_eq!(zone.offset_at(0), (9 * 3600, "JST"));
+        for cut in 1..=whole.len() - Header::SIZE {
+            assert!(
+                TimeZone::from_tzif(&whole[..whole.len() - cut]).is_none(),
+                "{cut} bytes short and still read"
+            );
+        }
     }
 
     #[test]
