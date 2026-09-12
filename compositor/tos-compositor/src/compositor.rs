@@ -1514,11 +1514,24 @@ impl Compositor {
             }
             Action::MovePaneToWorkspace(n) => {
                 let moved = self.session.move_focused_to_workspace(area, n);
-                if moved {
-                    self.sync_layout();
-                    self.needs_full_redraw = true;
+                if !moved {
+                    // A refusal with nothing said reads as a dropped
+                    // keystroke, which is why a refused split says so too.
+                    // Which of the reasons applied — no such workspace, the
+                    // one already on screen, the last pane of this one, or no
+                    // room over there — does not come back through a bool, so
+                    // the message says the one thing true of all of them.
+                    self.notifications.status("the pane cannot move there");
                 }
-                moved
+                // Resynced whether or not the pane went. The panes are sized
+                // from geometry this arm may have just changed, and a bool
+                // does not say how far the session got before it gave up;
+                // leaving the resync out is how a workspace ends up drawn in
+                // rectangles none of its programs have been told about.
+                // Resyncing a workspace that did not change costs nothing.
+                self.sync_layout();
+                self.needs_full_redraw = true;
+                true
             }
             Action::RenameWorkspace => {
                 // The prompt opens on the name the workspace has now, which is

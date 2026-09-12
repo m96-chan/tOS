@@ -903,3 +903,42 @@ fn every_row_has_room_for_its_keys() {
         assert!(width <= INNER, "{row:?} needs {width} columns");
     }
 }
+
+#[test]
+fn a_refused_move_to_a_workspace_leaves_the_panes_the_size_they_are_drawn() {
+    // A refused move used to rewrite the workspace it had failed to leave and
+    // then skip its resync, because the arm only resynced when the pane went.
+    // The next frame was drawn from geometry no PTY had been told about, and
+    // every program in the workspace rendered at the wrong width until some
+    // unrelated key happened to resync it.
+    let mut c = compositor(&["/bin/sh", "-c", "sleep 5"]);
+    for _ in 0..4 {
+        c.perform(Action::Split(Axis::Columns));
+    }
+
+    // A workspace whose focused pane has no room left to divide has no room
+    // for a pane from anywhere else either, which is the refusal.
+    c.perform(Action::NewWorkspace);
+    loop {
+        let before = c.session().active().panes().len();
+        c.perform(Action::Split(Axis::Columns));
+        if c.session().active().panes().len() == before {
+            break;
+        }
+    }
+    c.perform(Action::SelectWorkspace(1));
+
+    let before = c.session().active().panes();
+    c.perform(Action::MovePaneToWorkspace(2));
+    for (id, rect) in c.session().active().geometry(c.grid_area()) {
+        let grid = c.pane(id).expect("pane").terminal.grid();
+        assert_eq!(
+            (grid.cols() as u32, grid.rows() as u32),
+            (rect.width, rect.height),
+            "{id:?} is drawn in {rect:?} but its terminal is {}x{}",
+            grid.cols(),
+            grid.rows(),
+        );
+    }
+    assert_eq!(c.session().active().panes(), before, "the pane stayed put");
+}

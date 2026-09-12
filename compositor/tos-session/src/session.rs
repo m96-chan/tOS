@@ -520,6 +520,16 @@ impl Session {
         }
 
         let source = self.active;
+        // The destination gets the last word, and it may say no, so keep the
+        // workspace the pane is leaving. Undoing the move by hand cannot
+        // restore it: closing a pane hands its space to its neighbours, and
+        // splitting the pane back in afterwards puts it beside whichever pane
+        // focus moved to, in a tree weighted differently from the one the user
+        // was looking at. Worse, that second split can be refused in its own
+        // right when the pane it lands on is too narrow to divide, which left
+        // the pane in no tree at all while focus still pointed at it. A copy
+        // is the only thing that gives back the workspace as it was found.
+        let restore = self.workspaces[source].clone();
         let neighbour = self.workspaces[source]
             .panes()
             .into_iter()
@@ -532,19 +542,15 @@ impl Session {
             self.workspaces[source].focus = neighbour;
         }
 
-        let destination = &mut self.workspaces[target];
-        let focus = destination.focus;
-        if !destination.layout.split(area, focus, Axis::Columns, pane) {
-            // Put the pane back rather than losing it to a workspace that has
-            // no room for it.
-            let source_workspace = &mut self.workspaces[source];
-            let source_focus = source_workspace.focus;
-            source_workspace
-                .layout
-                .split(area, source_focus, Axis::Columns, pane);
-            source_workspace.focus = pane;
+        let focus = self.workspaces[target].focus;
+        if !self.workspaces[target]
+            .layout
+            .split(area, focus, Axis::Columns, pane)
+        {
+            self.workspaces[source] = restore;
             return false;
         }
+        let destination = &mut self.workspaces[target];
         destination.focus = pane;
         destination.zoomed = None;
         true
@@ -786,6 +792,72 @@ mod tests {
         session.select_workspace(1);
         // Workspace 1 has a single pane, so its pane cannot leave.
         assert!(!session.move_focused_to_workspace(area(), 2));
+    }
+
+    /// A workspace whose focused pane has no room left to divide, so that
+    /// moving a pane into it is refused.
+    fn full_workspace(session: &mut Session) {
+        session.new_workspace();
+        while session.split_focused(area(), Axis::Columns).is_some() {}
+    }
+
+    #[test]
+    fn a_refused_move_leaves_the_pane_in_the_tree_it_started_in() {
+        // The rollback used to put the pane back by splitting it in beside
+        // whatever focus had moved to, and that split can be refused in its
+        // own right: a pane two cells wide has nowhere to put a second one.
+        // The pane then belonged to no workspace at all while `focus` still
+        // named it, so every keystroke went to a pane nothing drew and the
+        // next close read as the last pane in the session.
+        let mut session = Session::new();
+        // Splitting the first pane over and over leaves a row that halves
+        // towards the left edge, where the outermost panes are too narrow to
+        // divide again.
+        let root = session.focus();
+        for _ in 0..5 {
+            session.set_focus(root);
+            session.split_focused(area(), Axis::Columns).unwrap();
+        }
+        let narrow = session.active().panes()[1];
+        full_workspace(&mut session);
+        session.select_workspace(1);
+        session.set_focus(narrow);
+
+        let tree = session.workspaces()[0].panes();
+        let geometry = session.workspaces()[0].geometry(area());
+        assert!(!session.move_focused_to_workspace(area(), 2));
+        assert_eq!(
+            session.workspace_of(narrow),
+            Some(session.workspaces()[0].id)
+        );
+        assert_eq!(session.workspaces()[0].panes(), tree);
+        assert_eq!(session.workspaces()[0].geometry(area()), geometry);
+        assert_eq!(session.focus(), narrow);
+        // A pane in the tree closes to itself. An orphan closed to nothing,
+        // which is how the compositor is told the session is over.
+        assert_eq!(session.close_pane(narrow), vec![narrow]);
+    }
+
+    #[test]
+    fn a_refused_move_leaves_the_source_widths_alone() {
+        // Closing a pane hands its space to its neighbours, so splitting it
+        // back in afterwards is not the tree it came from. The pane returned
+        // second in a row it had been last in, with every width rewritten,
+        // for a key that reported that nothing had happened.
+        let mut session = Session::new();
+        for _ in 0..4 {
+            session.split_focused(area(), Axis::Columns).unwrap();
+        }
+        let moving = session.focus();
+        full_workspace(&mut session);
+        session.select_workspace(1);
+        assert_eq!(session.focus(), moving);
+
+        let tree = session.workspaces()[0].panes();
+        let geometry = session.workspaces()[0].geometry(area());
+        assert!(!session.move_focused_to_workspace(area(), 2));
+        assert_eq!(session.workspaces()[0].panes(), tree);
+        assert_eq!(session.workspaces()[0].geometry(area()), geometry);
     }
 
     #[test]
