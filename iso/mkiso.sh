@@ -184,6 +184,18 @@ depmod -b "$ROOT" "$KVER"
 for applet in blkid mkdir rm chmod hostname reboot; do
     ln -sf /bin/busybox "$ROOT/bin/$applet" 2>/dev/null || true
 done
+
+# The kernel loads a module it needs mid-syscall by running the program named
+# in kernel.modprobe, which is /sbin/modprobe and not on any PATH — /init
+# installs busybox's applets into /bin, so without this the kernel asks for a
+# module and finds nothing to ask with.
+#
+# Two mounts the installer makes need it. ext4 wants crc32c from the crypto
+# API, because Debian's mke2fs turns metadata_csum on: without the driver the
+# root filesystem it just made answers "Cannot load crc32c driver" and refuses
+# to mount. FAT wants its codepage the same way, which is the ESP under UEFI.
+# Both modules are already on the image; nothing could reach them.
+ln -sf /bin/busybox "$ROOT/sbin/modprobe"
 (cd "$ROOT" && find . | cpio -o -H newc --quiet | gzip -9) \
     >"$ISODIR/boot/initramfs.gz"
 
