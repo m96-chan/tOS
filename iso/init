@@ -48,10 +48,26 @@ mkdir -p /run/live
 # The kernel ships these as modules. Load whatever the machine has; missing
 # hardware just means a harmless failure. The last three are not hardware at
 # all: they are how the squashfs on the medium becomes a writable root.
+#
+# This loop is the only thing that loads anything. There is no udev here, and
+# this kernel is built without CONFIG_UEVENT_HELPER — /sys/kernel/uevent_helper
+# does not exist — so nothing asks for a driver on the machine's behalf: a
+# module that is on the image and not named here is a module that never loads.
+# The network drivers were packed and this was missed, and the symptom was the
+# one the whole network menu shows: `lo`, and "no wired or wireless
+# interfaces", on a machine whose adapter was sitting on the PCI bus.
+#
+# virtio_pci has to come with virtio_net rather than after it. virtio_net binds
+# virtio devices, not PCI ones, and without the bus driver bound there is no
+# virtio device for it to claim — loading virtio_net alone leaves the adapter
+# unclaimed and silent, which is exactly what it looked like. It was missing
+# here before for the same reason nobody noticed: the machines this is booted
+# on take their disk and screen from IDE and VGA, so nothing else needed it.
 for mod in bochs virtio_gpu simpledrm cirrus vmwgfx vboxvideo \
     evdev atkbd i8042 psmouse virtio_input hid_generic usbhid \
     sd_mod sr_mod cdrom ata_piix ahci virtio_blk virtio_scsi \
     nvme usb_storage uas xhci_pci ehci_pci ohci_pci sdhci_pci mmc_block \
+    virtio_pci virtio_net e1000 e1000e r8169 igb \
     isofs ext4 vfat \
     loop squashfs overlay; do
     modprobe "$mod" 2>/dev/null
