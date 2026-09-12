@@ -267,4 +267,14 @@ EOF
 ISO="dist/tos-$ARCH.iso"
 grub-mkrescue -o "$ISO" "$ISODIR" --quiet
 rm -rf "$WORK"
+
+# Everything above ran as root inside the container, so dist/ and the image in
+# it come out owned by root on the host. That is not a cosmetic problem: the
+# host has no passwordless sudo, so a root-owned dist/ cannot be deleted, and
+# `git worktree remove` on a worktree an image was built in fails until
+# somebody works out why. Hand it back to whoever invoked the build; build.sh
+# says who that is, and a build run some other way just skips this.
+if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
+    chown -R "$HOST_UID:$HOST_GID" dist
+fi
 ls -lh "$ISO"

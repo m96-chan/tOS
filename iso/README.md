@@ -35,8 +35,19 @@ artifact.
 ## Running
 
 ```sh
-iso/run.sh            # QEMU, bochs-drm framebuffer, serial log on stdout
+iso/run.sh            # VirtualBox, headless, serial log on stdout
+iso/run.sh --gui      # ... in a window as well
 ```
+
+The VM is created and destroyed around the boot, so nothing it does survives
+and the name is free for the next run. It has no disk, which means it is for
+watching the image boot rather than for testing `tos-install` — installing
+needs a machine you keep.
+
+CI boots the same image under QEMU (`iso.yml` and `release.yml` drive it
+inline), so the image is proved on two hypervisors and neither is the only
+witness. That is also why this script does not have to stay QEMU: the developer
+path and the gate are different things.
 
 Any virtual machine will do: the initramfs carries the DRM drivers QEMU,
 VirtualBox and VMware put in front of a guest (`bochs`, `virtio_gpu`,
@@ -98,7 +109,7 @@ emergency busybox shell on the console.
 | `mkiso.sh`  | container-side build: static binaries, initramfs, `grub-mkrescue` |
 | `init`      | initramfs PID 1: mounts, modprobe, `switch_root` into `root=`, or find the medium and exec `tos` |
 | `profile`   | sourced by every shell; prints the banner and the install hint |
-| `run.sh`    | boots `dist/tos-<arch>.iso` in QEMU                           |
+| `run.sh`    | boots `dist/tos-<arch>.iso` in VirtualBox, and cleans up after |
 
 ## Known limits
 

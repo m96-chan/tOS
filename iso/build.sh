@@ -28,7 +28,12 @@ esac
 
 # Named volumes keep the registry and target dir warm between builds, and
 # keep the container's Linux artifacts out of the host target/.
+# The container runs as root and writes dist/ into the checkout. Passing the
+# invoking user in lets mkiso.sh hand it back, which matters on a host with no
+# passwordless sudo — see the note beside the chown there.
 exec "$engine" run --rm --platform "$platform" \
+    -e HOST_UID="$(id -u)" \
+    -e HOST_GID="$(id -g)" \
     -v "$PWD":/src \
     -v "tos-iso-cargo-$ARCH":/usr/local/cargo/registry \
     -v "tos-iso-target-$ARCH":/src/target \
