@@ -6,4 +6,6 @@
 //! `tos-compositor` owns all of that, per `docs/design/ime.md`.
 
 pub mod dict;
+pub mod history;
+pub mod okuri;
 pub mod romaji;
