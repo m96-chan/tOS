@@ -474,9 +474,19 @@ than being silently dropped, so applications can fall back instead of hanging.
 
 Only inline transmission is read, though. `t=f` and `t=t`, where the
 application hands over a path instead of the bytes, are still refused, and
-that is the route some file managers take for a large image. No preview tool
-has been run against tOS yet, so what is verified is the decoding, not the
-integration.
+that is the route some file managers take for a large image.
+
+`tos-preview` is the program that uses all of this, and it ships on the ISO
+next to `tos` and `tos-install`. It reads a PNG, sizes it to the pane from the
+cell metrics the kernel is already holding in the pane's `winsize`, and hands
+the file to the terminal as `f=100` rather than decoding it first — the same
+route a file manager takes, so what is exercised is the integration and not
+only the decoder. It has been run in a pane and the resulting frame counted
+pixel by pixel against the picture that went in (`preview/tests/pane.rs`), and
+it has been run on the booted ISO under QEMU with the picture read off a
+second disc — the live image itself still carries no image file to point it
+at, which is the last thing between this and a session that can demonstrate
+itself.
 
 Placements are scaled once and the result is kept, so a repeat frame costs a
 blend instead of a resample. The cache is a plain CPU one, bounded in bytes
@@ -912,6 +922,7 @@ backends.
 ```text
 tOS/
 ├── installer/           tos-install: put tOS on a disk from the live session
+├── preview/             tos-preview: show an image in a pane
 ├── iso/                 bootable image and its initramfs
 └── compositor/
     ├── tos-term/        terminal model: cells, grid, VT parser, graphics

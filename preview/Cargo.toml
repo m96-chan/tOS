@@ -1,0 +1,25 @@
+[package]
+name = "tos-preview"
+description = "Show an image in a tOS pane, over the compositor's graphics protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tos-preview"
+path = "src/main.rs"
+
+[lib]
+name = "tos_preview"
+path = "src/lib.rs"
+
+[dependencies]
+tos-platform = { workspace = true }
+tos-term = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tos-compositor = { workspace = true }
+tos-render = { workspace = true }
