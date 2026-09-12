@@ -35,6 +35,7 @@ use crate::lock::{self, LockOutcome, LockScreen};
 use crate::notify::{self, Chosen, Notifications};
 use crate::overlay::{Overlay, OverlayItem, OverlayOutcome, Placement};
 use crate::pane::Pane;
+use crate::pointer::{self, Pointer};
 use crate::power;
 use crate::selection::{Selection, SelectionMode};
 use crate::status::{self, Bar, Hit, Piece, Segment};
@@ -260,8 +261,9 @@ pub struct Compositor {
     session_ended_while_locked: bool,
     needs_full_redraw: bool,
     running: bool,
-    /// Pointer position in pixels, for mouse routing.
-    pointer: (u32, u32),
+    /// The mouse pointer: where it is, whether it is being shown, and where
+    /// the last frame drew it. See [`crate::pointer`].
+    pointer: Pointer,
     /// What a mouse button went down on, while it is still down.
     mouse_grab: Option<Grab>,
     /// The previous left press, for double and triple click.
@@ -381,7 +383,7 @@ impl Compositor {
             session_ended_while_locked: false,
             needs_full_redraw: true,
             running: true,
-            pointer: (0, 0),
+            pointer: Pointer::default(),
             mouse_grab: None,
             last_click: None,
             pending_writes: false,
@@ -706,28 +708,56 @@ impl Compositor {
             return self.locked_input(event);
         }
         match event {
-            InputEvent::Key(key) => self.handle_key(key),
+            InputEvent::Key(key) => {
+                // Typing puts the arrow away. Somebody at the keyboard is
+                // reading the line they are typing, and the pointer is
+                // wherever their hand left it — which, for anyone who typed
+                // after clicking into a pane, is directly on top of that line.
+                // It comes back on the next motion, so getting it back costs
+                // the same gesture as wanting it.
+                let put_away = self.pointer.hide();
+                self.handle_key(key) || put_away
+            }
             // A host terminal reports cells; a device reports pixels. The two
             // are separate types so the conversion can never be skipped.
-            InputEvent::Mouse(mouse) => self.route_mouse(
-                mouse.col as u32,
-                mouse.row as u32,
-                mouse.button,
-                mouse.action,
-                mouse.modifiers,
-            ),
+            InputEvent::Mouse(mouse) => {
+                let (cw, ch) = self.cell_size();
+                // Synthesised back the other way, so a nested session gets a
+                // pointer too. It snaps to the corner of the cell because SGR
+                // mouse reporting carries a cell number and nothing finer:
+                // there is no sub-cell position to be had, and an arrow drawn
+                // at the middle of the cell would be claiming a precision the
+                // host terminal never sent.
+                let moved = self
+                    .pointer
+                    .moved_to(mouse.col as u32 * cw, mouse.row as u32 * ch);
+                let routed = self.route_mouse(
+                    mouse.col as u32,
+                    mouse.row as u32,
+                    mouse.button,
+                    mouse.action,
+                    mouse.modifiers,
+                );
+                routed || moved
+            }
             InputEvent::Pointer(pointer) => {
                 let (cw, ch) = self.cell_size();
                 let x = pointer.x.max(0.0) as u32;
                 let y = pointer.y.max(0.0) as u32;
-                self.pointer = (x, y);
-                self.route_mouse(
+                // Before the routing rather than after it, because the two
+                // answers are ORed together and `route_mouse` says `false` for
+                // a motion that grabbed nothing. That used to mean a bare
+                // motion asked for no frame at all, which was correct while
+                // there was nothing on screen to move.
+                let moved = self.pointer.moved_to(x, y);
+                let routed = self.route_mouse(
                     x / cw,
                     y / ch,
                     pointer.button,
                     pointer.action,
                     pointer.modifiers,
-                )
+                );
+                routed || moved
             }
             InputEvent::Paste(text) => {
                 self.paste_text(&text);
@@ -2665,10 +2695,44 @@ impl Compositor {
     /// Whether anything has changed since the last frame.
     pub fn needs_render(&self) -> bool {
         self.needs_full_redraw
+            || self.pointer_moved_since_it_was_drawn()
             || self
                 .panes
                 .values()
                 .any(|pane| pane.terminal.damage().is_dirty())
+    }
+
+    /// Where the arrow belongs this frame, or `None` for no arrow at all.
+    ///
+    /// The lock is the only thing that takes it away other than the pointer's
+    /// own state: a locked screen shows nothing of the session, and an arrow
+    /// left on top of the password box would be the one thing on screen still
+    /// tracking a hand that has not proved whose it is. `locked_input` drops
+    /// pointer events anyway, so it cannot move while it is gone.
+    fn pointer_rect(&self) -> Option<PixelRect> {
+        if self.lock.is_some() {
+            return None;
+        }
+        let rect = self.pointer.rect(self.cell_size())?;
+        // Clipped to the panel so that the remembered rectangle is the one
+        // that was actually painted. `intersect` keeps the corner and only
+        // shrinks the far edges, so the hotspot — and therefore the shape of
+        // what gets drawn — is untouched by this.
+        let clipped = rect.intersect(&PixelRect::new(0, 0, self.size.0, self.size.1));
+        (!clipped.is_empty()).then_some(clipped)
+    }
+
+    /// Whether the arrow is somewhere other than where it was last painted.
+    ///
+    /// This is what makes a bare motion produce a frame. There is no
+    /// screen-space damage to mark — `Damage` belongs to a pane's grid and the
+    /// pointer is in neither — and a `moved` flag set by the motion would be
+    /// one more thing to remember to clear, with a stuck one costing a frame
+    /// per poll for the rest of the session. Comparing wanted against painted
+    /// answers the question and retires itself: after a frame the two agree,
+    /// so a hand that has stopped moving stops asking.
+    fn pointer_moved_since_it_was_drawn(&self) -> bool {
+        self.pointer_rect() != self.pointer.painted()
     }
 
     /// Paint a frame.
@@ -2698,8 +2762,28 @@ impl Compositor {
             }
         }
 
+        // And the same trick for the arrow, with one wrinkle the preedit does
+        // not have: the preedit is always over the pane it is being typed
+        // into, and the pointer is over whatever it is pointing at. Working
+        // out what that was is `uncover_pointer` below.
+        let pointer = self.pointer_rect();
+        let uncover = self.pointer.painted().filter(|was| Some(*was) != pointer);
+        let mut repaint_chrome = false;
+        if !force {
+            if let Some(was) = uncover {
+                repaint_chrome = self.uncover_pointer(was, &geometry);
+            }
+        }
+
         if force {
             surface.clear(self.chrome.background);
+        } else if let Some(was) = uncover.filter(|_| repaint_chrome) {
+            // Nothing owns these pixels, so nothing is going to repaint them
+            // and the arrow would stay where it was. Painting the background
+            // back is safe over the panes this rectangle also touches, because
+            // it happens before they draw and their damaged rows cover the
+            // whole of the part that overlaps.
+            surface.fill(was, self.chrome.background);
         }
 
         let mut drawn: Vec<PaneId> = Vec::with_capacity(geometry.len());
@@ -2750,7 +2834,7 @@ impl Compositor {
             );
         }
 
-        if force {
+        if force || repaint_chrome {
             let focused_rect = geometry
                 .iter()
                 .find(|(id, _)| *id == focus)
@@ -2817,6 +2901,20 @@ impl Compositor {
         // decision anybody has to make.
         self.draw_ime(surface, &geometry);
 
+        // The arrow last of all, over the overlay and over the preedit. It is
+        // the one thing on screen that is not part of the session: whatever it
+        // is pointing at, it has to be on top of, or it is pointing from
+        // underneath.
+        if let Some(rect) = pointer {
+            pointer::draw(
+                surface,
+                rect,
+                self.chrome.foreground,
+                self.chrome.background,
+            );
+        }
+        self.pointer.set_painted(pointer);
+
         for (id, pane) in self.panes.iter_mut() {
             // A pane skipped for synchronized output was not painted, so its
             // damage still describes work outstanding; clearing it here would
@@ -2827,6 +2925,70 @@ impl Compositor {
             }
         }
         self.needs_full_redraw = false;
+    }
+
+    /// Mark what the arrow covered last frame as needing another look, and say
+    /// whether any of what it covered was the compositor's own chrome.
+    ///
+    /// Rows of panes, because rows of panes is the whole of the damage model:
+    /// `tos_term::Damage` is per pane and row granular, and tOS has no
+    /// screen-space dirty rectangle anywhere. Where the arrow sat over a pane
+    /// that is enough — the pane repaints those rows and the old arrow is gone
+    /// with them — so the rectangle is mapped back through
+    /// `session.active().geometry(area)` to find which pane, and which of its
+    /// own rows, each cell of it was.
+    ///
+    /// Where it did not sit over a pane there is nobody to ask, and that is
+    /// what the return value is for. Deliberately not `needs_full_redraw`,
+    /// which is the obvious way to write this and is wrong for the same reason
+    /// the retained path exists at all: a divider is one cell wide, the arrow
+    /// is about one cell wide, and dragging a divider is a gesture that sits on
+    /// one for as long as the resize takes — so a full redraw here would be a
+    /// whole panel repainted per report a mouse makes, for the entire drag.
+    /// What is outside every pane is exactly three things: the dividers, the
+    /// status bar and the strip at the right and bottom edges where whole cells
+    /// do not quite divide the panel. The bar repaints itself on every frame
+    /// regardless, so it needs nothing; the caller handles the other two by
+    /// painting the background back over the rectangle and running the divider
+    /// pass again.
+    fn uncover_pointer(&mut self, was: PixelRect, geometry: &[(PaneId, Rect)]) -> bool {
+        let (cw, ch) = self.cell_size();
+        let first_col = was.x.max(0) as u32 / cw;
+        let last_col = (was.right() - 1).max(0) as u32 / cw;
+        let first_row = was.y.max(0) as u32 / ch;
+        let last_row = (was.bottom() - 1).max(0) as u32 / ch;
+        let wanted = (last_col - first_col + 1) * (last_row - first_row + 1);
+
+        // Panes tile the grid and never overlap, so the cells each one accounts
+        // for can simply be added up and compared with the cells the arrow
+        // covered. Anything left over was not a pane.
+        let mut accounted = 0;
+        for (id, rect) in geometry {
+            let from_col = first_col.max(rect.x);
+            let to_col = last_col.min(rect.right().saturating_sub(1));
+            let from_row = first_row.max(rect.y);
+            let to_row = last_row.min(rect.bottom().saturating_sub(1));
+            if from_col > to_col || from_row > to_row {
+                continue;
+            }
+            accounted += (to_col - from_col + 1) * (to_row - from_row + 1);
+            if let Some(pane) = self.panes.get_mut(id) {
+                // Into the pane's own row numbering, and one past the last
+                // because `mark_range` is half open.
+                let from = (from_row - rect.y) as usize;
+                let to = (to_row - rect.y) as usize + 1;
+                pane.terminal.damage_mut().mark_range(from, to);
+            }
+        }
+
+        if self.config.status_bar {
+            let bar_row = self.grid_area().height;
+            if (first_row..=last_row).contains(&bar_row) {
+                accounted += last_col - first_col + 1;
+            }
+        }
+
+        accounted < wanted
     }
 
     /// Paint a locked frame: the lock, and nothing else at all.
@@ -2843,6 +3005,12 @@ impl Compositor {
     /// clear that ran once cleared one of them.
     fn render_locked(&mut self, surface: &mut Surface<'_>) {
         surface.clear(self.chrome.background);
+        // The clear took the arrow with it, and `pointer_rect` says there is
+        // none while the lock is up. Forgetting where it was is what keeps
+        // those two agreeing: a remembered rectangle that can never be matched
+        // would leave `needs_render` true for every pass of a locked session,
+        // which is a frame per poll for as long as nobody is there.
+        self.pointer.set_painted(None);
         let area = PixelRect::new(0, 0, self.size.0, self.size.1);
         if let Some(lock) = &self.lock {
             lock.draw(surface, &mut self.fonts, area, &self.chrome, Instant::now());
@@ -4688,6 +4856,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_locked_screen_stops_asking_for_frames_on_the_pointer_s_account() {
+        // `needs_render` answers the pointer's part of the question by
+        // comparing where the arrow belongs against where it was last drawn,
+        // and the lock says it belongs nowhere. A locked frame that did not
+        // also forget the old rectangle would leave those two unable ever to
+        // agree, which is a frame per pass of the loop for as long as nobody
+        // is there to see one.
+        let mut compositor = compositor_with_password("pointer-idle");
+        compositor.handle_input(InputEvent::Pointer(tos_input::PointerEvent {
+            x: 40.0,
+            y: 40.0,
+            button: None,
+            action: MouseAction::Motion,
+            modifiers: tos_input::Modifiers::NONE,
+        }));
+        let mut framebuffer = tos_render::OwnedFramebuffer::new(640, 360);
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, true);
+        }
+        assert!(
+            !compositor.needs_render(),
+            "a pointer standing still asks for a frame on every pass"
+        );
+
+        compositor.lock_session();
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, true);
+        }
+        assert!(compositor.is_locked());
+        assert!(
+            !compositor.needs_render(),
+            "a locked session repaints on every pass"
+        );
+    }
+
     // ---- idle -----------------------------------------------------------
 
     /// A display that remembers what it was told about blanking.
@@ -5414,6 +5620,10 @@ mod tests {
         // Every press used to be dropped here, so "nothing happened" is not
         // evidence on its own; this is the one press that should still be it.
         let mut compositor = compositor();
+        // The first mouse event of a session asks for a frame whatever it
+        // does to the session, because it is the one that brings the pointer
+        // onto the screen. The press this test is about is the one after it.
+        click_bar(&mut compositor, 1);
         assert!(!click_bar(&mut compositor, 1));
         assert_eq!(compositor.session.active_index(), 0);
     }

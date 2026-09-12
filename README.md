@@ -1028,6 +1028,17 @@ From inside a session, `leader ?` puts the binding list over the panes; both it
 and `--help` are generated from the keymap that is running, so neither can fall
 behind it.
 
+The mouse has a pointer to move. It is a small arrow drawn in software into the
+composited frame, after everything else and over everything else, outlined so
+that it stays findable against any background a pane or a menu can put behind
+it — a cell inversion needs no geometry but is several characters wide and says
+nothing about where the tip is. It appears the first time a pointing device is
+heard from and never before, so a machine that has no mouse is never given one
+to look for, and it goes away while somebody is typing and comes back on the
+next motion. Moving it repaints the rows of the pane it was over rather than the
+screen, the same way the Japanese preedit does, so a hand resting on a mouse
+costs a few rows of one pane per report instead of a frame of the panel.
+
 ## Configuration
 
 An installed machine starts the compositor from `/init`, so anything that can
