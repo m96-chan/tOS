@@ -84,6 +84,14 @@ pub enum Action {
     VolumeDown,
     /// Flip the default card between muted and not.
     ToggleMute,
+    /// Show or hide the status bar.
+    ///
+    /// `--no-status-bar` decides what a session starts as, which is the wrong
+    /// granularity for the thing it decides: whether a row of the display is
+    /// worth spending is a question that has a different answer while reading
+    /// a long file than it does the rest of the time, and restarting the
+    /// compositor to change your mind means losing every pane.
+    ToggleStatusBar,
 }
 
 /// A key combination.
@@ -271,6 +279,16 @@ impl Keymap {
             (KeyCode::Char('.'), Modifiers::SHIFT, Action::VolumeUp),
             (KeyCode::Char(','), Modifiers::SHIFT, Action::VolumeDown),
             (KeyCode::Char('m'), Modifiers::SHIFT, Action::ToggleMute),
+            // Shift and the s key: s on its own splits into rows, and the
+            // shifted key is free. b would have been the letter the bar is
+            // named after, but b is the radio — a person looking for
+            // Bluetooth has one word for it and a person looking for the bar
+            // has several, so the unambiguous name wins the letter.
+            (
+                KeyCode::Char('s'),
+                Modifiers::SHIFT,
+                Action::ToggleStatusBar,
+            ),
         ];
         for (code, modifiers, action) in bindings {
             keymap.bind_after_leader(Binding::new(*code, *modifiers), action.clone());
@@ -683,6 +701,34 @@ mod tests {
         assert_eq!(
             keymap.resolve(&press(KeyCode::Char('/'), Modifiers::NONE)),
             Resolution::Passthrough
+        );
+    }
+
+    #[test]
+    fn the_status_bar_can_be_hidden_from_the_keyboard() {
+        // `--no-status-bar` is a decision taken before there is a session;
+        // this is the same decision taken while looking at one.
+        let mut keymap = Keymap::default_bindings();
+        let shift_s = || press(KeyCode::Char('s'), Modifiers::SHIFT);
+        assert_eq!(
+            keymap.resolve(&press(
+                KeyCode::Char('s'),
+                Modifiers::SUPER.union(Modifiers::SHIFT)
+            )),
+            Resolution::Action(Action::ToggleStatusBar)
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&shift_s()),
+            Resolution::Action(Action::ToggleStatusBar)
+        );
+        // A shifted s is an S, which is most of what a pane gets it for, and
+        // the unshifted key still splits.
+        assert_eq!(keymap.resolve(&shift_s()), Resolution::Passthrough);
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('s'), Modifiers::NONE)),
+            Resolution::Action(Action::Split(Axis::Rows))
         );
     }
 

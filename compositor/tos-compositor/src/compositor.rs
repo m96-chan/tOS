@@ -23,7 +23,8 @@ use tos_system::Sysfs;
 use tos_term::TermEvent;
 
 use crate::bluetooth::{Choice, Controls, Scan, SCAN_SECONDS};
-use crate::chrome::{self, Chrome, StatusItem};
+use crate::chrome::{self, Chrome};
+use crate::clock::Clock;
 use crate::config::Config;
 use crate::copymode::{CopyMode, CopyOutcome};
 use crate::launcher;
@@ -33,6 +34,7 @@ use crate::overlay::{Overlay, OverlayItem, OverlayOutcome};
 use crate::pane::Pane;
 use crate::power;
 use crate::selection::{Selection, SelectionMode};
+use crate::status::{self, Bar, Hit, Piece, Segment};
 use crate::system::Machine;
 
 /// How often the cursor and blinking text change phase.
@@ -233,6 +235,16 @@ pub struct Compositor {
     /// sentence repeated, and pushes off the bar whatever was actually worth
     /// reading.
     said_no_sound_card: bool,
+    /// The clock on the status bar, with its zone already read.
+    clock: Clock,
+    /// What the clock last said.
+    ///
+    /// The repaint trigger, and the reason it is the rendered text rather than
+    /// a timestamp: a bar showing `%H:%M` has to repaint when the minute turns
+    /// over and not sixty times before it, and one showing `%S` has to repaint
+    /// every second. Comparing what would be drawn answers both without the
+    /// clock having to be asked how precise it is.
+    clock_text: String,
 }
 
 impl Compositor {
@@ -243,6 +255,9 @@ impl Compositor {
         physical_mm: Option<(u32, u32)>,
     ) -> io::Result<Self> {
         let fonts = build_fonts(&config, size, physical_mm);
+        // Before the config is moved into the struct, and once rather than per
+        // frame: this reads the time zone database off the disk.
+        let clock = Clock::new(&config.status.clock_format, &config.status.zone);
         let mut compositor = Compositor {
             session: Session::new(),
             panes: HashMap::new(),
@@ -273,6 +288,11 @@ impl Compositor {
             suspend_requested: false,
             shutdown: None,
             said_no_sound_card: false,
+            // Seeded rather than left empty, so that the first frame — which
+            // happens before the first tick — has a time on it rather than a
+            // gap where one is about to appear.
+            clock_text: clock.text(unix_now()),
+            clock,
             config,
         };
 
@@ -677,6 +697,21 @@ impl Compositor {
         modifiers: tos_input::Modifiers,
     ) -> bool {
         let area = self.grid_area();
+
+        // The bar first, because it is nowhere in the geometry below: the row
+        // it occupies is the row `grid_area` took away, so a press there
+        // matches no pane and would be dropped. Only a press, and only the
+        // left button: a drag that started in a pane and wandered down here
+        // still belongs to the selection it started, and falls through to the
+        // clamp that keeps it in its own pane.
+        if action == MouseAction::Press
+            && button == Some(MouseButton::Left)
+            && self.status_row() == Some(cell_y)
+        {
+            self.release_grab();
+            return self.click_status(cell_x);
+        }
+
         let geometry = self.session.active().geometry(area);
 
         // A drag that started in a pane keeps going there even once the
@@ -1076,6 +1111,18 @@ impl Compositor {
             Action::VolumeUp => self.change_volume(Knob::Up),
             Action::VolumeDown => self.change_volume(Knob::Down),
             Action::ToggleMute => self.change_volume(Knob::Mute),
+            Action::ToggleStatusBar => {
+                // The bar owns a row of the display, so this is a layout
+                // change as much as a drawing one: `grid_area` gives the row
+                // back, `sync_layout` tells the panes they are a line taller,
+                // and the terminals inside them are resized and told so. A
+                // toggle that only stopped drawing would leave every pane the
+                // wrong height and the bottom row of the session unpainted.
+                self.config.status_bar = !self.config.status_bar;
+                self.sync_layout();
+                self.needs_full_redraw = true;
+                true
+            }
             Action::Quit => {
                 self.running = false;
                 true
@@ -1898,6 +1945,15 @@ impl Compositor {
         if self.collect_scan() {
             changed = true;
         }
+        // And the clock moves without the machine moving either. The poll
+        // above is what wakes the loop for it — its deadline is folded into
+        // the wait in `frame_timeout_ms_at`, so the loop is up within a tenth
+        // of a second of every second — but a minute turning over is not a
+        // change in any reading, so it would report nothing and the bar would
+        // go on showing the old minute until somebody typed.
+        if self.tick_clock(unix_now()) {
+            changed = true;
+        }
         changed
     }
 
@@ -1950,7 +2006,7 @@ impl Compositor {
                 focused: *id == focus,
                 draw_cursor: true,
                 selection: pane.display_selection(),
-                selection_background: self.chrome.accent,
+                selection_background: self.chrome.selection(),
                 copy_cursor: self
                     .copy
                     .as_ref()
@@ -2015,12 +2071,18 @@ impl Compositor {
 
         if self.config.status_bar {
             self.draw_status(surface, area, ch);
-        } else if let Some(text) = self.notifications.status_line() {
-            // With no bar there is nowhere for a message to live, and going
-            // quiet is the one thing it must not do: this used to be why
-            // `--no-status-bar` made a failed split look like a dead key.
-            let over = PixelRect::new(0, 0, area.width * cw, ch);
-            notify::draw_banner(surface, &mut self.fonts, over, &self.chrome, &text);
+        }
+        // With no bar there is nowhere for a message to live, and going quiet
+        // is the one thing it must not do: this used to be why
+        // `--no-status-bar` made a failed split look like a dead key. A bar
+        // whose layout leaves the `message` segment out is the same case
+        // arrived at a different way, and gets the same banner rather than a
+        // configuration that silently swallows every failure.
+        if !self.config.status_bar || !self.config.status.shows_message() {
+            if let Some(text) = self.notifications.status_line() {
+                let over = PixelRect::new(0, 0, area.width * cw, ch);
+                notify::draw_banner(surface, &mut self.fonts, over, &self.chrome, &text);
+            }
         }
 
         // Last, and over everything: the overlay is modal, and the panes below
@@ -2071,61 +2133,233 @@ impl Compositor {
         self.needs_full_redraw = false;
     }
 
-    /// What the left of the status bar says: every workspace's name, in
-    /// position order, with the active one marked.
+    /// The bar as it will be drawn this frame: every configured segment asked
+    /// for its pieces, then laid out.
     ///
-    /// Separate from the drawing so that a test can read the bar's own words
-    /// rather than infer them from pixels.
-    fn status_items(&self) -> Vec<StatusItem> {
-        let active = self.session.active_index();
-        self.session
-            .workspaces()
-            .iter()
-            .enumerate()
-            .map(|(i, workspace)| StatusItem::new(workspace.name.clone(), i == active))
-            .collect()
+    /// Built rather than cached because everything on it is derived from state
+    /// that moves — the focused pane's title, the notification queue, the last
+    /// reading — and a cache would need invalidating from each of those. It is
+    /// a handful of `String`s once per frame, against a frame that touches
+    /// every pixel of the display.
+    ///
+    /// Also what a click consults, which is the point of it being a value:
+    /// where the third workspace starts is worked out once, and the drawing
+    /// and the routing read the same answer.
+    fn status_bar(&self) -> Bar {
+        let pieces = |segments: &[Segment]| -> Vec<Vec<Piece>> {
+            segments
+                .iter()
+                .map(|segment| self.segment_pieces(*segment))
+                .collect()
+        };
+        Bar::lay_out(
+            &pieces(&self.config.status.left),
+            &pieces(&self.config.status.right),
+            self.grid_area().width,
+        )
+    }
+
+    /// What one segment has to say, which is sometimes nothing.
+    ///
+    /// An empty vector is how absence is said, and it is said for two
+    /// different reasons that ought to look the same on the bar: a machine
+    /// with no battery has no charge to report, and a session with nothing
+    /// queued has no message to show. Neither is worth a slot saying so.
+    fn segment_pieces(&self, segment: Segment) -> Vec<Piece> {
+        let reading = self.machine.reading();
+        let one = |text: String| vec![Piece::new(text)];
+        match segment {
+            Segment::Workspaces => {
+                let active = self.session.active_index();
+                self.session
+                    .workspaces()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, workspace)| {
+                        // Numbered from one, the way the digit bindings are, so
+                        // that clicking the third workspace and pressing
+                        // super+3 reach the same call with the same argument.
+                        Piece::new(workspace.name.clone())
+                            .active(index == active)
+                            .clicking(Hit::Workspace(index + 1))
+                    })
+                    .collect()
+            }
+            Segment::Panes => {
+                let focus = self.session.focus();
+                self.session
+                    .active()
+                    .panes()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, id)| {
+                        let pane = self.panes.get(id)?;
+                        Some(
+                            Piece::new(chrome::pane_label(index, &pane.terminal, &pane.title))
+                                .active(*id == focus)
+                                .clicking(Hit::Pane(*id)),
+                        )
+                    })
+                    .collect()
+            }
+            Segment::Title => match self.focused_label() {
+                Some(label) => one(label),
+                None => Vec::new(),
+            },
+            Segment::Message => match self.status_message() {
+                // The elastic one: it is the only thing on the bar whose
+                // length is not the compositor's own choice, and clicking it
+                // opens the history, because the message that has just gone
+                // past is the one somebody wants back.
+                Some(text) => vec![Piece::new(text).elastic().clicking(Hit::Notifications)],
+                None => Vec::new(),
+            },
+            // What [`Compositor::tick_clock`] last worked out, rather than
+            // the time now. One reading per tick, drawn by every frame in
+            // between, which is also what makes the repaint trigger and the
+            // thing on screen provably the same string.
+            Segment::Clock => one(self.clock_text.clone()),
+            Segment::Battery => match reading.power.as_ref().and_then(status::battery_text) {
+                Some(text) => one(text),
+                None => Vec::new(),
+            },
+            Segment::Network => match &reading.link {
+                Some(link) => one(status::network_text(link)),
+                None => Vec::new(),
+            },
+            Segment::Volume => match &reading.volume {
+                Some(volume) => one(status::volume_text(volume)),
+                None => Vec::new(),
+            },
+            Segment::Bluetooth => match &reading.adapter {
+                Some(adapter) => one(status::bluetooth_text(adapter)),
+                None => Vec::new(),
+            },
+        }
+    }
+
+    /// The focused pane's label, and how far back it is looking.
+    fn focused_label(&self) -> Option<String> {
+        let focus = self.session.focus();
+        let panes = self.session.active().panes();
+        let index = panes.iter().position(|id| *id == focus).unwrap_or(0);
+        let pane = self.panes.get(&focus)?;
+        let label = chrome::pane_label(index, &pane.terminal, &pane.title);
+        match pane.terminal.display_offset() {
+            0 => Some(label),
+            scrolled => Some(format!("{label}  [scrollback {scrolled}]")),
+        }
+    }
+
+    /// The leader indicator, or else whatever is at the front of the queue.
+    ///
+    /// The leader comes first because it is the state of the keyboard right
+    /// now and lasts only until the next key, where a notification has three
+    /// seconds it can just as well spend later. Arming the leader does not
+    /// cost the queue its turn: [`Compositor::tick`] stops the clock on the
+    /// message while the indicator has the slot.
+    fn status_message(&self) -> Option<String> {
+        if self.keymap.is_pending() {
+            return Some("leader".to_string());
+        }
+        // Copy mode belongs beside the leader indicator rather than in the
+        // queue behind it: both say what the keyboard is doing at this
+        // instant, and a notification allowed to cover either would be three
+        // seconds in which the sheet's account of the keys is wrong.
+        if let Some(copy) = self.copy_mode() {
+            return Some(copy.status().to_string());
+        }
+        self.notifications.status_line()
+    }
+
+    /// The row the bar sits on, when there is one.
+    ///
+    /// `None` when the bar is off, and also when the display is too short for
+    /// [`Compositor::grid_area`] to have given up a row for it — otherwise a
+    /// click on the last row of a two row display would switch workspaces
+    /// instead of reaching the pane that is drawn there.
+    fn status_row(&self) -> Option<u32> {
+        let (_, ch) = self.cell_size();
+        let rows = (self.size.1 / ch).max(1);
+        let area = self.grid_area();
+        (self.config.status_bar && area.height < rows).then_some(area.height)
+    }
+
+    /// A left press on the status bar.
+    ///
+    /// The bar is outside every pane's geometry — that is what `grid_area`
+    /// subtracting a row means — so before this a press here matched nothing
+    /// and was dropped, which left a strip of workspaces that looks clickable
+    /// and was not.
+    fn click_status(&mut self, col: u32) -> bool {
+        match self.status_bar().hit(col) {
+            Some(Hit::Workspace(number)) => {
+                // `select_workspace` says it succeeded when it was asked for
+                // the one already active, which is the right answer for a
+                // binding and the wrong one here: a click on the workspace you
+                // are in should not cost a full redraw of the session.
+                if self.session.active_index() + 1 == number {
+                    return false;
+                }
+                let changed = self.session.select_workspace(number);
+                if changed {
+                    self.sync_layout();
+                    self.needs_full_redraw = true;
+                }
+                changed
+            }
+            Some(Hit::Pane(id)) => {
+                if self.session.focus() == id {
+                    return false;
+                }
+                let previous = self.session.focus();
+                self.session.set_focus(id);
+                self.clear_selection(previous);
+                self.needs_full_redraw = true;
+                true
+            }
+            Some(Hit::Notifications) => self.perform(Action::ShowNotifications),
+            None => false,
+        }
+    }
+
+    /// Let the clock catch up, and say whether the bar has to be repainted.
+    ///
+    /// Separate from [`Compositor::tick`], and taking the time rather than
+    /// reading it, so that a test can watch a minute turn over without having
+    /// to wait one out.
+    ///
+    /// A session with no clock on its bar does none of this and asks for no
+    /// frames on account of one — which matters, because the alternative is a
+    /// machine that wakes up, paints every pixel and goes back to sleep once a
+    /// minute for the rest of its life in order to redraw nothing.
+    fn tick_clock(&mut self, unix: i64) -> bool {
+        if !self.config.status.shows_clock() {
+            return false;
+        }
+        let text = self.clock.text(unix);
+        if text == self.clock_text {
+            return false;
+        }
+        self.clock_text = text;
+        // The clock is kept current even while nobody can see it, because it
+        // costs one formatted string and it means the bar is right on the
+        // frame it comes back rather than on the one after. Asking for that
+        // frame is the part that is skipped: there is nothing on a dark or
+        // hidden bar for a new minute to change.
+        !self.blanked && self.config.status_bar
     }
 
     fn draw_status(&mut self, surface: &mut Surface<'_>, area: Rect, cell_height: u32) {
-        let items = self.status_items();
-
-        let focus = self.session.focus();
-        // The leader indicator comes first: it is the state of the keyboard
-        // right now and it lasts only until the next key. Copy mode is the
-        // same kind of thing and comes next, because a message that hid which
-        // mode the keyboard is in would be a message about a key that has
-        // stopped doing what it says. Then the queue, and when it is empty,
-        // what the focused pane is.
-        let right = if self.keymap.is_pending() {
-            "leader".to_string()
-        } else if let Some(copy) = self.copy_mode() {
-            copy.status().to_string()
-        } else if let Some(line) = self.notifications.status_line() {
-            line
-        } else {
-            let panes = self.session.active().panes();
-            let index = panes.iter().position(|p| *p == focus).unwrap_or(0);
-            match self.panes.get(&focus) {
-                Some(pane) => {
-                    let scrolled = pane.terminal.display_offset();
-                    let label = chrome::pane_label(index, &pane.terminal, &pane.title);
-                    if scrolled > 0 {
-                        format!("{label}  [scrollback {scrolled}]")
-                    } else {
-                        label
-                    }
-                }
-                None => String::new(),
-            }
-        };
-
-        let bar = PixelRect::new(
+        let bar = self.status_bar();
+        let colors = self.chrome.bar();
+        let rect = PixelRect::new(
             0,
             (area.height * cell_height) as i32,
             self.size.0,
             cell_height,
         );
-        chrome::draw_status_bar(surface, &mut self.fonts, bar, &self.chrome, &items, &right);
+        bar.draw(surface, &mut self.fonts, rect, &colors);
     }
 
     /// Feed bytes straight into the focused pane's terminal, bypassing the
@@ -2328,6 +2562,19 @@ impl Compositor {
         // poweroff loses whatever the panes were writing.
         tos_system::power::request(self.machine.power(), action)
     }
+}
+
+/// Seconds since the epoch, which is the only form of the time anything here
+/// deals in: [`crate::clock`] turns it into a date, and nothing else needs it.
+///
+/// A clock the kernel has set before 1970 reads as the epoch rather than as an
+/// error. There is no sensible thing for a status bar to do about a machine
+/// whose battery-backed clock has failed, and refusing to draw one is not it.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// The selectors OSC 52 defines: the clipboard, primary, secondary, select,
@@ -2997,9 +3244,15 @@ mod tests {
         rename_to(&mut compositor, "build");
         assert!(compositor.overlay().is_none(), "accepting should close it");
         assert_eq!(compositor.session.active().name, "build");
-        let items = compositor.status_items();
-        assert_eq!(items[0].text, "build");
-        assert!(items[0].highlighted, "the active workspace is marked");
+        let bar = compositor.status_bar();
+        let first = &bar.pieces()[0];
+        assert_eq!(first.text, " build ");
+        assert_eq!(
+            first.ink,
+            crate::status::Ink::Active,
+            "the active workspace is marked"
+        );
+        assert_eq!(first.hit, Some(crate::status::Hit::Workspace(1)));
     }
 
     #[test]
@@ -3054,7 +3307,7 @@ mod tests {
         compositor.perform(Action::NewWorkspace);
         compositor.perform(Action::SelectWorkspace(1));
         compositor.perform(Action::ClosePane);
-        assert_eq!(compositor.status_items()[0].text, "1");
+        assert_eq!(compositor.status_bar().pieces()[0].text, " 1 ");
     }
 
     #[test]
@@ -4103,6 +4356,67 @@ mod tests {
         );
     }
 
+    // ---- the status bar ---------------------------------------------------
+
+    /// A session whose clock is in UT, so that a test asserting about what is
+    /// on the bar is not asserting about where the machine running it is.
+    fn compositor_showing(left: &[Segment], right: &[Segment]) -> Compositor {
+        compositor_with(Config {
+            status: status::Settings {
+                left: left.to_vec(),
+                right: right.to_vec(),
+                zone: crate::clock::Zone::Utc,
+                ..status::Settings::default()
+            },
+            ..Config::default()
+        })
+    }
+
+    /// A timestamp exactly on a minute, so that "thirty seconds later" is
+    /// unambiguously still the same one. 15:34 UT on the 4th of September
+    /// 2025, which is a Thursday and of no significance whatever.
+    const ON_THE_MINUTE: i64 = 1_757_000_040;
+
+    #[test]
+    fn a_minute_turning_over_puts_a_new_time_on_the_bar_and_asks_for_a_frame() {
+        let mut compositor = compositor_showing(&[Segment::Workspaces], &[Segment::Clock]);
+        compositor.tick_clock(ON_THE_MINUTE);
+        let before = compositor.status_bar().text();
+        assert!(before.contains("15:34"), "{before}");
+
+        // Half a minute later nothing on the bar has changed, so nothing asks
+        // for a frame: a clock showing minutes must not repaint every second.
+        assert!(
+            !compositor.tick_clock(ON_THE_MINUTE + 30),
+            "the same minute was treated as news"
+        );
+        assert_eq!(compositor.status_bar().text(), before);
+
+        // And on the minute it does both.
+        assert!(
+            compositor.tick_clock(ON_THE_MINUTE + 60),
+            "the minute turned over and nothing asked for a frame"
+        );
+        let after = compositor.status_bar().text();
+        assert!(after.contains("15:35"), "{after}");
+    }
+
+    #[test]
+    fn the_loop_wakes_up_often_enough_to_notice_the_minute() {
+        // The other half of a clock that ticks. The trigger above only fires
+        // if something calls `tick`, and what calls it is the frame loop
+        // coming back — which it does for the machine poll whether or not
+        // anything has happened, because that deadline is folded into the
+        // wait. A second is the coarsest this may be and still land a `%M`
+        // clock on the right side of a minute boundary.
+        let compositor = compositor_showing(&[Segment::Workspaces], &[Segment::Clock]);
+        let wait = compositor.frame_timeout_ms_at(Instant::now());
+        assert!(
+            wait > 0 && wait <= 1000,
+            "the loop would sleep for {wait}ms"
+        );
+    }
+
     #[test]
     fn what_a_scan_found_arrives_through_the_tick_and_into_the_open_menu() {
         // The whole point of running the inquiry elsewhere: the answer has to
@@ -4135,5 +4449,234 @@ mod tests {
             "the menu was not rebuilt: {:?}",
             overlay.items()
         );
+    }
+
+    #[test]
+    fn a_clock_behind_a_dark_screen_keeps_time_without_asking_for_frames() {
+        let mut compositor = compositor_showing(&[], &[Segment::Clock]);
+        compositor.tick_clock(ON_THE_MINUTE);
+        compositor.blanked = true;
+        assert!(
+            !compositor.tick_clock(ON_THE_MINUTE + 60),
+            "a minute nobody can see is not a reason to paint"
+        );
+        // But it is up to date for the frame the screen comes back on.
+        assert!(compositor.status_bar().text().contains("15:35"));
+    }
+
+    #[test]
+    fn a_bar_with_no_clock_on_it_never_wakes_up_for_one() {
+        let mut compositor = compositor_showing(&[Segment::Workspaces], &[Segment::Message]);
+        assert!(!compositor.tick_clock(ON_THE_MINUTE));
+        assert!(!compositor.tick_clock(ON_THE_MINUTE + 3600));
+    }
+
+    /// Press the left button on a cell of the status row.
+    fn click_bar(compositor: &mut Compositor, col: u32) -> bool {
+        let row = compositor.status_row().expect("a status row");
+        compositor.handle_input(InputEvent::Mouse(tos_input::MouseEvent {
+            button: Some(MouseButton::Left),
+            action: MouseAction::Press,
+            col: col as usize,
+            row: row as usize,
+            modifiers: tos_input::Modifiers::NONE,
+        }))
+    }
+
+    #[test]
+    fn clicking_a_workspace_on_the_bar_switches_to_it() {
+        let mut compositor = compositor();
+        compositor.perform(Action::NewWorkspace);
+        compositor.perform(Action::NewWorkspace);
+        assert_eq!(compositor.session.active_index(), 2);
+
+        // The strip reads " 1  2  3 ", so the first workspace is cell one.
+        assert!(click_bar(&mut compositor, 1), "the click did nothing");
+        assert_eq!(compositor.session.active_index(), 0);
+        // And the third is six cells along.
+        assert!(click_bar(&mut compositor, 7));
+        assert_eq!(compositor.session.active_index(), 2);
+    }
+
+    #[test]
+    fn clicking_the_workspace_already_active_is_not_a_change() {
+        // Every press used to be dropped here, so "nothing happened" is not
+        // evidence on its own; this is the one press that should still be it.
+        let mut compositor = compositor();
+        assert!(!click_bar(&mut compositor, 1));
+        assert_eq!(compositor.session.active_index(), 0);
+    }
+
+    #[test]
+    fn a_press_on_the_bar_never_reaches_a_pane() {
+        let mut compositor = compositor();
+        let focus = compositor.session.focus();
+        click_bar(&mut compositor, 1);
+        assert!(
+            compositor.panes[&focus].selection.is_none(),
+            "the bar started a selection in a pane"
+        );
+    }
+
+    #[test]
+    fn clicking_an_unfocused_pane_on_the_strip_focuses_it() {
+        // The pane strip is what gives an unfocused pane a name anywhere; this
+        // is what makes the name worth clicking on.
+        let mut compositor = compositor_showing(&[Segment::Panes], &[]);
+        compositor.perform(Action::Split(Axis::Columns));
+        let focus = compositor.session.focus();
+        let panes = compositor.session.active().panes();
+        let (index, other) = panes
+            .iter()
+            .enumerate()
+            .find(|(_, id)| **id != focus)
+            .map(|(index, id)| (index, *id))
+            .expect("a pane that is not focused");
+        // Every label is " n:shell ", which is nine cells.
+        assert!(
+            click_bar(&mut compositor, index as u32 * 9 + 1),
+            "the label was not clickable"
+        );
+        assert_eq!(compositor.session.focus(), other);
+    }
+
+    #[test]
+    fn an_unfocused_pane_is_named_on_the_strip_and_nowhere_else() {
+        let mut compositor = compositor_showing(&[Segment::Panes], &[Segment::Title]);
+        compositor.perform(Action::Split(Axis::Columns));
+        let focus = compositor.session.focus();
+        compositor.panes.get_mut(&focus).expect("a pane").title = "editing".to_string();
+        let text = compositor.status_bar().text();
+        // Both panes are on the strip, and the title segment says only one.
+        assert!(text.contains("1:shell"), "{text}");
+        assert!(text.contains("2:editing"), "{text}");
+    }
+
+    #[test]
+    fn the_bar_can_be_hidden_and_brought_back_and_the_panes_follow() {
+        let mut compositor = compositor();
+        let with_bar = compositor.grid_area().height;
+        let focus = compositor.session.focus();
+        let rows = compositor.panes[&focus].terminal.rows();
+
+        assert!(compositor.perform(Action::ToggleStatusBar));
+        assert_eq!(compositor.status_row(), None, "the bar is still there");
+        assert_eq!(compositor.grid_area().height, with_bar + 1);
+        assert_eq!(
+            compositor.panes[&focus].terminal.rows(),
+            rows + 1,
+            "the pane was not given the row back"
+        );
+
+        assert!(compositor.perform(Action::ToggleStatusBar));
+        assert_eq!(compositor.status_row(), Some(with_bar));
+        assert_eq!(compositor.panes[&focus].terminal.rows(), rows);
+    }
+
+    #[test]
+    fn a_machine_with_none_of_the_hardware_shows_empty_slots_rather_than_lies() {
+        // The test compositor's system root has no battery, no link, no card
+        // and no adapter, which is also a perfectly ordinary machine.
+        let compositor = compositor_showing(
+            &[Segment::Workspaces],
+            &[
+                Segment::Battery,
+                Segment::Network,
+                Segment::Volume,
+                Segment::Bluetooth,
+                Segment::Clock,
+            ],
+        );
+        let text = compositor.status_bar().text();
+        for word in ["bat", "vol", "bt", "unknown", "none"] {
+            assert!(!text.contains(word), "{text} claims {word}");
+        }
+        // And the rules that would have gone between them are not there
+        // either: four missing segments must not leave four separators.
+        let rules = compositor
+            .status_bar()
+            .pieces()
+            .iter()
+            .filter(|piece| piece.ink == status::Ink::Divider)
+            .count();
+        assert_eq!(rules, 0, "{text}");
+    }
+
+    #[test]
+    fn a_reading_from_the_machine_reaches_the_bar() {
+        let mut compositor = compositor_showing(&[], &[Segment::Battery, Segment::Volume]);
+        compositor
+            .machine_mut()
+            .set_reading(crate::system::Reading {
+                power: Some(tos_system::power::PowerState {
+                    batteries: vec![tos_system::power::Battery {
+                        name: "BAT0".into(),
+                        present: true,
+                        state: tos_system::power::ChargeState::Discharging,
+                        percent: Some(41),
+                        remaining: None,
+                        full: None,
+                        unit: None,
+                        time_remaining: None,
+                        power_watts: None,
+                    }],
+                    mains: Vec::new(),
+                }),
+                volume: Some(tos_system::audio::Volume {
+                    percent: 70,
+                    muted: false,
+                }),
+                ..crate::system::Reading::default()
+            });
+        let text = compositor.status_bar().text();
+        assert!(text.contains("41%"), "{text}");
+        assert!(text.contains("vol 70%"), "{text}");
+    }
+
+    #[test]
+    fn a_layout_with_no_message_segment_still_shows_what_went_wrong() {
+        // Otherwise arranging the bar to taste would be a way to make every
+        // failure the compositor reports disappear.
+        let mut compositor = compositor_showing(&[Segment::Workspaces], &[Segment::Clock]);
+        compositor.notifications.status("copied");
+        let mut framebuffer = tos_render::OwnedFramebuffer::new(640, 360);
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, false);
+        }
+        // The banner is drawn in the accent, over the top of the panes, which
+        // is what `--no-status-bar` already does.
+        let accent = compositor.chrome.accent.pack();
+        let (_, ch) = compositor.cell_size();
+        let first_row = (ch * 640) as usize;
+        assert!(
+            framebuffer.pixels()[..first_row].contains(&accent),
+            "the message was drawn nowhere"
+        );
+    }
+
+    #[test]
+    fn the_bar_takes_its_colours_from_the_configuration() {
+        let bar = tos_term::Rgb::new(0x22, 0x00, 0x44);
+        let mut compositor = compositor_with(Config {
+            chrome: Chrome {
+                status_background: Some(bar),
+                ..Chrome::default()
+            },
+            ..Config::default()
+        });
+        let mut framebuffer = tos_render::OwnedFramebuffer::new(640, 360);
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, false);
+        }
+        let (_, ch) = compositor.cell_size();
+        let above = (compositor.grid_area().height * ch * 640) as usize;
+        assert!(
+            framebuffer.pixels()[above..].contains(&bar.pack()),
+            "the bar is not the colour it was asked to be"
+        );
+        // And nothing above it moved: this colour is the bar's alone.
+        assert!(!framebuffer.pixels()[..above].contains(&bar.pack()));
     }
 }

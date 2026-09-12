@@ -17,9 +17,11 @@ use std::path::{Path, PathBuf};
 use tos_term::{Palette, Rgb};
 
 use crate::chrome::Chrome;
+use crate::clock::Zone;
 use crate::config::{
     parse_args, parse_args_over, parse_interval, parse_size, Backend, Config, ConfigSource,
 };
+use crate::status;
 
 /// The file tOS looks for in each directory of the search path.
 pub const FILE_NAME: &str = "tos.conf";
@@ -179,10 +181,10 @@ pub fn apply(config: &mut Config, text: &str) -> Vec<String> {
 ///
 /// Adding a setting is one arm of this match, which is the point of the shape:
 /// the sections the format reserves but cannot answer yet — `[keys]` for
-/// bindings, `[status]` for the status bar's segments, `[fonts]` for the
-/// fallback list — each become an arm when the code behind them lands. Until
-/// then an unknown key is reported rather than ignored, because a setting that
-/// is silently dropped looks exactly like a setting that does not work.
+/// bindings, `[fonts]` for the fallback list — each become an arm when the
+/// code behind them lands, the way `[status]` did. Until then an unknown key
+/// is reported rather than ignored, because a setting that is silently dropped
+/// looks exactly like a setting that does not work.
 fn set(config: &mut Config, section: &str, key: &str, value: &str) -> Result<(), String> {
     match (section, key) {
         ("", "backend") => {
@@ -213,6 +215,11 @@ fn set(config: &mut Config, section: &str, key: &str, value: &str) -> Result<(),
         ("idle", other) => return Err(format!("unknown setting: [idle] {other}")),
         ("colors", key) => set_palette(&mut config.palette, key, value)?,
         ("chrome", key) => set_chrome(&mut config.chrome, key, value)?,
+        // The status bar is two subjects that belong together: what it says,
+        // and what colour it says it in. They share a section because the
+        // person writing one is the person writing the other, and the colours
+        // land in `Chrome` anyway — this is a heading, not a second home.
+        ("status", key) => set_status(&mut config.status, &mut config.chrome, key, value)?,
         ("", key) => return Err(format!("unknown setting: {key}")),
         (section, key) => return Err(format!("unknown setting: [{section}] {key}")),
     }
@@ -248,7 +255,41 @@ fn set_chrome(chrome: &mut Chrome, key: &str, value: &str) -> Result<(), String>
         "accent-text" => chrome.accent_text = color(value)?,
         "divider" => chrome.divider = color(value)?,
         "divider-focused" => chrome.divider_focused = color(value)?,
+        // Here rather than under `[status]` because selected text is in a
+        // pane, not on the bar. It is separate from `accent` at all because it
+        // is the one highlight drawn over somebody else's palette, and a
+        // palette whose own blue is near the accent leaves a selection that
+        // cannot be made out.
+        "selection" => chrome.selection = Some(color(value)?),
         other => return Err(format!("unknown setting: [chrome] {other}")),
+    }
+    Ok(())
+}
+
+/// What the status bar shows, and what it shows it in.
+///
+/// The colours are `Option` in [`Chrome`] and are set here, which is what
+/// makes `[chrome] accent` move the bar's highlight along with every other
+/// highlight while `[status] active` moves only the bar's. Somebody who wants
+/// one colour scheme writes one line; somebody who wants the bar to stand
+/// apart from the panes writes the other.
+fn set_status(
+    status: &mut status::Settings,
+    chrome: &mut Chrome,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    match key {
+        "left" => status.left = status::Settings::parse_list(value)?,
+        "right" => status.right = status::Settings::parse_list(value)?,
+        "clock" => status.clock_format = value.to_string(),
+        "timezone" => status.zone = Zone::parse(value),
+        "background" => chrome.status_background = Some(color(value)?),
+        "foreground" => chrome.status_foreground = Some(color(value)?),
+        "active" => chrome.status_active = Some(color(value)?),
+        "active-text" => chrome.status_active_text = Some(color(value)?),
+        "divider" => chrome.status_divider = Some(color(value)?),
+        other => return Err(format!("unknown setting: [status] {other}")),
     }
     Ok(())
 }
@@ -403,6 +444,83 @@ mod tests {
             startup.config.idle_blank,
             Some(std::time::Duration::from_secs(120))
         );
+    }
+
+    #[test]
+    fn the_status_bar_takes_its_segments_and_its_order_from_the_file() {
+        let mut config = Config::default();
+        apply_to(
+            &mut config,
+            "[status]\n\
+             left = workspaces panes\n\
+             right = volume, bluetooth, clock\n\
+             clock = %a %H:%M\n\
+             timezone = Asia/Tokyo\n",
+        );
+        assert_eq!(
+            config.status.left,
+            vec![status::Segment::Workspaces, status::Segment::Panes]
+        );
+        assert_eq!(
+            config.status.right,
+            vec![
+                status::Segment::Volume,
+                status::Segment::Bluetooth,
+                status::Segment::Clock
+            ]
+        );
+        assert_eq!(config.status.clock_format, "%a %H:%M");
+        assert_eq!(config.status.zone, Zone::Named("Asia/Tokyo".to_string()));
+    }
+
+    #[test]
+    fn a_segment_that_does_not_exist_is_reported_and_the_side_is_left_alone() {
+        let mut config = Config::default();
+        let before = config.status.right.clone();
+        let problems = apply(
+            &mut config,
+            "[status]\nright = clock batery\nleft = title\n",
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("batery"), "{:?}", problems[0]);
+        assert_eq!(config.status.right, before, "a bad word took the good ones");
+        // And the line after it still applies, the way every other bad line
+        // in this file does.
+        assert_eq!(config.status.left, vec![status::Segment::Title]);
+    }
+
+    #[test]
+    fn the_bar_can_be_coloured_apart_from_the_rest_of_the_chrome() {
+        let mut config = Config::default();
+        apply_to(
+            &mut config,
+            "[chrome]\n\
+             accent = #ff0000\n\
+             selection = #00ff00\n\
+             [status]\n\
+             background = #101010\n\
+             active = #0000ff\n",
+        );
+        let bar = config.chrome.bar();
+        assert_eq!(bar.background, Rgb::new(0x10, 0x10, 0x10));
+        assert_eq!(bar.active, Rgb::new(0, 0, 0xff), "the bar's own highlight");
+        // What the bar was not given follows the chrome, so one `accent` line
+        // still moves everything that was not singled out.
+        assert_eq!(bar.active_text, config.chrome.accent_text);
+        assert_eq!(config.chrome.selection(), Rgb::new(0, 0xff, 0));
+    }
+
+    #[test]
+    fn a_chrome_colour_set_after_a_status_colour_still_reaches_the_bar() {
+        // The fallback is taken when the bar is drawn rather than when the
+        // file is read, so the order of the two sections cannot matter.
+        let mut config = Config::default();
+        apply_to(
+            &mut config,
+            "[status]\nforeground = #123456\n[chrome]\naccent = #abcdef\n",
+        );
+        assert_eq!(config.chrome.bar().active, Rgb::new(0xab, 0xcd, 0xef));
+        assert_eq!(config.chrome.bar().foreground, Rgb::new(0x12, 0x34, 0x56));
     }
 
     #[test]

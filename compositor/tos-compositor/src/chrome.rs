@@ -9,6 +9,17 @@ use tos_session::Axis;
 use tos_term::{Rgb, Terminal};
 
 /// Colors used by the compositor's own interface.
+///
+/// Six of these are one colour each; the rest are overrides, and the
+/// difference is deliberate. A person who sets `accent` means "the colour this
+/// session is highlighted in", and every highlight in it — the workspace on
+/// the bar, the row under the cursor in a menu, the text the mouse has
+/// selected — should move together. A person who sets the status bar's own
+/// background means that one strip and nothing else. So the general colours
+/// are values and the particular ones are `Option`, resolved against the
+/// general ones at the moment of drawing rather than at the moment of parsing:
+/// resolving at parse time would make the answer depend on which order the two
+/// lines appear in the file, which is not a thing anybody should have to know.
 #[derive(Debug, Clone, Copy)]
 pub struct Chrome {
     pub background: Rgb,
@@ -18,6 +29,32 @@ pub struct Chrome {
     pub accent_text: Rgb,
     pub divider: Rgb,
     pub divider_focused: Rgb,
+    /// The status bar's own strip, when it is not to be the same colour as
+    /// everything else the compositor draws.
+    pub status_background: Option<Rgb>,
+    /// The text of a segment that is not highlighted. Falls back to [`dim`]
+    /// rather than to [`foreground`], because the bar is meant to be read when
+    /// looked at and ignored otherwise.
+    ///
+    /// [`dim`]: Chrome::dim
+    /// [`foreground`]: Chrome::foreground
+    pub status_foreground: Option<Rgb>,
+    /// The block behind the active workspace and the focused pane.
+    pub status_active: Option<Rgb>,
+    /// The text inside that block.
+    pub status_active_text: Option<Rgb>,
+    /// The rule between two segments, which is what makes a row of unrelated
+    /// facts read as a row of unrelated facts rather than as a sentence.
+    pub status_divider: Option<Rgb>,
+    /// The block behind text the mouse or the keyboard has selected in a pane.
+    ///
+    /// Separate from [`accent`] because it is the one highlight that sits on
+    /// top of somebody else's colours: a palette whose own blue is close to
+    /// the accent leaves a selection that cannot be seen, and until now there
+    /// was no way to move one without moving the other.
+    ///
+    /// [`accent`]: Chrome::accent
+    pub selection: Option<Rgb>,
 }
 
 impl Default for Chrome {
@@ -30,7 +67,46 @@ impl Default for Chrome {
             accent_text: Rgb::new(0x10, 0x10, 0x14),
             divider: Rgb::new(0x2c, 0x2c, 0x34),
             divider_focused: Rgb::new(0x5f, 0x87, 0xd7),
+            status_background: None,
+            status_foreground: None,
+            status_active: None,
+            status_active_text: None,
+            status_divider: None,
+            selection: None,
         }
+    }
+}
+
+/// The colours the status bar actually paints with, with every fallback
+/// already taken.
+///
+/// Resolved into a struct of its own so that the drawing code never has to ask
+/// whether a colour was configured — a question it would have to ask about
+/// five separate fields, on every piece of every frame.
+#[derive(Debug, Clone, Copy)]
+pub struct BarColors {
+    pub background: Rgb,
+    pub foreground: Rgb,
+    pub active: Rgb,
+    pub active_text: Rgb,
+    pub divider: Rgb,
+}
+
+impl Chrome {
+    /// What the status bar paints with.
+    pub fn bar(&self) -> BarColors {
+        BarColors {
+            background: self.status_background.unwrap_or(self.background),
+            foreground: self.status_foreground.unwrap_or(self.dim),
+            active: self.status_active.unwrap_or(self.accent),
+            active_text: self.status_active_text.unwrap_or(self.accent_text),
+            divider: self.status_divider.unwrap_or(self.divider),
+        }
+    }
+
+    /// What selected text sits on.
+    pub fn selection(&self) -> Rgb {
+        self.selection.unwrap_or(self.accent)
     }
 }
 
@@ -111,80 +187,6 @@ pub fn draw_divider(
             );
         }
     }
-}
-
-/// One segment of the status bar.
-pub struct StatusItem {
-    pub text: String,
-    pub highlighted: bool,
-}
-
-impl StatusItem {
-    pub fn new(text: impl Into<String>, highlighted: bool) -> Self {
-        StatusItem {
-            text: text.into(),
-            highlighted,
-        }
-    }
-}
-
-/// Draw the status bar across `area`.
-pub fn draw_status_bar(
-    surface: &mut Surface<'_>,
-    fonts: &mut FontStack,
-    area: Rect,
-    chrome: &Chrome,
-    left: &[StatusItem],
-    right: &str,
-) {
-    surface.fill(area, chrome.background);
-
-    let mut x = area.x;
-    for item in left {
-        let label = format!(" {} ", item.text);
-        let (fg, bg) = if item.highlighted {
-            (chrome.accent_text, chrome.accent)
-        } else {
-            (chrome.dim, chrome.background)
-        };
-        x = draw_text(
-            surface,
-            fonts,
-            x,
-            area.y,
-            &label,
-            fg,
-            Some(bg),
-            item.highlighted,
-        );
-    }
-
-    if right.is_empty() {
-        return;
-    }
-    // Right aligned, with a cell of margin, in whatever the workspace items
-    // left. Text that does not fit is cut rather than dropped: the messages
-    // too long for the bar are exactly the ones worth reading, because a
-    // failure carries an `io::Error` and those are long.
-    let metrics = fonts.metrics();
-    let cw = metrics.cell_width.max(1);
-    let room = (((area.right() - x).max(0) as u32) / cw).saturating_sub(1) as usize;
-    if room == 0 {
-        return;
-    }
-    let text = clip_marked(right, room);
-    let width = tos_term::str_width(&text) as u32 * cw;
-    let start = area.right() - width as i32 - cw as i32;
-    draw_text(
-        surface,
-        fonts,
-        start,
-        area.y,
-        &text,
-        chrome.dim,
-        Some(chrome.background),
-        false,
-    );
 }
 
 /// Cut text to `cols` cells, never slicing a double width character in half.
@@ -324,64 +326,6 @@ mod tests {
             let inked = (0..metrics.cell_width).any(|x| fb.pixel(x, y) != 0);
             assert!(inked, "divider missing on row {row}");
         }
-    }
-
-    #[test]
-    fn the_status_bar_fills_its_area() {
-        let mut fonts = fonts();
-        let chrome = Chrome::default();
-        let metrics = fonts.metrics();
-        let mut fb = OwnedFramebuffer::new(metrics.cell_width * 20, metrics.cell_height);
-        {
-            let mut surface = fb.surface();
-            draw_status_bar(
-                &mut surface,
-                &mut fonts,
-                Rect::new(0, 0, metrics.cell_width * 20, metrics.cell_height),
-                &chrome,
-                &[StatusItem::new("1", true), StatusItem::new("2", false)],
-                "tOS",
-            );
-        }
-        // The highlighted workspace uses the accent colour.
-        assert!(fb.pixels().iter().any(|&px| px == chrome.accent.pack()));
-        // And nothing is left transparent.
-        assert!(!fb.pixels().iter().all(|&px| px == 0));
-    }
-
-    /// Draw a bar of `cols` cells with one highlighted workspace and this
-    /// message, and say whether any of the message reached the surface. The
-    /// workspace is highlighted so the only dim ink can be the message.
-    fn bar_with_message(cols: u32, message: &str) -> bool {
-        let mut fonts = fonts();
-        let chrome = Chrome::default();
-        let metrics = fonts.metrics();
-        let (w, h) = (metrics.cell_width * cols, metrics.cell_height);
-        let mut fb = OwnedFramebuffer::new(w, h);
-        {
-            let mut surface = fb.surface();
-            draw_status_bar(
-                &mut surface,
-                &mut fonts,
-                Rect::new(0, 0, w, h),
-                &chrome,
-                &[StatusItem::new("1", true)],
-                message,
-            );
-        }
-        fb.pixels().iter().any(|&px| px == chrome.dim.pack())
-    }
-
-    #[test]
-    fn a_message_too_long_for_the_bar_is_clipped_rather_than_dropped() {
-        // The message that does not fit is the one worth reading: this is
-        // what an `io::Error` from a failed split looks like on a narrow bar.
-        let long = "split failed: no such file or directory (os error 2)";
-        assert!(bar_with_message(20, long), "the message was not drawn");
-        assert!(bar_with_message(80, long));
-        // Down to a bar with no room at all for it, which draws nothing and
-        // does not panic working out where the text would start.
-        assert!(!bar_with_message(3, long));
     }
 
     #[test]
