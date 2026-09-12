@@ -2374,6 +2374,14 @@ impl Compositor {
             if self.mouse_grab == Some(Grab::Pane(pane)) {
                 self.mouse_grab = None;
             }
+            // A divider being dragged is dropped whichever pane went, not
+            // only one beside it. Closing frees nodes in the layout tree and
+            // splitting hands the same slots out again, so a drag that
+            // outlived a pane could come back pointing at a split that was
+            // built after it — and resize something nobody was holding.
+            if matches!(self.mouse_grab, Some(Grab::Divider(_))) {
+                self.mouse_grab = None;
+            }
             // A copy mode whose pane has gone has nothing left to select in,
             // and leaving it up would swallow the keyboard on behalf of text
             // that no longer exists.
