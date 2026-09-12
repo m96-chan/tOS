@@ -2707,6 +2707,15 @@ impl Compositor {
                 Some(label) => one(label),
                 None => Vec::new(),
             },
+            Segment::Layout => match self.session.active().arrangement() {
+                // Splits is not announced. It is what every session starts in
+                // and where most of them stay, so naming it would spend a slot
+                // on a word that never changes; the segment appearing at all
+                // is itself the news that the panes are somewhere other than
+                // where the splits left them.
+                Arrangement::Splits => Vec::new(),
+                other => one(other.name().to_string()),
+            },
             Segment::Message => match self.status_message() {
                 // The elastic one: it is the only thing on the bar whose
                 // length is not the compositor's own choice, and clicking it
@@ -5034,6 +5043,23 @@ mod tests {
     /// unambiguously still the same one. 15:34 UT on the 4th of September
     /// 2025, which is a Thursday and of no significance whatever.
     const ON_THE_MINUTE: i64 = 1_757_000_040;
+
+    #[test]
+    fn the_bar_names_the_arrangement_only_once_it_is_not_the_tree() {
+        let mut compositor = compositor_showing(&[Segment::Layout], &[]);
+        // Splits says nothing: a word that is on the bar in every session
+        // that ever runs tells nobody anything, and the segment appearing is
+        // itself the news.
+        assert_eq!(compositor.status_bar().text().trim(), "");
+
+        compositor.perform(Action::NextLayout);
+        assert_eq!(compositor.status_bar().text().trim(), "tall");
+        compositor.perform(Action::NextLayout);
+        assert_eq!(compositor.status_bar().text().trim(), "fat");
+        compositor.perform(Action::PreviousLayout);
+        compositor.perform(Action::PreviousLayout);
+        assert_eq!(compositor.status_bar().text().trim(), "");
+    }
 
     #[test]
     fn a_minute_turning_over_puts_a_new_time_on_the_bar_and_asks_for_a_frame() {

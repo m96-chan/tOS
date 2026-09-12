@@ -72,6 +72,13 @@ pub enum Segment {
     Panes,
     /// The focused pane's label, and how far back its viewport is scrolled.
     Title,
+    /// How the active workspace's panes are arranged, when that is not the
+    /// split tree every session starts in.
+    ///
+    /// The answer to layout cycling feeling random: `ctrl+shift+l` moves the
+    /// panes and, without this, leaves nothing on screen saying what it moved
+    /// them into. Kitty puts the same word in its tab bar.
+    Layout,
     /// The leader indicator, or else the notification queue. Elastic, and
     /// clicking it opens the history.
     Message,
@@ -95,6 +102,7 @@ impl Segment {
             Segment::Workspaces => "workspaces",
             Segment::Panes => "panes",
             Segment::Title => "title",
+            Segment::Layout => "layout",
             Segment::Message => "message",
             Segment::Clock => "clock",
             Segment::Battery => "battery",
@@ -111,10 +119,11 @@ impl Segment {
     /// Every segment there is, which is also what an unknown name is reported
     /// against: a file that asks for `batery` gets told what it could have
     /// asked for instead of being left to guess.
-    pub const ALL: [Segment; 9] = [
+    pub const ALL: [Segment; 10] = [
         Segment::Workspaces,
         Segment::Panes,
         Segment::Title,
+        Segment::Layout,
         Segment::Message,
         Segment::Clock,
         Segment::Battery,
@@ -150,7 +159,10 @@ impl Default for Settings {
     /// are one word in a file away for the person who does want them.
     fn default() -> Settings {
         Settings {
-            left: vec![Segment::Workspaces, Segment::Title],
+            // The arrangement is on the default bar and costs nothing to
+            // have there: it says nothing at all while the workspace is in
+            // the splits every session starts in, which is most of the time.
+            left: vec![Segment::Workspaces, Segment::Layout, Segment::Title],
             right: vec![
                 Segment::Message,
                 Segment::Network,
