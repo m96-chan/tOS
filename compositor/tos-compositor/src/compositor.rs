@@ -2719,10 +2719,10 @@ impl Compositor {
             && self.copy.is_none()
             && self.notifications.advance(now)
         {
-            // Without a status bar the notification is a banner over the panes,
-            // and the cells it covered are only repainted on damage they have
-            // not got. Retiring it has to uncover them.
-            self.needs_full_redraw |= !self.config.status_bar;
+            // A banner is over the panes, and the cells it covered are only
+            // repainted on damage they have not got. Retiring it has to
+            // uncover them.
+            self.needs_full_redraw |= self.notification_is_a_banner();
             changed = true;
         }
         // The machine moves without anybody touching the session: a battery
@@ -2806,6 +2806,20 @@ impl Compositor {
     /// so a hand that has stopped moving stops asking.
     fn pointer_moved_since_it_was_drawn(&self) -> bool {
         self.pointer_rect() != self.pointer.painted()
+    }
+
+    /// Whether a notification on the queue is drawn as a banner over the panes
+    /// rather than in a slot on the status bar.
+    ///
+    /// Two places need this and they have to be the same question: the one
+    /// that draws the banner, and the one that asks for the repaint retiring
+    /// it owes the cells underneath. They were once `!status_bar` and
+    /// `!status_bar || !shows_message()`, and a bar whose layout leaves the
+    /// `message` segment out fell into the gap — the banner was drawn over
+    /// pane row 0, nothing damaged that row when its time was up, and it sat
+    /// there until something unrelated forced a full redraw.
+    fn notification_is_a_banner(&self) -> bool {
+        !self.config.status_bar || !self.config.status.shows_message()
     }
 
     /// Paint a frame.
@@ -2982,7 +2996,7 @@ impl Compositor {
         // whose layout leaves the `message` segment out is the same case
         // arrived at a different way, and gets the same banner rather than a
         // configuration that silently swallows every failure.
-        if !self.config.status_bar || !self.config.status.shows_message() {
+        if self.notification_is_a_banner() {
             if let Some(text) = self.notifications.status_line() {
                 let over = PixelRect::new(0, 0, area.width * cw, ch);
                 notify::draw_banner(surface, &mut self.fonts, over, &self.chrome, &text);
