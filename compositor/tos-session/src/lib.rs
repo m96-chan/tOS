@@ -11,5 +11,5 @@ pub mod session;
 
 pub use describe::{cheat_sheet, BindingHelp};
 pub use keys::{Action, Binding, Keymap, Resolution};
-pub use layout::{Axis, Direction, Layout, PaneId, Rect};
+pub use layout::{Arrangement, Axis, Direction, Layout, PaneId, Rect};
 pub use session::{Session, Workspace, WorkspaceId};
