@@ -50,7 +50,7 @@
 
 use std::io;
 use std::net::Ipv4Addr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The port a client listens on.
 ///
@@ -619,6 +619,11 @@ pub struct Client {
     /// The offer taken up, kept so that the REQUEST can name it and so that
     /// an ACK for a different address can be told from an ACK for ours.
     taken: Option<Offer>,
+    /// The `secs` last handed to [`Client::discover`], kept so that the
+    /// REQUEST can carry the same count. Only the retry loop knows how long
+    /// this client has been asking, and the REQUEST is built here, in the
+    /// middle of a `receive`, where there is nobody to ask.
+    secs: u16,
 }
 
 /// The two numbers out of an OFFER that the REQUEST has to repeat.
@@ -635,6 +640,7 @@ impl Client {
             xid,
             state: State::Init,
             taken: None,
+            secs: 0,
         }
     }
 
@@ -653,9 +659,16 @@ impl Client {
     /// it. A server with a backup uses it to decide when the backup should
     /// answer, so a client that always sends zero is one a failover pair
     /// never gets round to helping.
+    ///
+    /// Calling it again is how a retransmission is built: the same
+    /// transaction, the same options, a later `secs`. It returns to SELECTING
+    /// and forgets any offer taken, so the caller has to know it is still in
+    /// that stage before asking — [`acquire`] does that with
+    /// [`Client::state`].
     pub fn discover(&mut self, secs: u16) -> Vec<u8> {
         self.state = State::Selecting;
         self.taken = None;
+        self.secs = secs;
         let mut message = Message::request(self.mac, self.xid);
         message.secs = secs;
         message.set_message_type(MessageType::Discover);
@@ -707,6 +720,16 @@ impl Client {
     /// offered that its offer was not taken and can go back in the pool, and
     /// `ciaddr` is for a client that already holds the address it is asking
     /// about, which one halfway through its first handshake does not.
+    ///
+    /// `secs` is this client's own count of how long it has been asking,
+    /// carried over from the DISCOVER that drew the offer, and not the `secs`
+    /// on the offer itself. RFC 2131's table of what a server fills in says a
+    /// reply's `secs` is zero, so echoing it puts a REQUEST on the wire
+    /// claiming a client that has been retrying for a minute has only just
+    /// started — the one thing the field exists to tell a server apart.
+    /// Unlike the DISCOVER it is not rebuilt on a retransmission: by the time
+    /// a REQUEST is out some server has already answered, so there is no
+    /// backup left to fail over to, and §4.1 asks for the same packet again.
     fn take(&mut self, offer: &Message) -> Step {
         if offer.yiaddr.is_unspecified() {
             return Step::Ignore;
@@ -719,7 +742,7 @@ impl Client {
         self.state = State::Requesting;
 
         let mut message = Message::request(self.mac, self.xid);
-        message.secs = offer.secs;
+        message.secs = self.secs;
         message.set_message_type(MessageType::Request);
         message.set(option::REQUESTED_ADDRESS, taken.address.octets().to_vec());
         if let Some(server) = taken.server {
@@ -799,6 +822,23 @@ pub trait Transport {
     /// `Ok(None)` is the timeout expiring, which is the ordinary answer on a
     /// network with no DHCP server on it, and so is not an error.
     fn receive(&mut self, timeout: Duration) -> io::Result<Option<Vec<u8>>>;
+
+    /// The monotonic clock [`acquire`] measures an attempt's budget against.
+    ///
+    /// The default is the real one, which is the whole answer for anything
+    /// that is really a socket, so this is a third method on an existing seam
+    /// rather than a `Clock` trait of its own. A separate clock would have to
+    /// be handed to the transport as well: the only thing in the retry loop
+    /// that takes any time is [`Transport::receive`], so a fake network that
+    /// wants its fake delays to show up on the deadline has to be the thing
+    /// that moves the clock. Two seams that have to be kept in step are worse
+    /// than one, and the one that already knows how long it waited is this.
+    ///
+    /// [`FakeServer`] overrides it, which is what lets a test watch a fifteen
+    /// second retry schedule run all the way out in no time at all.
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
 }
 
 /// How many times [`acquire`] sends before giving up.
@@ -818,27 +858,70 @@ pub const FIRST_WAIT: Duration = Duration::from_secs(1);
 
 /// The most datagrams read in one attempt before the attempt is abandoned.
 ///
-/// Without a bound, a segment busy with DHCP for other machines is an endless
-/// loop: every datagram is ignored, the deadline is never reached, and the
-/// caller never comes back. Sixteen is far more than a handshake needs and
-/// far fewer than a busy network produces in a second.
+/// The deadline in [`acquire`] bounds how long an attempt takes but not how
+/// much work it does, and those are different failures. A segment handing
+/// over datagrams as fast as they can be dropped — every one of them somebody
+/// else's DHCP, every one of them ignored — would keep this loop spinning for
+/// the whole of the attempt's budget on a thread the compositor also draws
+/// frames with. Sixteen is far more than a handshake needs and far fewer than
+/// a busy network produces in a second, so an ordinary conversation never
+/// meets it.
+///
+/// It cannot be the only bound. Counting datagrams without a deadline to go
+/// with it multiplies the budget rather than caps it: each datagram then
+/// carries a fresh timeout of its own, and sixteen of them is sixteen waits.
 const MAX_DATAGRAMS: u32 = 16;
 
 /// Run the whole handshake and come back with a lease.
 ///
+/// Fifteen seconds is the worst this can cost: [`ATTEMPTS`] budgets of
+/// [`FIRST_WAIT`] doubling, 1 + 2 + 4 + 8, and nothing that arrives in
+/// between can add to them. That number is a promise made above this module
+/// as well as in it — while an acquisition is in flight the compositor holds
+/// the link's `dhcp` slot and answers a second request with "already asking
+/// on …", so an attempt that overruns is not a slow menu entry, it is a menu
+/// entry that cannot be pressed again until it finishes.
+///
 /// The waiting here is the receive timeout rather than a sleep, which is what
 /// makes it testable: [`FakeServer`] answers at once, and the retry schedule
-/// never costs a test a second.
+/// never costs a test a second. Time is read through [`Transport::now`] for
+/// the same reason, so that the fifteen seconds above is something a test
+/// asserts rather than something a test sits through.
 pub fn acquire<T: Transport>(transport: &mut T, mac: [u8; 6], xid: u32) -> io::Result<Lease> {
     let mut client = Client::new(mac, xid);
+    let started = transport.now();
     let mut elapsed = 0u16;
-    let mut pending = client.discover(elapsed);
+    // Filled by the first pass below, which is always in INIT and so always
+    // builds one.
+    let mut pending = Vec::new();
 
     for attempt in 0..ATTEMPTS {
+        // A retransmitted DISCOVER is rebuilt rather than resent, because
+        // `secs` has to say how long this client has been asking — see
+        // [`Client::discover`] for the server that is waiting to hear a big
+        // enough number. Not once a REQUEST is pending: rebuilding then would
+        // drop the offer that was taken and start the conversation over,
+        // against a server that has already reserved an address for it.
+        if client.state() != State::Requesting {
+            pending = client.discover(elapsed);
+        }
         transport.send(&pending)?;
-        let wait = FIRST_WAIT * 2u32.pow(attempt);
+
+        // A deadline, not a timeout per datagram. Each receive gets what is
+        // left of the attempt's budget, so that a segment carrying DHCP for
+        // other machines — the case [`MAX_DATAGRAMS`] exists for — cannot
+        // make one attempt cost MAX_DATAGRAMS attempts' worth of waiting.
+        // Handing the whole budget to every receive instead lets each ignored
+        // datagram start the clock again, and the fifteen seconds this module
+        // documents becomes four minutes on exactly the kind of network that
+        // is hardest to get an address on.
+        let deadline = transport.now() + FIRST_WAIT * 2u32.pow(attempt);
         for _ in 0..MAX_DATAGRAMS {
-            let Some(datagram) = transport.receive(wait)? else {
+            let remaining = deadline.saturating_duration_since(transport.now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Some(datagram) = transport.receive(remaining)? else {
                 break;
             };
             match client.receive(&datagram) {
@@ -853,7 +936,13 @@ pub fn acquire<T: Transport>(transport: &mut T, mac: [u8; 6], xid: u32) -> io::R
                 }
             }
         }
-        elapsed = elapsed.saturating_add(wait.as_secs() as u16);
+        // Read off the clock rather than added up from the schedule. An
+        // attempt cut short by [`MAX_DATAGRAMS`] spends less than its budget,
+        // and a `secs` counted off the schedule anyway would tell a server the
+        // client has been asking for longer than it has, and would end below
+        // with an error naming fifteen seconds nobody waited.
+        elapsed =
+            u16::try_from(transport.now().duration_since(started).as_secs()).unwrap_or(u16::MAX);
     }
 
     Err(io::Error::new(
@@ -926,8 +1015,21 @@ pub struct FakeServer {
     /// Datagrams handed over before any real reply: other machines' traffic,
     /// for the tests about what a broadcast socket overhears.
     pub noise: Vec<Vec<u8>>,
+    /// How long each datagram takes to turn up, on the fake clock.
+    ///
+    /// Zero — the default — is a server that answers the instant it is asked,
+    /// which is what every test about the handshake itself wants. Setting it
+    /// is how a test asks what a busy segment does to the retry schedule, and
+    /// it costs nothing: the delay is only ever added to [`Transport::now`],
+    /// so a simulated minute of other people's DHCP goes by between two
+    /// instructions.
+    pub arrival: Duration,
     /// Replies waiting to be read.
     pending: Vec<Vec<u8>>,
+    /// The fake clock: a real [`Instant`] to hang it off, because one cannot
+    /// be built from nothing, and the simulated time added to it.
+    started: Instant,
+    spent: Duration,
 }
 
 impl FakeServer {
@@ -945,7 +1047,10 @@ impl FakeServer {
             omit_netmask: false,
             sent: Vec::new(),
             noise: Vec::new(),
+            arrival: Duration::ZERO,
             pending: Vec::new(),
+            started: Instant::now(),
+            spent: Duration::ZERO,
         }
     }
 
@@ -953,6 +1058,14 @@ impl FakeServer {
     pub fn refusing(mut self, why: &str) -> FakeServer {
         self.refuse = Some(why.to_string());
         self
+    }
+
+    /// How much of the fake clock the conversation so far has used.
+    ///
+    /// What a test asserts against when the question is how long an
+    /// acquisition took, rather than what it said.
+    pub fn spent(&self) -> Duration {
+        self.spent
     }
 
     /// What the client sent, parsed.
@@ -1035,16 +1148,26 @@ impl Transport for FakeServer {
         Ok(())
     }
 
-    fn receive(&mut self, _timeout: Duration) -> io::Result<Option<Vec<u8>>> {
+    fn receive(&mut self, timeout: Duration) -> io::Result<Option<Vec<u8>>> {
+        let waiting = !self.noise.is_empty() || !self.pending.is_empty();
+        if !waiting || self.arrival > timeout {
+            // Nothing waiting is the timeout expiring, not an error: a
+            // network with no server on it is an ordinary network. So is a
+            // datagram still in flight when the caller gives up on it, and
+            // both cost the caller the whole of what it was prepared to wait,
+            // which is the part a deadline is made of.
+            self.spent += timeout;
+            return Ok(None);
+        }
+        self.spent += self.arrival;
         if !self.noise.is_empty() {
             return Ok(Some(self.noise.remove(0)));
         }
-        if self.pending.is_empty() {
-            // Nothing waiting is the timeout expiring, not an error: a
-            // network with no server on it is an ordinary network.
-            return Ok(None);
-        }
         Ok(Some(self.pending.remove(0)))
+    }
+
+    fn now(&self) -> Instant {
+        self.started + self.spent
     }
 }
 
@@ -1541,6 +1664,75 @@ mod tests {
         let error = acquire(&mut silence, MAC, XID).expect_err("nobody answered");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(silence.sent, ATTEMPTS as usize, "one send per attempt");
+    }
+
+    /// A segment where nothing that arrives is ours: offers for the machine
+    /// next door, half a second apart, far more of them than any attempt can
+    /// read. Nothing here can finish a handshake, so the only things that can
+    /// end an attempt are the clock and [`MAX_DATAGRAMS`].
+    fn a_segment_nobody_answers_on() -> FakeServer {
+        let mut server = FakeServer::new();
+        server.arrival = Duration::from_millis(500);
+        server.noise = (1..=128)
+            .map(|n| reply(MessageType::Offer, OTHER_MAC, XID ^ n).encode())
+            .collect();
+        server
+    }
+
+    #[test]
+    fn a_segment_full_of_other_machines_traffic_does_not_extend_the_budget() {
+        let mut server = a_segment_nobody_answers_on();
+        let error = acquire(&mut server, MAC, XID).expect_err("nobody answered");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        // 1 + 2 + 4 + 8, and not a second more however much arrives in the
+        // meantime. Every one of those datagrams is dropped, and a dropped
+        // datagram used to buy the attempt another whole wait of its own.
+        assert_eq!(server.spent(), Duration::from_secs(15));
+        assert_eq!(
+            server.transcript().len(),
+            ATTEMPTS as usize,
+            "still one send per attempt"
+        );
+    }
+
+    #[test]
+    fn a_retransmitted_discover_says_how_long_the_client_has_been_asking() {
+        let mut server = a_segment_nobody_answers_on();
+        acquire(&mut server, MAC, XID).expect_err("nobody answered");
+
+        let sent = server.seen();
+        assert_eq!(
+            sent.iter()
+                .filter_map(|message| message.message_type())
+                .collect::<Vec<_>>(),
+            vec![MessageType::Discover; ATTEMPTS as usize],
+            "no offer was ever taken, so every send is a DISCOVER"
+        );
+        // The schedule this client keeps, read off the clock: it asks, waits
+        // a second, asks again, waits two. A backup server that is told
+        // nothing but zero never decides its turn has come.
+        assert_eq!(
+            sent.iter().map(|message| message.secs).collect::<Vec<_>>(),
+            vec![0, 1, 3, 7]
+        );
+    }
+
+    #[test]
+    fn a_request_carries_the_clients_own_count_rather_than_the_servers_zero() {
+        let mut client = Client::new(MAC, XID);
+        client.discover(9);
+
+        let mut offer = reply(MessageType::Offer, MAC, XID);
+        // What a conforming server sends: RFC 2131 has the server fill in a
+        // zero here, so there is nothing in the offer worth echoing.
+        offer.secs = 0;
+        let Step::Send(request) = client.receive(&offer.encode()) else {
+            panic!("the offer was not taken up");
+        };
+
+        let request = Message::parse(&request).expect("a request");
+        assert_eq!(request.secs, 9);
     }
 
     #[test]
