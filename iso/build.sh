@@ -26,6 +26,33 @@ aarch64) platform=linux/arm64 ;;
     ;;
 esac
 
+# target/ is the one directory mkiso.sh cannot hand back itself. Docker creates
+# a bind target it does not find, and creates it as root, so the host ends up
+# with a root-owned target/ that the container can no longer see past its own
+# mount: a `cargo build` on the host then fails on a directory it cannot write,
+# and `git worktree remove` fails on one it cannot delete, and neither says
+# why.
+#
+# Made here rather than repaired afterwards. Docker leaves a mountpoint that
+# already exists alone, so this costs nothing, needs no second container and no
+# network, works the same under podman, and — unlike a repair after the build —
+# does not have to be remembered on the path where the build failed, which is
+# the path that used to leave the directory owned by root.
+mkdir -p target
+
+# A checkout poisoned by an older build still has to be handed back, and
+# nothing here may use sudo: the hosts this is run from have no passwordless
+# one, which is the whole reason the build is in a container. So the repair is
+# another container, which is already root — once, and only when it is needed.
+# Not under rootless podman, where the container's root is already the invoking
+# user and a chown to this uid inside it would name a subuid instead, handing
+# target/ to an id nobody can write to: the symptom this exists to prevent,
+# reached from the other side.
+if [ ! -w target ] && [ "$engine" = docker ]; then
+    "$engine" run --rm -v "$PWD":/src alpine \
+        chown "$(id -u):$(id -g)" /src/target
+fi
+
 # Named volumes keep the registry and target dir warm between builds, and
 # keep the container's Linux artifacts out of the host target/.
 # The container runs as root and writes dist/ into the checkout. Passing the

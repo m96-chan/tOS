@@ -875,7 +875,7 @@ mod tests {
 
     /// A backend that looks like the live image with its medium mounted.
     fn live_backend() -> Recorder {
-        crate::install::planning_backend()
+        crate::install::live_planning_backend()
     }
 
     fn type_text(app: &mut App, text: &str) {

@@ -130,8 +130,8 @@ impl Settings {
         if let Some(problem) = name_problem(&self.username, "User name") {
             return Some(problem);
         }
-        if self.username == "root" {
-            return Some("User name cannot be root".to_string());
+        if let Some(taken) = DEBIAN_NAMES.iter().find(|name| **name == self.username) {
+            return Some(format!("User name {taken} is Debian's already"));
         }
         None
     }
@@ -153,6 +153,67 @@ impl Settings {
         }
     }
 }
+
+/// The names a Debian base system has already taken.
+///
+/// The installer adds its user by appending one line to the `/etc/passwd` and
+/// one to the `/etc/group` the rootfs brought with it, which is right — `_apt`
+/// and the rest are Debian's to keep — but it means a name can now collide,
+/// where writing both files whole made that impossible. `getpwnam` and
+/// `getgrnam` answer with the first line that matches, so a person who called
+/// themselves `games` would be handed uid 5, a home of `/usr/games` and a
+/// shell of `nologin`, with their password hash and their home directory
+/// sitting beside it belonging to nobody.
+///
+/// The group names are here for the same reason and are the longer half of the
+/// list: `disk`, `video` and `sudo` are nobody's user name but all three are
+/// group names Debian ships, and a duplicate there gives the person a primary
+/// gid of 1000 while `chgrp disk` moves a file to gid 6.
+///
+/// Refused at the screen where the name is typed, which is before the disk has
+/// been touched. `root` is in the list rather than beside it, because it was
+/// only ever the first name of this kind.
+const DEBIAN_NAMES: [&str; 37] = [
+    // /etc/passwd
+    "root",
+    "daemon",
+    "bin",
+    "sys",
+    "sync",
+    "games",
+    "man",
+    "lp",
+    "mail",
+    "news",
+    "uucp",
+    "proxy",
+    "www-data",
+    "backup",
+    "list",
+    "irc",
+    "nobody",
+    "systemd-network",
+    "sshd",
+    "messagebus",
+    // /etc/group, which the same append writes to
+    "disk",
+    "tty",
+    "dialout",
+    "fax",
+    "voice",
+    "cdrom",
+    "floppy",
+    "tape",
+    "audio",
+    "video",
+    "plugdev",
+    "staff",
+    "users",
+    "nogroup",
+    "sudo",
+    "src",
+    "shadow",
+];
 
 /// Names have to survive being written into `/etc/passwd` and a host file.
 fn name_problem(name: &str, what: &str) -> Option<String> {
@@ -179,6 +240,22 @@ fn name_problem(name: &str, what: &str) -> Option<String> {
 /// Where `/init` mounts the medium the live session booted from.
 pub const LIVE_MEDIUM_BOOT: &str = "/run/live/medium/boot";
 
+/// The Debian rootfs on the medium, which is what an installed machine is
+/// made of. `iso/mkiso.sh` puts it here and `iso/init` mounts it from here.
+///
+/// Unpacked from the medium rather than copied out of the running session:
+/// the live root is this same image with a tmpfs overlay in front of it, so
+/// copying it would carry across every file the session happened to write —
+/// the resolver a DHCP lease left, a half-finished `apt install`, a password
+/// somebody typed into a file. The image is the same bytes every time.
+pub const LIVE_ROOTFS_IMAGE: &str = "/run/live/medium/live/filesystem.squashfs";
+
+/// Where the target root is mounted while it is being installed to.
+///
+/// Named because more than the plan needs it: what `--plan` prints has to be
+/// able to talk about files under the new root before there is a `Plan` to ask.
+pub const MOUNT_POINT: &str = "/mnt/target";
+
 /// Sizes of the partitions the installer creates.
 pub const ESP_MIB: u64 = 512;
 /// The BIOS boot partition GRUB embeds its core image into.
@@ -195,7 +272,8 @@ pub enum Step {
     FormatRoot,
     /// Mount root, and the ESP beneath it.
     Mount,
-    /// Put the system onto the root filesystem.
+    /// Put the system onto the root filesystem: unpack the Debian rootfs, or
+    /// copy the running one when the medium carries no rootfs image.
     CopySystem,
     /// Write `/etc` for the installed system.
     Configure,
@@ -213,7 +291,7 @@ impl Step {
             Step::FormatEsp => "Create the EFI system partition",
             Step::FormatRoot => "Create the root filesystem",
             Step::Mount => "Mount the new system",
-            Step::CopySystem => "Copy tOS onto the disk",
+            Step::CopySystem => "Unpack the system onto the disk",
             Step::Configure => "Write the system configuration",
             Step::Bootloader => "Install the bootloader",
             Step::Finish => "Flush and unmount",
@@ -235,6 +313,10 @@ pub struct Plan {
     /// rather than the running filesystem: an initramfs does not contain the
     /// kernel that loaded it.
     pub boot_source: String,
+    /// The Debian rootfs image to unpack onto the disk. When it is not on the
+    /// medium the installer falls back to copying the running system, which
+    /// is what an image built before the rootfs existed leaves it with.
+    pub rootfs_image: String,
 }
 
 impl Plan {
@@ -243,9 +325,10 @@ impl Plan {
             disk,
             firmware,
             settings,
-            mount_point: "/mnt/target".to_string(),
+            mount_point: MOUNT_POINT.to_string(),
             source_root: "/".to_string(),
             boot_source: LIVE_MEDIUM_BOOT.to_string(),
+            rootfs_image: LIVE_ROOTFS_IMAGE.to_string(),
         }
     }
 
@@ -365,6 +448,36 @@ mod tests {
             in_use: false,
             is_boot_medium: false,
         }
+    }
+
+    #[test]
+    fn a_name_debian_already_uses_is_refused_before_the_disk_is_touched() {
+        // The installer appends its line to the passwd the rootfs brought,
+        // so a name that is already in it produces a second entry that
+        // getpwnam never returns: the person's home, their credential and
+        // their uid all belong to an account nothing can reach. Writing the
+        // whole file used to make that impossible.
+        // Both halves: a user name Debian's passwd has, and a name that is
+        // only ever a group — the same append writes to /etc/group too.
+        for taken in [
+            "root", "games", "www-data", "nobody", "disk", "sudo", "video",
+        ] {
+            let settings = Settings {
+                username: taken.to_string(),
+                ..Settings::default()
+            };
+            let problem = settings.problem();
+            assert!(
+                problem.is_some_and(|p| p.contains(taken)),
+                "{taken} was accepted as a user name"
+            );
+        }
+        // And an ordinary name still is one.
+        let settings = Settings {
+            username: "yusuke".into(),
+            ..Settings::default()
+        };
+        assert_eq!(settings.problem(), None);
     }
 
     fn plan(firmware: Firmware) -> Plan {

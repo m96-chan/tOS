@@ -9,7 +9,10 @@ Three decisions, in the order they have to be made.
 
 **Wireless links will be joined through `wpa_supplicant`, driven over its
 UNIX control socket, not through iwd and not through D-Bus.** Nothing is
-built for it yet; it is gated on [#20](https://github.com/m96-chan/tOS/issues/20).
+built for it yet. It was gated on [#20](https://github.com/m96-chan/tOS/issues/20),
+which has landed: the rootfs is a Debian squashfs now, so there is somewhere to
+put a supplicant and something to install one with. What is left is the client
+and the firmware, not the place to keep them.
 
 **Nothing scans for access points until the supplicant is there.**
 `SIOCGIWSCAN` is not being used, and the reason is measured rather than
@@ -36,10 +39,12 @@ would notice. The rest of this document is about closing that gap.
 
 ## Wired: why a DHCP client rather than a DHCP client package
 
-There is no `dhclient` on a tOS machine and there is nowhere obvious to put
-one. The live ISO is a busybox initramfs; the installed system is the same
-initramfs copied onto a disk. Even after #20 lands and both become a Debian
-rootfs, adding `isc-dhcp-client` means adding a daemon, a configuration
+There is no `dhclient` on a tOS machine, and the argument for keeping it that
+way outlived the reason it started. When this was written the live ISO was a
+busybox initramfs and the installed system was that same initramfs copied onto
+a disk, so there was nowhere to put one; since #20 both are a Debian rootfs and
+`apt install isc-dhcp-client` would work. It is still not wanted, for the
+second reason rather than the first: adding it means adding a daemon, a configuration
 language, a hook directory and a supervision story for something the
 compositor has to be able to start and stop from a menu.
 
@@ -267,10 +272,12 @@ with the standard library and a seam, and the other cannot.
 
 ### What would have to be true before any of it is written
 
-#20 has to land. Until the rootfs is a Debian squashfs there is nowhere to put
-a supplicant binary, nowhere to put `/etc/wpa_supplicant`, and no firmware for
-the radio either. A supplicant client written before then would be untested
-against a real supplicant and unrunnable on either image.
+#20 has landed, which was the first condition: the rootfs is a Debian squashfs,
+so there is somewhere to put a supplicant binary and `/etc/wpa_supplicant`, and
+apt to put them there with. What is still missing is the firmware for the radio
+— the image packs no firmware at all — and a machine with a real wireless
+adapter to write the client against. A supplicant client written without one
+would be untested against a real supplicant.
 
 ---
 
@@ -418,6 +425,217 @@ status line.
 | Wired: DHCP on link-up | acquisition, address, netmask, route, `resolv.conf` |
 | Wired: lease renewal | **not built** — see above for what it takes |
 | Wi-Fi: supplicant decision | wpa_supplicant, recorded above |
-| Wi-Fi: scan / join | **not built**, gated on #20; scan reasoned against above |
+| Wi-Fi: scan / join | **not built**; #20 landed, so what is left is firmware and a radio to test against |
 | TUI control surface | `super+shift+n`, two overlays |
 | Live ISO needs only status | every privileged step reports its refusal |
+
+---
+
+## The first time any of this ran — [#84](https://github.com/m96-chan/tOS/issues/84)
+
+Everything above this line was designed, written and unit tested against a
+`FakeServer`, and had never touched an interface, because a tOS VM had no
+interface to touch. This section is the record of the first boot that did:
+what was wrong, what it cost to fix, what was seen, and what is still only a
+design. It is deliberately specific — the point of an experiment is that
+somebody can tell whether it was really run.
+
+Measured 2026-09-12, on the ISO built from this tree: Debian bookworm,
+kernel 6.1.0-53-amd64, busybox 1.35.0.
+
+### Two faults, stacked, and the second was only visible past the first
+
+`iso/mkiso.sh` packed a module closure with nothing under `drivers/net` in it
+at all — no `virtio_net`, no `e1000`, nothing. A VirtualBox VM given a NAT
+adapter booted to `lo` alone, and `super+shift+n` did not open a menu: it put
+`no wired or wireless interfaces` on the status bar, which is the compositor
+correctly reporting that there was nothing to offer. The adapter was really
+there. On that machine `/sys/bus/pci/devices/0000:00:03.0` was vendor `0x1af4`
+device `0x1000`, class `0x020000`, and it had no `driver` symlink: a network
+controller on the bus with nothing bound to it.
+
+Packing the five drivers did not fix it. The next image still showed `lo`
+alone, because **nothing on this machine ever asks for a module.** There is no
+udev in the initramfs, and this kernel is built without `CONFIG_UEVENT_HELPER`
+— `/sys/kernel/uevent_helper` does not exist, which is checkable from a pane
+and was. The only thing that loads a module is the `modprobe` loop in
+`iso/init`, so a module that is packed and not named there is dead weight.
+Packing a driver and loading it are two separate edits in two separate files,
+and the first one alone looks exactly like the bug it was meant to fix.
+
+And then `modprobe virtio_net` by hand *still* produced no interface, which is
+the part most worth writing down. `virtio_net` binds virtio devices, not PCI
+ones. The PCI adapter needs `virtio_pci` bound to it before a virtio device
+exists for `virtio_net` to claim, and `virtio_pci` — though it had been in the
+packed list for a long time — had never been in `/init`'s loop either. Nothing
+had ever needed it: the machines this image is booted on take their disk from
+IDE and their screen from VGA or vmsvga, so the one virtio device that
+mattered was the one nobody had. `modprobe virtio_pci`, and `eth0` appeared in
+the same second, with `0000:00:03.0/driver` now pointing at `virtio-pci`.
+
+### What the drivers cost
+
+Five names — `virtio_net`, `e1000`, `e1000e`, `r8169`, `igb` — pull seven more
+through `modprobe --show-depends`: `libphy`, `realtek`, `mdio_devres`,
+`i2c-algo-bit`, `dca`, `failover`, `net_failover`. Twelve modules.
+
+```text
+initramfs.gz   25,925,814 -> 26,558,126     +632,312 bytes   +2.4%
+tos-x86_64.iso 54,423,552 -> 55,054,336     +630,784 bytes
+```
+
+618 KiB of compressed initramfs for the ability to be on a network at all.
+That is the argument for keeping the list a closure rather than taking
+`drivers/net` entire, which is the same argument the display and storage lists
+were already making, and the number is small enough that the next card
+somebody needs is not worth agonising over.
+
+No firmware came with any of it — `--no-install-recommends` keeps
+`firmware-realtek` and friends off the image on purpose. The kernel package
+says so at build time, warning about `rtl_nic/rtl8168*.fw` for `r8169`. A
+Realtek card that needs its blob will get whatever its PHY does by default,
+and that is untested here (see below).
+
+### What was seen
+
+Driven headless: VirtualBox with the serial console to a file, the compositor
+menu driven by `VBoxManage controlvm keyboardputscancode`, and the screen read
+back with `controlvm screenshotpng`. Command output from a pane was redirected
+to `/dev/ttyS0`, because `Notifications::status` writes only to the screen —
+there is no log file, no `/dev/kmsg`, nothing on serial — so the status bar is
+readable only as a picture, and anything needing exact text has to be asked
+for from a shell.
+
+On a NAT `virtio-net` adapter, in order, all of it through the menu:
+
+```text
+super+shift+n            network:  eth0   wired  down
+choose eth0              eth0  down:  bring the link up / ask for an address
+bring the link up        eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>
+                         operstate up, carrier 1, 08:00:27:54:ee:7d
+ask for an address       status bar, about two seconds later:
+                         eth0 10.0.2.15/24 via 10.0.2.2
+```
+
+and on the machine afterwards:
+
+```text
+inet 10.0.2.15/24 brd 10.0.2.255 scope global eth0
+default via 10.0.2.2 dev eth0
+10.0.2.0/24 dev eth0 scope link  src 10.0.2.15
+
+/etc/resolv.conf:
+# written by tOS from the DHCP lease on eth0
+search tail33b9af.ts.net
+nameserver 100.100.100.100
+nameserver 0.100.100.100
+```
+
+The netmask is the one the server sent and not a classful guess — `/24` on a
+`10.` address is precisely the case the "netmask with the address, always"
+rule above was written for, and a `/8` here would have been the symptom it
+predicts. Address before route, route installed, resolvers written.
+
+Reachability from a pane: `ping -c 3 10.0.2.2` and `ping -c 2 1.1.1.1` both
+0% loss, 0.14 ms to the gateway against 3.5 ms off-network, which is the shape
+of a real round trip rather than a local one. `nslookup example.com` used
+`100.100.100.100` — the resolver out of the lease, read from the file tOS
+wrote — and got real answers back, so `/etc/resolv.conf` is not merely written
+but usable.
+
+The same run repeated on a NAT `82540EM` adapter, to exercise the other
+emulation that was packed: `e1000` bound it, `eth0` appeared, and the menu
+took it to the same `10.0.2.15/24 via 10.0.2.2`.
+
+### The one cross-check worth having
+
+`nameserver 0.100.100.100` in that file looks like a parser that lost a byte,
+and the honest thing was to assume it was ours. It is not. busybox `udhcpc`,
+run against the same server on the same machine, reports the identical pair:
+
+```text
+EV=bound ip=10.0.2.15 mask=255.255.255.0 router=10.0.2.2
+         dns=[100.100.100.100 0.100.100.100] domain=[tail33b9af.ts.net]
+         server=10.0.2.2 lease=86400
+```
+
+Every field agrees with what `dhcp.rs` produced. The malformed resolver is
+VirtualBox's NAT, which passes the host's resolvers through and had an IPv6
+one (`fd7a:115c:a1e0::53`, Tailscale) to fit into a four-byte DHCPv4 option 6.
+So the first real-server check of the option parser is that it matches a
+mature implementation byte for byte, including on a server's bad output —
+which is a better result than a clean one would have been.
+
+### The QEMU witness, and a capture
+
+The same image under the `qemu-system-x86_64` line the CI smoke boot now uses
+— `-netdev user -device virtio-net-pci` — reaches the compositor, and driving
+the same four keystrokes over the QEMU monitor produces this on the netdev,
+dumped with `filter-dump`:
+
+```text
+DHCP 68->67  DISCOVER  yiaddr=0.0.0.0
+DHCP 67->68  OFFER     yiaddr=10.0.2.15
+DHCP 68->67  REQUEST   yiaddr=0.0.0.0
+DHCP 67->68  ACK       yiaddr=10.0.2.15
+```
+
+That is the handshake at the top of this document, on a wire, against a server
+nobody in this repository wrote, captured rather than asserted. Two different
+NAT implementations — VirtualBox's and QEMU's slirp — both answer the
+`BROADCAST` flag, which is the bet "A UDP socket, not a raw one" made.
+
+### What did not work
+
+busybox `wget` segfaults. Every fetch: by hostname, by IP, and against an
+address with nothing listening, always exit 139. Bare `wget` with no arguments
+prints its usage and exits 1, so the applet is there and starts. Crashing
+against an unreachable address means it dies before any connection succeeds,
+which puts the fault in the busybox-static build on the image and not in the
+network — `ping` and `nslookup`, which are the same binary, both work over the
+same link. It wants its own issue; it is not evidence about anything above.
+
+### Is NAT enough?
+
+For this issue, yes, and it should stay the gate.
+
+NAT proved the whole path end to end against two independent server
+implementations: the interface exists and enumerates, `SIOCSIFFLAGS` brings
+the link up, DISCOVER/OFFER/REQUEST/ACK completes, the options parse the same
+as `udhcpc` parses them, the address and netmask and route land on a real
+kernel in an order it accepts, `/etc/resolv.conf` is written and is usable,
+and packets reach the internet. It is free, it is deterministic, it needs no
+privilege on a CI runner, and it now runs on both witnesses.
+
+What it does not exercise, stated so that nobody mistakes a green boot for
+more than it is:
+
+- **Renewal.** Still not built, and this run made that concrete rather than
+  theoretical: the lease is 86400 seconds, T1 falls twelve hours in, and
+  nothing wakes up. A boot that lasts a minute could never have shown it.
+- **A server that ignores the broadcast flag.** Both NATs honour it, so the
+  one acknowledged risk in the socket decision above remains untested by
+  construction. Only an out-of-spec server can test it, and neither of these
+  is one.
+- **A slow or hostile server.** Both answered in milliseconds, so the 1/2/4/8
+  retry schedule and the fifteen-second give-up never ran. Nor did NAK, nor a
+  second server racing the first, nor an ACK for an address that was never
+  offered — all of which have `FakeServer` tests and no field evidence.
+- **Carrier transitions.** No cable was pulled; nothing here says what the
+  poll does when a link goes away and comes back with a different lease.
+- **Being addressable.** NAT is one-way. Nothing tOS does today wants an
+  inbound connection, but a bridged adapter is the only thing that would show
+  DHCP from a real server on a real segment, ARP from other machines, or a
+  second client contending for the same pool.
+- **Real hardware.** `e1000e`, `r8169` and `igb` were packed and have never
+  bound to anything — there was no such card to boot on. Only `virtio_net`
+  and `e1000` are known to work. `r8169` in particular is packed without its
+  firmware, and whether that matters depends on a chip nobody here has.
+
+The shape of the answer, then: NAT is the right gate because it is the one
+that can run unattended on every build, and the list above is the argument for
+a bridged rig rather than against this one. The overlap is not accidental —
+almost everything NAT cannot show is something that is **not built yet**
+(renewal above all). When renewal is written it will need a test rig that can
+hold a lease and move a clock, and that is the moment to build the bridged
+witness, not before.

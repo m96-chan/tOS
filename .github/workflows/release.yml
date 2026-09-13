@@ -27,9 +27,12 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86
           # A release must boot: success = the compositor announces itself
-          # and the live medium is found, same gate as the iso workflow.
+          # and the live medium is found, same gate as the iso workflow —
+          # including the virtio-net adapter, so a release is booted on a
+          # machine shaped like the one iso.yml proved, not a quieter one.
           timeout 120 qemu-system-x86_64 \
             -m 1024 -cdrom dist/tos-x86_64.iso \
+            -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
             -vga std -display none -serial file:serial.log &
           qemu_pid=$!
           for _ in $(seq 60); do
@@ -41,6 +44,19 @@ jobs:
           cat serial.log || true
           grep -q "tOS: starting compositor" serial.log
           grep -q "tOS: live medium is" serial.log
+          # And that it got into the Debian rootfs. Both lines above are
+          # printed by the initramfs fallback too, so without this a release
+          # whose squashfs never mounts ships green — with an image that has
+          # no apt on it, which is the whole of what the rootfs is for.
+          grep -q "tOS: booting the Debian rootfs" serial.log
+      - name: dpkg and apt are on the image being released
+        # The same assertions the iso workflow makes. A release that boots is
+        # not a release that can install anything: a rootfs missing apt, the
+        # installer or the Japanese face prints nothing on serial and passes
+        # every gate above it.
+        run: |
+          sudo apt-get install -y --no-install-recommends squashfs-tools
+          iso/check-rootfs.sh dist/tos-x86_64.iso
       - name: Stamp the version into the artifacts
         run: |
           mv dist/tos-x86_64.iso "dist/tos-${GITHUB_REF_NAME}-x86_64.iso"

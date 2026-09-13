@@ -181,9 +181,8 @@ impl<'a> Installer<'a> {
     }
 
     fn copy_system(&mut self) -> Result<(), String> {
-        // The live system is an initramfs, so what is on disk is what runs.
-        // Everything the kernel provides is left out: those are mount points
-        // in the installed system, not files to copy.
+        // Everything the kernel provides is left out of both paths below:
+        // those are mount points in the installed system, not files.
         for directory in ["dev", "proc", "sys", "run", "tmp", "mnt", "var/log"] {
             let path = format!("{}/{directory}", self.plan.mount_point);
             self.backend
@@ -191,6 +190,63 @@ impl<'a> Installer<'a> {
                 .map_err(|e| format!("cannot create {path}: {e}"))?;
         }
 
+        // Both halves of the question, because the image being on the medium
+        // does not mean this session can open it. The rescue session — the one
+        // that runs when the squashfs would not mount and `/init` fell back to
+        // the initramfs — still has the medium and so still has the image,
+        // while its busybox world has no `unsquashfs` anywhere. Asking only
+        // about the file sent exactly that session down the path it cannot
+        // finish, and it found out here: after Partition, FormatEsp and
+        // FormatRoot had already been run over the disk it was installing to.
+        if self.backend.exists(&self.plan.rootfs_image) && self.can_unpack() {
+            self.unpack_rootfs()?;
+        } else {
+            self.copy_live_system()?;
+        }
+
+        self.copy_boot_files()
+    }
+
+    /// Whether this session can open a squashfs at all.
+    ///
+    /// Looked for by path rather than run, because the only honest moment to
+    /// ask is before anything has been written to the disk, and running it to
+    /// find out is a thing that can go wrong on its own.
+    fn can_unpack(&self) -> bool {
+        UNSQUASHFS
+            .iter()
+            .any(|program| self.backend.exists(program))
+    }
+
+    /// Unpack the Debian rootfs from the medium onto the new root.
+    ///
+    /// This is what makes an installed tOS machine a machine rather than a
+    /// photograph of one. What lands here has a glibc, a dpkg and an apt, so
+    /// the first thing its owner wants to add to it is something they can
+    /// actually add; before this the disk got a copy of the busybox initramfs
+    /// and whatever `iso/mkiso.sh` had not packed was unreachable forever.
+    fn unpack_rootfs(&mut self) -> Result<(), String> {
+        let image = self.plan.rootfs_image.clone();
+        let target = self.plan.mount_point.clone();
+        self.progress.note("   unpacking the Debian rootfs");
+        // `-f` because the root is already mounted and so already has a
+        // lost+found, and under UEFI an empty /boot/efi for the ESP as well;
+        // unsquashfs refuses a destination that exists without it. The
+        // progress bar is a carriage-return animation, and the installer's
+        // log pane is a list of lines.
+        self.command("unsquashfs", &["-f", "-no-progress", "-d", &target, &image])
+    }
+
+    /// Copy the running system onto the disk, which is what there is to
+    /// install when the medium carries no rootfs image.
+    ///
+    /// An image built before the rootfs step existed, or one whose squashfs
+    /// would not mount, leaves the session running out of the initramfs. The
+    /// disk then gets that same small world — no dpkg and no apt — which is
+    /// worse than Debian and much better than refusing to install at all.
+    fn copy_live_system(&mut self) -> Result<(), String> {
+        self.progress
+            .note("   no rootfs image on the medium: copying the live system");
         for directory in COPIED_DIRECTORIES {
             let from = format!("{}{directory}", self.plan.source_root.trim_end_matches('/'));
             if !self.backend.exists(&from) {
@@ -202,8 +258,7 @@ impl<'a> Installer<'a> {
                 .copy_tree(&from, &to)
                 .map_err(|e| format!("cannot copy {from}: {e}"))?;
         }
-
-        self.copy_boot_files()
+        Ok(())
     }
 
     /// Put the kernel and initramfs where GRUB expects them.
@@ -257,28 +312,7 @@ impl<'a> Installer<'a> {
             ),
         )?;
 
-        // A minimal passwd and group, so the installed system has the user the
-        // installer was told about. Login is not gated yet: the console starts
-        // the compositor directly, exactly as the live image does.
-        //
-        // The password field is `*`, not `x`. `x` means "the hash is in
-        // /etc/shadow", and tOS writes no /etc/shadow — its credential is
-        // /etc/tos/shadow, which no login program reads. Promising a file that
-        // does not exist is how this line came to be a lie about an account
-        // with no credential at all. `*` says what is true, that nothing logs
-        // in through this file, and it stays true the day a Debian userland
-        // and its PAM arrive on the disk.
-        self.write(
-            &format!("{root}/etc/passwd"),
-            &format!(
-                "root:*:0:0:root:/root:/bin/sh\n{user}:*:1000:1000:{user}:/home/{user}:/bin/sh\n",
-                user = settings.username
-            ),
-        )?;
-        self.write(
-            &format!("{root}/etc/group"),
-            &format!("root:x:0:\n{user}:x:1000:\n", user = settings.username),
-        )?;
+        self.accounts(&root, &settings)?;
         self.write_credential(&root, &settings)?;
         let home = format!("{root}/home/{}", settings.username);
         self.backend
@@ -315,6 +349,55 @@ impl<'a> Installer<'a> {
             &format!("tOS {}\n", env!("CARGO_PKG_VERSION")),
         )?;
         Ok(())
+    }
+
+    /// Give the installed system the account the installer was told about.
+    ///
+    /// A Debian root arrives with an `/etc/passwd` of its own, holding the
+    /// system accounts Debian's packages run as. `_apt` is one of them, and
+    /// apt drops to it before it opens a socket; a machine missing that line
+    /// cannot download a package at all. So the person's account is added to
+    /// that file rather than written over it. When there is no such file the
+    /// disk got the busybox world instead, and the two lines below are the
+    /// whole of its user database.
+    ///
+    /// The password field is `*` either way, not `x`. `x` means "the hash is
+    /// in /etc/shadow", and tOS sets no shadow entry for this account — its
+    /// credential is /etc/tos/shadow, which no login program reads. Promising
+    /// a hash that is not there is how this line came to be a lie about an
+    /// account with no credential at all. `*` says what is true, that nothing
+    /// logs in through this file, and it stays true the day a PAM arrives on
+    /// the disk. Nothing gates the console in either case: it starts the
+    /// compositor directly, exactly as the live image does.
+    fn accounts(&mut self, root: &str, settings: &Settings) -> Result<(), String> {
+        let user = &settings.username;
+        let passwd = format!("{root}/etc/passwd");
+        let group = format!("{root}/etc/group");
+        let account = format!("{user}:*:1000:1000:{user}:/home/{user}:/bin/sh\n");
+        let membership = format!("{user}:x:1000:\n");
+
+        // Each file answers for itself. Deciding both from whether `passwd`
+        // exists made the group file's fate depend on the other file's
+        // evidence, and `append_file` creates what it cannot open — so a root
+        // with a passwd and no group got an `/etc/group` whose only line was
+        // the person's, with no `root`, no `tty`, no `disk` and no `_apt`
+        // group on the machine at all. Written silently, and reported as a
+        // successful install.
+        self.add_account(&passwd, &account, "root:*:0:0:root:/root:/bin/sh\n")?;
+        self.add_account(&group, &membership, "root:x:0:\n")
+    }
+
+    /// Add one line to an account file, or write the file if it is not there.
+    ///
+    /// `root_line` is what the file needs before the person's line when tOS is
+    /// the one creating it — the busybox world, where these two lines are the
+    /// whole user database. Where Debian unpacked its own, `root` is Debian's
+    /// to write and this only appends.
+    fn add_account(&mut self, path: &str, line: &str, root_line: &str) -> Result<(), String> {
+        if self.backend.exists(path) {
+            return self.append(path, line);
+        }
+        self.write(path, &format!("{root_line}{line}"))
     }
 
     /// Write the credential the tOS lock unlocks with, if there is one.
@@ -519,6 +602,13 @@ impl<'a> Installer<'a> {
             .write_file(path, contents)
             .map_err(|e| format!("cannot write {path}: {e}"))
     }
+
+    fn append(&mut self, path: &str, contents: &str) -> Result<(), String> {
+        self.progress.note(format!("   append to {path}"));
+        self.backend
+            .append_file(path, contents)
+            .map_err(|e| format!("cannot append to {path}: {e}"))
+    }
 }
 
 fn describe(program: &str, args: &[&str]) -> String {
@@ -533,17 +623,21 @@ fn describe(program: &str, args: &[&str]) -> String {
 /// How many times to wait for a partition node before giving up.
 const PARTITION_WAIT_ATTEMPTS: usize = 20;
 
-/// What is copied out of the live system onto the disk.
+/// What is copied out of the live system onto the disk when there is no
+/// rootfs image to unpack instead.
 ///
-/// The live image is an initramfs, so this is the whole of it: the compositor,
-/// busybox and the kernel modules. `/boot` is not among them, because it is
-/// on the medium rather than in the initramfs.
+/// That happens on an image built before the rootfs step existed, and on one
+/// whose squashfs would not mount. The live image is then an initramfs, so
+/// this is the whole of it: the compositor, busybox and the kernel modules.
+/// `/boot` is not among them, because it is on the medium rather than in the
+/// initramfs.
 ///
-/// `/usr` is here for the font. Every path the compositor searches is under
-/// `/usr/share/fonts`, so a machine installed without it finds no face at all
-/// and falls back to the built-in ASCII one, which draws every kana as a
-/// hollow box. `/usr/lib/grub` rides along, which is what an installed machine
-/// would need to put its bootloader back.
+/// `/usr` is here for what little is under it, and `/usr/lib/grub` with it,
+/// which is what an installed machine would need to put its bootloader back.
+/// The font and the dictionary are not in the initramfs any more — they are
+/// in the rootfs, which is the path this one is not — so a machine installed
+/// this way draws Latin from the compositor's built-in ASCII face and cannot
+/// type Japanese.
 pub const COPIED_DIRECTORIES: &[&str] = &["/bin", "/sbin", "/lib", "/usr", "/etc", "/root"];
 
 /// The files GRUB loads, taken from the live medium.
@@ -574,12 +668,36 @@ pub const BOOT_FILES: &[&str] = &["vmlinuz", "initramfs.gz"];
 /// `sysctl.*=` is the generic form the kernel applies just before `/init`.
 const CMDLINE: &str = "root=LABEL=tos-root rw console=tty0 sysctl.kernel.sysrq=434";
 
-/// A recorder primed to look like a live session with its medium mounted.
+/// Where `unsquashfs` lives on a session that has one.
+///
+/// `/usr/bin` is where the rootfs build asserts it landed and `/bin` is the
+/// same file on a usr-merged Debian. `/sbin` is where `iso/mkiso.sh` puts the
+/// tools it copies into the initramfs, so if the rescue session is ever given
+/// one this finds it there rather than having to be remembered.
+const UNSQUASHFS: [&str; 3] = ["/usr/bin/unsquashfs", "/bin/unsquashfs", "/sbin/unsquashfs"];
+
+/// A recorder primed to look like the session it is running in.
 ///
 /// This is what a dry run and `--plan` walk, so that what they print is the
 /// whole sequence rather than the prefix that runs before the first missing
 /// path stops it.
+///
+/// The directories and the boot files are the shape of a live session and are
+/// taken as read. Which *installation* this is, though, is asked of the
+/// machine: whether there is a rootfs image on the medium and something able
+/// to open it is the one question that decides between unpacking Debian and
+/// copying the session, and hard-coding the answer made the dry run describe
+/// the unpack on a rescue session that cannot do it — the session where
+/// somebody is most likely to read the plan before they let it run.
 pub fn planning_backend() -> crate::exec::Recorder {
+    planning_backend_for(&crate::exec::System)
+}
+
+/// The same, against a stated world rather than this machine.
+///
+/// Public to the crate's tests, which have to describe a live medium without
+/// being run on one.
+fn planning_backend_for(world: &dyn crate::exec::Backend) -> crate::exec::Recorder {
     let mut backend = crate::exec::Recorder::new();
     for directory in COPIED_DIRECTORIES {
         backend.existing.push(directory.to_string());
@@ -589,7 +707,39 @@ pub fn planning_backend() -> crate::exec::Recorder {
             .existing
             .push(format!("{}/{file}", crate::plan::LIVE_MEDIUM_BOOT));
     }
+
+    let image = crate::plan::LIVE_ROOTFS_IMAGE;
+    let tool = UNSQUASHFS.iter().find(|tool| world.exists(tool));
+    if let (true, Some(tool)) = (world.exists(image), tool) {
+        backend.existing.push(image.to_string());
+        backend.existing.push(tool.to_string());
+        // And the account files the unpacked rootfs will bring with it, so
+        // the plan shows the append a real install makes rather than the
+        // overwrite it would only do onto a disk that came from the busybox
+        // world.
+        for file in ["etc/passwd", "etc/group"] {
+            backend
+                .existing
+                .push(format!("{}/{file}", crate::plan::MOUNT_POINT));
+        }
+    }
     backend
+}
+
+/// A recorder for a session that has a medium with a rootfs on it.
+///
+/// `pub(crate)` because `app.rs`'s tests drive the dry run and have to describe
+/// a live medium without being run on one — and since [`planning_backend`]
+/// started asking the machine, a helper that called it was describing whatever
+/// machine `cargo test` happened to be on.
+#[cfg(test)]
+pub(crate) fn live_planning_backend() -> crate::exec::Recorder {
+    let mut world = crate::exec::Recorder::new();
+    world
+        .existing
+        .push(crate::plan::LIVE_ROOTFS_IMAGE.to_string());
+    world.existing.push(UNSQUASHFS[0].to_string());
+    planning_backend_for(&world)
 }
 
 /// Where the session's environment is written, and what /etc/inittab respawns.
@@ -599,16 +749,26 @@ pub const SESSION_SCRIPT_PATH: &str = "/etc/tos-session";
 ///
 /// busybox init hands a program it respawns almost nothing, and none of what a
 /// tOS session needs: `ENV`, which is how each pane's shell comes to read
-/// `/etc/profile` and print the message of the day, nor `HOME`, nor `SHELL`.
-/// The live image exports these in `/init` and nothing carries an environment
-/// across `switch_root`, so an installed machine writes them down here
-/// instead. `iso/init` is the live counterpart and the two have to agree.
+/// `/etc/profile` and print the message of the day, nor `HOME`, nor `SHELL`,
+/// nor `TERM`, nor a `PATH` with `/usr/local` on it. Nothing carries an
+/// environment across `switch_root` either, so an installed machine writes
+/// them down here instead.
+///
+/// **`iso/live-session` is the live counterpart and the two have to agree.**
+/// It used to be `iso/init`, and the day the exports moved out of that file
+/// this comment went on naming it — which is how the two came to differ by a
+/// `TERM` the terminfo in the rootfs exists for and a `PATH` without the two
+/// `/usr/local` directories apt puts things in. A machine installed from an
+/// image is meant to be that image.
 const SESSION_SCRIPT: &str = "#!/bin/sh\n\
                               # Written by the tOS installer.\n\
+                              # iso/live-session is the live counterpart.\n\
                               export HOME=/root\n\
                               export SHELL=/bin/sh\n\
+                              export TERM=xterm-256color\n\
                               export TOS=1\n\
                               export ENV=/etc/profile\n\
+                              export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
                               exec /sbin/tos\n";
 
 /// The installed system's startup script.
@@ -621,6 +781,7 @@ const RC_SCRIPT: &str = "#!/bin/sh\n\
                          mount -t devpts none /dev/pts 2>/dev/null\n\
                          mount -t tmpfs none /dev/shm 2>/dev/null\n\
                          mount -t tmpfs none /tmp 2>/dev/null\n\
+                         mount -t tmpfs none /run 2>/dev/null\n\
                          mount -o remount,rw / 2>/dev/null\n\
                          hostname -F /etc/hostname 2>/dev/null\n";
 
@@ -650,7 +811,7 @@ mod tests {
 
     /// Run a whole installation against a recorder.
     fn install(firmware: Firmware) -> Recorder {
-        let mut backend = planning_backend();
+        let mut backend = live_backend();
         let mut installer = Installer::new(plan(firmware), &mut backend);
         let progress = installer.run();
         assert!(
@@ -662,8 +823,31 @@ mod tests {
     }
 
     /// A recorder that looks like a live session with its medium mounted.
+    ///
+    /// Stated as a world rather than subtracted from a fixture: the plan is
+    /// derived from what the session has, so a test says what is on the
+    /// machine and reads back the installation that follows from it.
     fn live_backend() -> Recorder {
-        planning_backend()
+        live_planning_backend()
+    }
+
+    /// The same, on a medium that carries no Debian rootfs: an image built
+    /// before the rootfs step existed, which the installer still has to be
+    /// able to install from — and, with the image present but nothing able to
+    /// open it, the rescue session.
+    fn rootfsless_backend() -> Recorder {
+        planning_backend_for(&Recorder::new())
+    }
+
+    /// Run a whole installation against a recorder that has been set up.
+    fn install_with(firmware: Firmware, backend: &mut Recorder) {
+        let mut installer = Installer::new(plan(firmware), backend);
+        let progress = installer.run();
+        assert!(
+            progress.failure().is_none(),
+            "installation failed: {:?}",
+            progress.failure()
+        );
     }
 
     /// What was written to a path, and the mode it was asked for.
@@ -685,6 +869,21 @@ mod tests {
     /// What was written to a path, when only the contents matter.
     fn written(backend: &Recorder, path: &str) -> String {
         file(backend, path).0
+    }
+
+    /// What was added to the end of a path.
+    fn appended(backend: &Recorder, path: &str) -> String {
+        backend
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                crate::exec::Action::AppendFile {
+                    path: touched,
+                    contents,
+                } if touched == path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("nothing was appended to {path}"))
     }
 
     /// Whether a path was written at all.
@@ -796,14 +995,42 @@ mod tests {
     }
 
     #[test]
-    fn the_system_is_copied_out_of_the_live_image() {
+    fn the_debian_rootfs_is_unpacked_onto_the_disk() {
         let backend = install(Firmware::Uefi);
+        assert!(
+            backend.did(&format!(
+                "unsquashfs -f -no-progress -d /mnt/target {}",
+                crate::plan::LIVE_ROOTFS_IMAGE
+            )),
+            "the rootfs was not unpacked: {:?}",
+            backend.transcript()
+        );
+    }
+
+    #[test]
+    fn the_rootfs_is_unpacked_rather_than_the_live_session_being_copied() {
+        // The live root is this same image with a tmpfs over it, so copying
+        // it would put whatever the session scribbled onto the disk.
+        let backend = install(Firmware::Uefi);
+        for directory in COPIED_DIRECTORIES {
+            assert!(
+                !backend.did(&format!("copy {directory} -> /mnt/target{directory}")),
+                "{directory} was copied out of the live session"
+            );
+        }
+    }
+
+    #[test]
+    fn a_medium_without_a_rootfs_falls_back_to_copying_the_live_system() {
+        let mut backend = rootfsless_backend();
+        install_with(Firmware::Uefi, &mut backend);
         for directory in COPIED_DIRECTORIES {
             assert!(
                 backend.did(&format!("copy {directory} -> /mnt/target{directory}")),
                 "{directory} was not copied"
             );
         }
+        assert!(!backend.did("unsquashfs"), "there was nothing to unpack");
     }
 
     #[test]
@@ -820,14 +1047,34 @@ mod tests {
 
     #[test]
     fn a_missing_source_directory_is_skipped_rather_than_failing() {
-        // A live image without /root should still install.
-        let mut backend = live_backend();
+        // A live image without /root should still install. Only the fallback
+        // copies anything, so that is where this can go wrong.
+        let mut backend = rootfsless_backend();
         backend.existing.retain(|path| path != "/root");
-        let mut installer = Installer::new(plan(Firmware::Uefi), &mut backend);
-        let progress = installer.run();
-        assert!(progress.failure().is_none());
+        install_with(Firmware::Uefi, &mut backend);
         assert!(backend.did("copy /bin -> /mnt/target/bin"));
         assert!(!backend.did("copy /root"));
+    }
+
+    #[test]
+    fn a_session_that_cannot_open_a_squashfs_copies_instead_of_failing() {
+        // The rescue session: the squashfs would not mount, `/init` fell back
+        // to the initramfs, and the medium — and so the image on it — is still
+        // there while nothing in that busybox world can open it. Deciding on
+        // the image alone sent exactly that session down the unpack path, and
+        // it found out at the unpack: after Partition, FormatEsp and FormatRoot
+        // had already been run over the disk.
+        let mut backend = planning_backend();
+        backend
+            .existing
+            .retain(|path| !path.ends_with("unsquashfs"));
+        install_with(Firmware::Uefi, &mut backend);
+
+        assert!(
+            !backend.did("unsquashfs"),
+            "unpacked with a tool this session has not got"
+        );
+        assert!(backend.did("copy /bin -> /mnt/target/bin"));
     }
 
     #[test]
@@ -844,10 +1091,13 @@ mod tests {
 
         assert_eq!(written(&backend, "/mnt/target/etc/hostname"), "workshop\n");
         assert!(written(&backend, "/mnt/target/etc/hosts").contains("workshop"));
-        let passwd = written(&backend, "/mnt/target/etc/passwd");
+        // Appended, not written: this install unpacks a Debian rootfs, which
+        // arrives with its own passwd and its own root line. The medium that
+        // carries no rootfs is where tOS writes the whole file, and that is
+        // where root's line is asserted.
+        let passwd = appended(&backend, "/mnt/target/etc/passwd");
         assert!(passwd.contains("yusuke:*:1000:1000"));
-        assert!(passwd.starts_with("root:*:0:0"));
-        assert!(written(&backend, "/mnt/target/etc/group").contains("yusuke:x:1000:"));
+        assert!(appended(&backend, "/mnt/target/etc/group").contains("yusuke:x:1000:"));
         assert!(backend.did("mkdir -p /mnt/target/home/yusuke"));
     }
 
@@ -856,7 +1106,11 @@ mod tests {
         // `x` means "the hash is in /etc/shadow", and there is no /etc/shadow:
         // the tOS credential is /etc/tos/shadow, which nothing that reads
         // passwd knows about. `*` is the true statement.
-        let backend = install(Firmware::Uefi);
+        // The file is tOS's to write only where no Debian rootfs was
+        // unpacked first; where one was, root belongs to Debian and the
+        // installer appends its one line.
+        let mut backend = rootfsless_backend();
+        install_with(Firmware::Uefi, &mut backend);
         let passwd = written(&backend, "/mnt/target/etc/passwd");
         assert!(
             !passwd.contains(":x:"),
@@ -865,6 +1119,35 @@ mod tests {
         assert!(passwd.contains("root:*:0:0"), "{passwd}");
         assert!(passwd.contains("tos:*:1000:1000"), "{passwd}");
         assert!(!wrote(&backend, "/mnt/target/etc/shadow"));
+    }
+
+    #[test]
+    fn a_debian_roots_own_accounts_are_added_to_rather_than_replaced() {
+        // The unpacked rootfs brings its own /etc/passwd, and `_apt` is in it.
+        // apt drops to that account before it opens a socket, so a passwd file
+        // written over the top of Debian's is a machine that cannot download
+        // the package it was installed to be able to download.
+        let mut backend = live_backend();
+        backend.existing.push("/mnt/target/etc/passwd".to_string());
+        install_with(Firmware::Uefi, &mut backend);
+
+        assert!(
+            !wrote(&backend, "/mnt/target/etc/passwd"),
+            "Debian's own passwd was overwritten"
+        );
+        assert!(
+            !wrote(&backend, "/mnt/target/etc/group"),
+            "Debian's own group file was overwritten"
+        );
+        assert!(backend.did("append to /mnt/target/etc/passwd"));
+        assert!(backend.did("append to /mnt/target/etc/group"));
+
+        let added = appended(&backend, "/mnt/target/etc/passwd");
+        assert!(added.contains("tos:*:1000:1000"), "{added}");
+        assert!(
+            !added.contains("root:"),
+            "root is Debian's line to write, not ours: {added}"
+        );
     }
 
     #[test]
@@ -991,12 +1274,85 @@ mod tests {
         }
     }
 
+    // There is no test here that the Japanese face reaches an installed
+    // machine, and there cannot usefully be one: the face is a package inside
+    // the squashfs now, so nothing this side of `unsquashfs` can see it. The
+    // one that used to stand here asserted only that unsquashfs ran and that
+    // /usr was copied on the path its own comment said carries no font, and
+    // it would have passed with fonts-vlgothic deleted from the image. The
+    // assertion that means it lives in .github/workflows/iso.yml, against the
+    // built squashfs.
+
     #[test]
-    fn the_font_comes_along_so_an_installed_machine_can_draw_japanese() {
-        // Every path tos-font searches is under /usr/share/fonts. Without it
-        // the machine falls back to the ASCII face and every kana is a box.
-        let backend = install(Firmware::Bios);
-        assert!(backend.did("copy /usr -> /mnt/target/usr"));
+    fn a_group_file_that_is_missing_on_its_own_is_written_whole() {
+        // The two files used to be decided together, from whether passwd
+        // existed, and `append_file` creates what it cannot open — so a root
+        // with a passwd and no group got a group file whose only line was the
+        // person's: no root group, no tty, no disk, and no _apt for apt to
+        // drop to.
+        let mut backend = live_backend();
+        let path = format!("{}/etc/group", crate::plan::MOUNT_POINT);
+        backend.existing.retain(|existing| *existing != path);
+        install_with(Firmware::Uefi, &mut backend);
+
+        let group = written(&backend, &path);
+        assert!(
+            group.starts_with("root:x:0:"),
+            "a group file tOS wrote itself has to have a root group: {group}"
+        );
+        assert!(group.contains("tos:x:1000:"), "{group}");
+        // And passwd, which was there, is still only appended to.
+        assert!(backend.did(&format!(
+            "append to {}/etc/passwd",
+            crate::plan::MOUNT_POINT
+        )));
+    }
+
+    #[test]
+    fn the_plan_describes_the_installation_this_session_can_actually_do() {
+        // `--plan` and the dry run walk a recorder, and it used to be told
+        // that the medium and unsquashfs were there whatever the machine had.
+        // On a rescue session — the one that exists because the squashfs
+        // would not mount, and the one where somebody is most likely to read
+        // the plan first — it described an unpack that could not happen.
+        let mut backend = rootfsless_backend();
+        install_with(Firmware::Uefi, &mut backend);
+
+        assert!(
+            !backend.did("unsquashfs"),
+            "the plan promised an unpack this session cannot do: {:?}",
+            backend.transcript()
+        );
+        assert!(backend.did("copy /bin -> /mnt/target/bin"));
+    }
+
+    #[test]
+    fn an_installed_machine_gets_the_environment_the_live_one_has() {
+        // iso/live-session exists so the session environment is written once,
+        // and an installed machine cannot run it — busybox init respawns what
+        // the installer wrote. So the exports are compared to the file rather
+        // than to a memory of it: they drifted by a TERM and a PATH the first
+        // time this was left to a comment.
+        fn exports(script: &str) -> Vec<String> {
+            let mut found: Vec<String> = script
+                .lines()
+                .map(|line| line.trim().trim_end_matches('\\').trim().to_string())
+                .filter(|line| line.starts_with("export "))
+                .collect();
+            found.sort();
+            found
+        }
+
+        let live = exports(include_str!("../../iso/live-session"));
+        let installed = exports(SESSION_SCRIPT);
+        assert!(live.len() >= 5, "no exports found in iso/live-session");
+        // Both directions, and whole lines: a `contains` would have passed a
+        // TOS=10 against a TOS=1, and an export added to this file alone —
+        // the one edited by hand — is the drift that is likelier of the two.
+        assert_eq!(
+            live, installed,
+            "iso/live-session and the installed session export different things"
+        );
     }
 
     #[test]

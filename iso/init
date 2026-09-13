@@ -1,7 +1,12 @@
 #!/bin/busybox sh
 # shellcheck shell=dash
-# PID 1 inside the tOS initramfs: bring up /dev and drivers, then hand the
-# machine to the compositor.
+# PID 1 inside the tOS initramfs: bring up /dev and drivers, find the root this
+# machine is supposed to run, and hand itself over to it.
+#
+# There are three roots it can find, tried in this order: the ext4 one an
+# installed machine names with root=, the Debian squashfs on a live medium, and
+# — when neither is there — this initramfs, which is a rescue session rather
+# than a system. Only the last of the three leaves this script running.
 
 /bin/busybox --install -s /bin
 
@@ -10,16 +15,45 @@
 # one, and /sbin has to come first for that to be the one found.
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin
 
+# Where the console nodes are. Everything in /dev here is devtmpfs: the
+# initramfs's own /dev carries nothing but the console and null that mkiso.sh
+# mknods, so once the pivot below moves devtmpfs into the new root, this is the
+# only way back to a tty. Nothing else needs to know.
+devdir=/dev
+
 # /init's own stdout is whichever console= came last on the kernel command
 # line, and the machine may have several. Anything a person needs to read
 # goes to all of them: a screen is the usual one, a serial line is what CI
 # and anyone debugging a headless boot captures.
 say() {
     said=
-    for tty in /dev/tty0 /dev/ttyS0; do
-        [ -c "$tty" ] && echo "$@" >"$tty" 2>/dev/null && said=1
+    for tty in "$devdir/tty0" "$devdir/ttyS0"; do
+        [ -c "$tty" ] && { echo "$@" >"$tty"; } 2>/dev/null && said=1
     done
     [ -n "$said" ] || echo "$@"
+}
+
+# Whether a path inside the root about to be switched into can be executed.
+#
+# `[ -x /newroot/sbin/init ]` is not that question. /sbin/init in a Debian root
+# is a symlink to /bin/busybox, and an absolute symlink is resolved against the
+# root this shell is running in — the initramfs, which has a busybox of its own
+# and always will. So the check passed for a target root whose busybox had been
+# removed, and switch_root then deleted the initramfs, chrooted, failed to exec
+# and panicked: exactly what looking before leaping is for. Follow the link by
+# hand instead, re-rooting every absolute target as we go.
+executable_in_root() {
+    target=$1
+    hops=0
+    while [ -L "/newroot$target" ] && [ "$hops" -lt 8 ]; do
+        link=$(readlink "/newroot$target")
+        case "$link" in
+            /*) target=$link ;;
+            *) target="${target%/*}/$link" ;;
+        esac
+        hops=$((hops + 1))
+    done
+    [ -x "/newroot$target" ]
 }
 
 mount -t proc none /proc
@@ -30,13 +64,41 @@ mount -t devpts none /dev/pts
 mount -t tmpfs none /dev/shm
 mount -t tmpfs none /tmp
 
+# Everything the live session is assembled out of goes under /run: the medium,
+# the squashfs read off it, and the tmpfs the overlay writes into. /run is a
+# mount of its own so that one `mount --move` carries the whole lot across the
+# pivot. An overlay whose layers were left behind in an initramfs that
+# switch_root then deleted is a root filesystem that stops working the first
+# time anything reads a file out of it.
+mkdir -p /run
+mount -t tmpfs none /run
+mkdir -p /run/live
+
 # The kernel ships these as modules. Load whatever the machine has; missing
-# hardware just means a harmless failure.
+# hardware just means a harmless failure. The last three are not hardware at
+# all: they are how the squashfs on the medium becomes a writable root.
+#
+# This loop is the only thing that loads anything. There is no udev here, and
+# this kernel is built without CONFIG_UEVENT_HELPER — /sys/kernel/uevent_helper
+# does not exist — so nothing asks for a driver on the machine's behalf: a
+# module that is on the image and not named here is a module that never loads.
+# The network drivers were packed and this was missed, and the symptom was the
+# one the whole network menu shows: `lo`, and "no wired or wireless
+# interfaces", on a machine whose adapter was sitting on the PCI bus.
+#
+# virtio_pci has to come with virtio_net rather than after it. virtio_net binds
+# virtio devices, not PCI ones, and without the bus driver bound there is no
+# virtio device for it to claim — loading virtio_net alone leaves the adapter
+# unclaimed and silent, which is exactly what it looked like. It was missing
+# here before for the same reason nobody noticed: the machines this is booted
+# on take their disk and screen from IDE and VGA, so nothing else needed it.
 for mod in bochs virtio_gpu simpledrm cirrus vmwgfx vboxvideo \
     evdev atkbd i8042 psmouse virtio_input hid_generic usbhid \
     sd_mod sr_mod cdrom ata_piix ahci virtio_blk virtio_scsi \
     nvme usb_storage uas xhci_pci ehci_pci ohci_pci sdhci_pci mmc_block \
-    isofs ext4 vfat; do
+    virtio_pci virtio_net e1000 e1000e r8169 igb \
+    isofs ext4 vfat \
+    loop squashfs overlay; do
     modprobe "$mod" 2>/dev/null
 done
 # Give /dev/dri/card0 a moment to appear before tos probes for it.
@@ -97,7 +159,7 @@ if [ -n "$root_device" ]; then
     init=
     if [ -n "$mounted" ]; then
         for candidate in /sbin/init /bin/init; do
-            if [ -x "/newroot$candidate" ]; then
+            if executable_in_root "$candidate"; then
                 init=$candidate
                 break
             fi
@@ -126,57 +188,119 @@ fi
 # The kernel and initramfs live on the medium, not in the initramfs, so the
 # installer needs the medium mounted to copy them onto a disk. Look for the
 # partition that carries /boot/vmlinuz.
+#
+# The rootfs image is the mark, and /boot/vmlinuz only if nothing carries one:
+# an installed tOS root has a /boot/vmlinuz of its own, because the installer
+# put it there. Taking that as the medium mounts the very disk the machine was
+# booted to repair, finds no squashfs on it, boots the rescue session for want
+# of one — and then the installer refuses that disk for being the live medium.
 mkdir -p /run/live/medium
-for dev in /dev/sr* /dev/sd?? /dev/sd? /dev/vd?? /dev/vd? /dev/nvme*n*p* /dev/nvme*n*; do
-    [ -b "$dev" ] || continue
-    if mount -o ro "$dev" /run/live/medium 2>/dev/null; then
-        if [ -f /run/live/medium/boot/vmlinuz ]; then
-            say "tOS: live medium is $dev"
-            break
+medium=
+for mark in live/filesystem.squashfs boot/vmlinuz; do
+    for dev in /dev/sr* /dev/sd?? /dev/sd? /dev/vd?? /dev/vd? /dev/nvme*n*p* /dev/nvme*n*; do
+        [ -b "$dev" ] || continue
+        if mount -o ro "$dev" /run/live/medium 2>/dev/null; then
+            if [ -f "/run/live/medium/$mark" ]; then
+                say "tOS: live medium is $dev"
+                medium=$dev
+                break
+            fi
+            umount /run/live/medium 2>/dev/null
         fi
-        umount /run/live/medium 2>/dev/null
-    fi
+    done
+    [ -n "$medium" ] && break
 done
-if [ ! -f /run/live/medium/boot/vmlinuz ]; then
+if [ -z "$medium" ]; then
     say "tOS: no live medium found; the installer cannot copy a kernel"
 fi
 
-export HOME=/root
-export SHELL=/bin/sh
-export TERM=xterm-256color
-export TOS=1
-# busybox ash reads ENV for every interactive shell, which is how the message
-# of the day reaches each pane the compositor opens.
-export ENV=/etc/profile
-
-# The emergency shell is a rescue tool, and a rescue tool on a machine that
-# somebody else is standing at is an unauthenticated root shell on the screen
-# they were locked out of. An installed system and the live image run this
-# same script — nothing pivots to the installed root yet — so the command
-# line is the only thing that can tell them apart. The live image asks for the
-# shell by name; an installed machine that needs one adds the word at the GRUB
-# prompt. See docs/design/lock-other-doors.md.
-rescue=
-if [ -r /proc/cmdline ]; then
-    read -r cmdline </proc/cmdline
-    case " $cmdline " in
-    *" tos.rescue "*) rescue=1 ;;
-    esac
+# The medium also carries a whole Debian, as one read-only squashfs file.
+# Mounting it and stacking a tmpfs in front of it with overlayfs is what turns
+# it into a root filesystem that can be written to, and that is the difference
+# between a live session somebody can install a package into and the busybox
+# museum piece this image used to boot (#20, #83).
+#
+# Every step below is allowed to fail. What is at the bottom of this file is a
+# working tOS with a smaller world behind it, and a machine that gets that is
+# far better off than one that gets a panic.
+mkdir -p /run/live/rootfs /run/live/overlay /newroot
+squashfs=/run/live/medium/live/filesystem.squashfs
+pivot=
+if [ ! -f "$squashfs" ]; then
+    say "tOS: no rootfs image on the medium; using the initramfs session"
+elif ! mount -t squashfs -o ro,loop "$squashfs" /run/live/rootfs 2>/dev/null; then
+    say "tOS: cannot mount the rootfs image; using the initramfs session"
+elif ! mount -t tmpfs none /run/live/overlay 2>/dev/null; then
+    say "tOS: cannot make the rootfs writable; using the initramfs session"
+else
+    mkdir -p /run/live/overlay/upper /run/live/overlay/work
+    if mount -t overlay overlay \
+        -o "lowerdir=/run/live/rootfs,upperdir=/run/live/overlay/upper,workdir=/run/live/overlay/work" \
+        /newroot 2>/dev/null; then
+        pivot=1
+    else
+        say "tOS: cannot stack a writable layer on the rootfs"
+    fi
 fi
 
-say "tOS: starting compositor"
-restarts=0
-while :; do
-    /sbin/tos
-    status=$?
-    if [ -n "$rescue" ]; then
-        say "tOS: compositor exited ($status), dropping to emergency shell"
-        exec sh
+# switch_root panics if it cannot exec what it was handed, and a panic here is
+# a blank screen with no way back. Look before leaping, the same way the
+# installed-root path above does.
+if [ -n "$pivot" ] && ! executable_in_root /sbin/tos-session; then
+    say "tOS: the rootfs carries no session; using the initramfs session"
+    pivot=
+fi
+
+if [ -n "$pivot" ]; then
+    # /run goes first because it is the move that can plausibly fail — it
+    # carries the medium, the squashfs and the overlay's own upper layer — and
+    # until it succeeds nothing has been taken away from the session below.
+    # Private first: --move refuses a mount that shares its propagation, and
+    # nothing wants the root we are about to delete keeping a view of these.
+    mount --make-rprivate /run 2>/dev/null || true
+    mkdir -p /newroot/run
+    if mount --move /run /newroot/run 2>/dev/null; then
+        # The kernel's own filesystems next. Unlike the installed root above,
+        # nothing on the other side mounts them again — iso/live-session
+        # mounts nothing — so a move that does not take is not the harmless
+        # thing it is there: without /proc the session cannot read the command
+        # line and `tos.rescue` is silently ignored, without /sys the
+        # compositor sees no disk and no interface, without /dev no screen and
+        # no keyboard.
+        carried=1
+        for fs in /dev /proc /sys; do
+            if mount --move "$fs" "/newroot$fs" 2>/dev/null; then
+                # devtmpfs is on the other side now, and it was the only thing
+                # here with a tty0 or a ttyS0 in it. Everything said from this
+                # point has to be said through the new root's nodes: say()
+                # falls back to its own stdout when it finds neither, and that
+                # is /dev/console, the last console= on the command line, which
+                # is tty0 — the screen. The line below is the one both CI
+                # workflows grep out of the serial log, and said through a /dev
+                # that has moved away it reaches the screen and nothing else: a
+                # boot that is entirely correct and that no gate can see.
+                case $fs in
+                /dev) devdir=/newroot/dev ;;
+                esac
+            else
+                say "tOS: $fs did not come across"
+                carried=
+            fi
+        done
+        # Said after the moves and not before them. This is the line both CI
+        # workflows grep for, and printed first it called a half-carried pivot
+        # a good boot — the machine on the other side had no keyboard and the
+        # gate was green. Going through with switch_root anyway is still
+        # right: /run has already moved, so the session below no longer has
+        # the medium it would fall back to.
+        [ -n "$carried" ] && say "tOS: booting the Debian rootfs"
+        exec switch_root /newroot /sbin/tos-session
     fi
-    if [ "$restarts" -eq 0 ]; then
-        say "tOS: add tos.rescue to the kernel command line for a shell"
-    fi
-    restarts=$((restarts + 1))
-    say "tOS: compositor exited ($status), restarting"
-    sleep 1
-done
+    say "tOS: cannot carry the live mounts across; using the initramfs session"
+fi
+
+# No rootfs, so this initramfs is the system after all. It has the compositor
+# and busybox and nothing else — no dpkg, no apt, and the compositor's built-in
+# ASCII face instead of a Japanese one. It is a rescue path, and it is still a
+# tOS a person can install from.
+exec /sbin/tos-session

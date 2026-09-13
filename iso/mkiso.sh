@@ -5,13 +5,17 @@
 # Layout of the result:
 #   kernel     Debian linux-image (virtio + DRM as modules)
 #   initramfs  busybox + /sbin/tos (static musl build) + needed modules
+#   rootfs     minimal Debian bookworm as a squashfs: glibc, dpkg, apt, bash
 #   bootloader GRUB (BIOS + UEFI hybrid via grub-mkrescue)
 #
-# Boot flow: GRUB -> kernel -> /init -> exec tos (DRM backend).
+# Boot flow: GRUB -> kernel -> /init -> squashfs under a tmpfs overlay ->
+# switch_root -> /sbin/tos-session -> tos (DRM backend).
 #
-# The README's target userspace is a Debian rootfs; this image is the
-# kernel/compositor half of that story, with busybox standing in for the
-# rootfs until the squashfs stage exists.
+# The README's target userspace is Debian, and the squashfs is it. The
+# initramfs is no longer the system: it is the few megabytes that find the
+# medium, put a writable Debian together out of it, and get out of the way.
+# It keeps a session of its own only as a rescue path, for a machine where
+# the rootfs cannot be mounted at all.
 set -eu
 
 ARCH=$(uname -m)
@@ -20,11 +24,13 @@ x86_64)
     RUST_TARGET=x86_64-unknown-linux-musl
     KERNEL_PKG=linux-image-amd64
     GRUB_PKGS="grub-pc-bin grub-efi-amd64-bin"
+    DEB_ARCH=amd64
     ;;
 aarch64)
     RUST_TARGET=aarch64-unknown-linux-musl
     KERNEL_PKG=linux-image-arm64
     GRUB_PKGS="grub-efi-arm64-bin"
+    DEB_ARCH=arm64
     ;;
 *)
     echo "mkiso: unsupported architecture $ARCH" >&2
@@ -38,7 +44,8 @@ apt-get update
 # kernel package then skips generating its own initrd, which would fail in
 # a container anyway.
 apt-get install -y --no-install-recommends \
-    musl-tools busybox-static cpio kmod fonts-vlgothic skkdic \
+    musl-tools busybox-static cpio kmod skkdic \
+    mmdebstrap squashfs-tools \
     "$KERNEL_PKG" \
     grub-common grub2-common $GRUB_PKGS xorriso mtools \
     fdisk dosfstools e2fsprogs
@@ -60,6 +67,23 @@ ROOT="$WORK/root"
 ISODIR="$WORK/iso"
 mkdir -p "$ROOT" "$ISODIR/boot/grub" dist
 
+# dist/ is written by this container, which is root, into a directory bind
+# mounted from the host — so everything in it comes out owned by root. The host
+# has no passwordless sudo, so a root-owned dist/ cannot be deleted and
+# `git worktree remove` fails on the worktree the image was built in, until
+# somebody works out why.
+#
+# On EXIT rather than at the end, because a build that failed is the one that
+# leaves it that way most often: the mirror was unreachable, an assertion about
+# the rootfs fired, cargo did not compile. build.sh says who invoked it; a
+# build run some other way skips this and keeps what it had.
+hand_dist_back() {
+    if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
+        chown -R "$HOST_UID:$HOST_GID" dist 2>/dev/null || true
+    fi
+}
+trap hand_dist_back EXIT
+
 # --- initramfs ---------------------------------------------------------
 mkdir -p "$ROOT/bin" "$ROOT/sbin" "$ROOT/dev" "$ROOT/proc" "$ROOT/sys" \
     "$ROOT/tmp" "$ROOT/root" "$ROOT/etc" "$ROOT/lib/modules/$KVER"
@@ -68,8 +92,12 @@ cp "$TOS_BIN" "$ROOT/sbin/tos"
 cp "$INSTALLER_BIN" "$ROOT/sbin/tos-install"
 cp "$PREVIEW_BIN" "$ROOT/sbin/tos-preview"
 cp iso/init "$ROOT/init"
+# The session script goes on both sides of the pivot: this copy runs when the
+# rootfs could not be mounted, the copy in the squashfs when it could. One file
+# in the tree so the two cannot drift apart.
+cp iso/live-session "$ROOT/sbin/tos-session"
 chmod 755 "$ROOT/init" "$ROOT/sbin/tos" "$ROOT/sbin/tos-install" \
-    "$ROOT/sbin/tos-preview"
+    "$ROOT/sbin/tos-preview" "$ROOT/sbin/tos-session"
 
 # The message of the day, which is where a person is told that this is a live
 # session and how to put it on a disk.
@@ -77,58 +105,13 @@ mkdir -p "$ROOT/etc/tos" "$ROOT/run/live/medium"
 cp .motd_art "$ROOT/etc/tos/motd_art"
 cp iso/profile "$ROOT/etc/profile"
 
-# The font. Without one on the image the compositor finds nothing to load and
-# falls back to its built-in ASCII face, which draws every kana as a hollow
-# box; an image that cannot show Japanese is not much of a Japanese desktop.
-#
-# VL Gothic is the cheapest face Debian has that covers both Latin and
-# Japanese. It is 4,088,728 bytes on disk and costs 2,544,069 of them once the
-# initramfs is gzipped, which is 2.4 MiB on a 49.5 MiB image: measured by
-# regzipping the shipped archive with the file taken out. IPAGothic would cost
-# 4.3 MB and the smallest usable cut of Noto Sans CJK 13.6 MB, for a repertoire
-# this image has no use for.
-#
-# It is also exactly fixed pitch — every Latin glyph half an em, every kana and
-# kanji a full em — which is the 1:2 ratio tos-term's width table already
-# assumes, so a wide character lands on two cells with nothing rescaled. That
-# makes it the primary face here rather than only a fallback.
-#
-# Licence: M+ / Sazanami / BSD-3-Clause, all redistributable.
-VLGOTHIC=usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf
-mkdir -p "$ROOT/$(dirname "$VLGOTHIC")"
-cp "/$VLGOTHIC" "$ROOT/$VLGOTHIC"
-
-# The dictionary. The font is what makes Japanese legible; this is what makes
-# it typable. SKK-JISYO.L is a sorted text file the IME binary searches, which
-# is why tOS needs no conversion daemon at all — see docs/design/ime.md.
-#
-# Converted here, once, rather than at run time: tOS is UTF-8 throughout and
-# is not going to learn a second encoding to read one file.
-#
-# Debian's skkdic (20230109-1) ships it in EUC-JP — checked, not assumed.
-# file(1) gets no further than "ISO-8859 text", but the dictionary's own first
-# line is `;; -*- mode: fundamental; coding: euc-jp -*-`, it is not valid UTF-8
-# (iconv stops at byte 1366), and `iconv -f EUC-JP` reads all 4,489,936 bytes
-# of it without a single illegal sequence. That first line still says euc-jp in
-# the converted copy: it is a comment inside the dictionary, not something tOS
-# reads.
-#
-# 4,489,936 bytes of EUC-JP become 6,156,948 of UTF-8 and cost 1,995,397 of
-# them once the initramfs is gzipped — measured the way the font's number was,
-# by regzipping the shipped archive with the file taken out: 25,880,398 with
-# it against 23,885,001 without. That is 3.7% of the image against VL Gothic's
-# 2,544,069, so the data that makes Japanese input possible is a quarter
-# cheaper than the face that makes it visible. The image goes from 52,379,648
-# bytes to 54,376,448.
-#
-# After #20 (the Debian rootfs) this copy goes away: the rootfs installs
-# skkdic itself, and its own /usr/share/skk/SKK-JISYO.L becomes the system
-# dictionary. The path below is the initramfs stand-in until then.
-#
-# Licence: GPL-2+ (skk-dev/dict), redistributable.
-SKKDIC=/usr/share/skk/SKK-JISYO.L
-mkdir -p "$ROOT/usr/share/tos"
-iconv -f EUC-JP -t UTF-8 "$SKKDIC" >"$ROOT/usr/share/tos/SKK-JISYO.L"
+# The font and the SKK dictionary used to be copied in here, and are not any
+# more: they live in the Debian rootfs below, where the session that reads them
+# now runs. Together they cost 4,539,466 bytes of the gzipped initramfs, which
+# is what paying for them twice would mean. What stays behind is a rescue
+# session that draws Latin from the compositor's built-in ASCII face and cannot
+# type Japanese — an acceptable thing for a path taken only when the rootfs
+# will not mount, and not worth 4.5 MB to avoid.
 
 # The tools the installer shells out to. Unlike the compositor these are
 # Debian binaries, so their libraries have to come along; the installer is
@@ -189,12 +172,34 @@ mknod -m 666 "$ROOT/dev/null" c 1 3
 # Display and input, then the storage stack the installer needs: without a
 # disk driver it sees no disks, and without the filesystem modules it cannot
 # mount what it just created.
+#
+# Then the network cards. Everything tOS can do to a network — enumerating
+# /sys/class/net, SIOCSIFFLAGS, the DHCP client, the whole super+shift+n menu
+# — needs an interface to do it to, and until these were packed a tOS VM had
+# `lo` and nothing else: the adapter sat on the PCI bus with no driver bound
+# and the menu answered "no wired or wireless interfaces". virtio_net and
+# e1000 are the two emulations QEMU and VirtualBox actually hand out; e1000e,
+# r8169 and igb are the cards a desktop or laptop is likely to have. The list
+# stays a closure and not the tree: these five pull seven more between them —
+# libphy, realtek, mdio_devres, i2c-algo-bit, dca, failover, net_failover —
+# and the twelve together cost 618 KiB of the compressed initramfs, measured
+# at 25,925,814 bytes before and 26,558,126 after. Nothing here is firmware:
+# r8169 asks for rtl_nic blobs this image does not carry, so a Realtek card
+# that needs one gets whatever its PHY does by default, which is untested.
 MODULES="bochs virtio_gpu simpledrm cirrus vmwgfx vboxvideo \
     evdev atkbd i8042 psmouse virtio_input hid_generic usbhid virtio_pci \
     sd_mod sr_mod cdrom ata_piix ahci libahci virtio_blk virtio_scsi \
     nvme usb_storage uas xhci_pci ehci_pci ohci_pci sdhci_pci mmc_block \
+    virtio_net e1000 e1000e r8169 igb \
     isofs ext4 vfat nls_cp437 nls_iso8859_1 nls_ascii"
-for mod in $MODULES; do
+# The rootfs stack, kept in its own list because it is not about what hardware
+# the machine has: these three are how /init turns one read-only file on the
+# medium into a writable Debian. `loop` makes the squashfs a block device,
+# `squashfs` reads it, `overlay` puts a tmpfs in front so the live session can
+# be written to. Without any one of them the machine falls back to the
+# initramfs session.
+ROOTFS_MODULES="loop squashfs overlay"
+for mod in $MODULES $ROOTFS_MODULES; do
     modprobe -S "$KVER" --show-depends "$mod" 2>/dev/null || true
 # `--show-depends` prints the module's default parameters after its path, so
 # only the first field is a filename. nvme is the first module in the list
@@ -230,6 +235,216 @@ done
 ln -sf /bin/busybox "$ROOT/sbin/modprobe"
 (cd "$ROOT" && find . | cpio -o -H newc --quiet | gzip -9) \
     >"$ISODIR/boot/initramfs.gz"
+
+# --- Debian rootfs -----------------------------------------------------
+# What a tOS machine is once it has finished booting. Before this the answer
+# was "the initramfs", which meant no dpkg, no apt and no way to add a single
+# program to a machine for the rest of its life (#83). A real glibc, a real
+# dpkg and a working apt are the whole point of choosing Debian, and this is
+# where they come from.
+#
+# mmdebstrap rather than debootstrap because it needs no privilege the build
+# container does not already have: it notices it cannot mount /proc inside the
+# chroot, says so, and carries on. debootstrap would need a privileged
+# container, and the ISO build is something CI has to be able to run.
+ROOTFS="$WORK/rootfs"
+MIRROR=${MIRROR:-http://deb.debian.org/debian}
+SUITE=${SUITE:-bookworm}
+
+# Never unpacked rather than deleted afterwards, so the rule also governs
+# everything apt installs later: a machine whose whole disk is a squashfs
+# should not spend it on manual pages it has no pager story for. Copyright
+# files stay — they are the terms under which this image may be handed to
+# anybody at all.
+cat >"$WORK/tos-minimal" <<'EOF'
+# Written by iso/mkiso.sh. See the note there.
+path-exclude=/usr/share/doc/*
+path-include=/usr/share/doc/*/copyright
+path-exclude=/usr/share/man/*
+path-exclude=/usr/share/locale/*
+path-exclude=/usr/share/info/*
+EOF
+
+# `--variant=apt` is essential plus apt, which is the smallest thing that can
+# still install a package. Everything beyond it is named here with a reason:
+#
+#   debian-archive-keyring  apt verifies the archive signature against it, and
+#                           without it `apt update` fails on every mirror.
+#   ca-certificates         and the same for an https mirror.
+#   bash                    #82, and the shell people actually expect. The
+#                           session still runs /bin/sh; see iso/live-session.
+#   busybox                 /sbin/init below, and the applets the installer
+#                           and the profile reach for.
+#   ncurses-base            the terminfo for the TERM tOS advertises. Without
+#                           it apt's own progress bar has nothing to draw on.
+#   fonts-vlgothic          the face the compositor loads, now dpkg's problem
+#                           rather than a file copied past it.
+#   e2fsprogs dosfstools    the installer makes these filesystems, and it now
+#   fdisk util-linux        runs here rather than in the initramfs.
+#   mount                   and so it needs a mount(8): Debian split it out of
+#                           util-linux, and nothing essential pulls it back
+#                           in. A rootfs without it installs as far as the
+#                           Mount step and stops there — found by booting one.
+#   grub2-common $GRUB_PKGS the installer's bootloader step, likewise.
+#   squashfs-tools          how the installer unpacks this very rootfs.
+#   kmod                    modprobe for a machine that has pivoted.
+ROOTFS_PACKAGES="debian-archive-keyring,ca-certificates,bash,busybox,\
+ncurses-base,fonts-vlgothic,e2fsprogs,dosfstools,fdisk,util-linux,mount,kmod,\
+squashfs-tools,grub2-common,$(echo "$GRUB_PKGS" | tr ' ' ',')"
+
+mmdebstrap \
+    --mode=root \
+    --variant=apt \
+    --architectures="$DEB_ARCH" \
+    --include="$ROOTFS_PACKAGES" \
+    --aptopt='Acquire::Retries "3"' \
+    --setup-hook="copy-in $WORK/tos-minimal /etc/dpkg/dpkg.cfg.d" \
+    "$SUITE" "$ROOTFS" "$MIRROR"
+
+# The build has one job and it is this; a rootfs that reached here without the
+# programs the issue is about is not worth putting on an image. The mount and
+# unsquashfs lines are here because tos-install runs inside this rootfs now,
+# and a missing one of those is an installation that stops halfway across a
+# disk it has already partitioned.
+for program in /usr/bin/apt /usr/bin/dpkg /bin/bash /bin/busybox \
+    /bin/mount /bin/umount /usr/bin/unsquashfs /usr/sbin/sfdisk \
+    /usr/sbin/mkfs.ext4 /usr/sbin/grub-install; do
+    if [ ! -x "$ROOTFS$program" ]; then
+        echo "mkiso: the rootfs has no $program" >&2
+        exit 1
+    fi
+done
+
+# The face the compositor loads is a package in here now rather than a file
+# copied past dpkg, which means nothing in the tree fails if it goes missing:
+# the compositor falls back to its built-in ASCII face and every kana becomes
+# a hollow box, with the boot and every other assertion still green.
+if [ ! -f "$ROOTFS/usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf" ]; then
+    echo "mkiso: the rootfs carries no Japanese face" >&2
+    exit 1
+fi
+
+# And that this busybox can be PID 1 and can reboot. The initramfs uses
+# busybox-static and an installed machine uses the rootfs's `busybox` package,
+# which is a different build with a different configuration — so "there is a
+# busybox" is not the question. An applet-less /sbin/init is a disk that
+# panics on every boot while the live image, which never execs init, stays
+# green through both workflows.
+for applet in init reboot poweroff; do
+    if ! "$ROOTFS/bin/busybox" --list | grep -qx "$applet"; then
+        echo "mkiso: the rootfs busybox has no $applet applet" >&2
+        exit 1
+    fi
+done
+
+# tOS itself, on top of Debian. The binaries are the same static musl ones the
+# initramfs carries: nothing here links against the rootfs, which is what makes
+# a broken upgrade inside the rootfs survivable.
+cp "$TOS_BIN" "$ROOTFS/sbin/tos"
+cp "$INSTALLER_BIN" "$ROOTFS/sbin/tos-install"
+cp "$PREVIEW_BIN" "$ROOTFS/sbin/tos-preview"
+cp iso/live-session "$ROOTFS/sbin/tos-session"
+chmod 755 "$ROOTFS/sbin/tos" "$ROOTFS/sbin/tos-install" \
+    "$ROOTFS/sbin/tos-preview" "$ROOTFS/sbin/tos-session"
+
+# PID 1 on an installed machine. Debian's essential set contains no init at
+# all — an init system is a package, and tOS installs none — so this is
+# busybox's, which is what reads the /etc/inittab the installer writes. It is
+# a symlink rather than a copy so that a machine which later installs a real
+# init has one file to displace.
+#
+# reboot, halt and poweroff come from the same place and for the same reason:
+# they are how a person turns the machine off, the inittab's ctrlaltdel line
+# names /sbin/reboot, and on Debian they belong to the init system that is not
+# here. busybox's talk to busybox init, which is the one running.
+ln -sf /bin/busybox "$ROOTFS/sbin/init"
+for applet in reboot halt poweroff; do
+    ln -sf /bin/busybox "$ROOTFS/sbin/$applet"
+done
+
+# The message of the day reaches a shell through /etc/profile, and Debian's
+# own /etc/profile is a file with opinions this has no business replacing.
+# It sources /etc/profile.d/*.sh, so tOS's part goes in there beside it.
+mkdir -p "$ROOTFS/etc/tos" "$ROOTFS/etc/profile.d" "$ROOTFS/run/live/medium"
+cp .motd_art "$ROOTFS/etc/tos/motd_art"
+cp iso/profile "$ROOTFS/etc/profile.d/tos.sh"
+
+# mmdebstrap leaves the build machine's own /etc/resolv.conf in the rootfs. On
+# a container host that is the container's: a resolver address that means
+# nothing on any machine this image is carried to, and a search domain that
+# tells everybody who boots the ISO what network it was built on. The
+# compositor writes this file itself when a DHCP lease arrives — see
+# compositor/tos-system — so what belongs here before then is nothing at all.
+: >"$ROOTFS/etc/resolv.conf"
+# Likewise the host name, which the installer overwrites on a machine it puts
+# on a disk. This is the one a live session answers to.
+echo tos >"$ROOTFS/etc/hostname"
+
+# The kernel's modules, so a machine that has pivoted can still load one. The
+# same pruned tree the initramfs got, metadata and all.
+mkdir -p "$ROOTFS/lib/modules"
+cp -a "$ROOT/lib/modules/$KVER" "$ROOTFS/lib/modules/$KVER"
+
+# The dictionary, converted out of the build container's skkdic rather than
+# installed into the rootfs as a package.
+#
+# Debian's skkdic (20230109-1) ships SKK-JISYO.L in EUC-JP — checked, not
+# assumed. file(1) gets no further than "ISO-8859 text", but the dictionary's
+# own first line is `;; -*- mode: fundamental; coding: euc-jp -*-`, it is not
+# valid UTF-8 (iconv stops at byte 1366), and `iconv -f EUC-JP` reads all
+# 4,489,936 bytes of it without one illegal sequence. tOS is UTF-8 throughout
+# and is not going to learn a second encoding to read one file, so the
+# conversion happens here, once, rather than at every boot.
+#
+# Installing the package as well would put both encodings on the image — the
+# 4.5 MB original that nothing can read beside the 6.2 MB copy that everything
+# can. /usr/share/tos/SKK-JISYO.L is searched before /usr/share/skk, so the
+# package would also be the copy that loses. See compositor/tos-ime.
+#
+# Licence: GPL-2+ (skk-dev/dict), redistributable.
+SKKDIC=/usr/share/skk/SKK-JISYO.L
+mkdir -p "$ROOTFS/usr/share/tos"
+iconv -f EUC-JP -t UTF-8 "$SKKDIC" >"$ROOTFS/usr/share/tos/SKK-JISYO.L"
+
+# The dpkg configuration above governs what apt unpacks from here on, but not
+# what is already unpacked: mmdebstrap extracts the essential set with tar
+# rather than through dpkg, so those packages' documentation arrives whatever
+# dpkg has been told. Take it out by hand to match, or the rule would be one
+# that applies only to packages somebody adds later.
+#
+# Worth 16,650,240 bytes of the squashfs, measured by compressing the same
+# rootfs both ways: 74,674,176 with these trees and 58,023,936 without. Most
+# of it is /usr/share/locale, 31.8 MB of translated messages that nothing can
+# currently display — the rootfs has no `locales` package, so no locale is
+# generated and every program falls back to C. Installing `locales` and
+# deleting the locale line from the dpkg configuration is the pair of changes
+# that would make them worth carrying.
+rm -rf "$ROOTFS/usr/share/man" "$ROOTFS/usr/share/locale" \
+    "$ROOTFS/usr/share/info"
+find "$ROOTFS/usr/share/doc" -mindepth 2 ! -name copyright -delete 2>/dev/null ||
+    true
+# grub-install opens this directory to find its translations and warns on the
+# console when it cannot. The warning is harmless and the installation finishes
+# either way, but it lands in the one log a person installing tOS is actually
+# reading, where it looks like something went wrong. An empty directory costs
+# nothing and says the true thing: there are no translations here.
+mkdir -p "$ROOTFS/usr/share/locale"
+
+# zstd rather than the default gzip or the live-image usual xz. The squashfs
+# is read while somebody waits — every page of every binary the session starts
+# comes through it — and zstd decompresses several times faster than xz for a
+# few per cent more image. Debian's kernel builds SQUASHFS_ZSTD in, so nothing
+# has to be loaded before the root can be read. 1 MiB blocks because the
+# alternative is compressing a rootfs 128 KiB at a time.
+mkdir -p "$ISODIR/live"
+mksquashfs "$ROOTFS" "$ISODIR/live/filesystem.squashfs" \
+    -comp zstd -Xcompression-level 19 -b 1M -noappend -quiet -no-progress
+
+# What minimal Debian costs, which #20 asks for in as many words. Printed
+# every build rather than written into a comment that would go stale.
+echo "mkiso: rootfs $(du -sb "$ROOTFS" | cut -f1) bytes unpacked, \
+$(stat -c%s "$ISODIR/live/filesystem.squashfs") bytes squashed"
+echo "mkiso: initramfs $(stat -c%s "$ISODIR/boot/initramfs.gz") bytes gzipped"
 
 # --- ISO ---------------------------------------------------------------
 cp "/boot/vmlinuz-$KVER" "$ISODIR/boot/vmlinuz"
@@ -269,12 +484,6 @@ grub-mkrescue -o "$ISO" "$ISODIR" --quiet
 rm -rf "$WORK"
 
 # Everything above ran as root inside the container, so dist/ and the image in
-# it come out owned by root on the host. That is not a cosmetic problem: the
-# host has no passwordless sudo, so a root-owned dist/ cannot be deleted, and
-# `git worktree remove` on a worktree an image was built in fails until
-# somebody works out why. Hand it back to whoever invoked the build; build.sh
-# says who that is, and a build run some other way just skips this.
-if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
-    chown -R "$HOST_UID:$HOST_GID" dist
-fi
+# it come out owned by root on the host — handed back by the EXIT trap set at
+# the top of this file, which runs whether the build got this far or not.
 ls -lh "$ISO"

@@ -890,9 +890,9 @@ banner is never erased on a bar with no message segment
 - [ ] the four defects 0.0.7 left open ([#85](https://github.com/m96-chan/tOS/issues/85), [#86](https://github.com/m96-chan/tOS/issues/86), [#87](https://github.com/m96-chan/tOS/issues/87), [#88](https://github.com/m96-chan/tOS/issues/88))
 - [ ] networking against a real interface ([#84](https://github.com/m96-chan/tOS/issues/84))
 - [ ] bash as the shell an installed machine gives you ([#82](https://github.com/m96-chan/tOS/issues/82))
-- [ ] a way to add anything to an installed machine ([#83](https://github.com/m96-chan/tOS/issues/83))
+- [x] a way to add anything to an installed machine ([#83](https://github.com/m96-chan/tOS/issues/83))
 - [ ] generic arm64 image ([#21](https://github.com/m96-chan/tOS/issues/21))
-- [ ] Debian rootfs tooling ([#20](https://github.com/m96-chan/tOS/issues/20))
+- [x] Debian rootfs tooling ([#20](https://github.com/m96-chan/tOS/issues/20))
 - [ ] hardware abstraction cleanup ([#22](https://github.com/m96-chan/tOS/issues/22))
 - [ ] images scanned out on DRM overlay planes ([#31](https://github.com/m96-chan/tOS/issues/31))
 
@@ -911,16 +911,15 @@ reason to hold a round open for the name of the release it is aimed at.
 
 - [x] generic x86_64 image
 - [ ] generic arm64 image
-- [ ] Debian rootfs tooling
+- [x] Debian rootfs tooling
 - [x] install / boot tooling
 - [ ] hardware abstraction cleanup
 
 `iso/` builds a bootable x86_64 image, and `tos-install` puts it on a disk
-from inside a pane. What lands on the disk is still the busybox initramfs
-world rather than a Debian rootfs, so the two remaining userspace items are
-the same piece of work. The unticked boxes here are the ones tracked under
-0.0.8 above; this section is the release they add up to, not a second pile of
-work.
+from inside a pane. What lands on the disk is a Debian bookworm rootfs with a
+working `apt`, unpacked from a squashfs on the medium. The unticked boxes here
+are the ones tracked under 0.0.8 above; this section is the release they add
+up to, not a second pile of work.
 
 ### Later — Android devices
 
