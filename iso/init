@@ -105,21 +105,30 @@ mkdir -p /run/live
 # here before for the same reason nobody noticed: the machines this is booted
 # on take their disk and screen from IDE and VGA, so nothing else needed it.
 #
-# The three nls_ modules at the end are the least obvious and the reason the
-# rest of this list is now the whole of it. Nothing has a device that needs
-# them: the kernel asks for one by name when a FAT filesystem is mounted —
-# cp437 for the codepage and ascii for the iocharset, which are Debian's
-# defaults — and it asks by running /sbin/modprobe in whatever root is current
-# at the time. After switch_root that root is the Debian rootfs, which carries
-# no modules at all, so the ESP the installer mounts would be refused for want
-# of a character table. This is the last moment in the life of the machine when
-# a module can be loaded, so everything that will ever be wanted is loaded here.
+# The tail of this list is the least obvious part of it and the reason the rest
+# is now the whole of it. Nothing on the machine has a device that needs those
+# modules: the kernel asks for them *by name*, mid-syscall, by running
+# /sbin/modprobe in whatever root is current at the time — and after
+# switch_root that root is the Debian rootfs, which carries no modules at all.
+# This loop is the last moment in the life of the machine when a module can be
+# loaded, so everything that will ever be wanted is loaded here.
+#
+# Two mounts the installer makes ask that way, and both are the same story.
+# FAT wants a codepage and an iocharset, cp437 and ascii being Debian's
+# defaults, which is the ESP under UEFI. ext4 wants crc32c from the crypto
+# API, because Debian's mke2fs turns metadata_csum on — and `modprobe ext4`
+# does not bring it: ext4 depends on libcrc32c for the symbol, while the
+# algorithm behind it is requested by name at mount time and not before. A
+# live session that had loaded ext4 and nothing else answered
+# `EXT4-fs (sda2): Cannot load crc32c driver` and refused to mount the root
+# filesystem the installer had just made, three steps into erasing a disk.
 for mod in bochs virtio_gpu simpledrm cirrus vmwgfx vboxvideo \
     evdev atkbd i8042 psmouse virtio_input hid_generic usbhid \
     sd_mod sr_mod cdrom ata_piix ahci virtio_blk virtio_scsi \
     nvme usb_storage uas xhci_pci ehci_pci ohci_pci sdhci_pci mmc_block \
     virtio_pci virtio_net e1000 e1000e r8169 igb \
     isofs ext4 vfat nls_cp437 nls_iso8859_1 nls_ascii \
+    crc32c_generic crc32c_intel \
     loop squashfs overlay; do
     modprobe "$mod" 2>/dev/null
 done

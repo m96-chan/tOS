@@ -230,7 +230,8 @@ MODULES="bochs virtio_gpu simpledrm cirrus vmwgfx vboxvideo \
     sd_mod sr_mod cdrom ata_piix ahci libahci virtio_blk virtio_scsi \
     nvme usb_storage uas xhci_pci ehci_pci ohci_pci sdhci_pci mmc_block \
     virtio_net e1000 e1000e r8169 igb \
-    isofs ext4 vfat nls_cp437 nls_iso8859_1 nls_ascii"
+    isofs ext4 vfat nls_cp437 nls_iso8859_1 nls_ascii \
+    crc32c_generic crc32c_intel"
 # The rootfs stack, kept in its own list because it is not about what hardware
 # the machine has: these three are how /init turns one read-only file on the
 # medium into a writable Debian. `loop` makes the squashfs a block device,
@@ -238,6 +239,31 @@ MODULES="bochs virtio_gpu simpledrm cirrus vmwgfx vboxvideo \
 # be written to. Without any one of them the machine falls back to the
 # initramfs session.
 ROOTFS_MODULES="loop squashfs overlay"
+
+# And that the image packs everything /init will reach for. The list is
+# written down twice — here, and in the loop at the top of iso/init — because
+# one of them says what to carry and the other says when to load it, and only
+# this one is read by the thing that packs. This one may hold more: libahci is
+# named here because it is a dependency and never loaded by name. It may not
+# hold less.
+#
+# The way it comes to hold less is somebody adding a module to iso/init
+# because a boot needed it, which is a change that appears to work: modprobe
+# says nothing about a module it cannot find, /init throws its output away,
+# and what breaks is a mount three steps into erasing somebody's disk.
+packed=" $MODULES $ROOTFS_MODULES "
+missing=
+for mod in $(sed -n '/^for mod in /,/; do$/p' iso/init |
+    sed 's/^for mod in //; s/; do$//; s/\\$//'); do
+    case "$packed" in
+    *" $mod "*) ;;
+    *) missing="$missing $mod" ;;
+    esac
+done
+if [ -n "$missing" ]; then
+    echo "mkiso: iso/init loads modules this image does not pack:$missing" >&2
+    exit 1
+fi
 for mod in $MODULES $ROOTFS_MODULES; do
     modprobe -S "$KVER" --show-depends "$mod" 2>/dev/null || true
 # `--show-depends` prints the module's default parameters after its path, so
