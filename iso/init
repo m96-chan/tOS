@@ -64,6 +64,18 @@ mount -t devpts none /dev/pts
 mount -t tmpfs none /dev/shm
 mount -t tmpfs none /tmp
 
+# The kernel creates the loopback interface down and leaves it down, and there
+# is no init system on any of the three paths below to bring it up: until this
+# line no tOS machine could talk to itself over IP at all. `wget
+# http://localhost/` resolved and then sat there until TCP gave up two minutes
+# later, which reads like a network fault and is not one.
+#
+# Here rather than in a session script because a link's state belongs to the
+# network namespace and not to the root filesystem, so switch_root carries it:
+# one line covers the installed machine, the live Debian session and the
+# rescue session alike. The kernel gives it 127.0.0.1/8 and ::1 as it comes up.
+ip link set lo up 2>/dev/null || true
+
 # Everything the live session is assembled out of goes under /run: the medium,
 # the squashfs read off it, and the tmpfs the overlay writes into. /run is a
 # mount of its own so that one `mount --move` carries the whole lot across the
