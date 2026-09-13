@@ -56,4 +56,32 @@ grep -q "^squashfs-root/usr/share/fonts/truetype/vlgothic/" "$list" || {
     exit 1
 }
 
+# And what the machine is subscribed to, which a listing of file names cannot
+# answer. A rootfs built against bookworm main alone installs packages happily
+# and can never receive a security fix, while `apt update` reports it is up to
+# date and means it (#98) — a failure that shows up the day a CVE is published
+# and not one day earlier, so it has to be caught here. The suite is mkiso.sh's
+# to name; it is read back out of that script rather than written down a second
+# time where the two could drift apart.
+suite=${SUITE:-$(sed -n 's/^SUITE=${SUITE:-\(.*\)}$/\1/p' "$(dirname "$0")/mkiso.sh")}
+if [ -z "$suite" ]; then
+    echo "cannot read SUITE out of mkiso.sh" >&2
+    exit 1
+fi
+
+sudo mount -o loop,ro "$iso" "$mount_point"
+sources=$(unsquashfs -cat "$mount_point/live/filesystem.squashfs" \
+    etc/apt/sources.list) || {
+    echo "the rootfs has no /etc/apt/sources.list" >&2
+    exit 1
+}
+sudo umount "$mount_point"
+
+for suffix in security updates; do
+    grep -q "^deb .* $suite-$suffix " <<<"$sources" || {
+        echo "the rootfs is not subscribed to $suite-$suffix" >&2
+        exit 1
+    }
+done
+
 echo "rootfs entries: $(wc -l <"$list")"

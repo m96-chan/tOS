@@ -248,7 +248,17 @@ ln -sf /bin/busybox "$ROOT/sbin/modprobe"
 # chroot, says so, and carries on. debootstrap would need a privileged
 # container, and the ISO build is something CI has to be able to run.
 ROOTFS="$WORK/rootfs"
+# http and not https, deliberately. apt checks the archive's signature against
+# debian-archive-keyring whichever transport carried it, so TLS would add no
+# integrity this machine does not already have; what it would add is a
+# dependency on the clock. tOS runs no time sync of any kind, and on a board
+# with a flat RTC battery it comes up in 1970, where every certificate is not
+# yet valid and apt fails on every mirror. A machine that cannot reach
+# security.debian.org is the whole of #98, and https is one more way to arrive
+# there. ca-certificates stays installed for everything else the machine will
+# want to talk to.
 MIRROR=${MIRROR:-http://deb.debian.org/debian}
+SECURITY_MIRROR=${SECURITY_MIRROR:-http://security.debian.org/debian-security}
 SUITE=${SUITE:-bookworm}
 
 # Never unpacked rather than deleted afterwards, so the rule also governs
@@ -292,6 +302,19 @@ ROOTFS_PACKAGES="debian-archive-keyring,ca-certificates,bash,busybox,\
 ncurses-base,fonts-vlgothic,e2fsprogs,dosfstools,fdisk,util-linux,mount,kmod,\
 squashfs-tools,grub2-common,$(echo "$GRUB_PKGS" | tr ' ' ',')"
 
+# Three suites and not one. `bookworm` is the frozen release: a point release
+# folds security fixes back into it, so an image built later picks some of them
+# up, but a machine already installed from an older one never does. It is
+# subscribed to a suite that does not move between point releases, and `apt
+# update` tells it it is up to date while every fix published since goes past
+# it (#98). -security is where those appear first; -updates carries the changes
+# that are not security but cannot wait for the point release either.
+#
+# mmdebstrap takes the extra suites as further mirror arguments and installs
+# from them as well as writing them to sources.list, so the image ships the
+# fixed package rather than merely being able to fetch it afterwards. Measured
+# against the package set above that costs no additional packages and 6.7 kB
+# more to download — the whole of it being a newer ca-certificates.
 mmdebstrap \
     --mode=root \
     --variant=apt \
@@ -299,7 +322,9 @@ mmdebstrap \
     --include="$ROOTFS_PACKAGES" \
     --aptopt='Acquire::Retries "3"' \
     --setup-hook="copy-in $WORK/tos-minimal /etc/dpkg/dpkg.cfg.d" \
-    "$SUITE" "$ROOTFS" "$MIRROR"
+    "$SUITE" "$ROOTFS" "$MIRROR" \
+    "deb $SECURITY_MIRROR $SUITE-security main" \
+    "deb $MIRROR $SUITE-updates main"
 
 # The build has one job and it is this; a rootfs that reached here without the
 # programs the issue is about is not worth putting on an image. The mount and
@@ -333,6 +358,18 @@ fi
 for applet in init reboot poweroff; do
     if ! "$ROOTFS/bin/busybox" --list | grep -qx "$applet"; then
         echo "mkiso: the rootfs busybox has no $applet applet" >&2
+        exit 1
+    fi
+done
+
+# And that mmdebstrap wrote the suites it was handed. It is free to arrange
+# them as it likes — a one-line sources.list today, deb822 under some future
+# version — and a rootfs subscribed to bookworm alone is indistinguishable
+# from a correct one until a CVE is published, which is too late to find out.
+for suffix in security updates; do
+    if ! grep -qr -- "$SUITE-$suffix" "$ROOTFS/etc/apt/sources.list" \
+        "$ROOTFS/etc/apt/sources.list.d"; then
+        echo "mkiso: the rootfs is not subscribed to $SUITE-$suffix" >&2
         exit 1
     fi
 done
