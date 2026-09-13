@@ -5,11 +5,14 @@
 # Layout of the result:
 #   kernel     Debian linux-image (virtio + DRM as modules)
 #   initramfs  busybox + /sbin/tos (static musl build) + needed modules
-#   rootfs     minimal Debian bookworm as a squashfs: glibc, dpkg, apt, bash
+#   rootfs     minimal Debian bookworm as a squashfs: glibc, dpkg, apt, bash,
+#              systemd
 #   bootloader GRUB (BIOS + UEFI hybrid via grub-mkrescue)
 #
 # Boot flow: GRUB -> kernel -> /init -> squashfs under a tmpfs overlay ->
-# switch_root -> /sbin/tos-session -> tos (DRM backend).
+# switch_root -> systemd -> tos-session.service -> /sbin/tos-session -> tos
+# (DRM backend). An installed machine is the same from switch_root on, which
+# is the point of #110: one answer to "what is PID 1 here", not two.
 #
 # The README's target userspace is Debian, and the squashfs is it. The
 # initramfs is no longer the system: it is the few megabytes that find the
@@ -361,8 +364,27 @@ EOF
 #   ca-certificates         and the same for an https mirror.
 #   bash                    #82, and the shell people actually expect. The
 #                           session still runs /bin/sh; see iso/live-session.
-#   busybox                 /sbin/init below, and the applets the installer
-#                           and the profile reach for.
+#   systemd-sysv            PID 1, on this image and on every machine
+#                           installed from it (#110). Debian's essential set
+#                           contains no init at all, and what stood here was
+#                           busybox's, reading an /etc/inittab the installer
+#                           wrote: three lines, enough for exactly one
+#                           program. A Debian package that ships a unit — and
+#                           newer ones increasingly ship nothing else — now
+#                           works when it is installed, with nothing written
+#                           on tOS's side. 13 packages and about 13.5 MB
+#                           unpacked, measured the same way as the pair
+#                           below, which is what `ip`, `ps` and `free`
+#                           already cost. docs/design/init.md has the whole
+#                           of the decision.
+#   busybox                 not PID 1 any more, and nothing else here needs
+#                           it: the installer runs Debian's sfdisk, mkfs,
+#                           mount, unsquashfs and grub-install, and a pane's
+#                           shell is bash or dash. It is on the image because
+#                           the initramfs's busybox-static is a different
+#                           build and #109 is still open about what a tOS
+#                           machine should be able to type; it is not load
+#                           bearing here.
 #   iproute2 procps         `ip`, `ps` and `free`: the first things anybody
 #                           types at a machine they cannot see inside (#97).
 #                           busybox carries applets by all three names and
@@ -387,9 +409,9 @@ EOF
 #   grub2-common $GRUB_PKGS the installer's bootloader step, likewise.
 #   squashfs-tools          how the installer unpacks this very rootfs.
 #   kmod                    modprobe for a machine that has pivoted.
-ROOTFS_PACKAGES="debian-archive-keyring,ca-certificates,bash,busybox,\
-iproute2,procps,ncurses-base,fonts-vlgothic,e2fsprogs,dosfstools,fdisk,\
-util-linux,mount,kmod,squashfs-tools,grub2-common,\
+ROOTFS_PACKAGES="debian-archive-keyring,ca-certificates,bash,systemd-sysv,\
+busybox,iproute2,procps,ncurses-base,fonts-vlgothic,e2fsprogs,dosfstools,\
+fdisk,util-linux,mount,kmod,squashfs-tools,grub2-common,\
 $(echo "$GRUB_PKGS" | tr ' ' ',')"
 
 # Three suites and not one. `bookworm` is the frozen release: a point release
@@ -439,15 +461,44 @@ if [ ! -f "$ROOTFS/usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf" ]; t
     exit 1
 fi
 
-# And that this busybox can be PID 1 and can reboot. The initramfs uses
-# busybox-static and an installed machine uses the rootfs's `busybox` package,
-# which is a different build with a different configuration — so "there is a
-# busybox" is not the question. An applet-less /sbin/init is a disk that
-# panics on every boot while the live image, which never execs init, stays
-# green through both workflows.
-for applet in init reboot poweroff; do
-    if ! "$ROOTFS/bin/busybox" --list | grep -qx "$applet"; then
-        echo "mkiso: the rootfs busybox has no $applet applet" >&2
+# And that there is a PID 1 in here, and that it is the one this image means.
+# A root with no init is a disk that panics on every boot — and the live image
+# would panic with it now that it execs the same program (#110).
+#
+# Every one of these is a symlink that systemd-sysv ships absolute:
+# /sbin/init -> /lib/systemd/systemd, and reboot, poweroff and halt ->
+# /bin/systemctl. A plain `[ -x ]` resolves an absolute symlink against the
+# *build container's* root, which has no systemd at all, so it answers about
+# the wrong machine — the same trap iso/init documents at `executable_in_root`,
+# and it answers "missing" for a rootfs that is perfectly good. Follow them by
+# hand instead, re-rooting every absolute target as we go.
+rootfs_exec() {
+    target=$1
+    hops=0
+    while [ -L "$ROOTFS$target" ] && [ "$hops" -lt 8 ]; do
+        link=$(readlink "$ROOTFS$target")
+        case $link in
+        /*) target=$link ;;
+        *) target="${target%/*}/$link" ;;
+        esac
+        hops=$((hops + 1))
+    done
+    [ -x "$ROOTFS$target" ]
+}
+
+init=$(readlink "$ROOTFS/sbin/init" 2>/dev/null || true)
+case $init in
+*/systemd) ;;
+*)
+    echo "mkiso: /sbin/init in the rootfs is ${init:-not a symlink}, not systemd" >&2
+    exit 1
+    ;;
+esac
+# And the three programs a person turns the machine off with, which belong to
+# the init system and arrive with systemd-sysv rather than being linked here.
+for program in /sbin/init /sbin/reboot /sbin/poweroff /sbin/halt; do
+    if ! rootfs_exec "$program"; then
+        echo "mkiso: the rootfs cannot execute $program" >&2
         exit 1
     fi
 done
@@ -474,20 +525,72 @@ cp iso/live-session "$ROOTFS/sbin/tos-session"
 chmod 755 "$ROOTFS/sbin/tos" "$ROOTFS/sbin/tos-install" \
     "$ROOTFS/sbin/tos-preview" "$ROOTFS/sbin/tos-session"
 
-# PID 1 on an installed machine. Debian's essential set contains no init at
-# all — an init system is a package, and tOS installs none — so this is
-# busybox's, which is what reads the /etc/inittab the installer writes. It is
-# a symlink rather than a copy so that a machine which later installs a real
-# init has one file to displace.
+# PID 1 on both images, and what starts the session on both (#110).
 #
-# reboot, halt and poweroff come from the same place and for the same reason:
-# they are how a person turns the machine off, the inittab's ctrlaltdel line
-# names /sbin/reboot, and on Debian they belong to the init system that is not
-# here. busybox's talk to busybox init, which is the one running.
-ln -sf /bin/busybox "$ROOTFS/sbin/init"
-for applet in reboot halt poweroff; do
-    ln -sf /bin/busybox "$ROOTFS/sbin/$applet"
+# The unit goes in /etc rather than /lib/systemd/system because tOS writes it
+# by hand and dpkg owns that other directory; /etc is also where it wins any
+# argument about a name. Enabling it is a symlink, not `systemctl enable`,
+# because this is a rootfs being assembled in a container and not a running
+# machine: `enable` is that symlink, and there is nothing here it could ask.
+#
+# Masking the gettys is the other half of the tty1 question the init decision
+# had to answer. getty@tty1 would take the console the compositor is drawing
+# on, and a serial getty — which systemd's generator adds by itself for every
+# console= on the kernel command line — is a login prompt on a line anybody
+# with the cable can reach. docs/design/lock-other-doors.md's rule stands
+# until #112 decides what a login on this machine is: one door, and the
+# compositor is it.
+mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
+cat >"$ROOTFS/etc/systemd/system/tos-session.service" <<'EOF'
+# Written by iso/mkiso.sh. The tOS session is the machine's reason to boot.
+[Unit]
+Description=tOS session
+Documentation=https://github.com/m96-chan/tOS
+Conflicts=getty@tty1.service
+After=systemd-user-sessions.service getty@tty1.service
+
+[Service]
+# /sbin/tos-session is iso/live-session: the environment, and then the
+# compositor. TOS_USER says whose session it is, and an installed machine
+# overrides it with a drop-in naming the person the installer was told about.
+ExecStart=/sbin/tos-session
+# The restart loop that used to be inside that script, and the respawn line
+# that used to be in an inittab. One mechanism, here, where `systemctl status`
+# can say how often it has fired.
+Restart=always
+RestartSec=1
+# A controlling terminal, because the rescue shell the session drops to under
+# tos.rescue is only a shell if it has one. The compositor takes the VT it
+# finds itself on, which is this one.
+StandardInput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+UtmpIdentifier=tty1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+ln -sf ../tos-session.service \
+    "$ROOTFS/etc/systemd/system/multi-user.target.wants/tos-session.service"
+# getty.target is what pulls one in at boot, on tty1 and on every console= the
+# generator finds; autovt@ is the one logind starts on demand when somebody
+# switches to an empty VT. A symlink to /dev/null is what "masked" is on disk.
+for unit in getty.target getty@.service serial-getty@.service autovt@.service; do
+    ln -sf /dev/null "$ROOTFS/etc/systemd/system/$unit"
 done
+
+# What this machine boots to. Debian's own default is graphical.target, which
+# is a target tOS has nothing under: there is no display manager and no X.
+# multi-user.target is the truth, and it is what the unit above is wanted by.
+ln -sf /lib/systemd/system/multi-user.target "$ROOTFS/etc/systemd/system/default.target"
+
+# An empty machine-id, which is how that file says "not set yet": systemd
+# generates one on the first boot and commits it. Shipping a filled-in one
+# would give every machine installed from this image the same identity, and
+# shipping no file at all leaves systemd deciding the root is not one it can
+# initialise.
+: >"$ROOTFS/etc/machine-id"
 
 # The message of the day reaches a shell through /etc/profile, and Debian's
 # own /etc/profile is a file with opinions this has no business replacing.

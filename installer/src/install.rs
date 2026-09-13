@@ -369,22 +369,7 @@ impl<'a> Installer<'a> {
         let fstab = self.fstab();
         self.write(&format!("{root}/etc/fstab"), &fstab)?;
 
-        // The console starts tOS, which is the whole point of the machine.
-        self.write(
-            &format!("{root}/etc/inittab"),
-            &format!(
-                "::sysinit:/etc/rc\n::respawn:{SESSION_SCRIPT_PATH}\n::ctrlaltdel:/sbin/reboot\n"
-            ),
-        )?;
-        self.write(&format!("{root}/etc/rc"), RC_SCRIPT)?;
-        let rc = format!("{root}/etc/rc");
-        let _ = self.backend.run("chmod", &["755", &rc]);
-        let session = format!("{root}{SESSION_SCRIPT_PATH}");
-        self.write(
-            &session,
-            &SESSION_SCRIPT.replace("{user}", &settings.username),
-        )?;
-        let _ = self.backend.run("chmod", &["755", &session]);
+        self.session_user(&root, &settings)?;
 
         // Say that this disk was installed. /etc is copied from the live
         // system, message of the day and all, so without a mark left here
@@ -517,6 +502,37 @@ impl<'a> Installer<'a> {
         self.write(path, &format!("{root_line}{line}"))
     }
 
+    /// Say whose session this machine's is.
+    ///
+    /// Everything else about the session is already on the disk: the rootfs
+    /// carries `/sbin/tos-session` and the `tos-session.service` that runs it,
+    /// so an installed machine starts the compositor because the image it came
+    /// from does (#110). The one thing the image cannot know is who is at the
+    /// keyboard, and `TOS_USER` is what the screen lock asks `/etc/shadow`
+    /// about (#111).
+    ///
+    /// A drop-in rather than an edit of the unit: the unit is the image's and
+    /// this line is the machine's, and a unit rewritten here is one that stops
+    /// improving the day a new image is installed over it. The three files
+    /// this replaced — `/etc/inittab`, `/etc/rc` and `/etc/tos-session` — were
+    /// the whole of what an installed machine ran, and they are gone rather
+    /// than carried alongside an init that does all three jobs.
+    fn session_user(&mut self, root: &str, settings: &Settings) -> Result<(), String> {
+        let directory = format!("{root}{SESSION_DROPIN_DIRECTORY}");
+        self.backend
+            .create_dir(&directory)
+            .map_err(|e| format!("cannot create {directory}: {e}"))?;
+        self.write(
+            &format!("{root}{SESSION_DROPIN}"),
+            &format!(
+                "# Written by the tOS installer: whose session this machine's is.\n\
+                 [Service]\n\
+                 Environment=TOS_USER={}\n",
+                settings.username
+            ),
+        )
+    }
+
     /// The installed system's `/etc/fstab`, by label so that the disk can move.
     fn fstab(&self) -> String {
         let mut fstab = String::from(
@@ -526,11 +542,14 @@ impl<'a> Installer<'a> {
         if self.plan.firmware == Firmware::Uefi {
             fstab.push_str("LABEL=TOS-ESP   /boot/efi  vfat  umask=0077         0 2\n");
         }
-        fstab.push_str(
-            "proc            /proc      proc  defaults           0 0\n\
-             sysfs           /sys       sysfs defaults           0 0\n\
-             devpts          /dev/pts   devpts gid=5,mode=620    0 0\n",
-        );
+        // `proc`, `sysfs` and `devpts` used to be here, because /etc/rc
+        // mounted them by hand and a line in this file was the only place
+        // that said so. systemd mounts all three before anything else runs
+        // (#110), so what they are now is three mount units generated to
+        // cover mountpoints that are already covered — which systemd carries
+        // out anyway, stacking a second mount over each and saying so on the
+        // console. A filesystem mounted twice is not a worse machine; a file
+        // that looks like it is arranging the boot and is not is a worse file.
         fstab
     }
 
@@ -850,59 +869,20 @@ const BASHRC: &str = include_str!("../../iso/bashrc");
 /// `/root/.profile` and `/etc/skel/.profile`.
 const PROFILE: &str = include_str!("../../iso/dot-profile");
 
-/// Where the session's environment is written, and what /etc/inittab respawns.
-pub const SESSION_SCRIPT_PATH: &str = "/etc/tos-session";
+/// Where a drop-in for `tos-session.service` goes: systemd reads every `.conf`
+/// in this directory on top of the unit itself.
+///
+/// The unit is the image's — `iso/mkiso.sh` writes it into the rootfs — and
+/// this is the installer's half: the one thing about the session that is this
+/// machine's rather than every machine's.
+pub const SESSION_DROPIN_DIRECTORY: &str = "/etc/systemd/system/tos-session.service.d";
 
-/// The environment the session runs in, and then the compositor.
+/// The one this installer writes.
 ///
-/// busybox init hands a program it respawns almost nothing, and none of what a
-/// tOS session needs: `ENV`, which is how each pane's shell comes to read
-/// `/etc/profile` and print the message of the day, nor `HOME`, nor `SHELL`,
-/// nor `TERM`, nor a `PATH` with `/usr/local` on it. Nothing carries an
-/// environment across `switch_root` either, so an installed machine writes
-/// them down here instead.
-///
-/// **`iso/live-session` is the live counterpart and the two have to agree.**
-/// It used to be `iso/init`, and the day the exports moved out of that file
-/// this comment went on naming it — which is how the two came to differ by a
-/// `TERM` the terminfo in the rootfs exists for and a `PATH` without the two
-/// `/usr/local` directories apt puts things in. A machine installed from an
-/// image is meant to be that image.
-///
-/// `{user}` is the one thing in here that is this machine's rather than every
-/// machine's: `TOS_USER` names the account the session belongs to, which is
-/// the account whose `/etc/shadow` line the screen lock asks for (#111). The
-/// live counterpart says `root`, because that is whose session it is there.
-const SESSION_SCRIPT: &str = "#!/bin/sh\n\
-                              # Written by the tOS installer.\n\
-                              # iso/live-session is the live counterpart.\n\
-                              export HOME=/root\n\
-                              export TOS_USER={user}\n\
-                              if [ -x /bin/bash ]; then\n\
-                              SHELL=/bin/bash\n\
-                              else\n\
-                              SHELL=/bin/sh\n\
-                              fi\n\
-                              export SHELL\n\
-                              export TERM=xterm-256color\n\
-                              export TOS=1\n\
-                              export ENV=/etc/profile\n\
-                              export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
-                              exec /sbin/tos\n";
-
-/// The installed system's startup script.
-const RC_SCRIPT: &str = "#!/bin/sh\n\
-                         # Written by the tOS installer.\n\
-                         mount -t proc none /proc 2>/dev/null\n\
-                         mount -t sysfs none /sys 2>/dev/null\n\
-                         mount -t devtmpfs none /dev 2>/dev/null\n\
-                         mkdir -p /dev/pts /dev/shm\n\
-                         mount -t devpts none /dev/pts 2>/dev/null\n\
-                         mount -t tmpfs none /dev/shm 2>/dev/null\n\
-                         mount -t tmpfs none /tmp 2>/dev/null\n\
-                         mount -t tmpfs none /run 2>/dev/null\n\
-                         mount -o remount,rw / 2>/dev/null\n\
-                         hostname -F /etc/hostname 2>/dev/null\n";
+/// Named for what is in it rather than numbered. Debian's convention of a
+/// numeric prefix is for ordering several drop-ins against each other, and
+/// there is one.
+pub const SESSION_DROPIN: &str = "/etc/systemd/system/tos-session.service.d/user.conf";
 
 #[cfg(test)]
 mod tests {
@@ -1452,71 +1432,40 @@ mod tests {
 
     #[test]
     fn the_installed_system_starts_the_compositor() {
+        // Nothing here writes an init script any more, and that is the point:
+        // the rootfs on the disk carries tos-session.service and the systemd
+        // that reads it, so an installed machine boots into tOS because the
+        // image it came from does (#110). What the installer adds is the one
+        // thing the image cannot know.
         let backend = install(Firmware::Uefi);
-        let inittab = backend
-            .actions
-            .iter()
-            .find_map(|action| match action {
-                crate::exec::Action::WriteFile { path, contents, .. }
-                    if path.ends_with("/etc/inittab") =>
-                {
-                    Some(contents.clone())
-                }
-                _ => None,
-            })
-            .expect("no inittab");
+        let dropin = written(&backend, &format!("/mnt/target{SESSION_DROPIN}"));
+        assert!(backend.did(&format!("mkdir -p /mnt/target{SESSION_DROPIN_DIRECTORY}")));
+        assert!(dropin.contains("[Service]"), "not a unit file: {dropin}");
         assert!(
-            inittab.contains(SESSION_SCRIPT_PATH),
-            "the machine has to boot into tOS: {inittab}"
-        );
-        let session = written(&backend, &format!("/mnt/target{SESSION_SCRIPT_PATH}"));
-        assert!(
-            session.contains("exec /sbin/tos"),
-            "the session script has to end at the compositor: {session}"
+            dropin.contains("Environment=TOS_USER=tos"),
+            "the session has to know whose it is: {dropin}"
         );
     }
 
     #[test]
-    fn the_session_carries_the_environment_init_does_not() {
-        // busybox init respawns with almost nothing set. Without ENV no pane
-        // running ash or dash reads /etc/profile, which is where the message
-        // of the day comes from; iso/live-session sets the same things on the
-        // live image.
-        let backend = install(Firmware::Bios);
-        let session = written(&backend, &format!("/mnt/target{SESSION_SCRIPT_PATH}"));
-        for variable in [
-            "export HOME=/root",
-            "export SHELL",
-            "export TERM=xterm-256color",
-            "export TOS=1",
-            "export ENV=/etc/profile",
-            "export PATH=/usr/local/sbin:",
+    fn nothing_is_written_for_an_init_that_is_no_longer_there() {
+        // /etc/inittab, /etc/rc and /etc/tos-session were the whole of what
+        // an installed machine ran, and every one of them is somebody else's
+        // job now. Left behind, they would be three files that look like they
+        // are running the machine and are read by nothing.
+        let backend = install(Firmware::Uefi);
+        for path in [
+            "/mnt/target/etc/inittab",
+            "/mnt/target/etc/rc",
+            "/mnt/target/etc/tos-session",
         ] {
             assert!(
-                session.contains(variable),
-                "the session should export {variable}: {session}"
+                !wrote(&backend, path),
+                "{path} was written: {:?}",
+                backend.transcript()
             );
         }
-        // SHELL is asked for rather than stated, because this same script is
-        // written onto a disk that got the busybox world and has no bash. An
-        // earlier version of this test asserted `SHELL=/bin/sh`, which went
-        // on passing once the fork arrived by matching the branch a Debian
-        // install never takes.
-        assert!(
-            session
-                .contains("if [ -x /bin/bash ]; then\nSHELL=/bin/bash\nelse\nSHELL=/bin/sh\nfi\n"),
-            "the session should decide SHELL from what is on the disk: {session}"
-        );
     }
-
-    // There is no test here that the Japanese face reaches an installed
-    // machine, and there cannot usefully be one: the face is a package inside
-    // the squashfs now, so nothing this side of `unsquashfs` can see it. The
-    // one that used to stand here asserted only that unsquashfs ran and that
-    // /usr was copied on the path its own comment said carries no font, and
-    // it would have passed with fonts-vlgothic deleted from the image. The
-    // assertion that means it lives in .github/workflows/iso.yml, against the
-    // built squashfs.
 
     #[test]
     fn an_account_on_a_debian_disk_gets_bash_and_a_bashrc_to_go_with_it() {
@@ -1649,67 +1598,39 @@ mod tests {
     }
 
     #[test]
-    fn an_installed_machine_gets_the_environment_the_live_one_has() {
-        // iso/live-session exists so the session environment is written once,
-        // and an installed machine cannot run it — busybox init respawns what
-        // the installer wrote. So the environment is compared to the file
-        // rather than to a memory of it: the two drifted by a TERM and a PATH
-        // the first time this was left to a comment.
-        //
-        // The whole block, not the `export` lines in it. SHELL stopped being
-        // one the day it was decided by an `if`, and a filter that kept only
-        // exports let that fork differ between the two files — a typo in the
-        // path it tests would have sent every installed machine back to dash
-        // with this test still green.
-        fn environment(script: &str) -> Vec<String> {
-            let lines: Vec<String> = script
-                .lines()
-                .map(|line| line.trim().trim_end_matches('\\').trim().to_string())
-                .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                .collect();
-            let first = lines
-                .iter()
-                .position(|line| line.starts_with("export HOME="))
-                .expect("the session environment starts at HOME and nothing exports it");
-            let last = lines
-                .iter()
-                .position(|line| line.starts_with("export PATH="))
-                .expect("the session environment ends at PATH and nothing exports it");
-            assert!(first < last, "PATH is exported before HOME");
-            lines[first..=last]
-                .iter()
-                // TOS_USER is the one line that is deliberately not the same
-                // on the two sides: the live session is root's and an
-                // installed machine is the session of whoever the installer
-                // was told about. That it is exported by both, in the same
-                // place, is the part worth pinning; the name after it is the
-                // machine's own.
-                .map(|line| match line.strip_prefix("export TOS_USER=") {
-                    Some(_) => "export TOS_USER".to_string(),
-                    None => line.clone(),
-                })
-                .collect()
+    fn the_session_the_machine_runs_is_the_one_in_the_tree() {
+        // The environment used to be written out a second time here, because
+        // busybox init respawned a script the installer wrote and could not
+        // run iso/live-session. The two copies drifted by a TERM and a PATH
+        // before a test compared them. Under systemd both images run the same
+        // file, so the drift is gone and what is left to pin is that the file
+        // still sets up a session: ENV, which is how a pane running dash
+        // reads /etc/profile and prints the message of the day, and the rest
+        // of what a compositor started by an init system is handed nothing of.
+        let session = include_str!("../../iso/live-session");
+        for variable in [
+            "export HOME=/root",
+            "export TOS_USER",
+            "export SHELL",
+            "export TERM=xterm-256color",
+            "export TOS=1",
+            "export ENV=/etc/profile",
+            "export PATH=/usr/local/sbin:",
+        ] {
+            assert!(
+                session.contains(variable),
+                "iso/live-session should export {variable}"
+            );
         }
-
-        let live = environment(include_str!("../../iso/live-session"));
-        let installed = environment(SESSION_SCRIPT);
+        // TOS_USER is defaulted rather than assigned, so that the drop-in the
+        // installer writes is not overwritten by the script it configures.
         assert!(
-            live.contains(&"export TOS_USER".to_string()),
-            "neither session says whose it is: {live:?}"
+            session.contains(": \"${TOS_USER:=root}\""),
+            "an installed machine's TOS_USER would be overwritten"
         );
-        assert!(live.len() >= 5, "no environment found in iso/live-session");
-        assert!(
-            live.iter().any(|line| line.contains("/bin/bash")),
-            "the session is supposed to look for a bash: {live:?}"
-        );
-        // Both directions, whole lines, and in order: a `contains` would have
-        // passed a TOS=10 against a TOS=1, and ENV has to come after the SHELL
-        // it used to be decided from. A line added to this file alone — the
-        // one edited by hand — is the likelier of the two drifts.
-        assert_eq!(
-            live, installed,
-            "iso/live-session and the installed session set up different environments"
-        );
+        // And bash is asked for rather than assumed, because the rescue
+        // session out of the initramfs has none.
+        assert!(session.contains("/bin/bash"), "the session found no bash");
     }
 
     #[test]
@@ -1743,6 +1664,11 @@ mod tests {
         assert!(fstab.contains("LABEL=TOS-ESP   /boot/efi"));
         // Device names change between boots; labels do not.
         assert!(!fstab.contains("/dev/sda"));
+        // And the kernel's own filesystems are not in here: systemd mounts
+        // them, and a line here would stack a second mount on each.
+        for api in ["/proc", "/sys", "/dev/pts"] {
+            assert!(!fstab.contains(api), "{api} is systemd's to mount: {fstab}");
+        }
     }
 
     #[test]

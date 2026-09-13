@@ -552,8 +552,9 @@ turned up. A machine with no sound card says so once and then stops saying
 it. Whether an installed system should get PipeWire instead is decided, with
 what was measured to decide it, in [`docs/design/audio.md`](docs/design/audio.md):
 it stays ALSA-only, because tOS sets the knob and never plays a sound, and
-because PipeWire from Debian is two systemd user units on a session that has
-no systemd.
+because PipeWire's units decline to start for root, which is the only user a
+tOS session has. The machine has systemd since #110, so a person who installs
+PipeWire on their own machine now has an init that will start it.
 
 
 
@@ -564,7 +565,9 @@ empty or to full where a rate is reported — absent rather than invented where
 it is not, which covers the idle battery whose `power_now` is zero. Two
 batteries are weighted into one reading, and a machine with none says so.
 Powering off and rebooting call `reboot(2)` directly, after `sync(2)`, because
-tOS may be PID 1 with no init to ask; suspend writes `mem` to
+tOS may be PID 1 with no init to ask — which since #110 is only the rescue
+session out of the initramfs, and is the next thing this should learn to tell
+apart; suspend writes `mem` to
 `/sys/power/state`. All three sit behind a trait, so the tests assert what was
 asked for without the machine acting on it. There is no UI on any of this yet,
 and the syscall path itself is only exercised on a real Linux machine.
@@ -723,8 +726,9 @@ rather than by `crypt(3)`, which the workspace cannot link. It was tOS's own
 `/etc/tos/shadow` until #111, and moving it is what makes the password the
 installer asks for a password `sshd`, `su` and `login` can use as well —
 `docs/design/credentials.md`. Which account is asked for is whose session it
-is: `TOS_USER`, set by `iso/live-session` and by the `/etc/tos-session` the
-installer writes. The line is read when the lock engages rather than when a
+is: `TOS_USER`, set by `iso/live-session` — which every tOS session runs —
+and overridden on an installed machine by the `tos-session.service` drop-in
+the installer writes. The line is read when the lock engages rather than when a
 password is offered, so a machine with no password does not lock — the binding
 says there is nothing to unlock with and the session carries on. An account
 with no password is `*` in that file, which is what the live image's root

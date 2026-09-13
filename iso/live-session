@@ -1,17 +1,24 @@
 #!/bin/sh
 # shellcheck shell=dash
-# The tOS session: the environment the compositor runs in, and the loop that
-# keeps it running.
+# The tOS session: the environment the compositor runs in, and what to do when
+# it exits.
 #
-# This file is on the image twice and in the tree once. /init execs it as PID 1
-# after pivoting into the Debian rootfs, and execs the initramfs copy when
-# there was no rootfs to pivot into. Both sides need the same environment and
-# the same rescue rule; leaving the loop in /init and writing it out again for
-# the rootfs is how the two would come to disagree about which one locks.
+# This file is on the image twice and in the tree once, and it is what every
+# tOS session is started by:
 #
-# An installed machine does not run this: busybox init reads the inittab the
-# installer wrote and respawns /etc/tos-session, which the installer writes
-# from installer/src/install.rs. The restart loop below is init's job there.
+#   live medium      /init pivots into the Debian rootfs and execs systemd,
+#                    whose tos-session.service runs this as /sbin/tos-session
+#   installed disk   the same rootfs on a disk, the same unit, with a drop-in
+#                    that names the person the installer was told about
+#   no rootfs        /init execs the initramfs copy of this file as PID 1,
+#                    which is the rescue session and has no init at all
+#
+# The environment is the same on all three, which is the reason it is one file:
+# it used to be written out a second time by the installer, and the two copies
+# drifted by a TERM and a PATH. The last of the three is the only one where
+# this is PID 1, and the only one where the restart loop at the bottom runs —
+# everywhere else systemd is what starts it again, and asking to be restarted
+# is how this says so.
 
 # PID 1's own stdout is whichever console= came last on the kernel command
 # line, and the machine may have several. Anything a person needs to read goes
@@ -25,21 +32,26 @@ say() {
     [ -n "$said" ] || echo "$@"
 }
 
-# The machine's name, which nothing else in a live session sets: the installed
-# machine gets it from /etc/rc, and without it here the kernel hostname stays
-# `(none)` and every prompt in every pane says so.
+# The machine's name. systemd sets it from this same file long before the
+# session starts, so on the two paths that have an init this changes nothing;
+# it is here for the rescue session, which has no init, and where without it
+# the kernel hostname stays `(none)` and every prompt in every pane says so.
 [ -r /etc/hostname ] && hostname -F /etc/hostname 2>/dev/null
 
 export HOME=/root
 # Whose session this is, and so whose /etc/shadow line the screen lock asks
-# for (#111). Root's, here: nobody has been asked who they are, and a live
-# image has no account but the one Debian ships. Debian's root carries `*`
-# rather than a hash, so by the rule in docs/design/screen-lock.md the live
-# session has nothing to lock with and never locks — which is what it did
-# before this line existed, and now says so rather than arriving there by
-# having no credential file at all. The installer writes the same variable
-# into /etc/tos-session, naming the person it was told about.
-export TOS_USER=root
+# for (#111). Root unless something said otherwise, which is the live image
+# and the rescue session: nobody has been asked who they are, and the image
+# has no account but the one Debian ships. Debian's root carries `*` rather
+# than a hash, so by the rule in docs/design/screen-lock.md such a session has
+# nothing to lock with and never locks.
+#
+# An installed machine is somebody's, and says so through the unit: the
+# installer writes a tos-session.service drop-in with Environment=TOS_USER
+# naming the person. Defaulted rather than assigned, so that the drop-in is
+# not overwritten by the script it configures.
+: "${TOS_USER:=root}"
+export TOS_USER
 # bash where the filesystem has one, /bin/sh where it does not. The Debian
 # rootfs has bash and /bin/sh there is dash; the initramfs rescue session has
 # neither, only busybox ash. This file runs as PID 1 on both sides, so it asks
@@ -93,6 +105,16 @@ while :; do
     fi
     if [ "$restarts" -eq 0 ]; then
         say "tOS: add tos.rescue to the kernel command line for a shell"
+    fi
+    # Where there is an init, leaving is how a service asks to be started
+    # again: tos-session.service is Restart=always, and a loop here as well
+    # would be a second mechanism doing the same job — with `systemctl status`
+    # reporting a session that has never restarted while it restarted all day.
+    # PID 1 is the one case with nothing above it to ask, and that is the
+    # rescue session out of the initramfs.
+    if [ "$$" -ne 1 ]; then
+        say "tOS: compositor exited ($status), asking init to start it again"
+        exit "$status"
     fi
     restarts=$((restarts + 1))
     say "tOS: compositor exited ($status), restarting"

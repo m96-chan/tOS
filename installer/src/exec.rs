@@ -78,13 +78,19 @@ pub trait Backend {
     ///
     /// The signature is as much of the fix as the implementation is. What was
     /// here before ran `reboot` off the `PATH` and dropped the answer with
-    /// `let _ =`. On the live image that program is busybox, and busybox
+    /// `let _ =`. On the live image that program was busybox, and busybox
     /// without `-f` restarts nothing itself: it signals PID 1 and leaves the
-    /// rest to init. PID 1 in a live session is `/bin/sh /sbin/tos-session`,
+    /// rest to init. PID 1 in a live session was `/bin/sh /sbin/tos-session`,
     /// a `while :` loop with no traps, so the signal went nowhere, busybox
     /// exited 0, and the installer had a success to discard. There was no
     /// failure to notice, which is why the key had never worked on any
     /// machine. Now there is no success to drop.
+    ///
+    /// PID 1 does listen now — it is systemd on both images since #110 — and
+    /// this still goes to the kernel. Not because nobody would answer, but
+    /// because there is nothing for a clean shutdown to do here: the session
+    /// this runs in is a tmpfs over a read-only squashfs, and the disk that
+    /// matters was unmounted by the installation's last step.
     fn reboot(&mut self) -> io::Error;
 }
 
