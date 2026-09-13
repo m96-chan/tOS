@@ -717,15 +717,20 @@ and closes on escape, and a password field is the opposite of all three. This
 one masks, it always submits, and escape clears the line because there is
 nothing to close.
 
-The password is checked against `/etc/tos/shadow`: tOS's own file, one `$6$`
-crypt line, hashed and verified by `tos-crypt` in this tree rather than by
-`crypt(3)`, which the workspace cannot link and which could not read the
-yescrypt hashes Debian writes anyway. The file is read when the lock engages
-rather than when a password is offered, so a machine with no password does not
-lock — the binding says there is nothing to unlock with and the session carries
-on. That one rule is what makes the live ISO behave without the compositor ever
-being told what live media is, and it is the same rule on an installed machine
-whose owner declined a password.
+The password is checked against `/etc/shadow`: the machine's own file, the
+account's `$6$` crypt line, hashed and verified by `tos-crypt` in this tree
+rather than by `crypt(3)`, which the workspace cannot link. It was tOS's own
+`/etc/tos/shadow` until #111, and moving it is what makes the password the
+installer asks for a password `sshd`, `su` and `login` can use as well —
+`docs/design/credentials.md`. Which account is asked for is whose session it
+is: `TOS_USER`, set by `iso/live-session` and by the `/etc/tos-session` the
+installer writes. The line is read when the lock engages rather than when a
+password is offered, so a machine with no password does not lock — the binding
+says there is nothing to unlock with and the session carries on. An account
+with no password is `*` in that file, which is what the live image's root
+carries and what an installed machine gets when its owner declines one, so
+that one rule still makes the live ISO behave without the compositor ever
+being told what live media is.
 
 What the lock owns is the input, not merely the keyboard. The gate is at the top
 of `handle_input` and not in `handle_key`, because mouse, pointer and paste

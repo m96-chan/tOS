@@ -76,6 +76,16 @@ only inside the compositor gets wrong.
 `tos-install`, hashed with SHA-512 crypt (`$6$`) implemented in tree. Not from
 `/etc/shadow`, and not from `crypt(3)`.**
 
+> **Superseded by #111, in `docs/design/credentials.md`.** The file is now
+> `/etc/shadow` and the account's line in it, for a reason this section did
+> not weigh: a password only the lock can read is a password `sshd`, `su` and
+> `login` are locked out of by construction. Everything below about the
+> *hashing* still holds — `$6$` in tree, not `crypt(3)` — and so does the rule
+> that a machine with no password does not lock; what changed is which file
+> the hash is written to and read from, and that an account with no password
+> now says `*` rather than being a file that is not there. The two sections
+> that are now history rather than description are marked where they start.
+
 ### There is nothing to read, and #20 does not change that
 
 The live ISO has no user database at all. `iso/mkiso.sh` creates `/etc/tos`
@@ -94,6 +104,11 @@ the user anything is the installer's configuration screen, which already
 collects the username. That is where the password comes from.
 
 ### `/etc/shadow` is the wrong file even when it exists
+
+**History. #111 decided the other way; see `docs/design/credentials.md`.** The
+coupling this section refuses is the thing that turned out to be wanted, and
+the yescrypt problem is real but is not fatal: a `$y$` line is one the lock
+refuses to engage over and says so, rather than one it has to verify.
 
 Two reasons, and the second one is fatal.
 
@@ -157,6 +172,11 @@ the framebuffer and holds an exclusive grab on every keyboard. A helper would
 be a boundary between the process and itself.
 
 ### An empty password is allowed, and means no file at all
+
+**History, in its mechanism only. #111 keeps the rule and changes how it is
+written down:** the account gets `*` in `/etc/shadow`, which is that file's
+way of saying nothing authenticates as it, rather than the credential file not
+existing.
 
 This was left open here and settled when the installer screen was written
 ([#48](https://github.com/m96-chan/tOS/issues/48)): the password field may be

@@ -12,16 +12,26 @@ use crate::plan::{Firmware, Plan, Settings, Step};
 /// Where tOS keeps its own files on an installed system.
 pub const CREDENTIAL_DIRECTORY: &str = "/etc/tos";
 
-/// The credential the screen lock reads: one `$6$` line, and deliberately not
-/// `/etc/shadow`. Writing a tOS password into Debian's file would silently
-/// make it the machine's login password too, and reading Debian's file back
-/// would mean verifying the yescrypt hashes it holds. The reasoning is in
-/// `docs/design/screen-lock.md`.
-pub const CREDENTIAL_FILE: &str = "/etc/tos/shadow";
+/// Where the machine's password lives: the file every program that
+/// authenticates anybody already reads.
+///
+/// It used to be `/etc/tos/shadow`, a file tOS owned and only the screen lock
+/// read, with `*` in `/etc/passwd` to say so. That was honest and it was also
+/// a machine no `sshd`, no `su` and no `login` could ever let anybody in to
+/// (#111). Writing a PAM module so that the rest of the world could be taught
+/// about tOS's own file is work spent arriving where the default already was.
+/// `docs/design/credentials.md` works through it.
+pub const SHADOW_FILE: &str = "/etc/shadow";
 
-/// Root reads it, nobody else. A hash anyone can read is a hash anyone can
-/// attack offline, at their leisure, on a machine they took.
-pub const CREDENTIAL_MODE: u32 = 0o600;
+/// Debian's mode for that file, and what this writes when it is the one
+/// creating it: root writes it, the `shadow` group reads it, nobody else sees
+/// a hash at all. A hash anyone can read is a hash anyone can attack offline,
+/// at their leisure, on a machine they took.
+///
+/// Only used where tOS writes the file. A Debian root arrives with an
+/// `/etc/shadow` of its own and the person's line is appended to it, which
+/// leaves the mode and the `root:shadow` ownership dpkg gave it alone.
+pub const SHADOW_MODE: u32 = 0o640;
 
 /// What happened to one step.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,7 +334,6 @@ impl<'a> Installer<'a> {
         )?;
 
         self.accounts(&root, &settings)?;
-        self.write_credential(&root, &settings)?;
         let home = format!("{root}/home/{}", settings.username);
         self.backend
             .create_dir(&home)
@@ -371,7 +380,10 @@ impl<'a> Installer<'a> {
         let rc = format!("{root}/etc/rc");
         let _ = self.backend.run("chmod", &["755", &rc]);
         let session = format!("{root}{SESSION_SCRIPT_PATH}");
-        self.write(&session, SESSION_SCRIPT)?;
+        self.write(
+            &session,
+            &SESSION_SCRIPT.replace("{user}", &settings.username),
+        )?;
         let _ = self.backend.run("chmod", &["755", &session]);
 
         // Say that this disk was installed. /etc is copied from the live
@@ -399,21 +411,21 @@ impl<'a> Installer<'a> {
     /// disk got the busybox world instead, and the two lines below are the
     /// whole of its user database.
     ///
-    /// The password field is `*` either way, not `x`. `x` means "the hash is
-    /// in /etc/shadow", and tOS sets no shadow entry for this account — its
-    /// credential is /etc/tos/shadow, which no login program reads. Promising
-    /// a hash that is not there is how this line came to be a lie about an
-    /// account with no credential at all. `*` says what is true, that nothing
-    /// logs in through this file, and it stays true the day a PAM arrives on
-    /// the disk. Nothing gates the console in either case: it starts the
-    /// compositor directly, exactly as the live image does.
+    /// The password field is `x`, and there is an `/etc/shadow` line behind
+    /// it. `x` means "the hash is in /etc/shadow", which used to be a lie —
+    /// the credential was `/etc/tos/shadow` and the field said `*` to say so —
+    /// and #111 is the decision that made it true instead: the machine's
+    /// password lives where every program that authenticates anybody already
+    /// looks for it.
     fn accounts(&mut self, root: &str, settings: &Settings) -> Result<(), String> {
         let user = &settings.username;
         let passwd = format!("{root}/etc/passwd");
         let group = format!("{root}/etc/group");
+        let shadow = format!("{root}{SHADOW_FILE}");
         let shell = self.login_shell(root);
-        let account = format!("{user}:*:{ACCOUNT_ID}:{ACCOUNT_ID}:{user}:/home/{user}:{shell}\n");
+        let account = format!("{user}:x:{ACCOUNT_ID}:{ACCOUNT_ID}:{user}:/home/{user}:{shell}\n");
         let membership = format!("{user}:x:{ACCOUNT_ID}:\n");
+        let secret = self.password_field(settings)?;
 
         // Each file answers for itself. Deciding both from whether `passwd`
         // exists made the group file's fate depend on the other file's
@@ -422,8 +434,57 @@ impl<'a> Installer<'a> {
         // the person's, with no `root`, no `tty`, no `disk` and no `_apt`
         // group on the machine at all. Written silently, and reported as a
         // successful install.
-        self.add_account(&passwd, &account, "root:*:0:0:root:/root:/bin/sh\n")?;
-        self.add_account(&group, &membership, "root:x:0:\n")
+        self.add_account(&passwd, &account, "root:x:0:0:root:/root:/bin/sh\n")?;
+        self.add_account(&group, &membership, "root:x:0:\n")?;
+        self.add_secret(&shadow, &secret, settings)
+    }
+
+    /// The password field of the person's `/etc/shadow` line: their hash, or
+    /// `*` where they declined a password.
+    ///
+    /// `*` is not a hash of anything and no password produces it, so an
+    /// account that carries it is one nothing can authenticate — which is
+    /// exactly what "no password" means, and what every other Debian account
+    /// in that file already says. Hashing an empty password instead would
+    /// give the machine a lock that opens for a bare Enter, and a login screen
+    /// that does the same.
+    ///
+    /// This is the installer's last chance to hold the password; after it,
+    /// only the hash exists anywhere on the disk.
+    fn password_field(&mut self, settings: &Settings) -> Result<String, String> {
+        if settings.password.is_empty() {
+            self.progress
+                .note("   no password given: nothing will log in, and the screen lock stays off");
+            return Ok("*".into());
+        }
+        tos_crypt::hash_password(settings.password.as_bytes())
+            .map_err(|e| format!("cannot hash the password: {e}"))
+    }
+
+    /// Add the person's line to `/etc/shadow`, or write the file if the root
+    /// on the disk has none.
+    ///
+    /// The aging fields are left empty rather than filled in. tOS runs no time
+    /// synchronisation of any kind, so the day number this would write is
+    /// whatever the RTC claims — and a machine that came up in 1970 would
+    /// write `0`, which every login program reads as "this password must be
+    /// changed before you may come in", on a machine with no `passwd` command
+    /// to change it with. Empty means the aging features are off, which is the
+    /// truth about a machine that has no clock to age anything against.
+    fn add_secret(&mut self, path: &str, secret: &str, settings: &Settings) -> Result<(), String> {
+        let line = format!("{}:{secret}:::::::\n", settings.username);
+        if self.backend.exists(path) {
+            return self.append(path, &line);
+        }
+        // Nothing but tOS has written a root here, so root's own line comes
+        // with it: `*`, because the installer sets no root password and an
+        // account with no line at all is one some login programs let in
+        // without asking anything.
+        self.progress
+            .note(format!("   write {path} (mode {SHADOW_MODE:04o})"));
+        self.backend
+            .write_file_with_mode(path, &format!("root:*:::::::\n{line}"), Some(SHADOW_MODE))
+            .map_err(|e| format!("cannot write {path}: {e}"))
     }
 
     /// The shell to name in `/etc/passwd`, which is whichever one is there.
@@ -454,43 +515,6 @@ impl<'a> Installer<'a> {
             return self.append(path, line);
         }
         self.write(path, &format!("{root_line}{line}"))
-    }
-
-    /// Write the credential the tOS lock unlocks with, if there is one.
-    ///
-    /// An empty password is allowed, and it produces no file rather than a
-    /// hash of nothing. The empty string hashes perfectly well, and a lock
-    /// that engaged and then opened for a bare Enter would be worse than no
-    /// lock at all; `docs/design/screen-lock.md` makes the missing file mean
-    /// "there is nothing to unlock with", which is exactly what is true of a
-    /// machine whose owner declined a password.
-    fn write_credential(&mut self, root: &str, settings: &Settings) -> Result<(), String> {
-        if settings.password.is_empty() {
-            self.progress
-                .note("   no password given: the screen lock will stay off");
-            return Ok(());
-        }
-
-        let directory = format!("{root}{CREDENTIAL_DIRECTORY}");
-        self.backend
-            .create_dir(&directory)
-            .map_err(|e| format!("cannot create {directory}: {e}"))?;
-
-        // Hashing is the installer's last chance to hold the password; after
-        // this only the hash exists anywhere on the disk.
-        let hash = tos_crypt::hash_password(settings.password.as_bytes())
-            .map_err(|e| format!("cannot hash the password: {e}"))?;
-
-        // One `$6$` line and a terminator, which is what a reader trims
-        // before it parses. Nothing names the user: this file is the
-        // session's credential, not a user database, and the machine has
-        // exactly one person at the keyboard.
-        let path = format!("{root}{CREDENTIAL_FILE}");
-        self.progress
-            .note(format!("   write {path} (mode {CREDENTIAL_MODE:04o})"));
-        self.backend
-            .write_file_with_mode(&path, &format!("{hash}\n"), Some(CREDENTIAL_MODE))
-            .map_err(|e| format!("cannot write {path}: {e}"))
     }
 
     /// The installed system's `/etc/fstab`, by label so that the disk can move.
@@ -779,7 +803,9 @@ fn planning_backend_for(world: &dyn crate::exec::Backend) -> crate::exec::Record
         // plan shows the append a real install makes rather than the overwrite
         // it would only do onto a disk that came from the busybox world — and
         // the bash it brings, which is what decides the login shell it writes.
-        for file in ["etc/passwd", "etc/group", "bin/bash"] {
+        // /etc/shadow is Debian's too: base-passwd writes a line for every
+        // system account it creates, all of them `*`.
+        for file in ["etc/passwd", "etc/group", "etc/shadow", "bin/bash"] {
             backend
                 .existing
                 .push(format!("{}/{file}", crate::plan::MOUNT_POINT));
@@ -842,10 +868,16 @@ pub const SESSION_SCRIPT_PATH: &str = "/etc/tos-session";
 /// `TERM` the terminfo in the rootfs exists for and a `PATH` without the two
 /// `/usr/local` directories apt puts things in. A machine installed from an
 /// image is meant to be that image.
+///
+/// `{user}` is the one thing in here that is this machine's rather than every
+/// machine's: `TOS_USER` names the account the session belongs to, which is
+/// the account whose `/etc/shadow` line the screen lock asks for (#111). The
+/// live counterpart says `root`, because that is whose session it is there.
 const SESSION_SCRIPT: &str = "#!/bin/sh\n\
                               # Written by the tOS installer.\n\
                               # iso/live-session is the live counterpart.\n\
                               export HOME=/root\n\
+                              export TOS_USER={user}\n\
                               if [ -x /bin/bash ]; then\n\
                               SHELL=/bin/bash\n\
                               else\n\
@@ -1254,29 +1286,33 @@ mod tests {
         // carries no rootfs is where tOS writes the whole file, and that is
         // where root's line is asserted.
         let passwd = appended(&backend, "/mnt/target/etc/passwd");
-        assert!(passwd.contains("yusuke:*:1000:1000"));
+        assert!(passwd.contains("yusuke:x:1000:1000"));
         assert!(appended(&backend, "/mnt/target/etc/group").contains("yusuke:x:1000:"));
         assert!(backend.did("mkdir -p /mnt/target/home/yusuke"));
     }
 
     #[test]
-    fn the_passwd_file_does_not_promise_a_shadow_file() {
-        // `x` means "the hash is in /etc/shadow", and there is no /etc/shadow:
-        // the tOS credential is /etc/tos/shadow, which nothing that reads
-        // passwd knows about. `*` is the true statement.
-        // The file is tOS's to write only where no Debian rootfs was
+    fn the_passwd_file_promises_a_shadow_line_that_is_there() {
+        // `x` means "the hash is in /etc/shadow". It said `*` until #111,
+        // because the credential was /etc/tos/shadow and nothing that reads
+        // passwd knew about it; now the machine's password is in the file
+        // every login program already reads, and the `x` is true.
+        // Both files are tOS's to write only where no Debian rootfs was
         // unpacked first; where one was, root belongs to Debian and the
         // installer appends its one line.
         let mut backend = rootfsless_backend();
         install_with(Firmware::Uefi, &mut backend);
         let passwd = written(&backend, "/mnt/target/etc/passwd");
-        assert!(
-            !passwd.contains(":x:"),
-            "still promising a shadow: {passwd}"
-        );
-        assert!(passwd.contains("root:*:0:0"), "{passwd}");
-        assert!(passwd.contains("tos:*:1000:1000"), "{passwd}");
-        assert!(!wrote(&backend, "/mnt/target/etc/shadow"));
+        assert!(passwd.contains("root:x:0:0"), "{passwd}");
+        assert!(passwd.contains("tos:x:1000:1000"), "{passwd}");
+
+        let (shadow, mode) = file(&backend, "/mnt/target/etc/shadow");
+        assert_eq!(mode, Some(0o640), "the hash must not be world readable");
+        // No password was asked for in this plan, so the person's field is
+        // `*` — an account nothing authenticates as, which is what root's
+        // says too.
+        assert!(shadow.contains("root:*:"), "{shadow}");
+        assert!(shadow.contains("tos:*:"), "{shadow}");
     }
 
     #[test]
@@ -1301,15 +1337,26 @@ mod tests {
         assert!(backend.did("append to /mnt/target/etc/group"));
 
         let added = appended(&backend, "/mnt/target/etc/passwd");
-        assert!(added.contains("tos:*:1000:1000"), "{added}");
+        assert!(added.contains("tos:x:1000:1000"), "{added}");
         assert!(
             !added.contains("root:"),
             "root is Debian's line to write, not ours: {added}"
         );
+
+        // And the same for /etc/shadow, which Debian writes a line into for
+        // every system account it makes. Written over, it would be a machine
+        // whose accounts all claimed a hash that was no longer in the file.
+        assert!(
+            !wrote(&backend, "/mnt/target/etc/shadow"),
+            "Debian's own shadow file was overwritten"
+        );
+        let secret = appended(&backend, "/mnt/target/etc/shadow");
+        assert!(secret.starts_with("tos:"), "{secret}");
+        assert!(!secret.contains("root:"), "{secret}");
     }
 
     #[test]
-    fn a_password_is_hashed_into_the_file_the_lock_reads() {
+    fn a_password_is_hashed_into_the_line_that_logs_the_person_in() {
         let mut backend = live_backend();
         let settings = Settings {
             username: "yusuke".into(),
@@ -1323,17 +1370,21 @@ mod tests {
         let progress = installer.run();
         assert!(progress.failure().is_none());
 
-        let (contents, mode) = file(&backend, "/mnt/target/etc/tos/shadow");
-        assert_eq!(mode, Some(0o600), "the hash must not be readable: {mode:?}");
-        assert!(backend.did("mkdir -p /mnt/target/etc/tos"));
-
-        // One line, and a terminator a reader trims before it parses.
-        assert_eq!(contents.lines().count(), 1);
-        assert!(contents.ends_with('\n'));
-        let hash = contents.trim_end();
+        // One line, added to the file Debian brought, and in that file's
+        // format: the account first, the hash second, and the aging fields
+        // after it empty.
+        let line = appended(&backend, "/mnt/target/etc/shadow");
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.ends_with('\n'));
+        let mut fields = line.trim_end().split(':');
+        assert_eq!(fields.next(), Some("yusuke"));
+        let hash = fields.next().expect("a password field");
         assert!(hash.starts_with("$6$"), "not a SHA-512 crypt line: {hash}");
+        assert_eq!(fields.clone().count(), 7, "not a shadow line: {line}");
+        assert!(fields.all(str::is_empty), "aging was written: {line}");
 
-        // The point of the whole issue: what was typed opens this.
+        // The point of the whole issue: what was typed opens this, and every
+        // program on the machine that authenticates anybody reads it.
         assert_eq!(
             tos_crypt::verify_password(b"correct horse battery staple", hash),
             Ok(true)
@@ -1381,22 +1432,22 @@ mod tests {
                     &mut backend,
                 )
                 .run();
-                written(&backend, "/mnt/target/etc/tos/shadow")
+                appended(&backend, "/mnt/target/etc/shadow")
             })
             .collect();
         assert_ne!(hashes[0], hashes[1]);
     }
 
     #[test]
-    fn no_password_means_no_credential_rather_than_a_hash_of_nothing() {
+    fn no_password_means_an_account_nothing_can_log_in_to() {
         // An empty password hashes perfectly well, and a lock that opened for
-        // a bare Enter would be worse than one that refuses to engage.
+        // a bare Enter — or an sshd that did — would be worse than an account
+        // nobody can authenticate as. `*` is how that file says so, and it is
+        // what every Debian system account in it already carries.
         let backend = install(Firmware::Uefi);
-        assert!(
-            !wrote(&backend, "/mnt/target/etc/tos/shadow"),
-            "an empty password must leave no credential: {:?}",
-            backend.transcript()
-        );
+        let line = appended(&backend, "/mnt/target/etc/shadow");
+        assert!(line.starts_with("tos:*:"), "{line}");
+        assert!(!line.contains("$6$"), "a password was invented: {line}");
     }
 
     #[test]
@@ -1625,11 +1676,27 @@ mod tests {
                 .position(|line| line.starts_with("export PATH="))
                 .expect("the session environment ends at PATH and nothing exports it");
             assert!(first < last, "PATH is exported before HOME");
-            lines[first..=last].to_vec()
+            lines[first..=last]
+                .iter()
+                // TOS_USER is the one line that is deliberately not the same
+                // on the two sides: the live session is root's and an
+                // installed machine is the session of whoever the installer
+                // was told about. That it is exported by both, in the same
+                // place, is the part worth pinning; the name after it is the
+                // machine's own.
+                .map(|line| match line.strip_prefix("export TOS_USER=") {
+                    Some(_) => "export TOS_USER".to_string(),
+                    None => line.clone(),
+                })
+                .collect()
         }
 
         let live = environment(include_str!("../../iso/live-session"));
         let installed = environment(SESSION_SCRIPT);
+        assert!(
+            live.contains(&"export TOS_USER".to_string()),
+            "neither session says whose it is: {live:?}"
+        );
         assert!(live.len() >= 5, "no environment found in iso/live-session");
         assert!(
             live.iter().any(|line| line.contains("/bin/bash")),

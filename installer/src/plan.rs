@@ -113,8 +113,9 @@ impl Password {
     /// box can no longer show.
     pub const MAX_CHARS: usize = 128;
 
-    /// Whether no password was given at all. The installer writes no
-    /// credential then, and the lock refuses to engage — which is the whole
+    /// Whether no password was given at all. The account's `/etc/shadow`
+    /// field is then `*`, nothing authenticates as it, and the lock refuses
+    /// to engage for want of a password to check — which is the whole
     /// of what declining one means.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -194,11 +195,11 @@ impl Settings {
     /// How the password reads on the last screen before the disk is erased.
     ///
     /// An empty one is allowed, so it has to be said out loud somewhere the
-    /// user cannot walk past it: a machine that will never lock is a choice,
+    /// user cannot walk past it: a machine nothing can log in to is a choice,
     /// and this is where it stops being a silent one.
     pub fn password_summary(&self) -> &'static str {
         if self.password.is_empty() {
-            "none, so the screen will not lock"
+            "none, so nothing will log in"
         } else {
             "set"
         }
@@ -744,7 +745,7 @@ mod tests {
     fn the_summary_says_whether_there_is_a_password() {
         let without = plan(Firmware::Uefi).summary().join("\n");
         assert!(
-            without.contains("Password   none, so the screen will not lock"),
+            without.contains("Password   none, so nothing will log in"),
             "declining a password has to be visible: {without}"
         );
 

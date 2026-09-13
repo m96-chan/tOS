@@ -19,15 +19,15 @@
 //! halves are published together with test vectors, and `tests/vectors.rs`
 //! runs all of them: NIST's for the hash, and the seven in Ulrich Drepper's
 //! specification for the scheme. A hash tOS writes is an ordinary `$6$` line,
-//! so `/etc/tos/shadow` stays readable by any other tool on the machine and
-//! this choice stays reversible.
+//! so the `/etc/shadow` line it goes into is one every other tool on the
+//! machine reads, and this choice stays reversible.
 //!
 //! The two things a caller needs:
 //!
 //! ```no_run
 //! # fn main() -> std::io::Result<()> {
 //! // The installer, having asked for a password twice and got the same
-//! // answer, writes this line to /etc/tos/shadow with mode 0600.
+//! // answer, writes this line into the account's /etc/shadow entry.
 //! let line = tos_crypt::hash_password(b"correct horse battery staple")?;
 //!
 //! // The lock, having read that line back, checks what was typed against it.

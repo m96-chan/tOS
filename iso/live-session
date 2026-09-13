@@ -31,6 +31,15 @@ say() {
 [ -r /etc/hostname ] && hostname -F /etc/hostname 2>/dev/null
 
 export HOME=/root
+# Whose session this is, and so whose /etc/shadow line the screen lock asks
+# for (#111). Root's, here: nobody has been asked who they are, and a live
+# image has no account but the one Debian ships. Debian's root carries `*`
+# rather than a hash, so by the rule in docs/design/screen-lock.md the live
+# session has nothing to lock with and never locks — which is what it did
+# before this line existed, and now says so rather than arriving there by
+# having no credential file at all. The installer writes the same variable
+# into /etc/tos-session, naming the person it was told about.
+export TOS_USER=root
 # bash where the filesystem has one, /bin/sh where it does not. The Debian
 # rootfs has bash and /bin/sh there is dash; the initramfs rescue session has
 # neither, only busybox ash. This file runs as PID 1 on both sides, so it asks

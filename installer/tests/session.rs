@@ -321,7 +321,9 @@ fn a_password_is_masked_and_has_to_be_typed_twice() {
     session.type_keys(b"\r");
     assert!(session.wait_for("Tab switches fields"));
     assert!(
-        session.screen().contains("the screen will never lock"),
+        session
+            .screen()
+            .contains("nothing logs in and nothing locks"),
         "an empty password should say what it costs:\n{}",
         session.screen()
     );

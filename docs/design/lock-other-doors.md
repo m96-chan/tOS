@@ -283,10 +283,13 @@ Door 3, is not even read yet.
 A getty is worth naming because it is the obvious next thing somebody adds
 when an installed machine is hard to debug, and it would be a complete bypass:
 Ctrl+Alt+F2, a login prompt, and tOS has no credential for a login to check.
-`/etc/passwd` has `x` in the password field and there is no `/etc/shadow`
-behind it, so depending on the `login` implementation that is either "no
+`/etc/passwd` had `*` in the password field and there was no `/etc/shadow`
+behind it, so depending on the `login` implementation that was either "no
 password accepted" or "any password accepted", and neither is a door you want
-beside a lock.
+beside a lock. **#111 answered the credential half of this**: the password is
+in `/etc/shadow` now, so a `login` on another VT would have something real to
+check. The rule below stands anyway — what a getty needs is a decision about
+logins, which is #112, and not merely a file to read.
 
 The rule: **a getty is a login prompt, and tOS has no login.** Adding one
 means answering the credential question for logins, not only for the lock,

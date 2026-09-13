@@ -66,6 +66,7 @@ fn with_credential(credential: Option<std::path::PathBuf>) -> (Compositor, Watch
         font: Some("/nonexistent".into()),
         system_root: "/nonexistent-so-this-machine-has-no-hardware".into(),
         credential: credential.unwrap_or_else(|| "/nonexistent-so-there-is-no-password".into()),
+        credential_user: "tos".into(),
         ..Config::default()
     };
     let mut compositor = Compositor::new(config, SIZE, None).expect("compositor");
@@ -294,7 +295,7 @@ fn suspending_a_machine_with_a_password_locks_it_before_it_sleeps() {
     // wakes the machine must never get a frame of the session first.
     let path = std::env::temp_dir().join(format!("tos-power-test-{}", std::process::id()));
     let hash = tos_crypt::sha512crypt::hash(b"the password", b"tOSlockscreen");
-    std::fs::write(&path, format!("{hash}\n")).expect("credential file");
+    std::fs::write(&path, format!("root:*:::::::\ntos:{hash}:::::::\n")).expect("credential file");
     let (mut compositor, _) = with_credential(Some(path.clone()));
 
     compositor.request_power(PowerAction::Suspend);
