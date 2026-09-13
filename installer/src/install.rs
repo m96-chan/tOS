@@ -23,6 +23,10 @@ pub const CREDENTIAL_DIRECTORY: &str = "/etc/tos";
 /// `docs/design/credentials.md` works through it.
 pub const SHADOW_FILE: &str = "/etc/shadow";
 
+/// The mode `sudo` insists on for a file in `/etc/sudoers.d`. Anything
+/// group- or world-writable is skipped, and skipped quietly.
+const SUDOERS_MODE: u32 = 0o440;
+
 /// Debian's mode for that file, and what this writes when it is the one
 /// creating it: root writes it, the `shadow` group reads it, nobody else sees
 /// a hash at all. A hash anyone can read is a hash anyone can attack offline,
@@ -421,7 +425,52 @@ impl<'a> Installer<'a> {
         // successful install.
         self.add_account(&passwd, &account, "root:x:0:0:root:/root:/bin/sh\n")?;
         self.add_account(&group, &membership, "root:x:0:\n")?;
-        self.add_secret(&shadow, &secret, settings)
+        self.add_secret(&shadow, &secret, settings)?;
+        self.add_sudo(root, settings)
+    }
+
+    /// Give the person a way to be root, because after #112 they are not one.
+    ///
+    /// A session's panes run as the account now, not as the compositor. That
+    /// is the point of having logged in, and it takes the machine's only route
+    /// to root with it: Debian's root carries `*` and tOS never changes it, so
+    /// `su` has nothing to accept, and an installed machine would have no way
+    /// to install a package on itself. Unadministrable is not more secure; it
+    /// is just finished in the wrong place.
+    ///
+    /// `sudo` is the route, and it is the one #111 was already aiming at. The
+    /// whole reason the password went into `/etc/shadow` rather than a private
+    /// file was so that the programs which authenticate people could use it,
+    /// and `sudo` reads it through PAM exactly as `sshd` does. Nothing extra
+    /// has to be taught anything.
+    ///
+    /// A drop-in rather than a line appended to the `sudo` group, because the
+    /// group needs an existing line edited in place — Debian ships `sudo:x:27:`
+    /// — and every other account this installer writes is appended whole.
+    /// `/etc/sudoers.d` is the supported way in and needs no surgery.
+    ///
+    /// **`NOPASSWD` exactly when there is no password**, which is the same rule
+    /// the login screen obeys: a machine whose owner declined one is not being
+    /// guarded, and `docs/design/login.md` says so. Requiring a password there
+    /// would ask for one that cannot exist — `*` authenticates nobody — and
+    /// leave the machine locked out of itself while protecting nothing that
+    /// anyone at its keyboard does not already have.
+    fn add_sudo(&mut self, root: &str, settings: &Settings) -> Result<(), String> {
+        let user = &settings.username;
+        let rule = if settings.password.is_empty() {
+            format!("{user} ALL=(ALL:ALL) NOPASSWD: ALL\n")
+        } else {
+            format!("{user} ALL=(ALL:ALL) ALL\n")
+        };
+        let path = format!("{root}/etc/sudoers.d/{user}");
+        self.progress
+            .note(format!("   write {path} (mode {SUDOERS_MODE:04o})"));
+        // sudo refuses to read a drop-in that anybody but root can write, and
+        // says so by ignoring it: a 0644 file here would be a machine that
+        // silently still has no way to root.
+        self.backend
+            .write_file_with_mode(&path, &rule, Some(SUDOERS_MODE))
+            .map_err(|e| format!("cannot write {path}: {e}"))
     }
 
     /// The password field of the person's `/etc/shadow` line: their hash, or
@@ -1269,6 +1318,43 @@ mod tests {
         assert!(passwd.contains("yusuke:x:1000:1000"));
         assert!(appended(&backend, "/mnt/target/etc/group").contains("yusuke:x:1000:"));
         assert!(backend.did("mkdir -p /mnt/target/home/yusuke"));
+    }
+
+    #[test]
+    fn the_person_gets_a_way_to_be_root_they_can_actually_use() {
+        // A session's panes run as the person now, and Debian's root carries
+        // `*`, so without this an installed machine has no route to root at
+        // all: `su` accepts nothing and there is nobody else to become.
+        let mut backend = live_backend();
+        let settings = Settings {
+            username: "yusuke".into(),
+            password: "hunter2".into(),
+            ..Settings::default()
+        };
+        let mut installer = Installer::new(
+            Plan::new(disk(), Firmware::Uefi, Bootloader::Present, settings),
+            &mut backend,
+        );
+        installer.run();
+
+        let (rule, mode) = file(&backend, "/mnt/target/etc/sudoers.d/yusuke");
+        assert_eq!(rule, "yusuke ALL=(ALL:ALL) ALL\n");
+        // sudo skips a drop-in anybody but root can write, and skips it
+        // silently — a 0644 here would be a machine that still cannot.
+        assert_eq!(mode, Some(0o440), "sudo ignores a writable drop-in");
+    }
+
+    #[test]
+    fn a_machine_with_no_password_is_not_locked_out_of_itself() {
+        // The same rule the login screen obeys: no password, no boundary.
+        // Asking for one that cannot exist — the field is `*`, which
+        // authenticates nobody — would leave the machine unable to administer
+        // itself while guarding nothing that somebody at its keyboard has not
+        // already got.
+        let mut backend = live_backend();
+        install_with(Firmware::Uefi, &mut backend);
+        let (rule, _) = file(&backend, "/mnt/target/etc/sudoers.d/tos");
+        assert_eq!(rule, "tos ALL=(ALL:ALL) NOPASSWD: ALL\n");
     }
 
     #[test]

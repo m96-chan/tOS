@@ -119,6 +119,12 @@ pub struct Config {
     /// configuration file. [`crate::lock::session_user`] is where it comes
     /// from.
     pub credential_user: String,
+    /// Where the accounts are. A seam for the same reason [`Config::credential`]
+    /// is: a test writes its own passwd file rather than depending on whoever
+    /// happens to exist on the machine running it.
+    pub passwd: PathBuf,
+    /// Where the group memberships are, likewise.
+    pub group: PathBuf,
     /// Whether a session on this display has to be logged into.
     ///
     /// Set by the DRM backend in `main`, and by nothing else: that session is
@@ -192,6 +198,8 @@ impl Default for Config {
             chrome: Chrome::default(),
             credential: PathBuf::from(crate::lock::CREDENTIAL_PATH),
             credential_user: crate::lock::session_user(),
+            passwd: PathBuf::from(crate::account::PASSWD_PATH),
+            group: PathBuf::from(crate::account::GROUP_PATH),
             gated: false,
             // Five minutes, then five more. The order is the point: locking
             // first means the screen that a passer-by wakes is the prompt,

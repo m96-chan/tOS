@@ -46,6 +46,30 @@ impl Winsize {
     }
 }
 
+/// The account a child is to run as.
+///
+/// Present only when the child is to run as somebody other than the process
+/// that forked it, which on tOS means a session that has been logged into: the
+/// compositor holds the VT, DRM master and the evdev devices and so is root,
+/// and a shell it starts has no business inheriting that.
+///
+/// The three fields are applied in the one order that works — `setgroups`,
+/// then `setgid`, then `setuid` — because each of the first two needs the
+/// privilege that the last one drops. Getting it wrong does not fail; it
+/// leaves a process that kept a group it should not have, which is why this is
+/// a type that carries all three rather than three arguments a caller could
+/// pass in any order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Credentials {
+    pub uid: u32,
+    pub gid: u32,
+    /// The supplementary groups, which replace the forking process's own. An
+    /// empty list is meaningful and is not the same as no `Credentials`: it
+    /// says this account is in no group but its own, and the root groups the
+    /// compositor is in must still go.
+    pub groups: Vec<u32>,
+}
+
 /// How to start a child on a new PTY.
 #[derive(Debug, Clone)]
 pub struct PtyConfig {
@@ -57,6 +81,9 @@ pub struct PtyConfig {
     pub unset_env: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub winsize: Winsize,
+    /// Who to become before `execve`. `None` keeps the caller's own uid, which
+    /// is what a nested tOS, a test, and the live image all want.
+    pub credentials: Option<Credentials>,
 }
 
 impl PtyConfig {
@@ -81,6 +108,7 @@ impl PtyConfig {
             unset_env: vec!["COLUMNS".into(), "LINES".into()],
             cwd: None,
             winsize,
+            credentials: None,
         }
     }
 
@@ -126,6 +154,18 @@ impl Pty {
             None => None,
         };
 
+        // Allocated here for the same reason argv and the environment are:
+        // after the fork this is a pointer the child reads and never a Vec it
+        // could grow.
+        let groups: Vec<libc::gid_t> = match &config.credentials {
+            Some(credentials) => credentials
+                .groups
+                .iter()
+                .map(|g| *g as libc::gid_t)
+                .collect(),
+            None => Vec::new(),
+        };
+
         let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
         if master < 0 {
             return Err(io::Error::last_os_error());
@@ -156,6 +196,27 @@ impl Pty {
             return Err(io::Error::last_os_error());
         }
 
+        // `grantpt` gave the slave to whoever called it, which is the
+        // compositor, which is root. A child that is about to stop being root
+        // would then own neither end of its own terminal: `tty(1)` still
+        // works, because permissions are checked at open and these are already
+        // open, but anything that reopens the device by name — `script`,
+        // `wall`, a `su` that wants to hand the terminal on — finds a file it
+        // may not touch. The group is left as `grantpt` set it, which is
+        // `tty`, because that is the group those programs are setgid to.
+        if let Some(credentials) = &config.credentials {
+            if unsafe {
+                libc::fchown(
+                    slave.0,
+                    credentials.uid as libc::uid_t,
+                    u32::MAX as libc::gid_t,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
         let pid = unsafe { libc::fork() };
         match pid {
             -1 => Err(io::Error::last_os_error()),
@@ -163,7 +224,13 @@ impl Pty {
                 // Child. Any failure here must exit rather than return, or two
                 // copies of the compositor would keep running.
                 unsafe {
-                    child_setup(master.0, slave.0, cwd.as_deref());
+                    child_setup(
+                        master.0,
+                        slave.0,
+                        cwd.as_deref(),
+                        config.credentials.as_ref(),
+                        &groups,
+                    );
                     libc::execve(program.as_ptr(), argv.as_ptr(), envp.as_ptr());
                     // execve only returns on failure.
                     libc::_exit(127);
@@ -349,7 +416,13 @@ const REAP_INTERVAL_MS: u64 = 5;
 /// # Safety
 /// Must be called only in the child of a fork, and must use only
 /// async-signal-safe functions.
-unsafe fn child_setup(master: RawFd, slave: RawFd, cwd: Option<&CStr>) {
+unsafe fn child_setup(
+    master: RawFd,
+    slave: RawFd,
+    cwd: Option<&CStr>,
+    credentials: Option<&Credentials>,
+    groups: &[libc::gid_t],
+) {
     // A new session, so this process can take a controlling terminal.
     if libc::setsid() < 0 {
         libc::_exit(126);
@@ -366,6 +439,27 @@ unsafe fn child_setup(master: RawFd, slave: RawFd, cwd: Option<&CStr>) {
         libc::close(slave);
     }
     libc::close(master);
+
+    // Before the chdir, so that a home directory this account cannot enter
+    // fails here rather than being entered by a root that was about to stop
+    // being one.
+    //
+    // The order is forced: `setgroups` and `setgid` both need the privilege
+    // that `setuid` gives away, so `setuid` goes last. Every one of them is
+    // checked. A `setuid` that fails and is ignored is the whole bug this
+    // exists to prevent — the child would go on to exec a shell with the uid
+    // it was trying to leave — so there is no path here that carries on.
+    if let Some(credentials) = credentials {
+        if libc::setgroups(groups.len() as _, groups.as_ptr()) < 0 {
+            libc::_exit(126);
+        }
+        if libc::setgid(credentials.gid as libc::gid_t) < 0 {
+            libc::_exit(126);
+        }
+        if libc::setuid(credentials.uid as libc::uid_t) < 0 {
+            libc::_exit(126);
+        }
+    }
 
     if let Some(dir) = cwd {
         if libc::chdir(dir.as_ptr()) < 0 {

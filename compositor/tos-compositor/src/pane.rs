@@ -8,6 +8,7 @@ use tos_render::TextureCache;
 use tos_session::Rect;
 use tos_term::{Palette, Terminal, TerminalConfig};
 
+use crate::account::Account;
 use crate::imagefile::ImageFiles;
 use crate::ime::ImeContext;
 use crate::selection::{Anchor, Selection};
@@ -67,9 +68,38 @@ impl Pane {
         scrollback: usize,
         palette: &Palette,
         command: Option<&[String]>,
+        account: Option<&Account>,
     ) -> io::Result<Pane> {
         let winsize = winsize_for(area, cell_size);
         let mut config = PtyConfig::shell(winsize);
+        // The account, before the command, so that an explicit command still
+        // runs as the person and not as root — `tos --command` on a machine
+        // that has been logged into is still that session's.
+        //
+        // Everything here is gated on `credentials_for` having said yes, and
+        // that is the point: the environment follows the uid. A compositor
+        // that cannot drop — a nested tOS, `cargo test`, the live image's root
+        // session — leaves `HOME` and `SHELL` exactly as the session script
+        // set them, because writing somebody else's home into the environment
+        // of a process that is still not them is how a shell ends up unable to
+        // write its own history file and nobody can say why.
+        if let Some(account) = account {
+            if let Some(credentials) =
+                crate::account::credentials_for(account, crate::account::running_as())
+            {
+                config.credentials = Some(credentials);
+                config.program = account.shell.clone();
+                config.cwd = Some(account.home.clone());
+                config
+                    .env
+                    .push(("HOME".into(), account.home.display().to_string()));
+                config.env.push(("USER".into(), account.name.clone()));
+                config.env.push(("LOGNAME".into(), account.name.clone()));
+                config
+                    .env
+                    .push(("SHELL".into(), account.shell.display().to_string()));
+            }
+        }
         if let Some(command) = command {
             let program = tos_pty::which(&command[0]).unwrap_or_else(|| command[0].clone().into());
             config.program = program;
