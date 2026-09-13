@@ -496,6 +496,24 @@ cp iso/dot-profile "$ROOTFS/etc/skel/.profile"
 # on a disk. This is the one a live session answers to.
 echo tos >"$ROOTFS/etc/hostname"
 
+# And the file that resolves it and the loopback, which no Debian package
+# ships: /etc/hosts is written by the installer that put the system there, and
+# mmdebstrap is not one. The initramfs got its own copy with #96; this is the
+# same hole on the other side of the pivot, where it is easier to miss because
+# a live session usually has a DNS server to ask and VirtualBox's answers for
+# `localhost`. A machine should not have to ask anyone where its own loopback
+# is — without this, `wget http://localhost/` on a live session with no lease
+# yet says `bad address`, which reads as a network fault and is not one.
+#
+# The installer writes the same two names plus the host it was given, so an
+# installed machine does not inherit this file; it is for the live session and
+# for anything that runs before an install.
+cat >"$ROOTFS/etc/hosts" <<'EOF'
+127.0.0.1	localhost
+127.0.1.1	tos
+::1	localhost ip6-localhost ip6-loopback
+EOF
+
 # No /lib/modules here either, so the initramfs holds the only copy. The cost
 # is worth saying plainly: a machine that has pivoted cannot modprobe anything
 # ever again — switch_root deletes the initramfs, and this is the directory the
