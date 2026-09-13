@@ -36,6 +36,57 @@ impl Firmware {
     }
 }
 
+/// Whether this session can make a disk bootable at all.
+///
+/// GRUB is in the Debian rootfs and nowhere else on the image, so the answer
+/// is yes in a live session and no in a rescue one — the session that runs
+/// when the squashfs will not mount. That is the session with the least to
+/// spare, and the one that would otherwise find out at the eighth step, with
+/// the disk already partitioned, formatted and written to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bootloader {
+    /// `grub-install` is here, so the last step can run.
+    Present,
+    /// It is not, and so nothing started from this session can finish.
+    Absent,
+}
+
+impl Bootloader {
+    /// Where `grub-install` lives on a session that has one.
+    ///
+    /// `/usr/sbin` is Debian's and `/sbin` is the same file on a usr-merged
+    /// root. `/sbin` is also where `iso/mkiso.sh` puts the tools it copies
+    /// into the initramfs, so if GRUB is ever put back there this finds it
+    /// without having to be remembered.
+    const PATHS: [&'static str; 2] = ["/usr/sbin/grub-install", "/sbin/grub-install"];
+
+    /// Which one this session is.
+    ///
+    /// Looked for by path rather than run, for the same reason `can_unpack`
+    /// is: the only honest moment to ask is before anything has been written
+    /// to the disk, and running grub-install to find out is exactly the thing
+    /// being avoided.
+    ///
+    /// The paths move with `TOS_INSTALL_SYSROOT`, the way [`SysfsSource`]'s
+    /// do. Without that the answer on a developer's machine would depend on
+    /// whether that machine happens to have GRUB installed, and the session
+    /// tests drive the real binary.
+    ///
+    /// [`SysfsSource`]: crate::disk::SysfsSource
+    pub fn detect(backend: &dyn crate::exec::Backend) -> Bootloader {
+        let root = std::env::var("TOS_INSTALL_SYSROOT").unwrap_or_default();
+        let root = root.trim_end_matches('/');
+        if Bootloader::PATHS
+            .iter()
+            .any(|path| backend.exists(&format!("{root}{path}")))
+        {
+            Bootloader::Present
+        } else {
+            Bootloader::Absent
+        }
+    }
+}
+
 /// The password for the account the installer creates.
 ///
 /// It is a type of its own rather than a `String` for one reason: `Settings`
@@ -215,6 +266,23 @@ const DEBIAN_NAMES: [&str; 37] = [
     "shadow",
 ];
 
+/// What a session with no GRUB in it has to say for itself.
+///
+/// This is the one thing the installer refuses over rather than degrades
+/// through, and the difference is what is left behind. A rescue session with
+/// no `unsquashfs` installs the busybox world instead of Debian and says so;
+/// that disk is worse than Debian and it boots. A disk with no bootloader is
+/// not a worse tOS, it is a disk somebody's files used to be on.
+///
+/// Kept to 64 columns so the confirmation screen can print it unwrapped.
+const NO_BOOTLOADER: &[&str] = &[
+    "This session cannot install a bootloader.",
+    "GRUB is in the Debian rootfs, which is what this session could",
+    "not mount. It could still erase this disk and copy a system onto",
+    "it, and the machine would have nothing to start from afterwards.",
+    "Boot the medium again, or write a new one, and install there.",
+];
+
 /// Names have to survive being written into `/etc/passwd` and a host file.
 fn name_problem(name: &str, what: &str) -> Option<String> {
     if name.is_empty() {
@@ -304,6 +372,9 @@ impl Step {
 pub struct Plan {
     pub disk: Disk,
     pub firmware: Firmware,
+    /// Whether the last step can be carried out, which decides whether any of
+    /// the others are allowed to start. See [`Plan::refusal`].
+    pub bootloader: Bootloader,
     pub settings: Settings,
     /// Where the new system is assembled.
     pub mount_point: String,
@@ -320,10 +391,11 @@ pub struct Plan {
 }
 
 impl Plan {
-    pub fn new(disk: Disk, firmware: Firmware, settings: Settings) -> Plan {
+    pub fn new(disk: Disk, firmware: Firmware, bootloader: Bootloader, settings: Settings) -> Plan {
         Plan {
             disk,
             firmware,
+            bootloader,
             settings,
             mount_point: MOUNT_POINT.to_string(),
             source_root: "/".to_string(),
@@ -425,6 +497,24 @@ impl Plan {
         ]
     }
 
+    /// Why this session must not erase a disk, if it must not.
+    ///
+    /// [`Disk::refusal`] asks this of the disk; this asks it of the session
+    /// the disk is about to be erased from. It is asked in three places —
+    /// `--plan`, the screen where the disk's name is typed, and the installer
+    /// itself — so that the answer arrives while it still costs nothing, and
+    /// so that nothing can reach `sfdisk` without having been past it.
+    ///
+    /// Several lines because one is not enough. "Cannot install a bootloader"
+    /// sounds like a step that would be skipped; what it means is that the
+    /// disk would be gone and the machine would not start.
+    pub fn refusal(&self) -> Option<&'static [&'static str]> {
+        match self.bootloader {
+            Bootloader::Present => None,
+            Bootloader::Absent => Some(NO_BOOTLOADER),
+        }
+    }
+
     /// The sentence a user has to type to confirm. Using the device name means
     /// a mistyped disk cannot be confirmed by muscle memory.
     pub fn confirmation_phrase(&self) -> String {
@@ -481,7 +571,7 @@ mod tests {
     }
 
     fn plan(firmware: Firmware) -> Plan {
-        Plan::new(disk(), firmware, Settings::default())
+        Plan::new(disk(), firmware, Bootloader::Present, Settings::default())
     }
 
     #[test]
@@ -549,6 +639,7 @@ mod tests {
                 ..disk()
             },
             Firmware::Uefi,
+            Bootloader::Present,
             Settings::default(),
         );
         assert_eq!(nvme.root_partition(), "/dev/nvme0n1p2");
@@ -564,6 +655,29 @@ mod tests {
             summary.contains("replacing everything on the disk"),
             "the user has to be told: {summary}"
         );
+    }
+
+    #[test]
+    fn a_session_with_no_grub_refuses_the_whole_installation() {
+        assert_eq!(plan(Firmware::Uefi).refusal(), None);
+
+        let refused = Plan::new(
+            disk(),
+            Firmware::Uefi,
+            Bootloader::Absent,
+            Settings::default(),
+        );
+        let reason = refused.refusal().expect("it offered to install");
+        let text = reason.join(" ");
+        assert!(text.contains("cannot install a bootloader"), "{text}");
+        // And says what that means for the disk. On its own, "no bootloader"
+        // reads like a step that would be skipped.
+        assert!(text.contains("erase this disk"), "{text}");
+        // The confirmation screen prints these unwrapped, inside a frame 70
+        // columns wide with two columns of inset on each side.
+        for line in reason {
+            assert!(line.chars().count() <= 64, "too wide to print: {line}");
+        }
     }
 
     #[test]
@@ -617,7 +731,10 @@ mod tests {
             password: "hunter2".into(),
             ..Settings::default()
         };
-        let printed = format!("{:?}", Plan::new(disk(), Firmware::Uefi, settings));
+        let printed = format!(
+            "{:?}",
+            Plan::new(disk(), Firmware::Uefi, Bootloader::Present, settings)
+        );
         assert!(!printed.contains("hunter2"), "{printed}");
         assert!(printed.contains("Password(set)"), "{printed}");
         assert!(format!("{:?}", Settings::default()).contains("Password(none)"));
@@ -635,7 +752,7 @@ mod tests {
             password: "hunter2".into(),
             ..Settings::default()
         };
-        let with = Plan::new(disk(), Firmware::Uefi, settings)
+        let with = Plan::new(disk(), Firmware::Uefi, Bootloader::Present, settings)
             .summary()
             .join("\n");
         assert!(with.contains("Password   set"));

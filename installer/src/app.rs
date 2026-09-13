@@ -11,7 +11,7 @@ use crate::disk::Disk;
 use crate::exec::Backend;
 use crate::install::{Installer, Progress, StepOutcome};
 use crate::motd;
-use crate::plan::{Firmware, Password, Plan, Settings};
+use crate::plan::{Bootloader, Firmware, Password, Plan, Settings};
 use crate::ui::{Color, Echo, Rect, Screen, Style};
 
 /// Which screen the installer is showing.
@@ -92,6 +92,11 @@ pub struct App {
     /// The second entry of the password, which goes nowhere near the disk.
     pub confirm_password: Password,
     pub firmware: Firmware,
+    /// Whether this session could make the disk bootable afterwards. Detected
+    /// once and carried, rather than asked of the machine wherever it is
+    /// wanted: the tests have to be able to describe a session they are not
+    /// running in.
+    pub bootloader: Bootloader,
     /// What the user has typed on the confirmation screen.
     pub confirmation: String,
     pub progress: Progress,
@@ -105,7 +110,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(disks: Vec<Disk>, firmware: Firmware, dry_run: bool) -> App {
+    pub fn new(disks: Vec<Disk>, firmware: Firmware, bootloader: Bootloader, dry_run: bool) -> App {
         // Start on the first disk that could actually be installed onto.
         let selected = disks.iter().position(Disk::is_installable).unwrap_or(0);
         App {
@@ -116,6 +121,7 @@ impl App {
             field: Field::Hostname,
             confirm_password: Password::default(),
             firmware,
+            bootloader,
             confirmation: String::new(),
             progress: Progress::default(),
             notice: None,
@@ -143,6 +149,7 @@ impl App {
         Some(Plan::new(
             disk.clone(),
             self.firmware,
+            self.bootloader,
             self.settings.clone(),
         ))
     }
@@ -334,6 +341,12 @@ impl App {
                     self.stage = Stage::PickDisk;
                     return Command::None;
                 };
+                if let Some(refusal) = plan.refusal() {
+                    // The screen has said the whole of it already; this is
+                    // what the Enter key gets for being pressed anyway.
+                    self.notice = Some(refusal[0].to_string());
+                    return Command::None;
+                }
                 if self.confirmation.trim() != plan.confirmation_phrase() {
                     // Getting this wrong is the safety net working, so say so
                     // plainly rather than just refusing.
@@ -381,6 +394,20 @@ impl App {
             self.notice = Some("There is nothing to install onto.".into());
             return;
         };
+
+        // Before the dry run as well as before the real one. A dry run on a
+        // session that cannot install is the one place somebody is asking the
+        // question this answers, and walking the plan there would print the
+        // eight steps as though they were going to happen.
+        if let Some(refusal) = plan.refusal() {
+            for line in refusal {
+                self.progress.log.push(line.to_string());
+            }
+            self.installed = false;
+            self.stage = Stage::Finished;
+            self.notice = Some(refusal[0].to_string());
+            return;
+        }
 
         if self.dry_run {
             // A dry run still walks the whole plan, so what it prints is what
@@ -616,15 +643,24 @@ impl App {
             return;
         };
 
+        // A refusal replaces the last three rows rather than adding to them:
+        // the disk's name cannot be typed into a box that is not drawn, and
+        // the reason wants the room the box was using.
+        let refusal = plan.refusal();
         let summary = plan.summary();
-        let height = (summary.len() as u16 + 8).min(area.height);
+        let tail = refusal.map_or(3, |lines| lines.len() as u16 + 1);
+        let height = (summary.len() as u16 + 5 + tail).min(area.height);
         let frame = Rect::centred(area, area.width.min(70), height);
-        screen.frame(frame, Some("This erases the disk"), Style::fg(DANGER));
+        let title = match refusal {
+            Some(_) => "This disk cannot be installed onto",
+            None => "This erases the disk",
+        };
+        screen.frame(frame, Some(title), Style::fg(DANGER));
         let inner = frame.inset(2);
 
         let mut y = inner.y;
         for line in &summary {
-            if y >= inner.bottom().saturating_sub(3) {
+            if y >= inner.bottom().saturating_sub(tail) {
                 break;
             }
             let style = if line.contains("replacing everything") {
@@ -639,6 +675,14 @@ impl App {
         }
 
         y += 1;
+        if let Some(refusal) = refusal {
+            for line in refusal {
+                screen.text_clipped(inner.x, y, inner.width, line, Style::fg(DANGER).bold());
+                y += 1;
+            }
+            return;
+        }
+
         let phrase = plan.confirmation_phrase();
         screen.text_clipped(
             inner.x,
@@ -749,7 +793,10 @@ impl App {
                 Stage::Welcome => "Enter  begin      Esc  leave".to_string(),
                 Stage::PickDisk => "↑↓  choose      Enter  continue      Esc  back".to_string(),
                 Stage::Configure => "Tab  next field   Enter  continue      Esc  back".to_string(),
-                Stage::Confirm => "Enter  erase and install      Esc  back".to_string(),
+                Stage::Confirm => match self.plan().and_then(|plan| plan.refusal()) {
+                    Some(_) => "Esc  back".to_string(),
+                    None => "Enter  erase and install      Esc  back".to_string(),
+                },
                 Stage::Installing => "Installing; this cannot be interrupted.".to_string(),
                 Stage::Finished => {
                     if self.installed {
@@ -869,6 +916,7 @@ mod tests {
         App::new(
             vec![disk("sda", 64), disk("sdb", 32)],
             Firmware::Uefi,
+            Bootloader::Present,
             false,
         )
     }
@@ -994,6 +1042,7 @@ mod tests {
         let app = App::new(
             vec![unusable("sda"), disk("sdb", 64)],
             Firmware::Uefi,
+            Bootloader::Present,
             false,
         );
         assert_eq!(app.disk().unwrap().name, "sdb");
@@ -1022,7 +1071,12 @@ mod tests {
 
     #[test]
     fn a_machine_with_no_usable_disk_says_so_and_goes_no_further() {
-        let mut app = App::new(vec![unusable("sda")], Firmware::Uefi, false);
+        let mut app = App::new(
+            vec![unusable("sda")],
+            Firmware::Uefi,
+            Bootloader::Present,
+            false,
+        );
         app.key(&press(KeyCode::Enter));
         assert_eq!(app.stage, Stage::Welcome, "must not reach the disk picker");
         assert!(app.notice.as_ref().unwrap().contains("No disk"));
@@ -1047,6 +1101,7 @@ mod tests {
         let mut app = App::new(
             vec![disk("sda", 64), unusable("sdb")],
             Firmware::Uefi,
+            Bootloader::Present,
             false,
         );
         app.key(&press(KeyCode::Enter));
@@ -1058,7 +1113,12 @@ mod tests {
 
     #[test]
     fn the_disk_list_says_why_a_disk_is_refused() {
-        let mut app = App::new(vec![unusable("sda")], Firmware::Uefi, false);
+        let mut app = App::new(
+            vec![unusable("sda")],
+            Firmware::Uefi,
+            Bootloader::Present,
+            false,
+        );
         app.stage = Stage::PickDisk;
         let mut screen = Screen::new(90, 24);
         app.draw(&mut screen);
@@ -1371,8 +1431,65 @@ mod tests {
     }
 
     #[test]
+    fn a_session_that_cannot_install_grub_says_so_where_the_name_is_typed() {
+        // The last screen before the disk is gone is the last place this can
+        // be said for free, so it is said there instead of being discovered
+        // at the eighth step.
+        let mut app = App::new(
+            vec![disk("sda", 64)],
+            Firmware::Uefi,
+            Bootloader::Absent,
+            false,
+        );
+        reach_confirmation(&mut app);
+
+        let mut screen = Screen::new(90, 32);
+        app.draw(&mut screen);
+        assert!(screen.contains("cannot install a bootloader"));
+        assert!(
+            !screen.contains("Type sda to confirm"),
+            "there is nothing to confirm"
+        );
+
+        // And the key that would have started it does not.
+        type_text(&mut app, "sda");
+        assert_eq!(app.key(&press(KeyCode::Enter)), Command::None);
+        assert_eq!(app.stage, Stage::Confirm);
+    }
+
+    #[test]
+    fn a_dry_run_in_a_rescue_session_shows_the_refusal_and_not_the_steps() {
+        // The dry run is what somebody runs to find out; it has to answer
+        // this question rather than walk eight steps that cannot happen.
+        let mut app = App::new(
+            vec![disk("sda", 64)],
+            Firmware::Uefi,
+            Bootloader::Absent,
+            true,
+        );
+        reach_confirmation(&mut app);
+
+        let mut backend = live_backend();
+        app.install(&mut backend);
+
+        assert_eq!(app.stage, Stage::Finished);
+        assert!(!app.installed);
+        assert!(app
+            .notice
+            .as_ref()
+            .is_some_and(|notice| notice.contains("cannot install a bootloader")));
+        assert!(app.progress.finished.is_empty(), "a step was walked");
+        assert!(backend.actions.is_empty(), "{:?}", backend.actions);
+    }
+
+    #[test]
     fn a_dry_run_writes_nothing_but_still_shows_the_plan() {
-        let mut app = App::new(vec![disk("sda", 64)], Firmware::Uefi, true);
+        let mut app = App::new(
+            vec![disk("sda", 64)],
+            Firmware::Uefi,
+            Bootloader::Present,
+            true,
+        );
         reach_confirmation(&mut app);
         type_text(&mut app, "sda");
         app.key(&press(KeyCode::Enter));
