@@ -322,12 +322,24 @@ impl<'a> Installer<'a> {
         // shell that is not a login shell reads ~/.bashrc and nothing else —
         // not /etc/profile, not $ENV — so without this the account lands on a
         // bare `bash-5.2$` with no history, no colour and no message of the
-        // day. The rootfs ships the same file as /root/.bashrc and
-        // /etc/skel/.bashrc; this is the copy for the account that did not
-        // exist when the image was built.
+        // day. ~/.profile is the other half of the same account: a login
+        // shell is the one kind that does not read ~/.bashrc, so `su - tos`
+        // would get none of what the pane it was typed in has. The rootfs
+        // ships both files as /root/... and /etc/skel/...; these are the
+        // copies for the account that did not exist when the image was built.
         if self.login_shell(&root) == "/bin/bash" {
             self.write(&format!("{home}/.bashrc"), BASHRC)?;
+            self.write(&format!("{home}/.profile"), PROFILE)?;
         }
+        // And the home has to belong to the person, which nothing so far has
+        // made it: the installer runs as root on the live system, so the
+        // directory and everything just written into it is root's. A home the
+        // account cannot write is a shell that cannot save a line of history,
+        // which is most of what the rc file above is there for.
+        let _ = self.backend.run(
+            "chown",
+            &["-R", &format!("{ACCOUNT_ID}:{ACCOUNT_ID}"), &home],
+        );
 
         let fstab = self.fstab();
         self.write(&format!("{root}/etc/fstab"), &fstab)?;
@@ -384,8 +396,8 @@ impl<'a> Installer<'a> {
         let passwd = format!("{root}/etc/passwd");
         let group = format!("{root}/etc/group");
         let shell = self.login_shell(root);
-        let account = format!("{user}:*:1000:1000:{user}:/home/{user}:{shell}\n");
-        let membership = format!("{user}:x:1000:\n");
+        let account = format!("{user}:*:{ACCOUNT_ID}:{ACCOUNT_ID}:{user}:/home/{user}:{shell}\n");
+        let membership = format!("{user}:x:{ACCOUNT_ID}:\n");
 
         // Each file answers for itself. Deciding both from whether `passwd`
         // exists made the group file's fate depend on the other file's
@@ -741,10 +753,6 @@ fn planning_backend_for(world: &dyn crate::exec::Backend) -> crate::exec::Record
     if let (true, Some(tool)) = (world.exists(image), tool) {
         backend.existing.push(image.to_string());
         backend.existing.push(tool.to_string());
-        // And the account files the unpacked rootfs will bring with it, so
-        // the plan shows the append a real install makes rather than the
-        // overwrite it would only do onto a disk that came from the busybox
-        // world.
         // The account files the unpacked rootfs will bring with it, so the
         // plan shows the append a real install makes rather than the overwrite
         // it would only do onto a disk that came from the busybox world — and
@@ -774,12 +782,25 @@ pub(crate) fn live_planning_backend() -> crate::exec::Recorder {
     planning_backend_for(&world)
 }
 
+/// The uid and gid of the account the installer creates, as `/etc/passwd`
+/// names it and as the account's home is chowned to. One place, because a
+/// home owned by a different number than the account is a shell that cannot
+/// write its own history and says nothing about why.
+const ACCOUNT_ID: &str = "1000";
+
 /// The `~/.bashrc` a tOS machine gives an account it creates.
 ///
 /// `include_str!` rather than a second copy: `iso/mkiso.sh` installs this same
 /// file as `/root/.bashrc` and `/etc/skel/.bashrc` inside the image, and a
 /// machine installed from an image is meant to be that image.
 const BASHRC: &str = include_str!("../../iso/bashrc");
+
+/// The `~/.profile` that goes with it, for the login shells that do not read
+/// `~/.bashrc` at all.
+///
+/// Same reason for `include_str!`: `iso/mkiso.sh` installs this file as
+/// `/root/.profile` and `/etc/skel/.profile`.
+const PROFILE: &str = include_str!("../../iso/dot-profile");
 
 /// Where the session's environment is written, and what /etc/inittab respawns.
 pub const SESSION_SCRIPT_PATH: &str = "/etc/tos-session";
@@ -811,7 +832,7 @@ const SESSION_SCRIPT: &str = "#!/bin/sh\n\
                               export SHELL\n\
                               export TERM=xterm-256color\n\
                               export TOS=1\n\
-                              [ \"$SHELL\" = /bin/bash ] || export ENV=/etc/profile\n\
+                              export ENV=/etc/profile\n\
                               export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
                               exec /sbin/tos\n";
 
@@ -1305,17 +1326,35 @@ mod tests {
 
     #[test]
     fn the_session_carries_the_environment_init_does_not() {
-        // busybox init respawns with almost nothing set. Without ENV no pane's
-        // shell reads /etc/profile, which is where the message of the day
-        // comes from; /init exports the same set on the live image.
+        // busybox init respawns with almost nothing set. Without ENV no pane
+        // running ash or dash reads /etc/profile, which is where the message
+        // of the day comes from; iso/live-session sets the same things on the
+        // live image.
         let backend = install(Firmware::Bios);
         let session = written(&backend, &format!("/mnt/target{SESSION_SCRIPT_PATH}"));
-        for variable in ["HOME=/root", "SHELL=/bin/sh", "TOS=1", "ENV=/etc/profile"] {
+        for variable in [
+            "export HOME=/root",
+            "export SHELL",
+            "export TERM=xterm-256color",
+            "export TOS=1",
+            "export ENV=/etc/profile",
+            "export PATH=/usr/local/sbin:",
+        ] {
             assert!(
                 session.contains(variable),
                 "the session should export {variable}: {session}"
             );
         }
+        // SHELL is asked for rather than stated, because this same script is
+        // written onto a disk that got the busybox world and has no bash. An
+        // earlier version of this test asserted `SHELL=/bin/sh`, which went
+        // on passing once the fork arrived by matching the branch a Debian
+        // install never takes.
+        assert!(
+            session
+                .contains("if [ -x /bin/bash ]; then\nSHELL=/bin/bash\nelse\nSHELL=/bin/sh\nfi\n"),
+            "the session should decide SHELL from what is on the disk: {session}"
+        );
     }
 
     // There is no test here that the Japanese face reaches an installed
@@ -1348,6 +1387,44 @@ mod tests {
             bashrc, BASHRC,
             "the installed rc file is not the one in the tree"
         );
+        // And the other half: bash reads ~/.bashrc for an interactive shell
+        // that is not a login shell, which is what a pane runs — `su - tos`
+        // is a login shell and reads this file instead.
+        let profile = written(&backend, "/mnt/target/home/tos/.profile");
+        assert!(profile.contains(".bashrc"), "{profile}");
+        assert_eq!(
+            profile, PROFILE,
+            "the installed profile is not the one in the tree"
+        );
+    }
+
+    #[test]
+    fn the_home_belongs_to_the_account_that_lives_in_it() {
+        // The installer runs as root on the live system, so the home and the
+        // dotfiles in it are root's until something says otherwise. A home
+        // the account cannot write is a shell that cannot append a line to
+        // ~/.bash_history — the rc file's history settings would be furniture
+        // in a room with no floor.
+        let backend = install(Firmware::Uefi);
+
+        assert!(
+            backend.did("chown -R 1000:1000 /mnt/target/home/tos"),
+            "nothing gave the account its own home: {:?}",
+            backend.transcript()
+        );
+        // After the files, or it would be chowning a directory it is about to
+        // put root-owned files into.
+        let chown = backend
+            .position_of("chown -R 1000:1000 /mnt/target/home/tos")
+            .expect("no chown");
+        let bashrc = backend
+            .position_of("write /mnt/target/home/tos/.bashrc")
+            .expect("no bashrc");
+        assert!(
+            bashrc < chown,
+            "the home was chowned before the files were written into it: {:?}",
+            backend.transcript()
+        );
     }
 
     #[test]
@@ -1366,6 +1443,14 @@ mod tests {
             !wrote(&backend, "/mnt/target/home/tos/.bashrc"),
             "a bashrc was written for a disk with no bash"
         );
+        // And no profile either: all it does is hand a login shell the rc
+        // file that is not there.
+        assert!(
+            !wrote(&backend, "/mnt/target/home/tos/.profile"),
+            "a profile was written for a disk with no bash"
+        );
+        // The home is still the account's, which has nothing to do with bash.
+        assert!(backend.did("chown -R 1000:1000 /mnt/target/home/tos"));
     }
 
     #[test]
@@ -1415,28 +1500,47 @@ mod tests {
     fn an_installed_machine_gets_the_environment_the_live_one_has() {
         // iso/live-session exists so the session environment is written once,
         // and an installed machine cannot run it — busybox init respawns what
-        // the installer wrote. So the exports are compared to the file rather
-        // than to a memory of it: they drifted by a TERM and a PATH the first
-        // time this was left to a comment.
-        fn exports(script: &str) -> Vec<String> {
-            let mut found: Vec<String> = script
+        // the installer wrote. So the environment is compared to the file
+        // rather than to a memory of it: the two drifted by a TERM and a PATH
+        // the first time this was left to a comment.
+        //
+        // The whole block, not the `export` lines in it. SHELL stopped being
+        // one the day it was decided by an `if`, and a filter that kept only
+        // exports let that fork differ between the two files — a typo in the
+        // path it tests would have sent every installed machine back to dash
+        // with this test still green.
+        fn environment(script: &str) -> Vec<String> {
+            let lines: Vec<String> = script
                 .lines()
                 .map(|line| line.trim().trim_end_matches('\\').trim().to_string())
-                .filter(|line| line.contains("export "))
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
                 .collect();
-            found.sort();
-            found
+            let first = lines
+                .iter()
+                .position(|line| line.starts_with("export HOME="))
+                .expect("the session environment starts at HOME and nothing exports it");
+            let last = lines
+                .iter()
+                .position(|line| line.starts_with("export PATH="))
+                .expect("the session environment ends at PATH and nothing exports it");
+            assert!(first < last, "PATH is exported before HOME");
+            lines[first..=last].to_vec()
         }
 
-        let live = exports(include_str!("../../iso/live-session"));
-        let installed = exports(SESSION_SCRIPT);
-        assert!(live.len() >= 5, "no exports found in iso/live-session");
-        // Both directions, and whole lines: a `contains` would have passed a
-        // TOS=10 against a TOS=1, and an export added to this file alone —
-        // the one edited by hand — is the drift that is likelier of the two.
+        let live = environment(include_str!("../../iso/live-session"));
+        let installed = environment(SESSION_SCRIPT);
+        assert!(live.len() >= 5, "no environment found in iso/live-session");
+        assert!(
+            live.iter().any(|line| line.contains("/bin/bash")),
+            "the session is supposed to look for a bash: {live:?}"
+        );
+        // Both directions, whole lines, and in order: a `contains` would have
+        // passed a TOS=10 against a TOS=1, and ENV has to come after the SHELL
+        // it used to be decided from. A line added to this file alone — the
+        // one edited by hand — is the likelier of the two drifts.
         assert_eq!(
             live, installed,
-            "iso/live-session and the installed session export different things"
+            "iso/live-session and the installed session set up different environments"
         );
     }
 

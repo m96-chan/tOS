@@ -45,11 +45,15 @@ export TERM=xterm-256color
 export TOS=1
 # ENV is how the message of the day reaches a pane whose shell is ash or dash:
 # both read it for every interactive shell. bash does not — it reads ENV only
-# when it is invoked as `sh` — so where bash is the shell this is not the
-# mechanism and saying it anyway would be a claim about a file nothing reads.
-# There, /root/.bashrc is the counterpart, and iso/bashrc is what mkiso.sh
-# installs as one.
-[ "$SHELL" = /bin/bash ] || export ENV=/etc/profile
+# when it is invoked as `sh` — so where bash is the shell the counterpart is
+# /root/.bashrc, and iso/bashrc is what mkiso.sh installs as one.
+#
+# Exported either way rather than only where the shell is not bash: tos.conf's
+# `shell =` and the compositor's -e change the program a pane runs without
+# changing $SHELL, so a machine that pointed either at dash would have a pane
+# that reads neither this nor ~/.bashrc, and the banner would be gone. bash
+# does no harm carrying a variable it never reads.
+export ENV=/etc/profile
 # Debian's own order, and /sbin before /bin matters on both sides of the pivot:
 # the initramfs has util-linux's mount in /sbin and busybox's in /bin, and only
 # the first of those can mount a filesystem by label.

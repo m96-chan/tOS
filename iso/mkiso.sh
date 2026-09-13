@@ -378,6 +378,11 @@ cp iso/profile "$ROOTFS/etc/profile.d/tos.sh"
 mkdir -p "$ROOTFS/etc/skel" "$ROOTFS/root"
 cp iso/bashrc "$ROOTFS/root/.bashrc"
 cp iso/bashrc "$ROOTFS/etc/skel/.bashrc"
+# And ~/.profile beside it, because a login shell is the one kind of shell
+# that does not read ~/.bashrc: `su - tos` would otherwise get none of what
+# the pane it was typed in has. This is the file that hands it over.
+cp iso/dot-profile "$ROOTFS/root/.profile"
+cp iso/dot-profile "$ROOTFS/etc/skel/.profile"
 
 # mmdebstrap leaves the build machine's own /etc/resolv.conf in the rootfs. On
 # a container host that is the container's: a resolver address that means

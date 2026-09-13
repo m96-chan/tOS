@@ -156,6 +156,7 @@ argument in the installer beside `CMDLINE`.
 | `live-session` | PID 1 of a live session either way: `/init` execs the copy inside the rootfs after pivoting, and the initramfs copy when there was no rootfs to pivot into. The session's environment and the loop that restarts the compositor |
 | `profile`   | `/etc/profile.d/tos.sh` in the rootfs, `/etc/profile` in the initramfs: the banner and the install hint, for a login shell or for an ash pane through `ENV` |
 | `bashrc`    | `/root/.bashrc` and `/etc/skel/.bashrc`: history, prompt, colour and the banner, for the interactive non-login shell a pane actually runs |
+| `dot-profile` | `/root/.profile` and `/etc/skel/.profile`: hands `~/.bashrc` to a login shell, which is the one kind of shell that does not read it |
 | `run.sh`    | boots `dist/tos-<arch>.iso` in VirtualBox, and cleans up after |
 
 ## Known limits
