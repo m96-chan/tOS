@@ -68,6 +68,24 @@ pub trait Backend {
 
     /// Whether a path exists. Used to decide between UEFI and BIOS.
     fn exists(&self, path: &str) -> bool;
+
+    /// Restart the machine now, and do not come back.
+    ///
+    /// There is no success to return, which is why this hands back the error
+    /// itself rather than a [`Result`]: a restart that happens never returns
+    /// here, so anything a caller receives is a machine that is still
+    /// running, and something the caller has to say out loud.
+    ///
+    /// The signature is as much of the fix as the implementation is. What was
+    /// here before ran `reboot` off the `PATH` and dropped the answer with
+    /// `let _ =`. On the live image that program is busybox, and busybox
+    /// without `-f` restarts nothing itself: it signals PID 1 and leaves the
+    /// rest to init. PID 1 in a live session is `/bin/sh /sbin/tos-session`,
+    /// a `while :` loop with no traps, so the signal went nowhere, busybox
+    /// exited 0, and the installer had a success to discard. There was no
+    /// failure to notice, which is why the key had never worked on any
+    /// machine. Now there is no success to drop.
+    fn reboot(&mut self) -> io::Error;
 }
 
 /// A backend that really does it.
@@ -162,6 +180,33 @@ impl Backend for System {
     fn exists(&self, path: &str) -> bool {
         std::path::Path::new(path).exists()
     }
+
+    fn reboot(&mut self) -> io::Error {
+        // SAFETY: `reboot` is handed one immediate by value — no pointer, no
+        // buffer, nothing of ours that has to outlive the call — and it is
+        // unsafe only because it is an `extern "C"` call. `RB_AUTOBOOT` is the
+        // restart the kernel performs itself, so it cannot be swallowed by a
+        // PID 1 that is not listening for signals, and it does not depend on
+        // which `reboot` happens to come first on the `PATH`.
+        //
+        // The abruptness costs nothing here: the caller syncs first, the
+        // installation's last step has already flushed and unmounted the
+        // target, and the root this runs from is a tmpfs overlay over a
+        // read-only squashfs with nothing to write back.
+        let result = unsafe { libc::reboot(libc::RB_AUTOBOOT) };
+
+        // `reboot(2)` returns only when it failed, and then -1. Anything else
+        // is the kernel coming back from a restart it did not perform, and
+        // `errno` would hold whatever the last unrelated call left there —
+        // rendered, most likely, as "Success". That is the exact shape of the
+        // bug this replaces, so say what happened rather than ask `errno`.
+        if result != -1 {
+            return io::Error::other(format!(
+                "reboot(2) returned {result} and the machine is still running"
+            ));
+        }
+        io::Error::last_os_error()
+    }
 }
 
 /// Recursive copy that preserves the executable bit, which matters for every
@@ -221,6 +266,9 @@ pub enum Action {
     CreateDir {
         path: String,
     },
+    /// The machine was asked to restart. Only a fake backend ever records
+    /// this, because the real one does not come back to be recorded.
+    Reboot,
 }
 
 impl Action {
@@ -257,6 +305,10 @@ impl Action {
             Action::AppendFile { path, .. } => format!("append to {path}"),
             Action::CopyTree { from, to } => format!("copy {from} -> {to}"),
             Action::CreateDir { path } => format!("mkdir -p {path}"),
+            // Named for the syscall and not for the program, so that a
+            // transcript reading plain `reboot` is visibly the old thing:
+            // spawning whatever is on the `PATH` and hoping PID 1 agrees.
+            Action::Reboot => "reboot(2)".to_string(),
         }
     }
 }
@@ -386,6 +438,15 @@ impl Backend for Recorder {
     fn exists(&self, path: &str) -> bool {
         self.existing.iter().any(|p| p == path)
     }
+
+    fn reboot(&mut self) -> io::Error {
+        self.actions.push(Action::Reboot);
+        // A recorder has no machine to take down, and the trait gives it no
+        // way to pretend otherwise — which is the point of the signature. The
+        // tests read the action; this error is what a caller would print if a
+        // recorder ever reached a real user, and it would be true.
+        io::Error::other("recorded the reboot rather than performing it")
+    }
 }
 
 /// `--dry-run`: a recorder that also reports what it would have done.
@@ -454,6 +515,25 @@ mod tests {
         assert!(backend.exists("/sys/firmware/efi"));
         assert!(!backend.exists("/sys/firmware/nothing"));
     }
+
+    #[test]
+    fn a_recorder_records_the_reboot_it_cannot_perform() {
+        let mut backend = Recorder::new();
+        let failure = backend.reboot();
+        assert_eq!(backend.transcript(), vec!["reboot(2)"]);
+        // The description says which reboot, because the bug being fixed was
+        // the other one: a child process that answers 0 whether or not the
+        // machine is going anywhere.
+        assert!(!backend.did("reboot "), "{:?}", backend.transcript());
+        assert!(failure.to_string().contains("recorded"), "{failure}");
+    }
+
+    // There is deliberately no test of `System::reboot`. It is the one method
+    // on the trait whose success cannot be observed and whose failure depends
+    // on who is running the suite: as an ordinary user it returns EPERM, and
+    // as root — which is how the ISO image is built — it would take the
+    // machine down in the middle of `cargo test`. The seam exists so that
+    // everything above it can be tested without ever reaching this call.
 
     #[test]
     fn the_real_backend_runs_a_program() {

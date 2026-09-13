@@ -429,6 +429,37 @@ impl App {
         self.stage = Stage::Finished;
     }
 
+    /// Act on [`Command::Reboot`]: restart into what was just installed.
+    ///
+    /// Returns the reason it did not happen, because there is nothing else to
+    /// return — see [`Backend::reboot`]. The caller must print what it gets
+    /// back. The offer on the finished screen used to be answered by running
+    /// `reboot` and discarding the result, which on the live image is busybox
+    /// signalling a PID 1 that is a shell loop: the machine stayed up, the
+    /// installer exited 0, and the user was told nothing at all.
+    ///
+    /// This lives here rather than in `main` so that the seam the rest of the
+    /// installation is tested through covers it too. It is also the one place
+    /// that can still refuse, and it does: a dry run has written nothing to
+    /// boot into, and a failed install has left a half-erased disk. Neither
+    /// can reach `Command::Reboot` through [`App::key`] today, because that
+    /// arm is guarded on `installed` — but the key guard is a UI decision,
+    /// and "never restart a machine that was only shown a plan" is not.
+    pub fn reboot(&self, backend: &mut dyn Backend) -> std::io::Error {
+        if self.dry_run {
+            return std::io::Error::other("a dry run has nothing to reboot into");
+        }
+        if !self.installed {
+            return std::io::Error::other("nothing was installed to reboot into");
+        }
+
+        // Flush first: the reboot may not give the kernel time to. `reboot(2)`
+        // with RB_AUTOBOOT does not sync on its way down — only sysrq does —
+        // so this is the flush, not a belt on top of one.
+        let _ = backend.run("sync", &[]);
+        backend.reboot()
+    }
+
     // ---- drawing --------------------------------------------------------
 
     /// Draw the current screen.
@@ -1403,6 +1434,80 @@ mod tests {
         assert!(app.installed, "{:?}", app.progress.failure());
         assert!(app.outcome_message().contains("installed"));
         assert_eq!(app.key(&typed('r')), Command::Reboot);
+    }
+
+    #[test]
+    fn the_reboot_flushes_and_then_asks_the_kernel_itself() {
+        let mut app = app();
+        reach_confirmation(&mut app);
+        type_text(&mut app, "sda");
+        app.key(&press(KeyCode::Enter));
+
+        let mut backend = live_backend();
+        app.install(&mut backend);
+        assert_eq!(app.key(&typed('r')), Command::Reboot);
+
+        // A fresh recorder, so the transcript holds the reboot and nothing
+        // the installation did on the way there.
+        let mut backend = Recorder::new();
+        let failure = app.reboot(&mut backend);
+
+        // The flush comes first, and the restart is the syscall rather than a
+        // child process named `reboot`. A transcript reading `sync`, `reboot`
+        // is what this had before the fix and what it must not go back to: on
+        // the live image that program is busybox, which signals a PID 1 that
+        // is a shell loop with no traps and then exits 0.
+        assert_eq!(backend.transcript(), vec!["sync", "reboot(2)"]);
+
+        // And it returned, so the machine is still here, and there is
+        // something to say about that. Only a fake backend gets this far.
+        assert!(failure.to_string().contains("recorded"), "{failure}");
+    }
+
+    #[test]
+    fn a_dry_run_reboots_nothing_even_when_it_is_asked_to() {
+        let mut app = App::new(
+            vec![disk("sda", 64)],
+            Firmware::Uefi,
+            Bootloader::Present,
+            true,
+        );
+        reach_confirmation(&mut app);
+        type_text(&mut app, "sda");
+        app.key(&press(KeyCode::Enter));
+        let mut backend = Recorder::new();
+        app.install(&mut backend);
+
+        // The finished screen of a dry run does not offer the key,
+        assert_eq!(app.key(&typed('r')), Command::None);
+        // and the thing behind the key refuses on its own account, because a
+        // dry run has written nothing there would be to boot into.
+        let refusal = app.reboot(&mut backend);
+        assert!(backend.actions.is_empty(), "{:?}", backend.actions);
+        assert!(refusal.to_string().contains("dry run"), "{refusal}");
+    }
+
+    #[test]
+    fn a_failed_installation_reboots_nothing_even_when_it_is_asked_to() {
+        let mut app = app();
+        reach_confirmation(&mut app);
+        type_text(&mut app, "sda");
+        app.key(&press(KeyCode::Enter));
+
+        let mut backend = live_backend();
+        backend = backend.failing("mkfs.ext4", "device is busy");
+        app.install(&mut backend);
+        assert!(!app.installed);
+
+        // Restarting into a disk that was erased and then not filled in is
+        // the one way to make a failed install worse.
+        let mut backend = Recorder::new();
+        let refusal = app.reboot(&mut backend);
+        assert!(backend.actions.is_empty(), "{:?}", backend.actions);
+        assert!(
+            refusal.to_string().contains("nothing was installed"),
+            "{refusal}"
+        );
     }
 
     #[test]
