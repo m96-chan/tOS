@@ -276,9 +276,12 @@ of its own can do.
 
 **Decision: none is added, and none should be added before tOS has a login.**
 
-There is no `getty` anywhere in the tree, on either configuration. The
-installed `/etc/inittab` starts the compositor and nothing else — and, per
-Door 3, is not even read yet.
+There is no `getty` anywhere in the tree, on either configuration — and since
+#110 there is an init that would happily start several. systemd's
+`getty.target` puts one on tty1, and its generator adds one on every `console=`
+the kernel command line names. All of them are masked in the rootfs, by name,
+in `iso/mkiso.sh`, which is this rule written down somewhere a boot can obey
+it rather than only somewhere a person can read it.
 
 A getty is worth naming because it is the obvious next thing somebody adds
 when an installed machine is hard to debug, and it would be a complete bypass:
