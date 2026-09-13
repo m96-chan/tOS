@@ -119,6 +119,19 @@ pub struct Config {
     /// configuration file. [`crate::lock::session_user`] is where it comes
     /// from.
     pub credential_user: String,
+    /// Whether a session on this display has to be logged into.
+    ///
+    /// Set by the DRM backend in `main`, and by nothing else: that session is
+    /// a machine's console, where the compositor is the only thing between a
+    /// person and a root shell (#112). A nested or headless one is a window on
+    /// a developer's desktop, already behind whatever that machine asks for,
+    /// and gating it would mean every `cargo test` on a machine whose root has
+    /// a password started at a prompt nobody typed into.
+    ///
+    /// A machine with no password is not gated whatever this says — there
+    /// would be nothing to ask for — which is the same rule the lock obeys and
+    /// the reason the live ISO needs no special case.
+    pub gated: bool,
     /// How long the session goes untouched before it locks, or `None` for
     /// never.
     ///
@@ -179,6 +192,7 @@ impl Default for Config {
             chrome: Chrome::default(),
             credential: PathBuf::from(crate::lock::CREDENTIAL_PATH),
             credential_user: crate::lock::session_user(),
+            gated: false,
             // Five minutes, then five more. The order is the point: locking
             // first means the screen that a passer-by wakes is the prompt,
             // where blanking first would leave five minutes in which a tap on
