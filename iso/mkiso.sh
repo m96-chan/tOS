@@ -87,6 +87,17 @@ trap hand_dist_back EXIT
 # --- initramfs ---------------------------------------------------------
 mkdir -p "$ROOT/bin" "$ROOT/sbin" "$ROOT/dev" "$ROOT/proc" "$ROOT/sys" \
     "$ROOT/tmp" "$ROOT/root" "$ROOT/etc" "$ROOT/lib/modules/$KVER"
+# The rescue session's whole toolbox, and one thing about it belongs on the
+# record rather than in an issue nobody reads twice: `busybox wget -T SEC`
+# stores the parsed number through a null pointer and dies of SIGSEGV before
+# it has looked at the URL (#96). Nothing about this image causes it. Debian's
+# busybox and busybox-static do it alike, a plain bookworm container does it,
+# and so does upstream 1.37: networking/wget.c declares the option `T:+`
+# whatever the configuration, then hands getopt32 a NULL destination for it
+# wherever FEATURE_WGET_TIMEOUT is compiled out — which is everywhere Debian
+# builds — and getopt32.c:567 writes an int through that pointer without the
+# null check the string case one line below it has. A fetch that has to give
+# up on time is `timeout SEC wget ...`, through busybox's own timeout applet.
 cp /bin/busybox "$ROOT/bin/busybox"
 cp "$TOS_BIN" "$ROOT/sbin/tos"
 cp "$INSTALLER_BIN" "$ROOT/sbin/tos-install"
@@ -104,6 +115,28 @@ chmod 755 "$ROOT/init" "$ROOT/sbin/tos" "$ROOT/sbin/tos-install" \
 mkdir -p "$ROOT/etc/tos" "$ROOT/run/live/medium"
 cp .motd_art "$ROOT/etc/tos/motd_art"
 cp iso/profile "$ROOT/etc/profile"
+
+# Every name this machine can resolve without asking a nameserver. Debian gets
+# the file from base-files; the initramfs had nothing at all, so `localhost`
+# was not a name a rescue session could resolve and wget and ping both
+# answered "bad address" for anything running on the machine itself. It goes
+# with the loopback interface /init now brings up: either one alone still
+# leaves that fetch failing, the name for want of an address and the address
+# for want of a route.
+#
+# This file and nothing beside it, each omission measured rather than assumed.
+# glibc looks in files before dns with no /etc/nsswitch.conf telling it to —
+# checked by pinning a real name here and watching the lookup take the pinned
+# address — so that file would only repeat what glibc already does. The NSS
+# modules everyone reaches for first are a dead end for a nearby reason: since
+# glibc 2.34 nss_files and nss_dns are inside libc itself, so this static
+# busybox dlopens nothing and resolves names here with no module on disk.
+# /etc/services is absent because nothing asks for it — busybox's wget never
+# calls getservbyname, it carries 80 and 443 itself. 336 bytes gzipped.
+cat >"$ROOT/etc/hosts" <<'EOF'
+127.0.0.1	localhost
+::1	localhost ip6-localhost ip6-loopback
+EOF
 
 # The font and the SKK dictionary used to be copied in here, and are not any
 # more: they live in the Debian rootfs below, where the session that reads them
@@ -139,16 +172,22 @@ maybe_tool() {
     return 0
 }
 
-# grub-install is in grub2-common, not grub-common: grub-common carries the
-# grub-mkrescue this script already used, which is why it was enough before.
-need_tool sfdisk partx mkfs.ext4 mkfs.vfat mount umount sync grub-install
-maybe_tool grub-mkimage grub-bios-setup grub-probe grub-mkdevicemap \
-    grub-editenv grub-macbless blkid
+need_tool sfdisk partx mkfs.ext4 mkfs.vfat mount umount sync
+maybe_tool blkid
 
-# grub-install reads its modules and templates out of these trees.
-mkdir -p "$ROOT/usr/lib/grub" "$ROOT/usr/share/grub"
-cp -a /usr/lib/grub/. "$ROOT/usr/lib/grub/" 2>/dev/null || true
-cp -a /usr/share/grub/. "$ROOT/usr/share/grub/" 2>/dev/null || true
+# GRUB is deliberately not among them. grub-install plus the module and
+# template trees it reads out of /usr/lib/grub and /usr/share/grub came to
+# 24,453,120 bytes raw and about 10 MB of this gzip — near half the
+# initramfs — and the rootfs carries the same files again for the installer,
+# which has lived there since #20. So a live session and an installed machine
+# lose nothing at all.
+#
+# The one session that loses something is the rescue one, which is the
+# initramfs and has no rootfs to reach: it can still partition a disk and copy
+# a system onto it, and what it left behind would have nothing to start it. So
+# tos-install looks for a grub-install before it offers to erase anything —
+# see Bootloader::detect and Plan::refusal in installer/src/plan.rs — and a
+# rescue session now refuses rather than producing that disk.
 
 # Every shared library those binaries need, resolved transitively by ldd.
 copy_libraries() {
@@ -191,7 +230,8 @@ MODULES="bochs virtio_gpu simpledrm cirrus vmwgfx vboxvideo \
     sd_mod sr_mod cdrom ata_piix ahci libahci virtio_blk virtio_scsi \
     nvme usb_storage uas xhci_pci ehci_pci ohci_pci sdhci_pci mmc_block \
     virtio_net e1000 e1000e r8169 igb \
-    isofs ext4 vfat nls_cp437 nls_iso8859_1 nls_ascii"
+    isofs ext4 vfat nls_cp437 nls_iso8859_1 nls_ascii \
+    crc32c_generic crc32c_intel"
 # The rootfs stack, kept in its own list because it is not about what hardware
 # the machine has: these three are how /init turns one read-only file on the
 # medium into a writable Debian. `loop` makes the squashfs a block device,
@@ -199,6 +239,31 @@ MODULES="bochs virtio_gpu simpledrm cirrus vmwgfx vboxvideo \
 # be written to. Without any one of them the machine falls back to the
 # initramfs session.
 ROOTFS_MODULES="loop squashfs overlay"
+
+# And that the image packs everything /init will reach for. The list is
+# written down twice — here, and in the loop at the top of iso/init — because
+# one of them says what to carry and the other says when to load it, and only
+# this one is read by the thing that packs. This one may hold more: libahci is
+# named here because it is a dependency and never loaded by name. It may not
+# hold less.
+#
+# The way it comes to hold less is somebody adding a module to iso/init
+# because a boot needed it, which is a change that appears to work: modprobe
+# says nothing about a module it cannot find, /init throws its output away,
+# and what breaks is a mount three steps into erasing somebody's disk.
+packed=" $MODULES $ROOTFS_MODULES "
+missing=
+for mod in $(sed -n '/^for mod in /,/; do$/p' iso/init |
+    sed 's/^for mod in //; s/; do$//; s/\\$//'); do
+    case "$packed" in
+    *" $mod "*) ;;
+    *) missing="$missing $mod" ;;
+    esac
+done
+if [ -n "$missing" ]; then
+    echo "mkiso: iso/init loads modules this image does not pack:$missing" >&2
+    exit 1
+fi
 for mod in $MODULES $ROOTFS_MODULES; do
     modprobe -S "$KVER" --show-depends "$mod" 2>/dev/null || true
 # `--show-depends` prints the module's default parameters after its path, so
@@ -233,6 +298,19 @@ done
 # to mount. FAT wants its codepage the same way, which is the ESP under UEFI.
 # Both modules are already on the image; nothing could reach them.
 ln -sf /bin/busybox "$ROOT/sbin/modprobe"
+
+# Asserted here rather than left to a boot test, because losing it costs
+# nothing anybody watches: the image still builds, still boots, and both CI
+# workflows stay green on a machine that cannot resolve its own name. Checking
+# for the name and not the file, since an /etc/hosts without `localhost` in it
+# is the same machine with a longer path to the same surprise. The fetch that
+# would prove the rest of this needs a network, and a smoke boot that reaches
+# the internet is a gate that fails on somebody else's outage.
+if ! grep -q '[[:space:]]localhost' "$ROOT/etc/hosts" 2>/dev/null; then
+    echo "mkiso: the initramfs has no /etc/hosts naming localhost" >&2
+    exit 1
+fi
+
 (cd "$ROOT" && find . | cpio -o -H newc --quiet | gzip -9) \
     >"$ISODIR/boot/initramfs.gz"
 
@@ -248,7 +326,17 @@ ln -sf /bin/busybox "$ROOT/sbin/modprobe"
 # chroot, says so, and carries on. debootstrap would need a privileged
 # container, and the ISO build is something CI has to be able to run.
 ROOTFS="$WORK/rootfs"
+# http and not https, deliberately. apt checks the archive's signature against
+# debian-archive-keyring whichever transport carried it, so TLS would add no
+# integrity this machine does not already have; what it would add is a
+# dependency on the clock. tOS runs no time sync of any kind, and on a board
+# with a flat RTC battery it comes up in 1970, where every certificate is not
+# yet valid and apt fails on every mirror. A machine that cannot reach
+# security.debian.org is the whole of #98, and https is one more way to arrive
+# there. ca-certificates stays installed for everything else the machine will
+# want to talk to.
 MIRROR=${MIRROR:-http://deb.debian.org/debian}
+SECURITY_MIRROR=${SECURITY_MIRROR:-http://security.debian.org/debian-security}
 SUITE=${SUITE:-bookworm}
 
 # Never unpacked rather than deleted afterwards, so the rule also governs
@@ -275,6 +363,17 @@ EOF
 #                           session still runs /bin/sh; see iso/live-session.
 #   busybox                 /sbin/init below, and the applets the installer
 #                           and the profile reach for.
+#   iproute2 procps         `ip`, `ps` and `free`: the first things anybody
+#                           types at a machine they cannot see inside (#97).
+#                           busybox carries applets by all three names and
+#                           Debian's package leaves them off PATH; symlinking
+#                           them there is free and was turned down anyway,
+#                           because busybox's `ip` prints a format no recipe
+#                           and no manual page agrees with, and somebody who
+#                           learns this machine's `ip` learns it wrong. 18
+#                           packages and 13,445,033 bytes unpacked, measured
+#                           in a bookworm container with recommends off and
+#                           the excludes above in place.
 #   ncurses-base            the terminfo for the TERM tOS advertises. Without
 #                           it apt's own progress bar has nothing to draw on.
 #   fonts-vlgothic          the face the compositor loads, now dpkg's problem
@@ -289,9 +388,23 @@ EOF
 #   squashfs-tools          how the installer unpacks this very rootfs.
 #   kmod                    modprobe for a machine that has pivoted.
 ROOTFS_PACKAGES="debian-archive-keyring,ca-certificates,bash,busybox,\
-ncurses-base,fonts-vlgothic,e2fsprogs,dosfstools,fdisk,util-linux,mount,kmod,\
-squashfs-tools,grub2-common,$(echo "$GRUB_PKGS" | tr ' ' ',')"
+iproute2,procps,ncurses-base,fonts-vlgothic,e2fsprogs,dosfstools,fdisk,\
+util-linux,mount,kmod,squashfs-tools,grub2-common,\
+$(echo "$GRUB_PKGS" | tr ' ' ',')"
 
+# Three suites and not one. `bookworm` is the frozen release: a point release
+# folds security fixes back into it, so an image built later picks some of them
+# up, but a machine already installed from an older one never does. It is
+# subscribed to a suite that does not move between point releases, and `apt
+# update` tells it it is up to date while every fix published since goes past
+# it (#98). -security is where those appear first; -updates carries the changes
+# that are not security but cannot wait for the point release either.
+#
+# mmdebstrap takes the extra suites as further mirror arguments and installs
+# from them as well as writing them to sources.list, so the image ships the
+# fixed package rather than merely being able to fetch it afterwards. Measured
+# against the package set above that costs no additional packages and 6.7 kB
+# more to download — the whole of it being a newer ca-certificates.
 mmdebstrap \
     --mode=root \
     --variant=apt \
@@ -299,7 +412,9 @@ mmdebstrap \
     --include="$ROOTFS_PACKAGES" \
     --aptopt='Acquire::Retries "3"' \
     --setup-hook="copy-in $WORK/tos-minimal /etc/dpkg/dpkg.cfg.d" \
-    "$SUITE" "$ROOTFS" "$MIRROR"
+    "$SUITE" "$ROOTFS" "$MIRROR" \
+    "deb $SECURITY_MIRROR $SUITE-security main" \
+    "deb $MIRROR $SUITE-updates main"
 
 # The build has one job and it is this; a rootfs that reached here without the
 # programs the issue is about is not worth putting on an image. The mount and
@@ -333,6 +448,18 @@ fi
 for applet in init reboot poweroff; do
     if ! "$ROOTFS/bin/busybox" --list | grep -qx "$applet"; then
         echo "mkiso: the rootfs busybox has no $applet applet" >&2
+        exit 1
+    fi
+done
+
+# And that mmdebstrap wrote the suites it was handed. It is free to arrange
+# them as it likes — a one-line sources.list today, deb822 under some future
+# version — and a rootfs subscribed to bookworm alone is indistinguishable
+# from a correct one until a CVE is published, which is too late to find out.
+for suffix in security updates; do
+    if ! grep -qr -- "$SUITE-$suffix" "$ROOTFS/etc/apt/sources.list" \
+        "$ROOTFS/etc/apt/sources.list.d"; then
+        echo "mkiso: the rootfs is not subscribed to $SUITE-$suffix" >&2
         exit 1
     fi
 done
@@ -395,10 +522,34 @@ cp iso/dot-profile "$ROOTFS/etc/skel/.profile"
 # on a disk. This is the one a live session answers to.
 echo tos >"$ROOTFS/etc/hostname"
 
-# The kernel's modules, so a machine that has pivoted can still load one. The
-# same pruned tree the initramfs got, metadata and all.
-mkdir -p "$ROOTFS/lib/modules"
-cp -a "$ROOT/lib/modules/$KVER" "$ROOTFS/lib/modules/$KVER"
+# And the file that resolves it and the loopback, which no Debian package
+# ships: /etc/hosts is written by the installer that put the system there, and
+# mmdebstrap is not one. The initramfs got its own copy with #96; this is the
+# same hole on the other side of the pivot, where it is easier to miss because
+# a live session usually has a DNS server to ask and VirtualBox's answers for
+# `localhost`. A machine should not have to ask anyone where its own loopback
+# is — without this, `wget http://localhost/` on a live session with no lease
+# yet says `bad address`, which reads as a network fault and is not one.
+#
+# The installer writes the same two names plus the host it was given, so an
+# installed machine does not inherit this file; it is for the live session and
+# for anything that runs before an install.
+cat >"$ROOTFS/etc/hosts" <<'EOF'
+127.0.0.1	localhost
+127.0.1.1	tos
+::1	localhost ip6-localhost ip6-loopback
+EOF
+
+# No /lib/modules here either, so the initramfs holds the only copy. The cost
+# is worth saying plainly: a machine that has pivoted cannot modprobe anything
+# ever again — switch_root deletes the initramfs, and this is the directory the
+# modprobe left in the rootfs would have looked in.
+#
+# What it does not cost is anything the image does by itself. This was a copy
+# of the same pruned tree, so the only modules it could ever have offered are
+# the ones iso/init loads before the pivot, and iso/init now loads all of them.
+# The three NLS modules were the difference, and the note beside them there
+# says why the kernel wanted one after the pivot.
 
 # The dictionary, converted out of the build container's skkdic rather than
 # installed into the rootfs as a package.

@@ -517,7 +517,11 @@ ask for an address       status bar, about two seconds later:
                          eth0 10.0.2.15/24 via 10.0.2.2
 ```
 
-and on the machine afterwards:
+and on the machine afterwards, in `ip addr` and `ip route` form — which that
+image could only print as `busybox ip`, because its rootfs carried no `ip` of
+that name at all ([#97](https://github.com/m96-chan/tOS/issues/97), since
+answered by putting `iproute2` and `procps` in the rootfs, so the same lines
+come out of `ip` called by its own name now):
 
 ```text
 inet 10.0.2.15/24 brd 10.0.2.255 scope global eth0

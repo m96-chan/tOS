@@ -64,6 +64,18 @@ mount -t devpts none /dev/pts
 mount -t tmpfs none /dev/shm
 mount -t tmpfs none /tmp
 
+# The kernel creates the loopback interface down and leaves it down, and there
+# is no init system on any of the three paths below to bring it up: until this
+# line no tOS machine could talk to itself over IP at all. `wget
+# http://localhost/` resolved and then sat there until TCP gave up two minutes
+# later, which reads like a network fault and is not one.
+#
+# Here rather than in a session script because a link's state belongs to the
+# network namespace and not to the root filesystem, so switch_root carries it:
+# one line covers the installed machine, the live Debian session and the
+# rescue session alike. The kernel gives it 127.0.0.1/8 and ::1 as it comes up.
+ip link set lo up 2>/dev/null || true
+
 # Everything the live session is assembled out of goes under /run: the medium,
 # the squashfs read off it, and the tmpfs the overlay writes into. /run is a
 # mount of its own so that one `mount --move` carries the whole lot across the
@@ -92,12 +104,31 @@ mkdir -p /run/live
 # unclaimed and silent, which is exactly what it looked like. It was missing
 # here before for the same reason nobody noticed: the machines this is booted
 # on take their disk and screen from IDE and VGA, so nothing else needed it.
+#
+# The tail of this list is the least obvious part of it and the reason the rest
+# is now the whole of it. Nothing on the machine has a device that needs those
+# modules: the kernel asks for them *by name*, mid-syscall, by running
+# /sbin/modprobe in whatever root is current at the time — and after
+# switch_root that root is the Debian rootfs, which carries no modules at all.
+# This loop is the last moment in the life of the machine when a module can be
+# loaded, so everything that will ever be wanted is loaded here.
+#
+# Two mounts the installer makes ask that way, and both are the same story.
+# FAT wants a codepage and an iocharset, cp437 and ascii being Debian's
+# defaults, which is the ESP under UEFI. ext4 wants crc32c from the crypto
+# API, because Debian's mke2fs turns metadata_csum on — and `modprobe ext4`
+# does not bring it: ext4 depends on libcrc32c for the symbol, while the
+# algorithm behind it is requested by name at mount time and not before. A
+# live session that had loaded ext4 and nothing else answered
+# `EXT4-fs (sda2): Cannot load crc32c driver` and refused to mount the root
+# filesystem the installer had just made, three steps into erasing a disk.
 for mod in bochs virtio_gpu simpledrm cirrus vmwgfx vboxvideo \
     evdev atkbd i8042 psmouse virtio_input hid_generic usbhid \
     sd_mod sr_mod cdrom ata_piix ahci virtio_blk virtio_scsi \
     nvme usb_storage uas xhci_pci ehci_pci ohci_pci sdhci_pci mmc_block \
     virtio_pci virtio_net e1000 e1000e r8169 igb \
-    isofs ext4 vfat \
+    isofs ext4 vfat nls_cp437 nls_iso8859_1 nls_ascii \
+    crc32c_generic crc32c_intel \
     loop squashfs overlay; do
     modprobe "$mod" 2>/dev/null
 done
@@ -301,6 +332,9 @@ fi
 
 # No rootfs, so this initramfs is the system after all. It has the compositor
 # and busybox and nothing else — no dpkg, no apt, and the compositor's built-in
-# ASCII face instead of a Japanese one. It is a rescue path, and it is still a
-# tOS a person can install from.
+# ASCII face instead of a Japanese one. It has no GRUB either, which is the one
+# of those that is not merely a worse tOS: tos-install will not erase a disk
+# from here, because it could partition it and fill it and still leave nothing
+# able to start it. It says so at the confirmation screen. So this is a session
+# to look at a broken machine from, and no longer one to install from.
 exec /sbin/tos-session

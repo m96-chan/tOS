@@ -9,7 +9,7 @@ use tos_install::app::{App, Command, Stage};
 use tos_install::disk::{self, SysfsSource};
 use tos_install::exec::{Backend, System};
 use tos_install::motd;
-use tos_install::plan::Firmware;
+use tos_install::plan::{Bootloader, Firmware};
 use tos_install::ui::{Screen, Terminal};
 
 /// How long to wait for the rest of an escape sequence before deciding the
@@ -116,12 +116,24 @@ fn print_plan(disks: &[tos_install::Disk]) -> ExitCode {
     let plan = tos_install::Plan::new(
         disk.clone(),
         firmware,
+        Bootloader::detect(&System),
         tos_install::plan::Settings::default(),
     );
     for line in plan.summary() {
         println!("{line}");
     }
     println!();
+
+    // A session that cannot finish the job prints why instead of the steps.
+    // Printing them as well would be the lie this is here to stop: eight
+    // things that are not going to happen, the first of which erases a disk.
+    if let Some(refusal) = plan.refusal() {
+        for line in refusal {
+            eprintln!("{line}");
+        }
+        return ExitCode::FAILURE;
+    }
+
     println!("Steps:");
 
     // Walk the plan against a recorder so the listing is what would really
@@ -137,7 +149,7 @@ fn print_plan(disks: &[tos_install::Disk]) -> ExitCode {
 
 fn run(disks: Vec<tos_install::Disk>, dry_run: bool) -> io::Result<ExitCode> {
     let firmware = Firmware::detect(&System);
-    let mut app = App::new(disks, firmware, dry_run);
+    let mut app = App::new(disks, firmware, Bootloader::detect(&System), dry_run);
 
     let mut terminal = Terminal::acquire()?;
     let (cols, rows) = terminal.size();

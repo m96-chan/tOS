@@ -106,7 +106,18 @@ impl<'a> Installer<'a> {
         self.progress.current = Some(step);
         self.progress.note(format!("── {}", step.label()));
 
-        let outcome = match self.dispatch(step) {
+        // Asked of every step rather than once at the top of `run`, because
+        // `run_step` is a door of its own: a session that cannot finish the
+        // job must not be able to start it through either one. The message is
+        // the first line only — the rest of the reason belongs on the screen
+        // that could still have stopped this, and this is the backstop behind
+        // it rather than the explanation.
+        let result = match self.plan.refusal() {
+            Some(refusal) => Err(refusal[0].to_string()),
+            None => self.dispatch(step),
+        };
+
+        let outcome = match result {
             Ok(()) => StepOutcome::Done,
             Err(message) => {
                 self.progress.note(format!("!! {message}"));
@@ -336,10 +347,15 @@ impl<'a> Installer<'a> {
         // directory and everything just written into it is root's. A home the
         // account cannot write is a shell that cannot save a line of history,
         // which is most of what the rc file above is there for.
-        let _ = self.backend.run(
+        //
+        // Checked, unlike the chmods below it. A chmod that fails leaves a
+        // script that still runs; this failing leaves an account that cannot
+        // write its own home, and an install that reported success is the
+        // only place that would ever have said so.
+        self.command(
             "chown",
             &["-R", &format!("{ACCOUNT_ID}:{ACCOUNT_ID}"), &home],
-        );
+        )?;
 
         let fstab = self.fstab();
         self.write(&format!("{root}/etc/fstab"), &fstab)?;
@@ -672,12 +688,18 @@ const PARTITION_WAIT_ATTEMPTS: usize = 20;
 /// `/boot` is not among them, because it is on the medium rather than in the
 /// initramfs.
 ///
-/// `/usr` is here for what little is under it, and `/usr/lib/grub` with it,
-/// which is what an installed machine would need to put its bootloader back.
-/// The font and the dictionary are not in the initramfs any more — they are
-/// in the rootfs, which is the path this one is not — so a machine installed
-/// this way draws Latin from the compositor's built-in ASCII face and cannot
-/// type Japanese.
+/// `/usr` is here for what little is under it, and that is less than it was:
+/// `/usr/lib/grub` went to the rootfs with the rest of GRUB, so this path can
+/// no longer put a bootloader onto a disk either. The font and the dictionary
+/// left the initramfs the same way — they are in the rootfs, which is the
+/// path this one is not — so a machine installed this way draws Latin from
+/// the compositor's built-in ASCII face and cannot type Japanese.
+///
+/// Which leaves no session that reaches here: the only one without an
+/// `unsquashfs` is the rescue session, and [`Plan::refusal`] stops that one
+/// before it starts. It stays because the two questions are separate — what
+/// goes onto the disk, and whether the disk can then be booted — and it is
+/// only today's image that makes the answers coincide.
 pub const COPIED_DIRECTORIES: &[&str] = &["/bin", "/sbin", "/lib", "/usr", "/etc", "/root"];
 
 /// The files GRUB loads, taken from the live medium.
@@ -855,7 +877,7 @@ mod tests {
     use super::*;
     use crate::disk::Disk;
     use crate::exec::Recorder;
-    use crate::plan::Settings;
+    use crate::plan::{Bootloader, Settings};
 
     fn disk() -> Disk {
         Disk {
@@ -871,7 +893,7 @@ mod tests {
     }
 
     fn plan(firmware: Firmware) -> Plan {
-        Plan::new(disk(), firmware, Settings::default())
+        Plan::new(disk(), firmware, Bootloader::Present, Settings::default())
     }
 
     /// Run a whole installation against a recorder.
@@ -976,6 +998,75 @@ mod tests {
             crate::plan::LIVE_MEDIUM_BOOT
         )));
         assert!(backend.did("initramfs.gz -> /mnt/target/boot/initramfs.gz"));
+    }
+
+    #[test]
+    fn a_session_that_cannot_install_grub_never_touches_the_disk() {
+        // The whole of this change in one assertion. A rescue session runs
+        // Partition, FormatRoot and CopySystem perfectly well and then finds
+        // at the eighth step that it has no grub-install; by then the disk it
+        // was pointed at is gone and what replaced it does not boot. So the
+        // question is asked before the first step instead, and the answer
+        // stops every one of them.
+        let mut backend = rootfsless_backend();
+        let refused = Plan::new(
+            disk(),
+            Firmware::Uefi,
+            Bootloader::Absent,
+            Settings::default(),
+        );
+        let mut installer = Installer::new(refused, &mut backend);
+        let progress = installer.run();
+
+        let failure = progress.failure().expect("it went ahead");
+        assert!(failure.contains("cannot install a bootloader"), "{failure}");
+        for command in [
+            "sfdisk",
+            "mkfs.ext4",
+            "mkfs.vfat",
+            "unsquashfs",
+            "grub-install",
+        ] {
+            assert!(!backend.did(command), "{command} ran anyway");
+        }
+        assert!(
+            backend.actions.is_empty(),
+            "the disk was touched: {:?}",
+            backend.actions
+        );
+    }
+
+    #[test]
+    fn one_step_of_a_refused_installation_is_refused_too() {
+        // `run_step` is a way in of its own, and a guard at the top of `run`
+        // would leave it open.
+        let mut backend = live_backend();
+        let refused = Plan::new(
+            disk(),
+            Firmware::Bios,
+            Bootloader::Absent,
+            Settings::default(),
+        );
+        let outcome = Installer::new(refused, &mut backend).run_step(Step::Partition);
+        assert!(matches!(outcome, StepOutcome::Failed(m) if m.contains("bootloader")));
+        assert!(!backend.did("sfdisk"));
+    }
+
+    #[test]
+    fn a_session_with_grub_installs_as_it_always_did() {
+        // The other half of the assertion above: the refusal is about the one
+        // session that has no GRUB, and not a new way for a live one to fail.
+        let backend = install(Firmware::Uefi);
+        assert!(backend.did("grub-install --target=x86_64-efi"));
+    }
+
+    #[test]
+    fn a_bootloader_is_looked_for_where_debian_and_the_initramfs_keep_one() {
+        assert_eq!(Bootloader::detect(&Recorder::new()), Bootloader::Absent);
+        for path in ["/usr/sbin/grub-install", "/sbin/grub-install"] {
+            let world = Recorder::new().with_existing(path);
+            assert_eq!(Bootloader::detect(&world), Bootloader::Present, "{path}");
+        }
     }
 
     #[test]
@@ -1150,8 +1241,10 @@ mod tests {
             username: "yusuke".into(),
             ..Settings::default()
         };
-        let mut installer =
-            Installer::new(Plan::new(disk(), Firmware::Uefi, settings), &mut backend);
+        let mut installer = Installer::new(
+            Plan::new(disk(), Firmware::Uefi, Bootloader::Present, settings),
+            &mut backend,
+        );
         installer.run();
 
         assert_eq!(written(&backend, "/mnt/target/etc/hostname"), "workshop\n");
@@ -1223,8 +1316,10 @@ mod tests {
             password: "correct horse battery staple".into(),
             ..Settings::default()
         };
-        let mut installer =
-            Installer::new(Plan::new(disk(), Firmware::Uefi, settings), &mut backend);
+        let mut installer = Installer::new(
+            Plan::new(disk(), Firmware::Uefi, Bootloader::Present, settings),
+            &mut backend,
+        );
         let progress = installer.run();
         assert!(progress.failure().is_none());
 
@@ -1257,8 +1352,10 @@ mod tests {
             password: "hunter2".into(),
             ..Settings::default()
         };
-        let mut installer =
-            Installer::new(Plan::new(disk(), Firmware::Uefi, settings), &mut backend);
+        let mut installer = Installer::new(
+            Plan::new(disk(), Firmware::Uefi, Bootloader::Present, settings),
+            &mut backend,
+        );
         let log = installer.run().log.join("\n");
 
         let transcript = format!("{:?}", backend.actions);
@@ -1279,7 +1376,11 @@ mod tests {
                     password: "hunter2".into(),
                     ..Settings::default()
                 };
-                Installer::new(Plan::new(disk(), Firmware::Uefi, settings), &mut backend).run();
+                Installer::new(
+                    Plan::new(disk(), Firmware::Uefi, Bootloader::Present, settings),
+                    &mut backend,
+                )
+                .run();
                 written(&backend, "/mnt/target/etc/tos/shadow")
             })
             .collect();
