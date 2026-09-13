@@ -232,9 +232,15 @@ fn run(disks: Vec<tos_install::Disk>, dry_run: bool) -> io::Result<ExitCode> {
 
     if reboot {
         let mut system = System;
-        // Flush first: the reboot may not give the kernel time to.
-        let _ = system.run("sync", &[]);
-        let _ = system.run("reboot", &[]);
+        // Everything below this line is unreachable on a machine that
+        // restarts: `App::reboot` only returns the reason it did not. That is
+        // the whole of #104 — the offer used to be answered by a `reboot`
+        // off the PATH whose exit status meant nothing, so the one outcome
+        // the user needed to hear about was the one that could not be seen.
+        let failure = app.reboot(&mut system);
+        eprintln!("tos-install: the machine did not reboot: {failure}");
+        eprintln!("tos-install: tOS is on the disk; restart when you are ready.");
+        return Ok(ExitCode::FAILURE);
     }
 
     Ok(if app.installed || dry_run {
