@@ -865,14 +865,45 @@ impl Compositor {
         }
     }
 
+    /// Whether the arrow is drawn over the box that is up.
+    ///
+    /// Only over a login screen. See [`Compositor::locked_input`] for why a
+    /// lock is the other answer.
+    fn lock_shows_the_pointer(&self) -> bool {
+        self.lock.as_ref().map(LockScreen::purpose) == Some(lock::Purpose::Login)
+    }
+
     /// Everything that arrives while the screen is locked.
     ///
-    /// One rule with no exceptions: a key goes to the lock, and nothing else
-    /// goes anywhere. Focus notifications are dropped along with the rest —
+    /// A key goes to the lock and nothing else goes anywhere, with one
+    /// exception. Focus notifications are dropped along with the rest —
     /// telling a pane it has the focus is still writing to a pane on behalf of
     /// somebody who has not proved who they are, and an exception is how a
     /// gate stops being one.
+    ///
+    /// The exception is where the pointer is, and only at a login screen.
+    /// What the gate is for is what a button does — a middle click pasting
+    /// the primary selection into a shell, a drag selecting and copying what
+    /// is on screen — and a motion carries an `(x, y)` and nothing else. A
+    /// lock has a session behind it and a hand in front of it that has not
+    /// said whose it is, so that one keeps the older rule of taking nothing
+    /// at all. A login has no session behind it and nobody has walked away
+    /// from it, and the arrow is the only thing tOS has to say that the mouse
+    /// works — on the first screen it ever shows, where a missing one is
+    /// indistinguishable from a mouse that is not plugged in.
+    ///
+    /// Either way the buttons go nowhere: this reaches `Pointer::moved_to`
+    /// and never `route_mouse`, so there is no selection, no paste and no
+    /// pane to click into.
     fn locked_input(&mut self, event: InputEvent) -> bool {
+        if let InputEvent::Pointer(pointer) = event {
+            if !self.lock_shows_the_pointer() {
+                return false;
+            }
+            let x = pointer.x.max(0.0) as u32;
+            let y = pointer.y.max(0.0) as u32;
+            return self.pointer.moved_to(x, y);
+        }
         let InputEvent::Key(key) = event else {
             return false;
         };
@@ -2895,13 +2926,17 @@ impl Compositor {
 
     /// Where the arrow belongs this frame, or `None` for no arrow at all.
     ///
-    /// The lock is the only thing that takes it away other than the pointer's
+    /// A lock is the only thing that takes it away other than the pointer's
     /// own state: a locked screen shows nothing of the session, and an arrow
     /// left on top of the password box would be the one thing on screen still
     /// tracking a hand that has not proved whose it is. `locked_input` drops
-    /// pointer events anyway, so it cannot move while it is gone.
+    /// pointer events there anyway, so it cannot move while it is gone.
+    ///
+    /// A login screen is not that (#122). Nothing is behind it and nobody has
+    /// walked away from it, and what a motion would give away — an `(x, y)`
+    /// over a panel showing nothing but a password box — is nothing.
     fn pointer_rect(&self) -> Option<PixelRect> {
-        if self.lock.is_some() {
+        if self.lock.is_some() && !self.lock_shows_the_pointer() {
             return None;
         }
         let rect = self.pointer.rect(self.cell_size())?;
@@ -3316,16 +3351,35 @@ impl Compositor {
     /// clear that ran once cleared one of them.
     fn render_locked(&mut self, surface: &mut Surface<'_>) {
         surface.clear(self.chrome.background);
-        // The clear took the arrow with it, and `pointer_rect` says there is
-        // none while the lock is up. Forgetting where it was is what keeps
-        // those two agreeing: a remembered rectangle that can never be matched
-        // would leave `needs_render` true for every pass of a locked session,
-        // which is a frame per poll for as long as nobody is there.
-        self.pointer.set_painted(None);
         let area = PixelRect::new(0, 0, self.size.0, self.size.1);
         if let Some(lock) = &self.lock {
             lock.draw(surface, &mut self.fonts, area, &self.chrome, Instant::now());
         }
+
+        // The clear took the arrow with it, so what is remembered as painted
+        // has to be what this frame painted. Over a lock that is nothing:
+        // `pointer_rect` says there is no arrow and `locked_input` drops the
+        // events that would move one, and remembering a rectangle that could
+        // never be matched would leave `needs_render` true for every pass of a
+        // locked session — a frame per poll for as long as nobody is there.
+        //
+        // Over a login the arrow is drawn, and over the box rather than under
+        // it, for the reason the unlocked path draws it last: whatever it is
+        // pointing at, it has to be on top of. The rectangle is remembered for
+        // the same reason as above, and settles the same way — a pointer that
+        // is not moving matches what was painted and asks for nothing.
+        let pointer = self.pointer_rect();
+        if let Some(rect) = pointer {
+            let (cw, ch) = self.cell_size();
+            pointer::draw(
+                surface,
+                (rect.x, rect.y),
+                (cw, ch),
+                self.chrome.foreground,
+                self.chrome.background,
+            );
+        }
+        self.pointer.set_painted(pointer);
         // The panes are still running and still marking damage nobody is
         // drawing. Dropping it is what lets the loop idle instead of finding
         // work outstanding on every pass, and nothing is lost by it: unlocking
@@ -5262,6 +5316,109 @@ mod tests {
         assert!(
             pixels.iter().any(|&p| p != 0),
             "the login screen drew nothing at all"
+        );
+    }
+
+    /// A hand moving over the panel, in display pixels.
+    fn moved_to(compositor: &mut Compositor, x: f64, y: f64) -> bool {
+        compositor.handle_input(InputEvent::Pointer(tos_input::PointerEvent {
+            x,
+            y,
+            button: None,
+            action: MouseAction::Motion,
+            modifiers: tos_input::Modifiers::NONE,
+        }))
+    }
+
+    #[test]
+    fn a_login_screen_shows_the_pointer() {
+        // #122. The arrow is the only thing tOS has that says a mouse is
+        // there — `Pointer::seen` is set by an event that arrived, never by a
+        // device claiming to exist — and a login screen is the first screen
+        // tOS shows anybody. No arrow there is indistinguishable from no
+        // mouse there.
+        let mut compositor = console_with("login-pointer", Some("tos"));
+        assert_eq!(
+            compositor.lock_screen().map(|screen| screen.purpose()),
+            Some(lock::Purpose::Login)
+        );
+        assert!(
+            compositor.pointer_rect().is_none(),
+            "an arrow before any device had said anything"
+        );
+
+        assert!(
+            moved_to(&mut compositor, 40.0, 40.0),
+            "a motion that moved the arrow owes a frame"
+        );
+        assert_eq!(
+            compositor.pointer_rect().map(|rect| (rect.x, rect.y)),
+            Some((40, 40))
+        );
+    }
+
+    #[test]
+    fn a_lock_screen_still_takes_the_pointer_away() {
+        // The half of #122 that deliberately did not change. A lock has a
+        // session behind it and a hand in front of it that has not said whose
+        // it is; a login has neither.
+        let mut compositor = compositor_with_password("lock-pointer");
+        assert!(moved_to(&mut compositor, 40.0, 40.0));
+        assert!(compositor.pointer_rect().is_some());
+
+        compositor.lock_session();
+        assert_eq!(
+            compositor.lock_screen().map(|screen| screen.purpose()),
+            Some(lock::Purpose::Lock)
+        );
+        assert!(
+            compositor.pointer_rect().is_none(),
+            "the arrow stayed where the hand left it, on top of the password box"
+        );
+        assert!(
+            !moved_to(&mut compositor, 200.0, 200.0),
+            "a locked screen took a motion and asked for a frame for it"
+        );
+        assert!(compositor.pointer_rect().is_none());
+    }
+
+    #[test]
+    fn a_click_at_the_login_screen_goes_nowhere() {
+        // Letting the arrow through is letting a position through and nothing
+        // else: this reaches `Pointer::moved_to` and never `route_mouse`.
+        let mut compositor = console_with("login-click", Some("tos"));
+        for (action, y) in [(MouseAction::Press, 20.0), (MouseAction::Drag, 60.0)] {
+            compositor.handle_input(InputEvent::Pointer(tos_input::PointerEvent {
+                x: 20.0,
+                y,
+                button: Some(MouseButton::Left),
+                action,
+                modifiers: tos_input::Modifiers::NONE,
+            }));
+        }
+        assert!(compositor.is_locked(), "a click opened the session");
+        assert_eq!(panes_running(&compositor), 0);
+        assert!(compositor.mouse_grab.is_none());
+    }
+
+    #[test]
+    fn a_login_screen_stops_asking_for_frames_once_the_pointer_stands_still() {
+        // The counterpart of
+        // `a_locked_screen_stops_asking_for_frames_on_the_pointer_s_account`.
+        // That one settles because the arrow belongs nowhere and the locked
+        // frame forgets where it was; this one has an arrow to draw, so it
+        // settles only if the frame remembers the rectangle it drew it into.
+        let mut compositor = console_with("login-pointer-idle", Some("tos"));
+        assert!(moved_to(&mut compositor, 40.0, 40.0));
+        let mut framebuffer = tos_render::OwnedFramebuffer::new(640, 360);
+        {
+            let mut surface = framebuffer.surface();
+            compositor.render_frame(&mut surface, true);
+        }
+        assert!(compositor.is_locked());
+        assert!(
+            !compositor.needs_render(),
+            "a login screen with a pointer on it repaints on every pass"
         );
     }
 

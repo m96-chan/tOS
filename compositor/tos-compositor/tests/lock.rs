@@ -9,7 +9,7 @@
 use std::time::{Duration, Instant};
 
 use tos_compositor::{Compositor, Config};
-use tos_input::{InputEvent, KeyCode, KeyEvent, Modifiers};
+use tos_input::{InputEvent, KeyCode, KeyEvent, Modifiers, MouseAction, PointerEvent};
 use tos_render::OwnedFramebuffer;
 
 const SIZE: (u32, u32) = (800, 480);
@@ -22,6 +22,16 @@ const ACCOUNT: &str = "tos";
 /// A compositor running `command`, with a credential file of this test's own
 /// making beside it.
 fn compositor(name: &str, command: &[&str]) -> Compositor {
+    built(name, command, false)
+}
+
+/// The same on a machine's console, which is the display that gets asked who
+/// is there: it comes up at a login screen with no session under it (#112).
+fn console(name: &str) -> Compositor {
+    built(name, &["/bin/sh", "-c", "sleep 30"], true)
+}
+
+fn built(name: &str, command: &[&str], gated: bool) -> Compositor {
     let path = std::env::temp_dir().join(format!("tos-lock-test-{}-{name}", std::process::id()));
     let hash = tos_crypt::sha512crypt::hash(PASSWORD.as_bytes(), b"tOSlockscreen");
     // /etc/shadow's format, because that is the file the lock reads now: the
@@ -39,6 +49,7 @@ fn compositor(name: &str, command: &[&str]) -> Compositor {
         inactive_fade: 0,
         credential: path,
         credential_user: ACCOUNT.into(),
+        gated,
         ..Config::default()
     };
     Compositor::new(config, SIZE, None).expect("compositor")
@@ -86,6 +97,27 @@ fn type_password(compositor: &mut Compositor, password: &str) {
 fn row_has_ink(framebuffer: &OwnedFramebuffer, y: u32, background: u32) -> bool {
     (0..SIZE.0).any(|x| framebuffer.pixel(x, y) != background)
 }
+
+/// Whether anything but the background is inside this square of pixels.
+fn ink_in(framebuffer: &OwnedFramebuffer, at: (u32, u32), side: u32, background: u32) -> bool {
+    (at.1..at.1 + side).any(|y| (at.0..at.0 + side).any(|x| framebuffer.pixel(x, y) != background))
+}
+
+/// A hand moving over the panel, in display pixels.
+fn move_pointer(compositor: &mut Compositor, x: f64, y: f64) {
+    compositor.handle_input(InputEvent::Pointer(PointerEvent {
+        x,
+        y,
+        button: None,
+        action: MouseAction::Motion,
+        modifiers: Modifiers::NONE,
+    }));
+}
+
+/// The corner of the panel, which the box in the middle of it does not reach,
+/// so anything that turns up here is the arrow and nothing else.
+const CORNER: (u32, u32) = (8, 8);
+const CORNER_SIDE: u32 = 48;
 
 #[test]
 fn a_locked_screen_shows_nothing_of_the_session() {
@@ -242,4 +274,53 @@ fn a_wrong_password_changes_nothing_but_the_message() {
     assert!(c.is_locked(), "a wrong password is not a way out");
     assert_eq!(c.lock_screen().expect("still locked").attempts(), 1);
     assert!(!row_has_ink(&framebuffer, text_row, background));
+}
+
+#[test]
+fn a_login_screen_paints_the_arrow_where_the_hand_is() {
+    // #122. `pointer_rect` deciding there ought to be an arrow is a different
+    // claim from a frame having one in it, and an arrow that is not on the
+    // screen is the whole of what this is about — which is why this asks the
+    // pixels rather than the compositor.
+    let mut c = console("login-arrow");
+    assert!(
+        c.is_locked(),
+        "a console came up without asking who was there"
+    );
+    let background = Config::default().chrome.background.pack();
+    let mut framebuffer = OwnedFramebuffer::new(SIZE.0, SIZE.1);
+
+    render_onto(&mut c, &mut framebuffer);
+    assert!(
+        !ink_in(&framebuffer, CORNER, CORNER_SIDE, background),
+        "the corner had something in it before the pointer did"
+    );
+
+    move_pointer(&mut c, 12.0, 12.0);
+    render_onto(&mut c, &mut framebuffer);
+    assert!(
+        ink_in(&framebuffer, CORNER, CORNER_SIDE, background),
+        "the login screen drew no arrow where the hand was"
+    );
+}
+
+#[test]
+fn a_locked_screen_paints_no_arrow() {
+    // The other half, which did not change: a lock has a session behind it
+    // and a hand in front of it that has not said whose it is.
+    let mut c = compositor("lock-arrow", &["/bin/sh", "-c", "sleep 30"]);
+    let background = Config::default().chrome.background.pack();
+    let mut framebuffer = OwnedFramebuffer::new(SIZE.0, SIZE.1);
+
+    move_pointer(&mut c, 12.0, 12.0);
+    assert!(c.lock_session());
+    render_onto(&mut c, &mut framebuffer);
+    assert!(
+        !ink_in(&framebuffer, CORNER, CORNER_SIDE, background),
+        "the arrow was left on top of the password box"
+    );
+
+    move_pointer(&mut c, 20.0, 20.0);
+    render_onto(&mut c, &mut framebuffer);
+    assert!(!ink_in(&framebuffer, CORNER, CORNER_SIDE, background));
 }
