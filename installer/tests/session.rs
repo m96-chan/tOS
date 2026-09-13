@@ -108,6 +108,31 @@ impl Session {
         self.screen().contains(needle)
     }
 
+    /// Read whatever the program has to say for `ms`, so that the assertion
+    /// after a keypress is made on a screen that has caught up with it.
+    ///
+    /// `wait_for` cannot do this job and looked as though it could: it returns
+    /// the moment its needle is on screen, and a needle that was *already*
+    /// there returns before the pty has been read at all — every screen here
+    /// carries the banner, so `wait_for("nothing")` matched "nothing is
+    /// written to disk" and judged the next assertion on the frame from before
+    /// the key was typed. Removing the guard being tested left the test green.
+    fn settle(&mut self, ms: u64) {
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        let mut buf = [0u8; 65536];
+        while Instant::now() < deadline {
+            if !self.pty.poll_readable(20).unwrap_or(false) {
+                continue;
+            }
+            match self.pty.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => self.terminal.advance(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => break,
+            }
+        }
+    }
+
     /// What is on screen right now.
     fn screen(&self) -> String {
         self.terminal.grid().to_text()
@@ -338,8 +363,7 @@ fn a_machine_with_no_usable_disk_says_so() {
 
     // And it refuses to go any further.
     session.type_keys(b"\r");
-    std::thread::sleep(Duration::from_millis(300));
-    session.wait_for("nothing");
+    session.settle(400);
     assert!(
         !session.screen().contains("Where should tOS go?"),
         "{}",
@@ -424,8 +448,7 @@ fn a_rescue_session_will_not_take_the_disk_name() {
 
     // Typing the name anyway starts nothing.
     session.type_keys(b"vda\r");
-    std::thread::sleep(Duration::from_millis(300));
-    session.wait_for("nothing");
+    session.settle(400);
     assert!(
         !session.screen().contains("Partition the disk"),
         "{}",

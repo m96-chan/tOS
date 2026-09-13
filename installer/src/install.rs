@@ -347,10 +347,15 @@ impl<'a> Installer<'a> {
         // directory and everything just written into it is root's. A home the
         // account cannot write is a shell that cannot save a line of history,
         // which is most of what the rc file above is there for.
-        let _ = self.backend.run(
+        //
+        // Checked, unlike the chmods below it. A chmod that fails leaves a
+        // script that still runs; this failing leaves an account that cannot
+        // write its own home, and an install that reported success is the
+        // only place that would ever have said so.
+        self.command(
             "chown",
             &["-R", &format!("{ACCOUNT_ID}:{ACCOUNT_ID}"), &home],
-        );
+        )?;
 
         let fstab = self.fstab();
         self.write(&format!("{root}/etc/fstab"), &fstab)?;
