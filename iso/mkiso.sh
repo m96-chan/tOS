@@ -409,7 +409,27 @@ EOF
 #   grub2-common $GRUB_PKGS the installer's bootloader step, likewise.
 #   squashfs-tools          how the installer unpacks this very rootfs.
 #   kmod                    modprobe for a machine that has pivoted.
-ROOTFS_PACKAGES="debian-archive-keyring,ca-certificates,bash,systemd-sysv,\
+#   udev                    the thing that makes `/dev/disk/by-label` exist.
+#                           Debian ships it as its own binary package and
+#                           nothing here pulls it: `systemd-sysv` depends on
+#                           `systemd`, and `systemd` only *recommends* `udev`,
+#                           which mmdebstrap does not install. Without it a
+#                           machine boots with systemd as PID 1 and no device
+#                           units at all, so every `LABEL=` line in fstab that
+#                           is not already mounted waits 90 seconds for a
+#                           device node nobody will create and then fails
+#                           `local-fs.target`. `/` survives that — the
+#                           initramfs mounted it before systemd started — so
+#                           the one line that actually breaks is the ESP, and
+#                           only a UEFI install has one. That install then
+#                           lands in emergency mode, where `sulogin` says
+#                           "the root account is locked" and means it: Debian's
+#                           root carries `*` and tOS never changes it, so there
+#                           is no way back in. Found by installing 37322ed8 and
+#                           rebooting it; `blkid` could read both labels the
+#                           whole time, which is what made it look like a
+#                           filesystem problem rather than a missing package.
+ROOTFS_PACKAGES="debian-archive-keyring,ca-certificates,bash,systemd-sysv,udev,\
 busybox,iproute2,procps,ncurses-base,fonts-vlgothic,e2fsprogs,dosfstools,\
 fdisk,util-linux,mount,kmod,squashfs-tools,grub2-common,\
 $(echo "$GRUB_PKGS" | tr ' ' ',')"
