@@ -87,6 +87,17 @@ trap hand_dist_back EXIT
 # --- initramfs ---------------------------------------------------------
 mkdir -p "$ROOT/bin" "$ROOT/sbin" "$ROOT/dev" "$ROOT/proc" "$ROOT/sys" \
     "$ROOT/tmp" "$ROOT/root" "$ROOT/etc" "$ROOT/lib/modules/$KVER"
+# The rescue session's whole toolbox, and one thing about it belongs on the
+# record rather than in an issue nobody reads twice: `busybox wget -T SEC`
+# stores the parsed number through a null pointer and dies of SIGSEGV before
+# it has looked at the URL (#96). Nothing about this image causes it. Debian's
+# busybox and busybox-static do it alike, a plain bookworm container does it,
+# and so does upstream 1.37: networking/wget.c declares the option `T:+`
+# whatever the configuration, then hands getopt32 a NULL destination for it
+# wherever FEATURE_WGET_TIMEOUT is compiled out — which is everywhere Debian
+# builds — and getopt32.c:567 writes an int through that pointer without the
+# null check the string case one line below it has. A fetch that has to give
+# up on time is `timeout SEC wget ...`, through busybox's own timeout applet.
 cp /bin/busybox "$ROOT/bin/busybox"
 cp "$TOS_BIN" "$ROOT/sbin/tos"
 cp "$INSTALLER_BIN" "$ROOT/sbin/tos-install"
@@ -104,6 +115,28 @@ chmod 755 "$ROOT/init" "$ROOT/sbin/tos" "$ROOT/sbin/tos-install" \
 mkdir -p "$ROOT/etc/tos" "$ROOT/run/live/medium"
 cp .motd_art "$ROOT/etc/tos/motd_art"
 cp iso/profile "$ROOT/etc/profile"
+
+# Every name this machine can resolve without asking a nameserver. Debian gets
+# the file from base-files; the initramfs had nothing at all, so `localhost`
+# was not a name a rescue session could resolve and wget and ping both
+# answered "bad address" for anything running on the machine itself. It goes
+# with the loopback interface /init now brings up: either one alone still
+# leaves that fetch failing, the name for want of an address and the address
+# for want of a route.
+#
+# This file and nothing beside it, each omission measured rather than assumed.
+# glibc looks in files before dns with no /etc/nsswitch.conf telling it to —
+# checked by pinning a real name here and watching the lookup take the pinned
+# address — so that file would only repeat what glibc already does. The NSS
+# modules everyone reaches for first are a dead end for a nearby reason: since
+# glibc 2.34 nss_files and nss_dns are inside libc itself, so this static
+# busybox dlopens nothing and resolves names here with no module on disk.
+# /etc/services is absent because nothing asks for it — busybox's wget never
+# calls getservbyname, it carries 80 and 443 itself. 336 bytes gzipped.
+cat >"$ROOT/etc/hosts" <<'EOF'
+127.0.0.1	localhost
+::1	localhost ip6-localhost ip6-loopback
+EOF
 
 # The font and the SKK dictionary used to be copied in here, and are not any
 # more: they live in the Debian rootfs below, where the session that reads them
@@ -233,6 +266,19 @@ done
 # to mount. FAT wants its codepage the same way, which is the ESP under UEFI.
 # Both modules are already on the image; nothing could reach them.
 ln -sf /bin/busybox "$ROOT/sbin/modprobe"
+
+# Asserted here rather than left to a boot test, because losing it costs
+# nothing anybody watches: the image still builds, still boots, and both CI
+# workflows stay green on a machine that cannot resolve its own name. Checking
+# for the name and not the file, since an /etc/hosts without `localhost` in it
+# is the same machine with a longer path to the same surprise. The fetch that
+# would prove the rest of this needs a network, and a smoke boot that reaches
+# the internet is a gate that fails on somebody else's outage.
+if ! grep -q '[[:space:]]localhost' "$ROOT/etc/hosts" 2>/dev/null; then
+    echo "mkiso: the initramfs has no /etc/hosts naming localhost" >&2
+    exit 1
+fi
+
 (cd "$ROOT" && find . | cpio -o -H newc --quiet | gzip -9) \
     >"$ISODIR/boot/initramfs.gz"
 
