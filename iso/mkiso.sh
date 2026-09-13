@@ -369,6 +369,16 @@ mkdir -p "$ROOTFS/etc/tos" "$ROOTFS/etc/profile.d" "$ROOTFS/run/live/medium"
 cp .motd_art "$ROOTFS/etc/tos/motd_art"
 cp iso/profile "$ROOTFS/etc/profile.d/tos.sh"
 
+# And through ~/.bashrc for the shell a pane actually runs, which is an
+# interactive shell that is not a login shell — the one case bash reads that
+# file and neither /etc/profile nor $ENV. /root is the one that matters, since
+# the session runs as root and every pane inherits its HOME; /etc/skel is for
+# the account the installer creates, so that `su -` lands somewhere furnished
+# rather than on a bare `bash-5.2$`.
+mkdir -p "$ROOTFS/etc/skel" "$ROOTFS/root"
+cp iso/bashrc "$ROOTFS/root/.bashrc"
+cp iso/bashrc "$ROOTFS/etc/skel/.bashrc"
+
 # mmdebstrap leaves the build machine's own /etc/resolv.conf in the rootfs. On
 # a container host that is the container's: a resolver address that means
 # nothing on any machine this image is carried to, and a search domain that

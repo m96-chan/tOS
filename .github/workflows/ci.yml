@@ -118,3 +118,6 @@ jobs:
           shellcheck --severity=warning iso/build.sh iso/run.sh iso/mkiso.sh \
             iso/init iso/live-session iso/check-rootfs.sh
           shellcheck --shell=sh --severity=warning iso/profile
+          # And the rc file, which is bash by definition: it exists because
+          # bash reads it where it reads neither /etc/profile nor $ENV.
+          shellcheck --shell=bash --severity=warning iso/bashrc

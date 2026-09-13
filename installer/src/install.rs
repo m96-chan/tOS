@@ -318,6 +318,16 @@ impl<'a> Installer<'a> {
         self.backend
             .create_dir(&home)
             .map_err(|e| format!("cannot create {home}: {e}"))?;
+        // Furnished, where the shell that reads it is there. An interactive
+        // shell that is not a login shell reads ~/.bashrc and nothing else —
+        // not /etc/profile, not $ENV — so without this the account lands on a
+        // bare `bash-5.2$` with no history, no colour and no message of the
+        // day. The rootfs ships the same file as /root/.bashrc and
+        // /etc/skel/.bashrc; this is the copy for the account that did not
+        // exist when the image was built.
+        if self.login_shell(&root) == "/bin/bash" {
+            self.write(&format!("{home}/.bashrc"), BASHRC)?;
+        }
 
         let fstab = self.fstab();
         self.write(&format!("{root}/etc/fstab"), &fstab)?;
@@ -373,7 +383,8 @@ impl<'a> Installer<'a> {
         let user = &settings.username;
         let passwd = format!("{root}/etc/passwd");
         let group = format!("{root}/etc/group");
-        let account = format!("{user}:*:1000:1000:{user}:/home/{user}:/bin/sh\n");
+        let shell = self.login_shell(root);
+        let account = format!("{user}:*:1000:1000:{user}:/home/{user}:{shell}\n");
         let membership = format!("{user}:x:1000:\n");
 
         // Each file answers for itself. Deciding both from whether `passwd`
@@ -385,6 +396,23 @@ impl<'a> Installer<'a> {
         // successful install.
         self.add_account(&passwd, &account, "root:*:0:0:root:/root:/bin/sh\n")?;
         self.add_account(&group, &membership, "root:x:0:\n")
+    }
+
+    /// The shell to name in `/etc/passwd`, which is whichever one is there.
+    ///
+    /// The Debian rootfs has bash and that is the shell a person expects — ash
+    /// has no programmable completion, a weaker line editor, no arrays and no
+    /// `[[`, and somebody who brings their dotfiles with them brings bash
+    /// ones. But the fallback path puts the busybox world on the disk, which
+    /// has no bash at all, and a passwd naming one there is a login that fails
+    /// rather than a shell that is merely spartan. So it is asked, not assumed
+    /// — the same question `iso/live-session` asks on the live side.
+    fn login_shell(&self, root: &str) -> &'static str {
+        if self.backend.exists(&format!("{root}/bin/bash")) {
+            "/bin/bash"
+        } else {
+            "/bin/sh"
+        }
     }
 
     /// Add one line to an account file, or write the file if it is not there.
@@ -717,7 +745,11 @@ fn planning_backend_for(world: &dyn crate::exec::Backend) -> crate::exec::Record
         // the plan shows the append a real install makes rather than the
         // overwrite it would only do onto a disk that came from the busybox
         // world.
-        for file in ["etc/passwd", "etc/group"] {
+        // The account files the unpacked rootfs will bring with it, so the
+        // plan shows the append a real install makes rather than the overwrite
+        // it would only do onto a disk that came from the busybox world — and
+        // the bash it brings, which is what decides the login shell it writes.
+        for file in ["etc/passwd", "etc/group", "bin/bash"] {
             backend
                 .existing
                 .push(format!("{}/{file}", crate::plan::MOUNT_POINT));
@@ -742,6 +774,13 @@ pub(crate) fn live_planning_backend() -> crate::exec::Recorder {
     planning_backend_for(&world)
 }
 
+/// The `~/.bashrc` a tOS machine gives an account it creates.
+///
+/// `include_str!` rather than a second copy: `iso/mkiso.sh` installs this same
+/// file as `/root/.bashrc` and `/etc/skel/.bashrc` inside the image, and a
+/// machine installed from an image is meant to be that image.
+const BASHRC: &str = include_str!("../../iso/bashrc");
+
 /// Where the session's environment is written, and what /etc/inittab respawns.
 pub const SESSION_SCRIPT_PATH: &str = "/etc/tos-session";
 
@@ -764,10 +803,15 @@ const SESSION_SCRIPT: &str = "#!/bin/sh\n\
                               # Written by the tOS installer.\n\
                               # iso/live-session is the live counterpart.\n\
                               export HOME=/root\n\
-                              export SHELL=/bin/sh\n\
+                              if [ -x /bin/bash ]; then\n\
+                              SHELL=/bin/bash\n\
+                              else\n\
+                              SHELL=/bin/sh\n\
+                              fi\n\
+                              export SHELL\n\
                               export TERM=xterm-256color\n\
                               export TOS=1\n\
-                              export ENV=/etc/profile\n\
+                              [ \"$SHELL\" = /bin/bash ] || export ENV=/etc/profile\n\
                               export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
                               exec /sbin/tos\n";
 
@@ -1284,6 +1328,47 @@ mod tests {
     // built squashfs.
 
     #[test]
+    fn an_account_on_a_debian_disk_gets_bash_and_a_bashrc_to_go_with_it() {
+        // #82. ash has no programmable completion, a much weaker line editor,
+        // no arrays and no `[[`, and every dotfile somebody arrives with is a
+        // bash dotfile — so a machine that hands them `/bin/sh` reads as
+        // broken rather than as deliberately small. The rc file is half of it:
+        // a pane runs an interactive shell that is not a login shell, which is
+        // the one case bash reads ~/.bashrc and neither /etc/profile nor $ENV.
+        let backend = install(Firmware::Uefi);
+
+        let account = appended(&backend, "/mnt/target/etc/passwd");
+        assert!(
+            account.contains(":/home/tos:/bin/bash\n"),
+            "the account should log in to bash: {account}"
+        );
+        let bashrc = written(&backend, "/mnt/target/home/tos/.bashrc");
+        assert!(bashrc.contains("HISTCONTROL"), "{bashrc}");
+        assert_eq!(
+            bashrc, BASHRC,
+            "the installed rc file is not the one in the tree"
+        );
+    }
+
+    #[test]
+    fn a_disk_that_got_the_busybox_world_is_not_promised_a_bash() {
+        // The fallback copies the initramfs, which has no bash anywhere. A
+        // passwd naming one there is a login that fails rather than a shell
+        // that is merely spartan, and an rc file for it is furniture for a
+        // room nobody can enter.
+        let mut backend = rootfsless_backend();
+        install_with(Firmware::Uefi, &mut backend);
+
+        let passwd = written(&backend, "/mnt/target/etc/passwd");
+        assert!(passwd.contains(":/bin/sh\n"), "{passwd}");
+        assert!(!passwd.contains("bash"), "{passwd}");
+        assert!(
+            !wrote(&backend, "/mnt/target/home/tos/.bashrc"),
+            "a bashrc was written for a disk with no bash"
+        );
+    }
+
+    #[test]
     fn a_group_file_that_is_missing_on_its_own_is_written_whole() {
         // The two files used to be decided together, from whether passwd
         // existed, and `append_file` creates what it cannot open — so a root
@@ -1337,7 +1422,7 @@ mod tests {
             let mut found: Vec<String> = script
                 .lines()
                 .map(|line| line.trim().trim_end_matches('\\').trim().to_string())
-                .filter(|line| line.starts_with("export "))
+                .filter(|line| line.contains("export "))
                 .collect();
             found.sort();
             found

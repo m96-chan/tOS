@@ -154,7 +154,8 @@ argument in the installer beside `CMDLINE`.
 | `mkiso.sh`  | container-side build: static binaries, initramfs, Debian rootfs, `grub-mkrescue` |
 | `init`      | initramfs PID 1: mounts, modprobe, then `switch_root` into `root=`, into the squashfs overlay, or into neither |
 | `live-session` | PID 1 of a live session either way: `/init` execs the copy inside the rootfs after pivoting, and the initramfs copy when there was no rootfs to pivot into. The session's environment and the loop that restarts the compositor |
-| `profile`   | sourced by every shell; prints the banner and the install hint |
+| `profile`   | `/etc/profile.d/tos.sh` in the rootfs, `/etc/profile` in the initramfs: the banner and the install hint, for a login shell or for an ash pane through `ENV` |
+| `bashrc`    | `/root/.bashrc` and `/etc/skel/.bashrc`: history, prompt, colour and the banner, for the interactive non-login shell a pane actually runs |
 | `run.sh`    | boots `dist/tos-<arch>.iso` in VirtualBox, and cleans up after |
 
 ## Known limits
@@ -175,12 +176,11 @@ argument in the installer beside `CMDLINE`.
   to bind to anything; the rest are packed and untried, and `r8169` ships
   without its `rtl_nic` firmware. `docs/design/network.md` records what was
   actually observed.
-- The session still runs `/bin/sh`, which in the rootfs is dash. `bash` is
-  installed, and switching to it is two lines rather than one (#82): `SHELL` in
-  `iso/live-session` for a live session, and the same export in the installer's
-  `SESSION_SCRIPT` for an installed machine, which runs what the installer
-  wrote and never reads `iso/live-session`. #82 is about the second of those.
-  The `shell =` key in `tos.conf` outranks both.
+- The session runs `bash` where the filesystem has one and `/bin/sh` where it
+  does not, which is the difference between a Debian rootfs and the initramfs
+  rescue session. Both `iso/live-session` and the installer's `SESSION_SCRIPT`
+  ask rather than assume, and `/etc/passwd` names whichever one actually landed
+  on the disk. The `shell =` key in `tos.conf` still outranks both.
 - An installed machine's PID 1 is busybox `init`, symlinked over the rootfs's
   empty `/sbin`. Debian's essential set contains no init at all — an init
   system is a package, and tOS installs none.

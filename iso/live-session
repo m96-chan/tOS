@@ -25,15 +25,31 @@ say() {
     [ -n "$said" ] || echo "$@"
 }
 
+# The machine's name, which nothing else in a live session sets: the installed
+# machine gets it from /etc/rc, and without it here the kernel hostname stays
+# `(none)` and every prompt in every pane says so.
+[ -r /etc/hostname ] && hostname -F /etc/hostname 2>/dev/null
+
 export HOME=/root
-export SHELL=/bin/sh
+# bash where the filesystem has one, /bin/sh where it does not. The Debian
+# rootfs has bash and /bin/sh there is dash; the initramfs rescue session has
+# neither, only busybox ash. This file runs as PID 1 on both sides, so it asks
+# rather than assuming — and what it finds decides the line below it too.
+if [ -x /bin/bash ]; then
+    SHELL=/bin/bash
+else
+    SHELL=/bin/sh
+fi
+export SHELL
 export TERM=xterm-256color
 export TOS=1
-# dash and busybox ash both read ENV for every interactive shell, which is how
-# the message of the day reaches each pane the compositor opens. In the Debian
-# rootfs /etc/profile is Debian's own and sources /etc/profile.d/*.sh, where
-# iso/profile is installed; in the initramfs it is iso/profile itself.
-export ENV=/etc/profile
+# ENV is how the message of the day reaches a pane whose shell is ash or dash:
+# both read it for every interactive shell. bash does not — it reads ENV only
+# when it is invoked as `sh` — so where bash is the shell this is not the
+# mechanism and saying it anyway would be a claim about a file nothing reads.
+# There, /root/.bashrc is the counterpart, and iso/bashrc is what mkiso.sh
+# installs as one.
+[ "$SHELL" = /bin/bash ] || export ENV=/etc/profile
 # Debian's own order, and /sbin before /bin matters on both sides of the pivot:
 # the initramfs has util-linux's mount in /sbin and busybox's in /bin, and only
 # the first of those can mount a filesystem by label.
