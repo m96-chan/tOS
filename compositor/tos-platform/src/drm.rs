@@ -13,7 +13,7 @@ use std::io;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 
-use tos_render::Surface;
+use tos_render::{Damage, Surface};
 
 use crate::display::Display;
 
@@ -672,6 +672,159 @@ impl Drop for DumbBuffer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The shadow buffer
+// ---------------------------------------------------------------------------
+
+/// The frame, in ordinary memory, and what each dumb buffer still owes it.
+///
+/// The compositor used to be handed a [`Surface`] over the mmapped dumb buffer
+/// itself, which is the obvious thing to do: there is no copy at all. Two
+/// things were wrong with it, and they compounded.
+///
+/// The first is that drawing is not only writing. Every antialiased glyph goes
+/// through `Surface::blend_mask`, which reads the destination pixel back to
+/// blend over it, and so does every image with an alpha channel. A dumb buffer
+/// is mapped write combining: writes are batched and sequential ones are
+/// nearly free, and reads are uncached, one to two orders of magnitude slower
+/// than the same read from system RAM, and they stall the write buffer on the
+/// way past. A panel of text is a few million of them. That is why #102 could
+/// photograph the compositor's raster order arriving on the screen for glyphs
+/// and never for a solid fill of the same area: `fill` is a `slice::fill` and
+/// the blend is a read-modify-write against the bus.
+///
+/// The second is that two dumb buffers alternate, so the frame being drawn did
+/// not start from the frame before it — which is what `retains_contents` said,
+/// and what made `Compositor::render_frame` clear the panel and repaint every
+/// cell of every pane for one pixel of pointer movement. Timed on the dev host
+/// at 1280x800 over a 213x71 grid of text: 745 µs a frame, where repainting
+/// only what changed is 22 µs.
+///
+/// Compositing here fixes both. Blends become read-modify-write against cached
+/// memory; the dumb buffer is only ever written, sequentially, which is exactly
+/// what its mapping is for; and because this buffer is the same memory every
+/// frame whichever dumb buffer is next, the previous frame really is there to
+/// build on and `retains_contents` can be true.
+///
+/// What it costs is the copy out, and that is the part that has to be earned.
+/// A whole frame is 4 MB at 1280x800, and copying all of it every time is
+/// enough on its own to be the floor on what a frame costs — even in system
+/// RAM, where that copy measures 60 µs, it is more than twice the 26 µs a
+/// whole damage-driven frame takes, and across a bus it is worse. So the copy
+/// is driven by [`Damage`]: the renderer writes down the rectangles it drew,
+/// and only the rows it touched are moved. One pixel of pointer motion copies
+/// 169 KB — the two arrow boxes and the status bar — rather than 4 MB.
+///
+/// [`Surface`]: tos_render::Surface
+struct Shadow {
+    pixels: Vec<u32>,
+    width: u32,
+    height: u32,
+    /// What the frame currently being drawn has touched.
+    drawn: Damage,
+    /// Per dumb buffer, what it has not been given yet.
+    ///
+    /// This is the part a single frame's damage cannot answer. Buffer A is
+    /// written on even frames and B on odd ones, so when A is written again it
+    /// is two frames stale, not one: giving it only what this frame changed
+    /// would leave last frame's changes missing from it, and the panel would
+    /// alternate between two versions of the screen a frame apart. Each buffer
+    /// is instead owed the union of every frame since it was last written, and
+    /// is square with the shadow — pixel for pixel — the moment it has been
+    /// paid. That invariant is what the rest of the backend leans on: blanking
+    /// and VT switches both put the CRTC straight onto a buffer without
+    /// drawing a frame first, and both are correct only because the buffer
+    /// they name holds a whole screen rather than a difference.
+    owed: [Damage; 2],
+}
+
+impl Shadow {
+    fn new(width: u32, height: u32) -> Shadow {
+        let mut shadow = Shadow {
+            pixels: vec![0; (width * height) as usize],
+            width,
+            height,
+            drawn: Damage::new(width, height),
+            owed: [Damage::new(width, height), Damage::new(width, height)],
+        };
+        // A dumb buffer is zeroed when it is created and so is this, so
+        // "nothing owed" would be true as well. It is stated rather than
+        // inferred: the invariant above is that a buffer holds the whole
+        // shadow only after it has been paid what it is owed, and two
+        // allocations that happen to agree is not that. It costs one full copy
+        // into each buffer, once, on the first two frames of the session.
+        shadow.owe_everything();
+        shadow
+    }
+
+    /// Everything, to both buffers.
+    ///
+    /// For the moments when what a dumb buffer holds stops being known.
+    fn owe_everything(&mut self) {
+        for owed in &mut self.owed {
+            owed.mark_all();
+        }
+    }
+
+    /// Composite one frame, and add what it touched to both buffers' debts.
+    fn draw(&mut self, draw: &mut dyn FnMut(&mut Surface<'_>)) {
+        self.drawn.clear();
+        let Shadow {
+            pixels,
+            width,
+            height,
+            drawn,
+            ..
+        } = self;
+        // Stride equals width: this buffer answers to nobody's alignment, and
+        // the copy out crosses to the dumb buffer's stride a row at a time.
+        let mut surface = Surface::with_damage(pixels, *width, *height, *width, drawn);
+        draw(&mut surface);
+        for owed in &mut self.owed {
+            owed.union(&self.drawn);
+        }
+    }
+
+    /// Bring `buffer` up to date with the shadow, and note that it is.
+    ///
+    /// The rows are copied whole, each one a single `memcpy` into the write
+    /// combining mapping, which is the access pattern that mapping is fast
+    /// for. Nothing is read back out of it.
+    fn copy_out(&mut self, index: usize, buffer: &mut DumbBuffer) {
+        // Both are made from the mode, so this holds by construction — and it
+        // is checked anyway because it is what makes the indexing below stay
+        // inside the mapping. A frame arriving into a buffer too small for it
+        // is worth stopping on rather than writing past.
+        assert!(
+            buffer.width >= self.width && buffer.height >= self.height,
+            "a {}x{} buffer cannot hold a {}x{} frame",
+            buffer.width,
+            buffer.height,
+            self.width,
+            self.height
+        );
+        let stride = buffer.stride_pixels();
+        self.pay(index, buffer.pixels(), stride);
+    }
+
+    /// The half of [`Shadow::copy_out`] with no device in it: the rows buffer
+    /// `index` is owed, copied into `pixels` at `stride` pixels to the row,
+    /// and the debt cleared.
+    ///
+    /// Split out for the same reason [`Scanout`] is separate from [`Card`] —
+    /// this is where the arithmetic is, and arithmetic does not need a
+    /// graphics card to be wrong in front of.
+    fn pay(&mut self, index: usize, pixels: &mut [u32], stride: u32) {
+        for (y, start, end) in self.owed[index].spans() {
+            let len = (end - start) as usize;
+            let from = (y * self.width + start) as usize;
+            let to = (y * stride + start) as usize;
+            pixels[to..to + len].copy_from_slice(&self.pixels[from..from + len]);
+        }
+        self.owed[index].clear();
+    }
+}
+
 const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
 
 /// The header every DRM event starts with.
@@ -938,7 +1091,9 @@ pub struct DrmDisplay {
     output: ConnectedOutput,
     mode: ModeInfo,
     buffers: [DumbBuffer; 2],
-    /// Which buffer the next frame is drawn into.
+    /// Where frames are composited, and what each dumb buffer owes it.
+    shadow: Shadow,
+    /// Which buffer the next frame is copied out to.
     back: usize,
     scanout: Scanout,
     /// Whether anything has been drawn yet. Unblanking puts the last frame
@@ -1005,6 +1160,7 @@ impl DrmDisplay {
             output,
             mode,
             buffers: [front, back],
+            shadow: Shadow::new(width, height),
             back: 1,
             scanout,
             has_frame: false,
@@ -1142,6 +1298,12 @@ impl DrmDisplay {
         // way out.
         if self.scanout.blanked {
             let front = 1 - self.back;
+            // The one place a dumb buffer is written by something other than
+            // `Shadow::copy_out`, so the one place the shadow stops describing
+            // what that buffer holds. It is reached from `Drop` and from
+            // nowhere else — there is no next frame to be wrong — but anything
+            // that calls this from somewhere with a session still running owes
+            // the shadow an `owe_everything` here.
             self.buffers[front].clear();
             let fb_id = self.buffers[front].fb_id;
             let _ = self.scanout.set_crtc(&mut self.card, fb_id);
@@ -1172,16 +1334,14 @@ impl Display for DrmDisplay {
         }
 
         let index = self.back;
-        let (width, height, stride) = {
-            let buffer = &self.buffers[index];
-            (buffer.width, buffer.height, buffer.stride_pixels())
-        };
-        {
-            let buffer = &mut self.buffers[index];
-            let pixels = buffer.pixels();
-            let mut surface = Surface::new(pixels, width, height, stride);
-            draw(&mut surface);
-        }
+        // Composited in system RAM and then copied out, rather than drawn
+        // straight into the buffer the flip will hand to the CRTC. See
+        // [`Shadow`] for what that is worth and what it costs; the short of it
+        // is that the blends stop reading back across the bus and the frame
+        // stops being a full repaint. What reaches the dumb buffer here is the
+        // finished frame, in one pass of sequential writes.
+        self.shadow.draw(draw);
+        self.shadow.copy_out(index, &mut self.buffers[index]);
 
         let fb_id = self.buffers[index].fb_id;
         self.scanout.present(&mut self.card, fb_id)?;
@@ -1191,9 +1351,17 @@ impl Display for DrmDisplay {
     }
 
     fn retains_contents(&self) -> bool {
-        // Two buffers alternate, so a frame does not start from the previous
-        // one; damage tracking would show stale content from two frames back.
-        false
+        // Two buffers still alternate, but the compositor no longer draws into
+        // them. It draws into [`Shadow`], which is one buffer and is the same
+        // one every frame, so a frame does start from the frame before it and
+        // repainting only what changed is correct. The dumb buffer that is
+        // two frames stale is caught up by `Shadow::owed`, which is the whole
+        // reason that field exists.
+        //
+        // This is the 33.6x in #105: with it false, `Compositor::render_frame`
+        // took `force = true` every time and repainted every cell of every
+        // pane — 725 µs — because the pointer moved one pixel.
+        true
     }
 
     fn release(&mut self) -> io::Result<()> {
@@ -1206,6 +1374,15 @@ impl Display for DrmDisplay {
 
     fn restore(&mut self) -> io::Result<()> {
         self.card.set_master()?;
+        // The shadow is untouched by any of this — it is this process's own
+        // memory, and the session that was switched away from is still in it
+        // whole. The dumb buffers are this process's GEM objects too and
+        // nobody else could have written them, but what a driver does with the
+        // memory behind them while another master holds the device is the
+        // kernel's business rather than something stated anywhere, so they are
+        // treated as unknown and paid in full. It costs one whole-screen copy
+        // at a moment that is already a mode set, once per VT switch back.
+        self.shadow.owe_everything();
         self.scanout.reacquired(&mut self.card)
     }
 
@@ -1701,5 +1878,204 @@ mod tests {
             .flip_unreported(&mut card, UNREPORTED_FLIPS_BEFORE_GIVING_UP, None)
             .expect("nothing to fail"));
         assert!(card.actions.is_empty());
+    }
+
+    // ---- the shadow buffer ----------------------------------------------
+
+    /// A shadow and the pair of buffers it feeds, without a card underneath.
+    ///
+    /// Small enough to write the expectations out by hand, and deliberately
+    /// given a stride wider than its width: a dumb buffer's pitch is whatever
+    /// the driver rounds a row up to, and a copy that assumed the two were the
+    /// same would draw a diagonal.
+    struct Panel {
+        shadow: Shadow,
+        buffers: [Vec<u32>; 2],
+        back: usize,
+    }
+
+    impl Panel {
+        const WIDTH: u32 = 8;
+        const HEIGHT: u32 = 4;
+        const STRIDE: u32 = 12;
+
+        fn new() -> Panel {
+            Panel {
+                shadow: Shadow::new(Panel::WIDTH, Panel::HEIGHT),
+                buffers: [
+                    vec![0; (Panel::STRIDE * Panel::HEIGHT) as usize],
+                    vec![0; (Panel::STRIDE * Panel::HEIGHT) as usize],
+                ],
+                back: 0,
+            }
+        }
+
+        /// One pass of [`DrmDisplay::frame`]: composite, copy out, swap.
+        fn frame(&mut self, mut draw: impl FnMut(&mut Surface<'_>)) -> usize {
+            let index = self.back;
+            self.shadow.draw(&mut draw);
+            self.shadow
+                .pay(index, &mut self.buffers[index], Panel::STRIDE);
+            self.back = 1 - index;
+            index
+        }
+
+        /// The visible pixels of a buffer, with the padding its stride adds
+        /// left out, so it can be compared against the shadow directly.
+        fn visible(&self, index: usize) -> Vec<u32> {
+            (0..Panel::HEIGHT)
+                .flat_map(|y| {
+                    let row = (y * Panel::STRIDE) as usize;
+                    self.buffers[index][row..row + Panel::WIDTH as usize].to_vec()
+                })
+                .collect()
+        }
+
+        /// Write a sentinel over a buffer, to see what the next copy walks on.
+        fn poison(&mut self, index: usize) {
+            self.buffers[index].fill(0xdead);
+        }
+
+        /// Draw nothing until both buffers are square with the shadow.
+        ///
+        /// Two frames, because one only settles the buffer it is copied into:
+        /// the other is still owed whatever the frame before that changed,
+        /// which is the point of `owed` and is asserted on its own below.
+        fn settle(&mut self) {
+            self.frame(|_| {});
+            self.frame(|_| {});
+            assert!(self.shadow.owed.iter().all(|owed| owed.is_empty()));
+        }
+    }
+
+    /// Paint row `y` across the whole width in a shade of its own.
+    fn row(y: i32, shade: u8) -> impl FnMut(&mut Surface<'_>) {
+        move |surface: &mut Surface<'_>| {
+            surface.fill(
+                tos_render::Rect::new(0, y, Panel::WIDTH, 1),
+                tos_term::Rgb::new(shade, shade, shade),
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_reaches_the_buffer_it_was_copied_into() {
+        let mut panel = Panel::new();
+        let index = panel.frame(row(1, 0x40));
+        assert_eq!(panel.visible(index), panel.shadow.pixels);
+        assert_eq!(panel.visible(index)[8..16], [0x40_4040; 8]);
+        // And it landed at the buffer's own stride, not the shadow's.
+        assert_eq!(panel.buffers[index][12..20], [0x40_4040; 8]);
+        assert_eq!(panel.buffers[index][8..12], [0; 4]);
+    }
+
+    #[test]
+    fn the_buffer_that_missed_a_frame_is_caught_up_when_its_turn_comes() {
+        // The bug `owed` exists to prevent. The buffers alternate, so the one
+        // being written is two frames stale rather than one: given only what
+        // this frame changed it would be missing the frame before, and the
+        // panel would flip between two versions of the screen a frame apart —
+        // which is exactly the "stale content from two frames back" that
+        // `retains_contents` used to return false because of.
+        let mut panel = Panel::new();
+        let first = panel.frame(row(0, 0x10));
+        let second = panel.frame(row(1, 0x20));
+        let third = panel.frame(row(2, 0x30));
+        assert_eq!(first, third, "the buffers did not alternate");
+        assert_ne!(first, second);
+        // Whichever buffer was written last holds the whole screen, every
+        // time. Blanking and VT switches both put the CRTC onto that buffer
+        // without a frame in between, and this is what makes them correct.
+        assert_eq!(panel.visible(third), panel.shadow.pixels);
+        assert_eq!(panel.visible(third)[0..8], [0x10_1010; 8]);
+        assert_eq!(panel.visible(third)[8..16], [0x20_2020; 8]);
+        assert_eq!(panel.visible(third)[16..24], [0x30_3030; 8]);
+    }
+
+    #[test]
+    fn the_shadow_keeps_the_frame_before_it() {
+        // What `retains_contents` promises the compositor: what it drew last
+        // frame is still in front of it, so it may repaint only the rows that
+        // changed. The dumb buffers alternate underneath; this does not.
+        let mut panel = Panel::new();
+        panel.frame(row(0, 0x10));
+        panel.frame(row(3, 0x30));
+        assert_eq!(panel.shadow.pixels[0..8], [0x10_1010; 8]);
+        assert_eq!(panel.shadow.pixels[24..32], [0x30_3030; 8]);
+    }
+
+    #[test]
+    fn only_the_rows_that_changed_are_copied() {
+        // The measurement the whole design turns on. Copying the whole panel
+        // every frame would cost about what the full repaint it replaces cost,
+        // so the only version worth having is one proportional to what
+        // changed.
+        let mut panel = Panel::new();
+        panel.frame(row(0, 0x10));
+        panel.settle();
+        let index = panel.back;
+        panel.poison(index);
+        panel.frame(row(2, 0x30));
+        assert_eq!(panel.visible(index)[16..24], [0x30_3030; 8]);
+        assert_eq!(panel.visible(index)[0..8], [0xdead; 8]);
+        assert_eq!(panel.visible(index)[24..32], [0xdead; 8]);
+        // And the padding a wider stride leaves at the end of a row is never
+        // written either.
+        assert_eq!(panel.buffers[index][8..12], [0xdead; 4]);
+    }
+
+    #[test]
+    fn a_frame_that_draws_nothing_copies_nothing() {
+        // The idle case, and the common one: the compositor was asked for a
+        // frame, found every cell where it left it, and drew nothing at all.
+        // Nothing should cross the bus for that.
+        let mut panel = Panel::new();
+        panel.frame(row(0, 0x10));
+        panel.settle();
+        let index = panel.back;
+        panel.poison(index);
+        panel.frame(|_| {});
+        assert!(panel.buffers[index].iter().all(|&pixel| pixel == 0xdead));
+    }
+
+    #[test]
+    fn a_dropped_frame_leaves_the_buffer_owed_what_it_missed() {
+        // A flip that did not report back in time has its frame dropped
+        // rather than drawn, so `back` does not move and nothing is copied.
+        // The next frame goes into the same buffer the dropped one would
+        // have, and is still owed everything since that buffer was written.
+        let mut panel = Panel::new();
+        panel.frame(row(0, 0x10));
+        let dropped = panel.back;
+        assert!(!panel.shadow.owed[dropped].is_empty());
+        // What a dropped frame does: no draw, no copy, no swap.
+        let next = panel.frame(row(1, 0x20));
+        assert_eq!(next, dropped);
+        assert_eq!(panel.visible(next), panel.shadow.pixels);
+    }
+
+    #[test]
+    fn a_buffer_whose_contents_are_unknown_is_paid_in_full() {
+        // Coming back from a VT switch. The shadow still holds the session,
+        // but what the dumb buffers hold while another master had the device
+        // is not this process's business to assume, so the next frame into
+        // each of them is a whole screen rather than a difference — even a
+        // frame that drew nothing.
+        let mut panel = Panel::new();
+        panel.frame(row(0, 0x10));
+        panel.frame(row(1, 0x20));
+        let index = panel.back;
+        panel.poison(index);
+        panel.shadow.owe_everything();
+        panel.frame(|_| {});
+        assert_eq!(panel.visible(index), panel.shadow.pixels);
+    }
+
+    #[test]
+    fn both_buffers_start_owed_the_whole_screen() {
+        let panel = Panel::new();
+        let whole = (Panel::WIDTH * Panel::HEIGHT) as u64;
+        assert_eq!(panel.shadow.owed[0].pixels(), whole);
+        assert_eq!(panel.shadow.owed[1].pixels(), whole);
     }
 }
