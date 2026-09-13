@@ -220,9 +220,48 @@ fn ioctl_num<T>(nr: u64) -> u64 {
 const DRM_IOCTL_SET_MASTER: u64 = io_only(0x1e);
 const DRM_IOCTL_DROP_MASTER: u64 = io_only(0x1f);
 const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
-/// How long to wait for a page flip to report back before falling back to a
-/// mode set. Two frames at 60Hz, so a slow panel is not given up on early.
-const FLIP_TIMEOUT_MS: u64 = 34;
+/// How long to wait for a page flip to report back, counted in the mode's own
+/// refresh periods rather than in milliseconds.
+///
+/// This used to be a flat 34 ms, described as two frames at 60Hz — which it
+/// is, at 60Hz. On a 30Hz mode it is less than one and a half refresh periods,
+/// so a single vblank barely fits inside it and anything that delays the
+/// process pushes it over; and what delays the process is exactly the work
+/// this backend does, since `retains_contents` is false and every frame is a
+/// full software repaint of the panel. The mode already says how long a
+/// refresh takes, and three of them is long enough that a wait which runs out
+/// means something is wrong rather than something is slow.
+const FLIP_TIMEOUT_REFRESHES: u64 = 3;
+/// The floor and ceiling on that wait.
+///
+/// The floor keeps a 144Hz panel from being given up on inside 21 ms, which is
+/// shorter than a scheduling hiccup. The ceiling is for a mode that reports a
+/// refresh rate nobody could scan out at: the wait is the compositor's whole
+/// loop, so a mode claiming 1Hz must not be allowed to stall it for a second.
+const FLIP_TIMEOUT_MIN_MS: u64 = 34;
+const FLIP_TIMEOUT_MAX_MS: u64 = 250;
+/// How many flips in a row may go unreported before the driver is taken at its
+/// word and the flip path is abandoned.
+///
+/// One is a late vblank and costs a dropped frame. Three in a row is a driver
+/// that is not going to report at all, and waiting out the deadline on every
+/// frame for the rest of the session is both a stall and — before this was
+/// noticed — a half-drawn frame on the panel each time. See
+/// [`Scanout::flip_unreported`].
+const UNREPORTED_FLIPS_BEFORE_GIVING_UP: u32 = 3;
+
+/// How long a flip may take to report back on a panel refreshing at
+/// `vrefresh` Hz.
+///
+/// A mode that reports no refresh rate at all is taken as 60Hz, which is what
+/// the constant this replaced assumed for every mode.
+fn flip_timeout_ms(vrefresh: u32) -> u64 {
+    let hz = if vrefresh == 0 { 60 } else { vrefresh as u64 };
+    // Rounded up, so a rate that does not divide a second evenly — 30Hz is
+    // 33.33 ms — is waited out rather than cut off just inside the period.
+    let period = 1000_u64.div_ceil(hz);
+    (period * FLIP_TIMEOUT_REFRESHES).clamp(FLIP_TIMEOUT_MIN_MS, FLIP_TIMEOUT_MAX_MS)
+}
 
 fn ioctl<T>(fd: RawFd, request: u64, arg: &mut T) -> io::Result<()> {
     let result = unsafe { libc::ioctl(fd, request as _, arg as *mut T) };
@@ -673,6 +712,15 @@ struct Scanout {
     /// Whether the CRTC is currently configured with tOS's mode.
     mode_set: bool,
     flip_pending: bool,
+    /// Whether this driver has ever been seen to report a flip completing.
+    ///
+    /// Starts true, because that is what a page flip is for and almost every
+    /// driver does it. It is turned off once and never on again within a
+    /// session on the screen: a driver that has left
+    /// [`UNREPORTED_FLIPS_BEFORE_GIVING_UP`] flips unreported in a row is not
+    /// going to start, and every flip queued after that costs a whole deadline
+    /// of waiting for an event that is not coming.
+    reports_flips: bool,
     /// Whether scanout has been switched off on purpose.
     ///
     /// Not the same as having released the display. tOS still holds DRM
@@ -690,6 +738,7 @@ impl Scanout {
             mode,
             mode_set: false,
             flip_pending: false,
+            reports_flips: true,
             blanked: false,
         }
     }
@@ -753,7 +802,13 @@ impl Scanout {
             // panel back up, so the frame is painted and left in its buffer.
             return Ok(());
         }
-        if !self.mode_set {
+        // A mode set is also how a frame reaches a driver that has been found
+        // not to report its flips. It is the slower of the two — the CRTC is
+        // reprogrammed rather than pointed at another buffer — but it is
+        // synchronous, so when it returns the screen is known to be showing
+        // this framebuffer and the other one is known to be free. That is the
+        // property the flip path only has when the completion event arrives.
+        if !self.mode_set || !self.reports_flips {
             return self.set_crtc(device, fb_id);
         }
         let mut flip = PageFlip {
@@ -780,6 +835,53 @@ impl Scanout {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// A flip whose completion event did not arrive inside its deadline.
+    ///
+    /// `times` is how many have now gone unreported in a row, and `front` is
+    /// the framebuffer that flip was aimed at. Returns whether the *other*
+    /// buffer — the one the next frame would be drawn into — is safe to draw
+    /// into.
+    ///
+    /// The answer is no for the first few, and saying so is the whole point of
+    /// this. The back buffer is only free because the flip completed, so a
+    /// wait that has just failed to prove the flip completed has also failed
+    /// to prove the buffer is free: it may still be the one on the panel, and
+    /// drawing into it puts the compositor's raster order on the screen — a
+    /// clear to the chrome background, then the rows arriving into it, which
+    /// is a panel that flashes black. Dropping the frame costs nothing that
+    /// matters, because nothing was drawn: no damage is cleared, the
+    /// compositor still wants a frame, and the loop comes straight back to
+    /// wait again.
+    ///
+    /// Once enough have gone unreported the driver is taken at its word.
+    /// Waiting is abandoned, the flip path with it, and the CRTC is put on the
+    /// framebuffer the flip was aimed at with a mode set — which is
+    /// synchronous, so afterwards the screen is known to be showing that one
+    /// and the other one is known to be free. That is what makes the answer
+    /// yes, and it is the only fallback that is still true when the events
+    /// were never coming.
+    fn flip_unreported(
+        &mut self,
+        device: &mut dyn Control,
+        times: u32,
+        front: Option<u32>,
+    ) -> io::Result<bool> {
+        if times < UNREPORTED_FLIPS_BEFORE_GIVING_UP {
+            return Ok(false);
+        }
+        self.flip_pending = false;
+        self.reports_flips = false;
+        // Nothing has been presented yet, so there is nothing on the screen to
+        // be drawing over and nothing to put the CRTC on. This cannot happen
+        // from `frame`, which only waits when a flip was queued, but a caller
+        // that has not drawn is not a reason to fail.
+        let Some(fb_id) = front else {
+            return Ok(true);
+        };
+        self.set_crtc(device, fb_id)?;
+        Ok(true)
     }
 
     /// Blank or unblank. `front` is the framebuffer the last frame was drawn
@@ -845,6 +947,11 @@ pub struct DrmDisplay {
     saved_crtc: Crtc,
     /// Sequence number of the last completed flip, for frame pacing.
     last_sequence: u32,
+    /// How many flips in a row have not reported back inside their deadline.
+    ///
+    /// Reset by the first one that does. Read by [`Scanout::flip_unreported`],
+    /// which decides what a run of them means.
+    unreported_flips: u32,
 }
 
 impl DrmDisplay {
@@ -903,6 +1010,7 @@ impl DrmDisplay {
             has_frame: false,
             saved_crtc,
             last_sequence: 0,
+            unreported_flips: 0,
         })
     }
 
@@ -926,9 +1034,13 @@ impl DrmDisplay {
 
     /// Wait for an outstanding flip to complete, so the back buffer is safe
     /// to draw into again.
-    fn wait_for_flip(&mut self) -> io::Result<()> {
+    ///
+    /// Returns whether it is. A `false` is a frame the caller must not draw:
+    /// see [`Scanout::flip_unreported`] for why the back buffer is not safe
+    /// merely because the waiting stopped.
+    fn wait_for_flip(&mut self) -> io::Result<bool> {
         if !self.scanout.flip_pending {
-            return Ok(());
+            return Ok(true);
         }
         let fd = self.card.fd();
         let mut poll = libc::pollfd {
@@ -939,8 +1051,8 @@ impl DrmDisplay {
         // Waiting must not be open ended, but it also must not give up on the
         // first interruption: drawing into a buffer the display is still
         // scanning out shows a torn frame, and the next flip is then rejected.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(FLIP_TIMEOUT_MS);
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(flip_timeout_ms(self.mode.vrefresh));
         while self.scanout.flip_pending {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -964,14 +1076,16 @@ impl DrmDisplay {
             }
             self.consume_events(&buf[..n as usize]);
         }
-        // A flip that never reported back leaves the compositor unsure which
-        // buffer is live; the next frame falls back to a mode set, which is
-        // unambiguous.
-        if self.scanout.flip_pending {
-            self.scanout.flip_pending = false;
-            self.scanout.mode_set = false;
+        if !self.scanout.flip_pending {
+            // The event arrived, so whatever delayed the ones before it has
+            // passed and the run starts again from nothing.
+            self.unreported_flips = 0;
+            return Ok(true);
         }
-        Ok(())
+        self.unreported_flips += 1;
+        let times = self.unreported_flips;
+        let front = self.front_fb();
+        self.scanout.flip_unreported(&mut self.card, times, front)
     }
 
     /// Walk the kernel's event stream, which packs variable length records.
@@ -1048,7 +1162,14 @@ impl Display for DrmDisplay {
     }
 
     fn frame(&mut self, draw: &mut dyn FnMut(&mut Surface<'_>)) -> io::Result<()> {
-        self.wait_for_flip()?;
+        if !self.wait_for_flip()? {
+            // The buffer this frame would go into may still be the one on the
+            // panel. Nothing is drawn and nothing is presented, so the
+            // compositor's damage is untouched and it asks for this frame
+            // again on the next pass — by which time the flip has either
+            // reported or been given up on.
+            return Ok(());
+        }
 
         let index = self.back;
         let (width, height, stride) = {
@@ -1096,7 +1217,11 @@ impl Display for DrmDisplay {
             // bookkeeping straight: left until after the blank it would turn
             // up mixed in with whatever wakes the screen again, and the
             // compositor would draw over a frame it thinks has been shown.
-            self.wait_for_flip()?;
+            //
+            // Whether the buffer came free is not this caller's question:
+            // nothing is about to be drawn, and the disable below clears the
+            // pending flip whichever way the wait went.
+            let _ = self.wait_for_flip()?;
         }
         let front = self.front_fb();
         self.scanout.blank(&mut self.card, blank, front)
@@ -1476,5 +1601,105 @@ mod tests {
             ]
         );
         assert!(!scanout.flip_pending);
+    }
+
+    #[test]
+    fn the_flip_deadline_is_the_panel_s_own_refresh_rate_and_not_sixty_hertz() {
+        // The constant this replaced was 34 ms for every mode, which is two
+        // frames at 60Hz and less than one and a half at 30Hz — so a 30Hz
+        // panel was given up on inside a single refresh period plus a
+        // scheduling hiccup, which is the whole bug.
+        assert!(
+            flip_timeout_ms(30) > 2 * 34,
+            "a 30Hz panel still gets a 60Hz deadline"
+        );
+        assert_eq!(flip_timeout_ms(30), 102);
+        assert_eq!(flip_timeout_ms(60), 51);
+        // A mode that reports nothing is taken as 60Hz, which is what every
+        // mode used to be taken as.
+        assert_eq!(flip_timeout_ms(0), flip_timeout_ms(60));
+        // Fast panels get the floor rather than a deadline shorter than the
+        // delay that would trip it, and a mode claiming a rate nobody scans
+        // out at does not get to stall the compositor's loop for a second.
+        assert_eq!(flip_timeout_ms(144), FLIP_TIMEOUT_MIN_MS);
+        assert_eq!(flip_timeout_ms(1), FLIP_TIMEOUT_MAX_MS);
+    }
+
+    #[test]
+    fn one_flip_that_does_not_report_costs_a_frame_and_not_the_buffer() {
+        // The back buffer is free only because the flip completed. A wait
+        // that could not prove the flip completed has not proved the buffer
+        // is free either, and drawing into it puts the compositor's raster
+        // order on the panel: the clear to the chrome background first, then
+        // the rows arriving into it.
+        let mut card = Recorder::new();
+        let mut scanout = showing(&mut card);
+        scanout.flip_pending = true;
+        card.actions.clear();
+
+        for times in 1..UNREPORTED_FLIPS_BEFORE_GIVING_UP {
+            assert!(
+                !scanout
+                    .flip_unreported(&mut card, times, Some(10))
+                    .expect("no ioctl to fail"),
+                "the frame was drawn after {times} unreported flips"
+            );
+            assert!(
+                scanout.flip_pending,
+                "the flip was forgotten while it may still be in flight"
+            );
+            assert!(
+                card.actions.is_empty(),
+                "the screen was touched: {:?}",
+                card.actions
+            );
+        }
+    }
+
+    #[test]
+    fn a_driver_that_never_reports_a_flip_stops_being_flipped_to() {
+        // Waiting out the deadline on every frame is a stall, and the frame
+        // after each one is drawn into a buffer nothing knows the state of.
+        // The way out is a mode set, which is synchronous: when it returns
+        // the panel is known to be showing that framebuffer and the other one
+        // is known to be free.
+        let mut card = Recorder::new();
+        let mut scanout = showing(&mut card);
+        scanout.flip_pending = true;
+        card.actions.clear();
+
+        assert!(
+            scanout
+                .flip_unreported(&mut card, UNREPORTED_FLIPS_BEFORE_GIVING_UP, Some(10))
+                .expect("the mode set"),
+            "the frame was dropped even after the flip path was abandoned"
+        );
+        assert_eq!(
+            card.actions,
+            vec!["set crtc 7 fb 10 mode 1920x1080 connectors 1"]
+        );
+        assert!(!scanout.flip_pending);
+
+        // And every frame after it is a mode set rather than a flip that
+        // would be waited out all over again.
+        card.actions.clear();
+        scanout.present(&mut card, 11).expect("the next frame");
+        assert_eq!(
+            card.actions,
+            vec!["set crtc 7 fb 11 mode 1920x1080 connectors 1"]
+        );
+    }
+
+    #[test]
+    fn giving_up_before_anything_was_ever_presented_touches_no_crtc() {
+        // There is no frame on the screen to be drawn over and no framebuffer
+        // to put the CRTC on, so the answer is yes and nothing is asked of
+        // the card.
+        let mut card = Recorder::new();
+        let mut scanout = scanout();
+        assert!(scanout
+            .flip_unreported(&mut card, UNREPORTED_FLIPS_BEFORE_GIVING_UP, None)
+            .expect("nothing to fail"));
+        assert!(card.actions.is_empty());
     }
 }
