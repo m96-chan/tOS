@@ -1,0 +1,17 @@
+# A tOS machine's ~/.profile, installed as /root/.profile and /etc/skel/.profile.
+#
+# A login shell reads this and does not read ~/.bashrc: bash reads ~/.bashrc
+# only for an interactive shell that is *not* a login shell, which is the case
+# a pane is, and for a login shell it reads /etc/profile and then the first of
+# ~/.bash_profile, ~/.bash_login, ~/.profile that it finds. Without this file
+# the two kinds of shell on one machine disagree — `su - tos` lands on a bare
+# `bash-5.2$` with no history and no colour while the pane it was typed in has
+# all of it.
+#
+# The message of the day is not here. A login shell reaches it through
+# /etc/profile, which sources /etc/profile.d/tos.sh; ~/.bashrc reads that file
+# itself because an interactive pane has no other way to it.
+
+if [ -n "$BASH_VERSION" ] && [ -r "$HOME/.bashrc" ]; then
+    . "$HOME/.bashrc"
+fi

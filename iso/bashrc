@@ -1,0 +1,41 @@
+# A tOS machine's ~/.bashrc, installed as /root/.bashrc and /etc/skel/.bashrc.
+#
+# This file exists because of how bash reads its configuration, which is not
+# how ash and dash read theirs. A pane runs an interactive shell that is *not*
+# a login shell, and for that case bash reads ~/.bashrc and nothing else: not
+# /etc/profile, and not $ENV — bash consults ENV only when it is invoked as
+# `sh`. The live image used ENV to get the banner into every pane, because ash
+# and dash do read it for every interactive shell, and that mechanism is the
+# thing #82 is about replacing rather than the shell itself.
+
+# A shell with no terminal has nothing to configure and must print nothing:
+# scp and rsync open one and take whatever it says as protocol.
+case $- in
+    *i*) ;;
+    *) return ;;
+esac
+
+# Enough history to be worth having, and none of the entries nobody wants: a
+# duplicate of the line above, or a line deliberately hidden with a space.
+HISTSIZE=10000
+HISTFILESIZE=20000
+HISTCONTROL=ignoreboth
+shopt -s histappend
+# A pane is resized by dragging a divider, which is a SIGWINCH the shell has
+# to act on or every line it draws afterwards wraps in the wrong column.
+shopt -s checkwinsize
+
+# The compositor advertises xterm-256color and draws true colour, so a prompt
+# with colour in it is safe here in a way it would not be on a terminal that
+# has to be guessed at. Colours are set with \[ \] around them so bash knows
+# they take no width; without that, recalling a long line wraps wrongly.
+PS1='\[\e[38;5;110m\]\u@\h\[\e[0m\]:\[\e[38;5;180m\]\w\[\e[0m\]\$ '
+
+alias ls='ls --color=auto'
+alias grep='grep --color=auto'
+alias ip='ip -color=auto'
+
+# The message of the day and the install hint. A login shell reaches this
+# through /etc/profile, which sources /etc/profile.d; an interactive pane has
+# no other way to it, and the file itself only speaks once per session.
+[ -r /etc/profile.d/tos.sh ] && . /etc/profile.d/tos.sh
