@@ -172,16 +172,22 @@ maybe_tool() {
     return 0
 }
 
-# grub-install is in grub2-common, not grub-common: grub-common carries the
-# grub-mkrescue this script already used, which is why it was enough before.
-need_tool sfdisk partx mkfs.ext4 mkfs.vfat mount umount sync grub-install
-maybe_tool grub-mkimage grub-bios-setup grub-probe grub-mkdevicemap \
-    grub-editenv grub-macbless blkid
+need_tool sfdisk partx mkfs.ext4 mkfs.vfat mount umount sync
+maybe_tool blkid
 
-# grub-install reads its modules and templates out of these trees.
-mkdir -p "$ROOT/usr/lib/grub" "$ROOT/usr/share/grub"
-cp -a /usr/lib/grub/. "$ROOT/usr/lib/grub/" 2>/dev/null || true
-cp -a /usr/share/grub/. "$ROOT/usr/share/grub/" 2>/dev/null || true
+# GRUB is deliberately not among them. grub-install plus the module and
+# template trees it reads out of /usr/lib/grub and /usr/share/grub came to
+# 24,453,120 bytes raw and about 10 MB of this gzip — near half the
+# initramfs — and the rootfs carries the same files again for the installer,
+# which has lived there since #20. So a live session and an installed machine
+# lose nothing at all.
+#
+# The one session that loses something is the rescue one, which is the
+# initramfs and has no rootfs to reach: it can still partition a disk and copy
+# a system onto it, and what it left behind would have nothing to start it. So
+# tos-install looks for a grub-install before it offers to erase anything —
+# see Bootloader::detect and Plan::refusal in installer/src/plan.rs — and a
+# rescue session now refuses rather than producing that disk.
 
 # Every shared library those binaries need, resolved transitively by ldd.
 copy_libraries() {
@@ -490,10 +496,16 @@ cp iso/dot-profile "$ROOTFS/etc/skel/.profile"
 # on a disk. This is the one a live session answers to.
 echo tos >"$ROOTFS/etc/hostname"
 
-# The kernel's modules, so a machine that has pivoted can still load one. The
-# same pruned tree the initramfs got, metadata and all.
-mkdir -p "$ROOTFS/lib/modules"
-cp -a "$ROOT/lib/modules/$KVER" "$ROOTFS/lib/modules/$KVER"
+# No /lib/modules here either, so the initramfs holds the only copy. The cost
+# is worth saying plainly: a machine that has pivoted cannot modprobe anything
+# ever again — switch_root deletes the initramfs, and this is the directory the
+# modprobe left in the rootfs would have looked in.
+#
+# What it does not cost is anything the image does by itself. This was a copy
+# of the same pruned tree, so the only modules it could ever have offered are
+# the ones iso/init loads before the pivot, and iso/init now loads all of them.
+# The three NLS modules were the difference, and the note beside them there
+# says why the kernel wanted one after the pivot.
 
 # The dictionary, converted out of the build container's skkdic rather than
 # installed into the rootfs as a package.

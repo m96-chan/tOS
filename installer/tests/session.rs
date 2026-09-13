@@ -18,7 +18,21 @@ impl FakeMachine {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("proc")).unwrap();
         std::fs::write(root.join("proc/mounts"), "").unwrap();
+        // A live session, which since GRUB left the initramfs means one with
+        // a grub-install in it. Written here rather than left to the host:
+        // whether the installer offers to install at all now depends on this
+        // file, and a test that asks the developer's laptop for it passes or
+        // fails for a reason that has nothing to do with the change.
+        std::fs::create_dir_all(root.join("usr/sbin")).unwrap();
+        std::fs::write(root.join("usr/sbin/grub-install"), "").unwrap();
         FakeMachine { root }
+    }
+
+    /// The session that runs when the squashfs will not mount, which has no
+    /// GRUB and so cannot make anything bootable.
+    fn rescue(self) -> Self {
+        std::fs::remove_file(self.root.join("usr/sbin/grub-install")).unwrap();
+        self
     }
 
     /// Add a disk of `gib` gibibytes.
@@ -355,6 +369,68 @@ fn the_plan_can_be_printed_without_a_terminal() {
     );
     assert!(text.contains("mkfs.ext4"));
     assert!(text.contains("grub-install"));
+}
+
+#[test]
+fn the_plan_of_a_rescue_session_says_it_cannot_finish_the_job() {
+    // The first of the three places this has to be said, and the one a
+    // careful person reads before they run anything at all.
+    let machine = FakeMachine::new("rescueplan").disk("vda", 64).rescue();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tos-install"))
+        .arg("--plan")
+        .env("TOS_INSTALL_SYSROOT", machine.path())
+        .output()
+        .expect("run tos-install --plan");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let problem = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "it offered to install: {text}");
+    assert!(
+        problem.contains("cannot install a bootloader"),
+        "stderr: {problem}"
+    );
+    assert!(
+        !text.contains("sfdisk"),
+        "steps that will not run were listed: {text}"
+    );
+}
+
+#[test]
+fn a_rescue_session_will_not_take_the_disk_name() {
+    // And the second place: the screen where the name is typed, which is the
+    // last one before the disk is gone.
+    let machine = FakeMachine::new("rescuetui").disk("vda", 64).rescue();
+    let mut session = Session::new(&machine, &["--dry-run"]);
+    assert!(session.wait_for("Enter to begin"), "{}", session.screen());
+    session.type_keys(b"\r");
+    assert!(session.wait_for("GiB"), "{}", session.screen());
+    session.type_keys(b"\r");
+    assert!(
+        session.wait_for("Tab switches fields"),
+        "{}",
+        session.screen()
+    );
+    session.type_keys(b"\r");
+
+    assert!(
+        session.wait_for("cannot install a bootloader"),
+        "{}",
+        session.screen()
+    );
+    let screen = session.screen();
+    assert!(
+        !screen.contains("Type vda to confirm"),
+        "there is nothing to confirm:\n{screen}"
+    );
+
+    // Typing the name anyway starts nothing.
+    session.type_keys(b"vda\r");
+    std::thread::sleep(Duration::from_millis(300));
+    session.wait_for("nothing");
+    assert!(
+        !session.screen().contains("Partition the disk"),
+        "{}",
+        session.screen()
+    );
 }
 
 #[test]

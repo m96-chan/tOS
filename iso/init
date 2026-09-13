@@ -104,12 +104,22 @@ mkdir -p /run/live
 # unclaimed and silent, which is exactly what it looked like. It was missing
 # here before for the same reason nobody noticed: the machines this is booted
 # on take their disk and screen from IDE and VGA, so nothing else needed it.
+#
+# The three nls_ modules at the end are the least obvious and the reason the
+# rest of this list is now the whole of it. Nothing has a device that needs
+# them: the kernel asks for one by name when a FAT filesystem is mounted —
+# cp437 for the codepage and ascii for the iocharset, which are Debian's
+# defaults — and it asks by running /sbin/modprobe in whatever root is current
+# at the time. After switch_root that root is the Debian rootfs, which carries
+# no modules at all, so the ESP the installer mounts would be refused for want
+# of a character table. This is the last moment in the life of the machine when
+# a module can be loaded, so everything that will ever be wanted is loaded here.
 for mod in bochs virtio_gpu simpledrm cirrus vmwgfx vboxvideo \
     evdev atkbd i8042 psmouse virtio_input hid_generic usbhid \
     sd_mod sr_mod cdrom ata_piix ahci virtio_blk virtio_scsi \
     nvme usb_storage uas xhci_pci ehci_pci ohci_pci sdhci_pci mmc_block \
     virtio_pci virtio_net e1000 e1000e r8169 igb \
-    isofs ext4 vfat \
+    isofs ext4 vfat nls_cp437 nls_iso8859_1 nls_ascii \
     loop squashfs overlay; do
     modprobe "$mod" 2>/dev/null
 done
@@ -313,6 +323,9 @@ fi
 
 # No rootfs, so this initramfs is the system after all. It has the compositor
 # and busybox and nothing else — no dpkg, no apt, and the compositor's built-in
-# ASCII face instead of a Japanese one. It is a rescue path, and it is still a
-# tOS a person can install from.
+# ASCII face instead of a Japanese one. It has no GRUB either, which is the one
+# of those that is not merely a worse tOS: tos-install will not erase a disk
+# from here, because it could partition it and fill it and still leave nothing
+# able to start it. It says so at the confirmation screen. So this is a session
+# to look at a broken machine from, and no longer one to install from.
 exec /sbin/tos-session
