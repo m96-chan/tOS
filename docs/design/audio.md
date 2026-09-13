@@ -17,6 +17,17 @@ systemd, no logind and no D-Bus, and PipeWire from Debian is shipped as two
 systemd user units and nothing else. Carrying it means tOS becoming a service
 supervisor, which is the one thing the README says it is not.
 
+> **One premise of that sentence moved: #110 put systemd on the image, on both
+> the live medium and every installed machine.** The decision is not revisited
+> here and the conclusion is unchanged, because the reasons that do the work
+> below are not the missing supervisor: the units carry `ConditionUser=!root`
+> and a tOS session is root's, there is still no D-Bus and no logind session,
+> and tOS sets a knob rather than playing a sound. What is now true is that a
+> person who installs PipeWire on their own machine has an init that will
+> start it, which is exactly the "an installed system is free to run PipeWire"
+> above. If that is ever wanted by default, this document is the one to
+> reopen, and `docs/design/init.md` is what changed under it.
+
 Everything below was read out of the packages bookworm actually ships and the
 sources those packages are built from, not recalled. Every claim names where
 it came from.
@@ -95,10 +106,10 @@ That is the whole package: `Installed-Size: 97` kB of unit files. There is no
 `postinst` can run `deb-systemd-helper --user unmask 'pipewire.service'`.
 
 `pipewire.service` and `pipewire.socket` both carry `ConditionUser=!root`.
-tOS runs as root — `iso/init` execs `/sbin/tos` directly, and on an installed
-disk `tos-install` writes `::respawn:/sbin/tos` into `/etc/inittab` with no
-login in front of it. So even on a machine that did have systemd, the units as
-shipped would decline to start for the only user tOS has.
+tOS runs as root — `tos-session.service` starts the compositor with no login
+in front of it, on the live image and on an installed disk alike. So even
+now that the machine does have systemd, the units as shipped would decline to
+start for the only user tOS has.
 
 ### The session bus it wants cannot be installed
 

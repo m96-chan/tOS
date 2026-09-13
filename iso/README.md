@@ -4,21 +4,37 @@ Bootable image where the compositor **is** userspace, on top of a real Debian:
 
 ```text
 live       GRUB -> Linux -> /init -> squashfs + tmpfs overlay
-                         -> switch_root -> tos-session -> tos
-installed  GRUB -> Linux -> /init -> switch_root -> init -> tos
+                         -> switch_root -> systemd -> tos-session -> tos
+installed  GRUB -> Linux -> /init -> switch_root -> systemd -> tos-session
+                         -> tos
 rescue     GRUB -> Linux -> /init -> tos-session -> tos   (initramfs only)
 ```
 
 `/init` looks for three roots in that order and hands the machine to the first
 one it finds. An installed machine names its root filesystem with `root=` on
 the kernel command line, which is what the installer writes and what the live
-image deliberately does not; busybox init then reads the `/etc/inittab` the
-installer left, runs `/etc/rc` and respawns the session. A live medium carries
-its root as one squashfs file, which `/init` mounts with a tmpfs stacked in
-front so the session can be written to. A machine that finds neither stays in
-the initramfs, which is a rescue session rather than a system — and, since
-GRUB moved into the rootfs, one to look at a broken machine from rather than
-one to install from.
+image deliberately does not. A live medium carries its root as one squashfs
+file, which `/init` mounts with a tmpfs stacked in front so the session can be
+written to. Either way what it execs is `/sbin/init`, which is **systemd**
+(#110): the same PID 1 on the live image and on the disk it installs, reading
+the same `tos-session.service`. A machine that finds neither root stays in the
+initramfs, which is a rescue session rather than a system — the one path with
+no init at all, where `/sbin/tos-session` is PID 1 and restarts the compositor
+itself — and, since GRUB moved into the rootfs, one to look at a broken
+machine from rather than one to install from.
+
+The GRUB menu has three entries: `tOS`, `tOS (verbose)` and
+`tOS (rescue shell)`. Only the last passes `tos.rescue`, which is what the
+session wants before it execs a shell when the compositor exits — it used to
+be on all of them, which made an unauthenticated root shell the default way to
+boot the image (#112).
+
+The session is a unit, `/etc/systemd/system/tos-session.service`, written into
+the rootfs by `mkiso.sh` and `Restart=always`. The gettys are masked — a
+`getty@tty1` would draw over the compositor and a serial getty is a login
+prompt on a line anybody with the cable can reach — so nothing but tOS is on
+the console. `docs/design/init.md` has the reasoning, including what systemd
+costs and what "apt install a daemon and it runs" is worth.
 
 Per the top-level README, tOS targets a **Debian** userspace, and the squashfs
 is it: a minimal bookworm with glibc, dpkg, apt and bash, built by
@@ -135,8 +151,9 @@ screen than the welcome text can spare.
 `tos-install` is a TUI that runs in a pane, which makes installing tOS the
 first real use of the platform as a platform. It picks a disk, writes a GPT
 with a boot partition and an ext4 root, unpacks the Debian rootfs onto it,
-installs GRUB, and writes `/etc/inittab` so the installed machine starts the
-compositor on the console.
+installs GRUB, and writes one drop-in for `tos-session.service` naming the
+person whose machine it is — the unit itself comes with the rootfs, so an
+installed machine starts the compositor because the image it came from does.
 
 The rootfs is unpacked from the medium rather than copied out of the running
 session, which is the same image with a tmpfs over it: copying that would put

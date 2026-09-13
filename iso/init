@@ -153,10 +153,10 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 
 # An installed machine has a root filesystem, and everything tos-install wrote
-# is inside it: the host name, the /etc/inittab that starts the compositor, and
-# the password the screen lock checks. Hand the machine over to it. Running the
-# session out of this initramfs instead leaves all of that on a disk nothing
-# reads, which is what used to happen.
+# is inside it: the host name, the unit drop-in that says whose session this
+# is, and the password the screen lock checks. Hand the machine over to it.
+# Running the session out of this initramfs instead leaves all of that on a
+# disk nothing reads, which is what used to happen.
 #
 # The live ISO names no root= — the grub.cfg in iso/mkiso.sh deliberately does
 # not — so a machine booted from the medium falls through to the live session
@@ -183,10 +183,12 @@ if [ -n "$root_device" ]; then
         sleep 0.2
     done
 
-    # busybox init is what reads the inittab, and it arrives on the disk as
-    # /bin/init when the installer copies /bin. Look before leaping: switching
-    # into a root with no init leaves the machine running nothing at all,
-    # where staying here at least puts a session on the screen.
+    # systemd is /sbin/init on that disk, because the rootfs it was installed
+    # from carries systemd-sysv (#110). /bin/init stays in the list for a disk
+    # installed from an older image, where it was busybox. Look before
+    # leaping: switching into a root with no init leaves the machine running
+    # nothing at all, where staying here at least puts a session on the
+    # screen.
     init=
     if [ -n "$mounted" ]; then
         for candidate in /sbin/init /bin/init; do
@@ -200,8 +202,8 @@ if [ -n "$root_device" ]; then
     if [ -n "$init" ]; then
         say "tOS: booting $root_device"
         # Carry the kernel's own filesystems over rather than leaving them on
-        # a root that is about to be deleted. /etc/rc mounts each of them
-        # again, so a move that does not take is not fatal.
+        # a root that is about to be deleted. systemd mounts each of them
+        # again on the other side, so a move that does not take is not fatal.
         for fs in /dev /proc /sys; do
             mount --move "$fs" "/newroot$fs" 2>/dev/null || true
         done
@@ -274,11 +276,25 @@ else
     fi
 fi
 
+# What to hand the rootfs over to. systemd, the same PID 1 an installed
+# machine gets, so that the live image and the disk it installs are not two
+# different systems (#110); /sbin/tos-session is the fallback for a rootfs
+# built before that decision, where it was the only thing there was.
+#
 # switch_root panics if it cannot exec what it was handed, and a panic here is
 # a blank screen with no way back. Look before leaping, the same way the
 # installed-root path above does.
-if [ -n "$pivot" ] && ! executable_in_root /sbin/tos-session; then
-    say "tOS: the rootfs carries no session; using the initramfs session"
+live_init=
+if [ -n "$pivot" ]; then
+    for candidate in /sbin/init /sbin/tos-session; do
+        if executable_in_root "$candidate"; then
+            live_init=$candidate
+            break
+        fi
+    done
+fi
+if [ -n "$pivot" ] && [ -z "$live_init" ]; then
+    say "tOS: the rootfs carries no init and no session; using the initramfs"
     pivot=
 fi
 
@@ -325,7 +341,7 @@ if [ -n "$pivot" ]; then
         # right: /run has already moved, so the session below no longer has
         # the medium it would fall back to.
         [ -n "$carried" ] && say "tOS: booting the Debian rootfs"
-        exec switch_root /newroot /sbin/tos-session
+        exec switch_root /newroot "$live_init"
     fi
     say "tOS: cannot carry the live mounts across; using the initramfs session"
 fi

@@ -30,9 +30,10 @@ sudo mount -o loop,ro "$iso" "$mount_point"
 unsquashfs -l "$mount_point/live/filesystem.squashfs" >"$list"
 sudo umount "$mount_point"
 
-# Debian is usr-merged, so /usr/bin is where /bin/apt really lives. tos-session
-# is what /init execs after the pivot, and init is what an installed machine's
-# inittab is read by; without either, the disk boots to nothing.
+# Debian is usr-merged, so /usr/bin is where /bin/apt really lives. init is
+# what /init execs after the pivot on both images since #110 — systemd — and
+# tos-session is what the unit it reads starts; without either, the disk boots
+# to nothing.
 # The installer's own tools are in this list for a reason of their own: the
 # installer runs from inside this rootfs, and a missing unsquashfs sends it
 # down the copy path — after Partition, FormatEsp and FormatRoot have already
@@ -41,11 +42,27 @@ sudo umount "$mount_point"
 for path in usr/bin/dpkg usr/bin/apt usr/bin/bash usr/bin/mount \
     usr/bin/unsquashfs usr/sbin/sfdisk usr/sbin/mkfs.ext4 usr/sbin/grub-install \
     usr/bin/ip usr/bin/ps usr/bin/free \
-    usr/sbin/init usr/sbin/tos usr/sbin/tos-install \
+    usr/sbin/init usr/lib/systemd/systemd usr/sbin/tos usr/sbin/tos-install \
     usr/sbin/tos-session var/lib/dpkg/status root/.bashrc root/.profile \
-    etc/hosts; do
+    etc/hosts etc/systemd/system/tos-session.service \
+    etc/systemd/system/multi-user.target.wants/tos-session.service; do
     grep -qx "squashfs-root/$path" "$list" || {
         echo "the rootfs has no /$path" >&2
+        exit 1
+    }
+done
+
+# And that nothing will take the console away from the session. A getty on
+# tty1 draws over the compositor, and a serial getty is a login prompt on a
+# line anybody with the cable can reach; both are masked, which is a symlink
+# to /dev/null and shows up in the listing as the unit name being present.
+# unsquashfs -l lists a symlink as its own path, so this is the same question
+# as the loop above and is asked separately only because failing it means
+# something different: the image boots and the screen is a fight.
+for unit in getty.target "getty@.service" "serial-getty@.service" \
+    "autovt@.service"; do
+    grep -qx "squashfs-root/etc/systemd/system/$unit" "$list" || {
+        echo "the rootfs does not mask $unit" >&2
         exit 1
     }
 done

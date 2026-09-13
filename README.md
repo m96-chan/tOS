@@ -552,8 +552,9 @@ turned up. A machine with no sound card says so once and then stops saying
 it. Whether an installed system should get PipeWire instead is decided, with
 what was measured to decide it, in [`docs/design/audio.md`](docs/design/audio.md):
 it stays ALSA-only, because tOS sets the knob and never plays a sound, and
-because PipeWire from Debian is two systemd user units on a session that has
-no systemd.
+because PipeWire's units decline to start for root, which is the only user a
+tOS session has. The machine has systemd since #110, so a person who installs
+PipeWire on their own machine now has an init that will start it.
 
 
 
@@ -564,7 +565,9 @@ empty or to full where a rate is reported — absent rather than invented where
 it is not, which covers the idle battery whose `power_now` is zero. Two
 batteries are weighted into one reading, and a machine with none says so.
 Powering off and rebooting call `reboot(2)` directly, after `sync(2)`, because
-tOS may be PID 1 with no init to ask; suspend writes `mem` to
+tOS may be PID 1 with no init to ask — which since #110 is only the rescue
+session out of the initramfs, and is the next thing this should learn to tell
+apart; suspend writes `mem` to
 `/sys/power/state`. All three sit behind a trait, so the tests assert what was
 asked for without the machine acting on it. There is no UI on any of this yet,
 and the syscall path itself is only exercised on a real Linux machine.
@@ -710,6 +713,20 @@ along with the rest again when a workspace before it closes. A name belongs to
 the workspace rather than to the position, which is why a named workspace keeps
 its name while its neighbours are renumbered around it.
 
+A machine with a password boots to a **login screen**, and ending a session
+comes back to it (#112). It is the lock screen with nothing behind it: the
+same masked field, the same wait after a wrong password, and a title that says
+which of the two it is and whose password it wants. Nothing is started until
+it is answered — the session is built when the password verifies, not before —
+and what comes back after a log out is a new session with a fresh layout and
+an empty clipboard, not the last person's. A machine with **no** password is
+not gated, because a login screen with nothing to check against is a brick:
+that is the live image, whose only account is Debian's root with `*`, and an
+installed machine whose owner declined a password. `exit` in the last pane and
+the `quit` binding are the same thing, and what they mean depends on that one
+rule: log out where there is a login to come back to, and hand the machine
+back to its init where there is not. `docs/design/login.md` has the rest.
+
 `super+shift+l`, or `ctrl+a` then `L`, locks the screen. The lock is a password
 field, and it is its own type rather than another use of that box for exactly
 that reason: the box echoes what is typed, refilters a list on every keystroke
@@ -723,8 +740,9 @@ rather than by `crypt(3)`, which the workspace cannot link. It was tOS's own
 `/etc/tos/shadow` until #111, and moving it is what makes the password the
 installer asks for a password `sshd`, `su` and `login` can use as well —
 `docs/design/credentials.md`. Which account is asked for is whose session it
-is: `TOS_USER`, set by `iso/live-session` and by the `/etc/tos-session` the
-installer writes. The line is read when the lock engages rather than when a
+is: `TOS_USER`, set by `iso/live-session` — which every tOS session runs —
+and overridden on an installed machine by the `tos-session.service` drop-in
+the installer writes. The line is read when the lock engages rather than when a
 password is offered, so a machine with no password does not lock — the binding
 says there is nothing to unlock with and the session carries on. An account
 with no password is `*` in that file, which is what the live image's root

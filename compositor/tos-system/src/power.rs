@@ -487,6 +487,15 @@ pub fn request(backend: &mut dyn PowerBackend, action: PowerAction) -> io::Resul
 /// Poweroff and reboot go straight to `reboot(2)` rather than running
 /// `/sbin/poweroff`, because tOS can be PID 1 with no init to ask and no
 /// guarantee the binary is in the image at all.
+///
+/// Since #110 there is an init on the two paths that matter, and `/sbin/`
+/// does carry those programs — so what this costs is now a real thing rather
+/// than a theoretical one: a machine restarted this way never unmounts its
+/// root, and an installed tOS root is a read-write ext4. The `sync(2)` above
+/// is what stands in for a shutdown. Asking systemd instead is worth doing
+/// and is not this change; the one path that still has no init to ask is the
+/// rescue session out of the initramfs, so whatever replaces this has to keep
+/// answering for that one.
 pub struct SystemPower {
     sleep_state: PathBuf,
 }

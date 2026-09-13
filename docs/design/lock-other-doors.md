@@ -276,9 +276,12 @@ of its own can do.
 
 **Decision: none is added, and none should be added before tOS has a login.**
 
-There is no `getty` anywhere in the tree, on either configuration. The
-installed `/etc/inittab` starts the compositor and nothing else — and, per
-Door 3, is not even read yet.
+There is no `getty` anywhere in the tree, on either configuration — and since
+#110 there is an init that would happily start several. systemd's
+`getty.target` puts one on tty1, and its generator adds one on every `console=`
+the kernel command line names. All of them are masked in the rootfs, by name,
+in `iso/mkiso.sh`, which is this rule written down somewhere a boot can obey
+it rather than only somewhere a person can read it.
 
 A getty is worth naming because it is the obvious next thing somebody adds
 when an installed machine is hard to debug, and it would be a complete bypass:
@@ -290,6 +293,13 @@ beside a lock. **#111 answered the credential half of this**: the password is
 in `/etc/shadow` now, so a `login` on another VT would have something real to
 check. The rule below stands anyway — what a getty needs is a decision about
 logins, which is #112, and not merely a file to read.
+
+**#112 answered the other half, and the rule survives it.** tOS has a login
+now — a screen the compositor draws, at the start of a session and at the end
+of one — so what Door 4 refuses is no longer "a login on a machine that has
+none". It is a *second* login, on a VT nothing here is drawing, reached by a
+key combination the compositor cannot see. That is still a bypass, and the
+masking in `iso/mkiso.sh` is still what keeps it shut.
 
 The rule: **a getty is a login prompt, and tOS has no login.** Adding one
 means answering the credential question for logins, not only for the lock,
