@@ -18,7 +18,7 @@
 //! ## Reading a line off disk
 //!
 //! [`Hash::parse`] is the part that faces a file, so it is the part written
-//! defensively. `/etc/tos/shadow` is what stands between a locked screen and
+//! defensively. `/etc/shadow` is what stands between a locked screen and
 //! the session behind it, and the failure that matters is not a panic — it is
 //! a malformed line that quietly behaves like a valid one. So the parser
 //! refuses anything it is not certain of rather than repairing it, and it

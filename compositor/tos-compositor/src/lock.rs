@@ -43,11 +43,43 @@ use crate::overlay::pad_to;
 
 /// Where the credential lives when nobody says otherwise.
 ///
-/// tOS's own file, not `/etc/shadow`: writing a tOS password into the file
-/// Debian's PAM reads would silently make it the machine's login password too,
-/// and the hashes already in that file are yescrypt, which this workspace has
-/// no way to check. `docs/design/screen-lock.md` works through both.
-pub const CREDENTIAL_PATH: &str = "/etc/tos/shadow";
+/// The machine's own file, and not tOS's. It used to be `/etc/tos/shadow`, on
+/// the reasoning that a tOS password in Debian's file would silently become
+/// the machine's login password too — which was right, and which turned out to
+/// be the thing that was wanted: a password no `sshd`, no `su` and no `login`
+/// could ever use is a password that only ever unlocks a screen (#111).
+/// `docs/design/credentials.md` works through the change; the file it replaced
+/// is described in `docs/design/screen-lock.md`.
+pub const CREDENTIAL_PATH: &str = "/etc/shadow";
+
+/// The environment variable that names the account a session belongs to.
+///
+/// Set by `iso/live-session` and by the `/etc/tos-session` the installer
+/// writes, which are the two things that start a session. The compositor runs
+/// as root on both, so the uid it happens to have is not the question being
+/// asked: the live image is root's session and says so, and an installed
+/// machine is the session of the person the installer was told about, whose
+/// password is the one that machine has.
+pub const SESSION_USER: &str = "TOS_USER";
+
+/// Whose password the lock asks for, when nothing has said.
+const DEFAULT_USER: &str = "root";
+
+/// The account this session belongs to.
+///
+/// Read from the environment rather than from the uid, for the reason in
+/// [`SESSION_USER`]. A session started by hand from a shell inherits whatever
+/// that shell had, which on both images is the same variable; a session
+/// started with neither falls back to `root`, whose line on a Debian root is
+/// `*` and so locks nothing — the safe way round of the two, since the other
+/// would be a lock over somebody else's password.
+pub fn session_user() -> String {
+    std::env::var(SESSION_USER)
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| DEFAULT_USER.to_string())
+}
 
 /// The widest the box grows, however wide the display is.
 const MAX_WIDTH: usize = 44;
@@ -72,14 +104,25 @@ const MAX_PENALTY: Duration = Duration::from_secs(8);
 /// be opened; it gets told there is no password.
 #[derive(Debug)]
 pub enum NoCredential {
-    /// There is no credential file. The ordinary case on the live ISO, and on
-    /// an installed machine whose owner declined a password.
+    /// There is no shadow file at all. The busybox world, and anything else
+    /// that is not a Debian root.
     Missing(PathBuf),
     /// The file is there and could not be read.
     Unreadable(PathBuf, io::Error),
-    /// The file is there and holds nothing this can check a password against.
-    /// Not a wrong password — a lock that treated it as one would be a lock
-    /// nobody could ever open.
+    /// The file is there and has no line for this account.
+    Unknown(PathBuf, String),
+    /// The account is there and has no password: `*`, `!`, or nothing at all
+    /// in the field. The ordinary case on the live ISO, whose root is Debian's
+    /// `*`, and on an installed machine whose owner declined a password.
+    ///
+    /// Distinct from [`NoCredential::Unusable`] because it is not a fault:
+    /// nothing is wrong with that file, and what it says is that this account
+    /// is not one anybody authenticates as.
+    NoPassword(PathBuf, String),
+    /// There is a password and it is not one this can check — a `$y$`
+    /// yescrypt line, which is what Debian's own `passwd` writes. Not a wrong
+    /// password: a lock that treated it as one would be a lock nobody could
+    /// ever open.
     Unusable(PathBuf, String),
 }
 
@@ -87,10 +130,16 @@ impl fmt::Display for NoCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NoCredential::Missing(path) => {
-                write!(f, "no password is set in {}", path.display())
+                write!(f, "there is no {}", path.display())
             }
             NoCredential::Unreadable(path, error) => {
                 write!(f, "cannot read {}: {error}", path.display())
+            }
+            NoCredential::Unknown(path, user) => {
+                write!(f, "{} has no line for {user}", path.display())
+            }
+            NoCredential::NoPassword(_, user) => {
+                write!(f, "no password is set for {user}")
             }
             NoCredential::Unusable(path, why) => {
                 write!(
@@ -105,19 +154,26 @@ impl fmt::Display for NoCredential {
 
 impl std::error::Error for NoCredential {}
 
-/// Read the credential, and say why there is none rather than how many ways
-/// there might have been.
+/// Read the account's credential, and say why there is none rather than how
+/// many ways there might have been.
 ///
-/// The file holds one line: the `$6$` crypt hash `tos-install` wrote, which is
-/// an ordinary shadow-format hash any other tool on the machine can read.
-/// Blank lines and anything after a `#` are skipped so that a person who opens
-/// the file to see what it is can leave a note in it.
+/// `/etc/shadow`, in the format every other program on the machine reads it
+/// in: one line per account, the account's name first and its password field
+/// second. The installer writes the person's line there as a `$6$` crypt
+/// hash, which is what `tos-crypt` produces and what this can check; Debian's
+/// own lines are `*`, an account nothing authenticates as.
 ///
-/// The mode of the file is not checked. It should be 0600 and the installer
-/// writes it that way, but refusing to lock a screen because the hash is more
-/// readable than it ought to be would trade a lock that works for one that
-/// does not, over a file only root can reach in the first place.
-pub fn read_credential(path: &Path) -> Result<String, NoCredential> {
+/// Comments are not a thing `/etc/shadow` has, so nothing is skipped but
+/// blank lines. A `#` at the start of a line would be an account named `#`,
+/// and treating it as a note is how a line could be commented out of a file
+/// that no other reader on the machine believes in.
+///
+/// The mode of the file is not checked. It should be 0640 and dpkg and the
+/// installer both write it that way, but refusing to lock a screen because
+/// the hash is more readable than it ought to be would trade a lock that
+/// works for one that does not, over a file only root can reach in the first
+/// place.
+pub fn read_credential(path: &Path, user: &str) -> Result<String, NoCredential> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -125,17 +181,35 @@ pub fn read_credential(path: &Path) -> Result<String, NoCredential> {
         }
         Err(e) => return Err(NoCredential::Unreadable(path.to_path_buf(), e)),
     };
-    let line = text
+    let field = text
         .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .ok_or_else(|| NoCredential::Unusable(path.to_path_buf(), "the file is empty".into()))?;
+        .filter(|line| !line.trim().is_empty())
+        .find_map(|line| {
+            let (name, rest) = line.split_once(':')?;
+            (name == user).then(|| rest.split(':').next().unwrap_or(""))
+        })
+        .ok_or_else(|| NoCredential::Unknown(path.to_path_buf(), user.to_string()))?;
+
+    // `*` and `!` are how that file says "nobody authenticates as this", and
+    // an empty field is how it says "anybody does, without being asked" —
+    // which is not a credential either, and is certainly not one to hand a
+    // lock. All three mean the same thing here: there is nothing to unlock
+    // with, so nothing locks. A `!` in front of a real hash is an account
+    // that has a password and has been disabled; the hash behind it is
+    // deliberately not read.
+    if field.is_empty() || field.starts_with('*') || field.starts_with('!') {
+        return Err(NoCredential::NoPassword(
+            path.to_path_buf(),
+            user.to_string(),
+        ));
+    }
+
     // Parsing it now rather than at the first keypress is the point: the
     // decision that this machine can be locked is made before the screen goes
-    // up, so a file that does not parse can never become a locked session
+    // up, so a hash that does not parse can never become a locked session
     // waiting for a password that will never be accepted.
-    match tos_crypt::Hash::parse(line) {
-        Ok(_) => Ok(line.to_string()),
+    match tos_crypt::Hash::parse(field) {
+        Ok(_) => Ok(field.to_string()),
         Err(e) => Err(NoCredential::Unusable(path.to_path_buf(), e.to_string())),
     }
 }
@@ -691,19 +765,52 @@ mod tests {
         );
     }
 
+    /// A shadow file the way the machine's own is laid out: Debian's system
+    /// accounts, none of which has a password, and the person's line among
+    /// them.
+    fn shadow(user: &str, field: &str) -> String {
+        format!(
+            "root:*:::::::\n\
+             daemon:*:20709:0:99999:7:::\n\
+             {user}:{field}:::::::\n\
+             _apt:*:20709:0:99999:7:::\n"
+        )
+    }
+
     #[test]
-    fn a_credential_file_is_read_back_as_written() {
+    fn the_account_line_is_found_among_the_others() {
         let hash = hash_of("hunter2");
-        let path = credential_file("plain", &format!("{hash}\n"));
-        assert_eq!(read_credential(&path).expect("a credential"), hash);
+        let path = credential_file("shadow", &shadow("tos", &hash));
+        assert_eq!(read_credential(&path, "tos").expect("a credential"), hash);
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn a_file_with_a_note_in_it_still_reads() {
+    fn the_aging_fields_after_the_hash_are_not_part_of_it() {
+        // Debian's own lines carry a day number and four more fields, and a
+        // reader that took the rest of the line would hand the hasher a
+        // credential no password could ever match.
         let hash = hash_of("hunter2");
-        let path = credential_file("commented", &format!("# the tOS lock password\n\n{hash}\n"));
-        assert_eq!(read_credential(&path).expect("a credential"), hash);
+        let path = credential_file(
+            "aged",
+            &format!("root:*:20709:0:99999:7:::\ntos:{hash}:20709:0:99999:7:::\n"),
+        );
+        assert_eq!(read_credential(&path, "tos").expect("a credential"), hash);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn another_accounts_password_is_not_this_sessions() {
+        // The live image is root's session, and root's line is `*`. A reader
+        // that took the first usable hash in the file would lock a live
+        // session against whatever account happened to have one.
+        let path = credential_file("other", &shadow("tos", &hash_of("hunter2")));
+        let why = read_credential(&path, "root").expect_err("root has no password");
+        assert!(matches!(why, NoCredential::NoPassword(..)), "{why}");
+        assert!(
+            why.to_string().contains("no password is set for root"),
+            "{why}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -711,23 +818,50 @@ mod tests {
     fn a_missing_file_is_no_credential_rather_than_an_error() {
         let path = std::env::temp_dir().join("tos-lock-definitely-not-here-1a2b3c");
         let _ = std::fs::remove_file(&path);
-        let why = read_credential(&path).expect_err("there is no file");
+        let why = read_credential(&path, "tos").expect_err("there is no file");
         assert!(matches!(why, NoCredential::Missing(_)), "{why}");
-        assert!(why.to_string().contains("no password is set"), "{why}");
+        assert!(why.to_string().contains("there is no"), "{why}");
     }
 
     #[test]
-    fn a_file_that_is_not_a_hash_is_refused_and_says_why() {
-        // The failure that matters: this must not be reported as a wrong
-        // password, because the screen would then never open.
-        for (name, contents) in [
+    fn an_account_with_no_line_is_not_an_account_with_no_password() {
+        let path = credential_file("stranger", &shadow("tos", &hash_of("hunter2")));
+        let why = read_credential(&path, "yusuke").expect_err("no such account");
+        assert!(matches!(why, NoCredential::Unknown(..)), "{why}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_account_nothing_authenticates_as_locks_nothing() {
+        // Every one of these is a file that is exactly right and an account
+        // that has no password: the live image's root, an installed machine
+        // whose owner declined one, and a disabled account. None of them is a
+        // fault to report.
+        for (name, field) in [
+            ("star", "*"),
+            ("bang", "!"),
+            ("disabled", "!$6$salt$digest"),
             ("empty", ""),
-            ("blank", "\n\n# nothing but a note\n"),
-            ("yescrypt", "$y$j9T$salt$digest\n"),
-            ("nonsense", "not a hash at all\n"),
         ] {
-            let path = credential_file(name, contents);
-            let why = read_credential(&path).expect_err("not a usable credential");
+            let path = credential_file(name, &shadow("tos", field));
+            let why = read_credential(&path, "tos").expect_err("no password");
+            assert!(matches!(why, NoCredential::NoPassword(..)), "{name}: {why}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn a_password_that_is_not_a_hash_is_refused_and_says_why() {
+        // The failure that matters: this must not be reported as a wrong
+        // password, because the screen would then never open. `$y$` is what
+        // Debian's own passwd(1) writes, so it is the one that will actually
+        // turn up.
+        for (name, field) in [
+            ("yescrypt", "$y$j9T$salt$digest"),
+            ("nonsense", "not a hash at all"),
+        ] {
+            let path = credential_file(name, &shadow("tos", field));
+            let why = read_credential(&path, "tos").expect_err("not a usable credential");
             assert!(matches!(why, NoCredential::Unusable(..)), "{name}: {why}");
             let _ = std::fs::remove_file(&path);
         }
@@ -738,8 +872,8 @@ mod tests {
         // A file that goes away while the screen is locked must not be able to
         // lock the owner out of their own session.
         let hash = hash_of("hunter2");
-        let path = credential_file("removed", &format!("{hash}\n"));
-        let mut lock = LockScreen::new(read_credential(&path).expect("a credential"));
+        let path = credential_file("removed", &shadow("tos", &hash));
+        let mut lock = LockScreen::new(read_credential(&path, "tos").expect("a credential"));
         std::fs::remove_file(&path).expect("remove");
         assert_eq!(
             offer(&mut lock, "hunter2", Instant::now()),

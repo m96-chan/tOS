@@ -110,6 +110,15 @@ pub struct Config {
     /// unlock against a file of the user's choosing would be a lock with a
     /// spare key printed on it.
     pub credential: PathBuf,
+    /// The account in that file whose password the lock asks for.
+    ///
+    /// A seam for the same reason the path is, and set from the environment
+    /// rather than from a setting: which person a session belongs to is the
+    /// session's to say, not a preference, and a session that could be told
+    /// to check somebody else's line would be a lock with a spare key in the
+    /// configuration file. [`crate::lock::session_user`] is where it comes
+    /// from.
+    pub credential_user: String,
     /// How long the session goes untouched before it locks, or `None` for
     /// never.
     ///
@@ -169,6 +178,7 @@ impl Default for Config {
             palette: Palette::new(),
             chrome: Chrome::default(),
             credential: PathBuf::from(crate::lock::CREDENTIAL_PATH),
+            credential_user: crate::lock::session_user(),
             // Five minutes, then five more. The order is the point: locking
             // first means the screen that a passer-by wakes is the prompt,
             // where blanking first would leave five minutes in which a tap on

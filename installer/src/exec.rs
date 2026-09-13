@@ -577,14 +577,11 @@ mod tests {
             .write_file("/mnt/etc/passwd", "root:*:0:0\n")
             .unwrap();
         backend
-            .write_file_with_mode("/mnt/etc/tos/shadow", "$6$\n", Some(0o600))
+            .write_file_with_mode("/mnt/etc/shadow", "root:*:::::::\n", Some(0o640))
             .unwrap();
         assert_eq!(
             backend.transcript(),
-            vec![
-                "write /mnt/etc/passwd",
-                "write /mnt/etc/tos/shadow (mode 0600)"
-            ]
+            vec!["write /mnt/etc/passwd", "write /mnt/etc/shadow (mode 0640)"]
         );
     }
 
@@ -594,7 +591,7 @@ mod tests {
         let mut backend = System;
         let dir = std::env::temp_dir().join("tos-install-mode-test");
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("etc").join("tos").join("shadow");
+        let path = dir.join("etc").join("shadow");
         let name = path.to_str().unwrap().to_string();
 
         backend

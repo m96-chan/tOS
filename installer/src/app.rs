@@ -662,7 +662,7 @@ impl App {
                 inner.x,
                 inner.y + 9,
                 inner.width,
-                "With no password, the screen will never lock.",
+                "With no password, nothing logs in and nothing locks.",
                 Style::fg(WARN),
             );
         }
@@ -1316,7 +1316,7 @@ mod tests {
         let mut screen = Screen::new(90, 30);
         app.draw(&mut screen);
         assert!(
-            screen.contains("the screen will never lock"),
+            screen.contains("nothing logs in and nothing locks"),
             "{}",
             screen.to_text()
         );
@@ -1327,7 +1327,7 @@ mod tests {
         let mut screen = Screen::new(90, 30);
         app.draw(&mut screen);
         assert!(
-            screen.contains("Password   none, so the screen will not lock"),
+            screen.contains("Password   none, so nothing will log in"),
             "the last screen has to say so too: {}",
             screen.to_text()
         );

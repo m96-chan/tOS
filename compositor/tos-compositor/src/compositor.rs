@@ -1839,7 +1839,7 @@ impl Compositor {
         if self.lock.is_some() {
             return false;
         }
-        match lock::read_credential(&self.config.credential) {
+        match lock::read_credential(&self.config.credential, &self.config.credential_user) {
             Ok(hash) => {
                 self.engage_lock(hash);
                 true
@@ -1862,7 +1862,7 @@ impl Compositor {
     /// Such a session blanks and stays unlocked, which is "no credential, no
     /// lock" arriving by the other road.
     fn lock_on_idle(&mut self) -> bool {
-        match lock::read_credential(&self.config.credential) {
+        match lock::read_credential(&self.config.credential, &self.config.credential_user) {
             Ok(hash) => {
                 self.engage_lock(hash);
                 true
@@ -4864,27 +4864,39 @@ mod tests {
 
     // ---- the lock -------------------------------------------------------
 
-    /// A credential file of this test's own making, so that nothing here
-    /// depends on whether the machine running it has a password of its own.
-    /// The password is always "tos"; what varies is whether the file is there.
+    /// The account these tests are the session of, written into every shadow
+    /// file below. Named rather than defaulted: `Config::default()` takes it
+    /// from the environment, and a machine with `TOS_USER` set in the shell
+    /// that ran `cargo test` would otherwise be asking these locks for a
+    /// different line than the one the fixture wrote.
+    const LOCK_ACCOUNT: &str = "tos";
+
+    /// A shadow file of this test's own making, so that nothing here depends
+    /// on whether the machine running it has a password of its own. The
+    /// password is always "tos"; what varies is whether the account has one.
+    ///
+    /// Laid out the way the machine's own file is, with root above the
+    /// person and carrying no password, so that a reader which took the
+    /// first line or the first hash it found would be caught here.
     fn credential(name: &str, password: Option<&str>) -> std::path::PathBuf {
         let path =
             std::env::temp_dir().join(format!("tos-lock-compositor-{}-{name}", std::process::id()));
-        match password {
-            Some(password) => {
-                let hash = tos_crypt::sha512crypt::hash(password.as_bytes(), b"tOScompositor");
-                std::fs::write(&path, format!("{hash}\n")).expect("credential file");
-            }
-            None => {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
+        let field = match password {
+            Some(password) => tos_crypt::sha512crypt::hash(password.as_bytes(), b"tOScompositor"),
+            None => "*".to_string(),
+        };
+        std::fs::write(
+            &path,
+            format!("root:*:::::::\n{LOCK_ACCOUNT}:{field}:::::::\n"),
+        )
+        .expect("credential file");
         path
     }
 
     fn compositor_with_password(name: &str) -> Compositor {
         compositor_with(Config {
             credential: credential(name, Some("tos")),
+            credential_user: LOCK_ACCOUNT.into(),
             ..Config::default()
         })
     }
@@ -4930,6 +4942,7 @@ mod tests {
         // password. The compositor never asks what kind of machine it is on.
         let mut compositor = compositor_with(Config {
             credential: credential("none", None),
+            credential_user: LOCK_ACCOUNT.into(),
             ..Config::default()
         });
         assert!(lock_binding(&mut compositor));
@@ -4939,7 +4952,7 @@ mod tests {
         );
         let said = compositor.notifications.status_line().unwrap_or_default();
         assert!(
-            said.starts_with("cannot lock: no password is set"),
+            said.starts_with("cannot lock: no password is set for tos"),
             "{said:?}"
         );
     }
@@ -4948,10 +4961,15 @@ mod tests {
     fn a_credential_that_does_not_parse_is_not_a_wrong_password() {
         // It is a refusal to engage. Treating it as a wrong password would
         // put up a screen that could never be opened.
+        // `$y$` is what Debian's own passwd(1) writes, so it is the line
+        // that will actually turn up on a machine somebody changed their
+        // password on.
         let path = credential("yescrypt", None);
-        std::fs::write(&path, "$y$j9T$salt$digest\n").expect("credential file");
+        std::fs::write(&path, format!("{LOCK_ACCOUNT}:$y$j9T$salt$digest:::::::\n"))
+            .expect("credential file");
         let mut compositor = compositor_with(Config {
             credential: path,
+            credential_user: LOCK_ACCOUNT.into(),
             ..Config::default()
         });
         compositor.lock_session();
@@ -5250,6 +5268,7 @@ mod tests {
         let mut compositor = idling(
             Config {
                 credential: credential("idle-blank", None),
+                credential_user: LOCK_ACCOUNT.into(),
                 ..Config::default()
             },
             None,
@@ -5288,6 +5307,7 @@ mod tests {
         let mut compositor = idling(
             Config {
                 credential: credential("idle-swallow", None),
+                credential_user: LOCK_ACCOUNT.into(),
                 ..Config::default()
             },
             None,
@@ -5317,6 +5337,7 @@ mod tests {
         let mut compositor = idling(
             Config {
                 credential: credential("idle-grab", None),
+                credential_user: LOCK_ACCOUNT.into(),
                 ..Config::default()
             },
             None,
@@ -5348,6 +5369,7 @@ mod tests {
         let mut compositor = idling(
             Config {
                 credential: credential("idle-locked-dark", Some("tos")),
+                credential_user: LOCK_ACCOUNT.into(),
                 ..Config::default()
             },
             Some(60),
@@ -5383,6 +5405,7 @@ mod tests {
         let mut compositor = idling(
             Config {
                 credential: credential("idle-together", Some("tos")),
+                credential_user: LOCK_ACCOUNT.into(),
                 ..Config::default()
             },
             Some(30),
@@ -5403,6 +5426,7 @@ mod tests {
         let mut compositor = idling(
             Config {
                 credential: credential("idle-no-credential", None),
+                credential_user: LOCK_ACCOUNT.into(),
                 ..Config::default()
             },
             Some(30),
@@ -5429,6 +5453,7 @@ mod tests {
         let mut compositor = idling(
             Config {
                 credential: credential("idle-off", Some("tos")),
+                credential_user: LOCK_ACCOUNT.into(),
                 ..Config::default()
             },
             None,
@@ -5448,6 +5473,7 @@ mod tests {
         let mut compositor = idling(
             Config {
                 credential: credential("idle-timeout", None),
+                credential_user: LOCK_ACCOUNT.into(),
                 ..Config::default()
             },
             None,
@@ -5484,6 +5510,7 @@ mod tests {
         let mut compositor = idling(
             Config {
                 credential: credential("idle-dark-wait", Some("tos")),
+                credential_user: LOCK_ACCOUNT.into(),
                 ..Config::default()
             },
             Some(60),
@@ -5514,6 +5541,7 @@ mod tests {
         // longer than that.
         let mut compositor = compositor_with(Config {
             credential: credential("idle-loop", Some("tos")),
+            credential_user: LOCK_ACCOUNT.into(),
             idle_lock: Some(Duration::from_millis(1)),
             idle_blank: Some(Duration::from_millis(1)),
             ..Config::default()
@@ -5534,6 +5562,7 @@ mod tests {
         let mut compositor = idling(
             Config {
                 credential: credential("idle-refused", None),
+                credential_user: LOCK_ACCOUNT.into(),
                 ..Config::default()
             },
             None,
@@ -5567,6 +5596,7 @@ mod tests {
         let mut compositor = idling(
             Config {
                 credential: credential("idle-output", None),
+                credential_user: LOCK_ACCOUNT.into(),
                 ..Config::default()
             },
             None,

@@ -15,13 +15,20 @@ use tos_render::OwnedFramebuffer;
 const SIZE: (u32, u32) = (800, 480);
 /// What every test here unlocks with.
 const PASSWORD: &str = "the password";
+/// And whose password it is. Named rather than left to the environment, which
+/// is where `Config::default()` gets it from.
+const ACCOUNT: &str = "tos";
 
 /// A compositor running `command`, with a credential file of this test's own
 /// making beside it.
 fn compositor(name: &str, command: &[&str]) -> Compositor {
     let path = std::env::temp_dir().join(format!("tos-lock-test-{}-{name}", std::process::id()));
     let hash = tos_crypt::sha512crypt::hash(PASSWORD.as_bytes(), b"tOSlockscreen");
-    std::fs::write(&path, format!("{hash}\n")).expect("credential file");
+    // /etc/shadow's format, because that is the file the lock reads now: the
+    // session's account among the others, and root above it with no password
+    // of its own.
+    std::fs::write(&path, format!("root:*:::::::\n{ACCOUNT}:{hash}:::::::\n"))
+        .expect("credential file");
 
     let config = Config {
         command: Some(command.iter().map(|s| s.to_string()).collect()),
@@ -31,6 +38,7 @@ fn compositor(name: &str, command: &[&str]) -> Compositor {
         font: Some("/nonexistent".into()),
         inactive_fade: 0,
         credential: path,
+        credential_user: ACCOUNT.into(),
         ..Config::default()
     };
     Compositor::new(config, SIZE, None).expect("compositor")
