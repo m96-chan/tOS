@@ -409,6 +409,16 @@ EOF
 #   grub2-common $GRUB_PKGS the installer's bootloader step, likewise.
 #   squashfs-tools          how the installer unpacks this very rootfs.
 #   kmod                    modprobe for a machine that has pivoted.
+#   sudo                    the only way to be root on an installed machine.
+#                           A session's panes run as the person now (#112), and
+#                           Debian's root carries `*`, so `su` has nothing to
+#                           accept and without this the machine cannot install
+#                           a package on itself. It authenticates against the
+#                           `/etc/shadow` line #111 put there, through PAM,
+#                           which is the reason that decision was taken. The
+#                           installer writes the drop-in that names the person;
+#                           this carries the program and creates the
+#                           `/etc/sudoers.d` the drop-in goes in.
 #   udev                    the thing that makes `/dev/disk/by-label` exist.
 #                           Debian ships it as its own binary package and
 #                           nothing here pulls it: `systemd-sysv` depends on
@@ -431,7 +441,7 @@ EOF
 #                           filesystem problem rather than a missing package.
 ROOTFS_PACKAGES="debian-archive-keyring,ca-certificates,bash,systemd-sysv,udev,\
 busybox,iproute2,procps,ncurses-base,fonts-vlgothic,e2fsprogs,dosfstools,\
-fdisk,util-linux,mount,kmod,squashfs-tools,grub2-common,\
+fdisk,util-linux,mount,kmod,sudo,squashfs-tools,grub2-common,\
 $(echo "$GRUB_PKGS" | tr ' ' ',')"
 
 # Three suites and not one. `bookworm` is the frozen release: a point release

@@ -218,6 +218,15 @@ fn link_detail(interface: &Interface) -> String {
 /// The running compositor.
 pub struct Compositor {
     config: Config,
+    /// The account this session's panes run as, read once here rather than at
+    /// every spawn: a passwd file that changes under a running session must
+    /// not mean that the third pane is somebody the first two are not.
+    ///
+    /// `None` is a machine whose `/etc/passwd` has no line for `TOS_USER`,
+    /// which is the live image's business only if somebody edits it. A pane
+    /// then starts as whoever the compositor is, which is what it did before
+    /// any of this existed.
+    session_account: Option<crate::account::Account>,
     session: Session,
     panes: HashMap<PaneId, Pane>,
     fonts: FontStack,
@@ -405,6 +414,15 @@ impl Compositor {
             clock,
             network_target: None,
             dhcp: None,
+            // Read before `config` is moved in, and kept even when it says
+            // nothing can be dropped to: `credentials_for` is what decides
+            // that, at the pane, so that the rule lives in one place.
+            session_account: crate::account::read(
+                &config.passwd,
+                &config.group,
+                &config.credential_user,
+            )
+            .ok(),
             config,
         };
 
@@ -525,6 +543,7 @@ impl Compositor {
             self.config.scrollback,
             &self.config.palette,
             command,
+            self.session_account.as_ref(),
         )
     }
 
