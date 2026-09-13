@@ -23,6 +23,12 @@ no init at all, where `/sbin/tos-session` is PID 1 and restarts the compositor
 itself — and, since GRUB moved into the rootfs, one to look at a broken
 machine from rather than one to install from.
 
+The GRUB menu has three entries: `tOS`, `tOS (verbose)` and
+`tOS (rescue shell)`. Only the last passes `tos.rescue`, which is what the
+session wants before it execs a shell when the compositor exits — it used to
+be on all of them, which made an unauthenticated root shell the default way to
+boot the image (#112).
+
 The session is a unit, `/etc/systemd/system/tos-session.service`, written into
 the rootfs by `mkiso.sh` and `Restart=always`. The gettys are masked — a
 `getty@tty1` would draw over the compositor and a serial getty is a login

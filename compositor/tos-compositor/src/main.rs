@@ -295,6 +295,20 @@ fn run_drm(config: Config) -> io::Result<()> {
     use tos_input::evdev::InputBackend;
     use tos_platform::{DrmDisplay, VirtualTerminal};
 
+    // This session is a machine's console: the screen, the keyboard and the
+    // virtual terminal, taken from the kernel by the three calls below. So it
+    // is the one that has to be logged into, and the one that ending a session
+    // comes back to a login screen from (#112). The nested and headless
+    // backends are windows on a desktop that already asked, and they set this
+    // nowhere.
+    //
+    // A machine with no password is not gated by it: there is nothing to
+    // check, and the compositor still never learns what live media is.
+    let config = Config {
+        gated: true,
+        ..config
+    };
+
     /// The screen, the keyboard and the console, for the one thing that takes
     /// all three away underneath a running session.
     ///

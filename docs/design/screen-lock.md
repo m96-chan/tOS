@@ -76,6 +76,11 @@ only inside the compositor gets wrong.
 `tos-install`, hashed with SHA-512 crypt (`$6$`) implemented in tree. Not from
 `/etc/shadow`, and not from `crypt(3)`.**
 
+> **#112 made this screen two screens.** The same type is the machine's login
+> boundary when there is no session behind it, at the start of a session and
+> at the end of one; `docs/design/login.md` is where that is decided, and
+> everything below still describes what both of them are.
+
 > **Superseded by #111, in `docs/design/credentials.md`.** The file is now
 > `/etc/shadow` and the account's line in it, for a reason this section did
 > not weigh: a password only the lock can read is a password `sshd`, `su` and

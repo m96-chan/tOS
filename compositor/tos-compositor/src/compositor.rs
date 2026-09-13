@@ -417,19 +417,100 @@ impl Compositor {
                 .status(format!("no dictionary: {problem}"));
         }
 
-        // The first pane exists in the session already; give it a process.
-        let root = compositor.session.root_pane();
-        let area = compositor
+        // Either a session, or the screen that has to be answered before there
+        // is one. Nothing is spawned behind a login screen: a session that had
+        // already started its shell before anybody said who they were would be
+        // a boundary in the drawing only (#112).
+        match compositor.session_gate() {
+            Some(hash) => compositor.show_login(hash),
+            None => compositor.begin_session()?,
+        }
+        Ok(compositor)
+    }
+
+    /// The credential this session has to be opened with, if it has one.
+    ///
+    /// `None` on a machine with no password, which is the live image and an
+    /// installed machine whose owner declined one: there would be nothing to
+    /// check, and a login screen with nothing to check against is a brick.
+    /// That is the same rule the lock obeys, arriving at the other end of the
+    /// session, and it is why neither needs to be told what live media is.
+    ///
+    /// `None` too where the display is not a machine's console — see
+    /// [`Config::gated`].
+    fn session_gate(&self) -> Option<String> {
+        if !self.config.gated {
+            return None;
+        }
+        lock::read_credential(&self.config.credential, &self.config.credential_user).ok()
+    }
+
+    /// Put the login screen up. There is no session behind it.
+    fn show_login(&mut self, hash: String) {
+        self.keymap.cancel_pending();
+        self.release_grab();
+        self.lock = Some(LockScreen::login(hash, self.config.credential_user.clone()));
+        self.needs_full_redraw = true;
+    }
+
+    /// Start a session: one workspace, one pane, one shell.
+    ///
+    /// The session is built here rather than in [`Compositor::new`] because it
+    /// is built more than once now — at startup, and again every time somebody
+    /// logs in after one ended. What it starts from is a new [`Session`], not
+    /// the tree the last person left: a workspace layout is as much theirs as
+    /// the shell history in it was.
+    fn begin_session(&mut self) -> io::Result<()> {
+        self.session = Session::new();
+        self.panes.clear();
+        let root = self.session.root_pane();
+        let area = self
             .session
             .active()
-            .geometry(compositor.grid_area())
+            .geometry(self.grid_area())
             .first()
             .map(|(_, rect)| *rect)
             .unwrap_or(Rect::new(0, 0, 80, 24));
-        let pane = compositor.spawn_pane(area)?;
-        compositor.panes.insert(root, pane);
-        compositor.sync_layout();
-        Ok(compositor)
+        let pane = self.spawn_pane(area)?;
+        self.panes.insert(root, pane);
+        self.sync_layout();
+        self.needs_full_redraw = true;
+        Ok(())
+    }
+
+    /// Take the session apart, leaving the machine with none.
+    ///
+    /// Dropping the panes closes their pseudoterminals, which is what tells
+    /// the programs in them that the person they were talking to has gone.
+    /// Everything else here is something that belonged to that person and
+    /// would otherwise be handed to whoever logs in next: what they copied,
+    /// the menu they left open, the selection they were dragging.
+    fn end_session(&mut self) {
+        self.panes.clear();
+        self.session = Session::new();
+        self.overlay = None;
+        self.copy = None;
+        self.mouse_grab = None;
+        self.clipboard.clear();
+        self.session_ended_while_locked = false;
+        self.needs_full_redraw = true;
+    }
+
+    /// End the session and ask who is there, or end the compositor where
+    /// there is nobody to ask.
+    ///
+    /// The second half is the live image and every machine with no password:
+    /// leaving is what it has always meant there, and the init that started
+    /// this starts another one. What it is not any more is a fall through the
+    /// floor onto a root shell (#112).
+    fn log_out(&mut self) {
+        match self.session_gate() {
+            Some(hash) => {
+                self.end_session();
+                self.show_login(hash);
+            }
+            None => self.running = false,
+        }
     }
 
     fn spawn_pane(&self, area: Rect) -> io::Result<Pane> {
@@ -1624,8 +1705,13 @@ impl Compositor {
                 true
             }
             Action::ImeToggle => self.toggle_ime(),
+            // Quit means "I am done with this session". Where there is a
+            // login screen to come back to, that is a log out and the machine
+            // stays up asking who is there; where there is not, it is the
+            // whole of what tOS was doing and the init that started it starts
+            // another.
             Action::Quit => {
-                self.running = false;
+                self.log_out();
                 true
             }
         }
@@ -1877,7 +1963,7 @@ impl Compositor {
         // session comes back.
         self.keymap.cancel_pending();
         self.release_grab();
-        self.lock = Some(LockScreen::new(hash));
+        self.lock = Some(LockScreen::new(hash, self.config.credential_user.clone()));
         // An open overlay is left exactly as it was, under the lock rather
         // than closed by it. Nothing of it is drawn while the lock is up, and
         // the person who gets it back is the person who left it there.
@@ -1895,15 +1981,35 @@ impl Compositor {
     }
 
     /// The one way out, and there is no other.
+    ///
+    /// Two things can be behind this screen. A session, which comes back
+    /// untouched — that is a lock. Or none, because this is the login screen
+    /// at the start of a machine's day, or because the last pane died while
+    /// the screen was locked; then answering it starts one.
     fn unlock(&mut self) {
         self.lock = None;
         // Nothing under the lock was drawn while it was up, and the damage
         // that would have said what to repaint was thrown away with each
         // locked frame. The whole screen is the only honest answer.
         self.needs_full_redraw = true;
-        // A pane that died while the screen was locked could not be allowed to
-        // end the session then. It ends it now.
-        if self.session_ended_while_locked {
+        self.session_ended_while_locked = false;
+        if !self.panes.is_empty() {
+            return;
+        }
+        // Nothing behind this screen, and nowhere to come back to: a display
+        // that is not a machine's console has no login boundary, so a session
+        // that ended under the lock ends the compositor with it, exactly as it
+        // did before there was one.
+        if !self.config.gated {
+            self.running = false;
+            return;
+        }
+        if let Err(e) = self.begin_session() {
+            // A machine that cannot start a shell is not one to sit at a
+            // prompt on. Say so and hand it back to the init, which is the
+            // only thing left that can do anything about it.
+            self.notifications
+                .status(format!("cannot start a session: {e}"));
             self.running = false;
         }
     }
@@ -2496,7 +2602,7 @@ impl Compositor {
             if self.lock.is_some() {
                 self.session_ended_while_locked = true;
             } else {
-                self.running = false;
+                self.log_out();
             }
             return;
         }
@@ -4976,6 +5082,187 @@ mod tests {
         assert!(!compositor.is_locked());
         let said = compositor.notifications.status_line().unwrap_or_default();
         assert!(said.contains("not a password tOS can check"), "{said:?}");
+    }
+
+    // ---- the login boundary (#112) --------------------------------------
+
+    /// A compositor on a machine's console: the one kind that is logged into.
+    fn console_with(name: &str, password: Option<&str>) -> Compositor {
+        compositor_with(Config {
+            credential: credential(name, password),
+            credential_user: LOCK_ACCOUNT.into(),
+            gated: true,
+            ..Config::default()
+        })
+    }
+
+    fn panes_running(compositor: &Compositor) -> usize {
+        compositor.panes.len()
+    }
+
+    #[test]
+    fn a_machine_with_a_password_starts_at_a_login_screen() {
+        let compositor = console_with("login-start", Some("tos"));
+        assert!(compositor.is_locked(), "the session started unasked");
+        assert_eq!(
+            compositor.lock_screen().map(|screen| screen.purpose()),
+            Some(lock::Purpose::Login),
+            "a lock has a session behind it and this has none"
+        );
+        // And nothing is running behind it. A shell started before anybody
+        // said who they were would make this a boundary in the drawing only.
+        assert_eq!(panes_running(&compositor), 0);
+        assert_eq!(
+            compositor.lock_screen().map(|screen| screen.user()),
+            Some(LOCK_ACCOUNT),
+            "the screen has to say whose password it wants"
+        );
+    }
+
+    #[test]
+    fn answering_the_login_screen_starts_the_session() {
+        let mut compositor = console_with("login-answer", Some("tos"));
+        answer(&mut compositor, "tos");
+        assert!(!compositor.is_locked());
+        assert_eq!(panes_running(&compositor), 1);
+        assert!(compositor.is_running());
+    }
+
+    #[test]
+    fn a_wrong_password_at_the_login_screen_starts_nothing() {
+        let mut compositor = console_with("login-wrong", Some("tos"));
+        answer(&mut compositor, "not it");
+        assert!(compositor.is_locked());
+        assert_eq!(panes_running(&compositor), 0);
+        assert_eq!(compositor.lock_screen().unwrap().attempts(), 1);
+    }
+
+    #[test]
+    fn a_machine_with_no_password_is_not_asked_who_is_there() {
+        // The live image, whose root carries `*`, and an installed machine
+        // whose owner declined a password. A login screen with nothing to
+        // check against is a brick, and the compositor arrives at that
+        // without being told what live media is — the same rule the lock
+        // obeys at the other end of the session.
+        let compositor = console_with("login-none", None);
+        assert!(!compositor.is_locked());
+        assert_eq!(panes_running(&compositor), 1);
+    }
+
+    #[test]
+    fn the_last_pane_closing_comes_back_to_the_login_screen() {
+        // `exit` in the last pane. What it used to reach was a bare root
+        // shell on the live image and a brand new session on an installed
+        // one; what it reaches now is the boundary it came in through.
+        let mut compositor = console_with("logout", Some("tos"));
+        answer(&mut compositor, "tos");
+        let focus = compositor.session.focus();
+        compositor.close_pane(focus);
+
+        assert!(
+            compositor.is_running(),
+            "the machine quit rather than asking"
+        );
+        assert!(compositor.is_locked());
+        assert_eq!(
+            compositor.lock_screen().map(|screen| screen.purpose()),
+            Some(lock::Purpose::Login)
+        );
+        assert_eq!(panes_running(&compositor), 0);
+
+        // And it is a way in, not a way to be stuck: the same password opens
+        // it and the machine has a session again.
+        answer(&mut compositor, "tos");
+        assert!(!compositor.is_locked());
+        assert_eq!(panes_running(&compositor), 1);
+    }
+
+    #[test]
+    fn the_session_that_comes_back_is_not_the_one_that_left() {
+        let mut compositor = console_with("logout-fresh", Some("tos"));
+        answer(&mut compositor, "tos");
+        press_key(
+            &mut compositor,
+            KeyCode::Char('d'),
+            tos_input::Modifiers::SUPER,
+        );
+        assert_eq!(panes_running(&compositor), 2, "the split did not happen");
+        compositor
+            .clipboard
+            .insert(CLIPBOARD, b"what the last person copied".to_vec());
+
+        for _ in 0..2 {
+            let focus = compositor.session.focus();
+            compositor.close_pane(focus);
+        }
+        answer(&mut compositor, "tos");
+
+        assert_eq!(panes_running(&compositor), 1, "the old layout came back");
+        assert_eq!(compositor.session.workspace_count(), 1);
+        assert!(
+            compositor.clipboard.is_empty(),
+            "the next person was handed what the last one copied"
+        );
+    }
+
+    #[test]
+    fn quitting_is_a_log_out_where_there_is_a_login_to_come_back_to() {
+        let mut compositor = console_with("logout-binding", Some("tos"));
+        answer(&mut compositor, "tos");
+        assert!(press_key(
+            &mut compositor,
+            KeyCode::Char('q'),
+            tos_input::Modifiers::SUPER
+        ));
+        assert!(
+            compositor.is_running(),
+            "quit handed the machine back rather than asking who is there"
+        );
+        assert!(compositor.is_locked());
+        assert_eq!(panes_running(&compositor), 0);
+    }
+
+    #[test]
+    fn quitting_still_quits_where_there_is_nobody_to_ask() {
+        // The live image. Leaving is what it has always meant there, and the
+        // init that started this starts another one — which is a session,
+        // where what tos.rescue asks for is a shell.
+        let mut compositor = console_with("quit-none", None);
+        press_key(
+            &mut compositor,
+            KeyCode::Char('q'),
+            tos_input::Modifiers::SUPER,
+        );
+        assert!(!compositor.is_running());
+    }
+
+    #[test]
+    fn a_display_that_is_not_a_console_is_not_logged_into() {
+        // The nested and headless backends: a window on a desktop that has
+        // already asked. Gating them would mean every `cargo test` on a
+        // machine whose root has a password started at a prompt.
+        let compositor = compositor_with(Config {
+            credential: credential("ungated", Some("tos")),
+            credential_user: LOCK_ACCOUNT.into(),
+            ..Config::default()
+        });
+        assert!(!compositor.is_locked());
+        assert_eq!(panes_running(&compositor), 1);
+    }
+
+    #[test]
+    fn a_login_screen_draws_with_no_session_under_it() {
+        // Every locked frame clears the panel and paints the box; with no
+        // panes at all there is nothing else to paint, and nothing here may
+        // assume there is.
+        let mut compositor = console_with("login-frame", Some("tos"));
+        let mut pixels = vec![0u32; 640 * 360];
+        let mut surface = Surface::new(&mut pixels, 640, 360, 640);
+        compositor.render_frame(&mut surface, false);
+        assert!(
+            pixels.iter().any(|&p| p != 0),
+            "the login screen drew nothing at all"
+        );
     }
 
     #[test]

@@ -294,6 +294,13 @@ in `/etc/shadow` now, so a `login` on another VT would have something real to
 check. The rule below stands anyway — what a getty needs is a decision about
 logins, which is #112, and not merely a file to read.
 
+**#112 answered the other half, and the rule survives it.** tOS has a login
+now — a screen the compositor draws, at the start of a session and at the end
+of one — so what Door 4 refuses is no longer "a login on a machine that has
+none". It is a *second* login, on a VT nothing here is drawing, reached by a
+key combination the compositor cannot see. That is still a bypass, and the
+masking in `iso/mkiso.sh` is still what keeps it shut.
+
 The rule: **a getty is a login prompt, and tOS has no login.** Adding one
 means answering the credential question for logins, not only for the lock,
 and it makes [#47](https://github.com/m96-chan/tOS/issues/47) load-bearing

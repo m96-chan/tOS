@@ -229,6 +229,33 @@ pub enum LockOutcome {
 }
 
 /// The password prompt, and the state machine behind it.
+/// Why this screen is up, which is the whole of the difference between a lock
+/// and a login.
+///
+/// The two are the same screen asking the same account for the same password,
+/// and the only thing that differs is what is behind it: a session that is
+/// waiting, or no session at all. Having two types would be having two places
+/// for the rate limit, the masking and the wrong-password wait to drift apart
+/// — which is what #112 said would happen, in the issue that added the second
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    /// The session is behind this and comes back when it opens.
+    Lock,
+    /// There is no session behind this. One starts when it opens.
+    Login,
+}
+
+impl Purpose {
+    /// What the box calls itself.
+    fn title(self) -> &'static str {
+        match self {
+            Purpose::Lock => "locked",
+            Purpose::Login => "log in",
+        }
+    }
+}
+
 pub struct LockScreen {
     /// The credential line, read once when the lock engaged.
     ///
@@ -236,6 +263,14 @@ pub struct LockScreen {
     /// or made unreadable while the screen is locked cannot lock the owner out
     /// of their own session.
     hash: String,
+    /// The account being asked for, which is whose session this is.
+    ///
+    /// Shown, because a screen that asks for a password without saying whose
+    /// is a screen somebody types the wrong one into — and on a login screen
+    /// it is the only thing on the panel that says what machine this is.
+    user: String,
+    /// Whether there is a session behind this.
+    purpose: Purpose,
     /// What has been typed, which nothing but [`LockScreen::submit`] reads.
     typed: String,
     /// Wrong answers so far, which is what the wait is computed from.
@@ -246,14 +281,36 @@ pub struct LockScreen {
 }
 
 impl LockScreen {
-    /// A fresh lock over this credential.
-    pub fn new(hash: String) -> Self {
+    /// A fresh lock over this credential, with a session behind it.
+    pub fn new(hash: String, user: String) -> Self {
+        LockScreen::over(hash, user, Purpose::Lock)
+    }
+
+    /// The same screen with nothing behind it: the login boundary at the start
+    /// of a session, and the one ending a session comes back to (#112).
+    pub fn login(hash: String, user: String) -> Self {
+        LockScreen::over(hash, user, Purpose::Login)
+    }
+
+    fn over(hash: String, user: String, purpose: Purpose) -> Self {
         LockScreen {
             hash,
+            user,
+            purpose,
             typed: String::new(),
             attempts: 0,
             ready_at: None,
         }
+    }
+
+    /// Whether a session is waiting behind this screen, or is yet to start.
+    pub fn purpose(&self) -> Purpose {
+        self.purpose
+    }
+
+    /// The account this is asking about.
+    pub fn user(&self) -> &str {
+        &self.user
     }
 
     /// How many wrong passwords have been offered.
@@ -422,7 +479,18 @@ impl LockScreen {
             text
         };
 
-        let mut top = "┌─ locked ".to_string();
+        // "┌─ log in ─ tos ──┐": what this is, and whose password it wants.
+        // The name is clipped rather than allowed to push the box wider,
+        // because the box's width is what the field under it was laid out
+        // against.
+        let mut top = format!(
+            "┌─ {} ─ {} ",
+            self.purpose.title(),
+            clip(
+                &self.user,
+                inner.saturating_sub(self.purpose.title().len() + 6)
+            )
+        );
         pad_to(&mut top, box_cols - 1, '─');
         top.push('┐');
         for (row, text) in [
@@ -578,7 +646,7 @@ mod tests {
     }
 
     fn lock(password: &str) -> LockScreen {
-        LockScreen::new(hash_of(password))
+        LockScreen::new(hash_of(password), "tos".into())
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -734,7 +802,7 @@ mod tests {
     fn an_empty_password_is_a_password() {
         // Whether the installer allows one is its decision; if it does, the
         // machine it set up has to be openable.
-        let mut lock = LockScreen::new(hash_of(""));
+        let mut lock = LockScreen::new(hash_of(""), "tos".into());
         assert_eq!(
             lock.handle_key(&press(KeyCode::Enter), Instant::now()),
             LockOutcome::Unlocked
@@ -775,6 +843,38 @@ mod tests {
              {user}:{field}:::::::\n\
              _apt:*:20709:0:99999:7:::\n"
         )
+    }
+
+    #[test]
+    fn the_box_says_which_screen_this_is_and_whose_password_it_wants() {
+        // The two screens are one type, and the title is the whole of what a
+        // person sees of the difference: a session waiting behind this, or no
+        // session yet. The name is there because a prompt that does not say
+        // whose password it wants is one people type the wrong one into.
+        let mut pixels = vec![0u32; 640 * 360];
+        let mut fonts = FontStack::new(Box::new(tos_font::BitmapFont::new(1)));
+        for (screen, word) in [
+            (LockScreen::new(hash_of("hunter2"), "tos".into()), "locked"),
+            (
+                LockScreen::login(hash_of("hunter2"), "tos".into()),
+                "log in",
+            ),
+        ] {
+            assert_eq!(screen.user(), "tos");
+            let mut surface = Surface::new(&mut pixels, 640, 360, 640);
+            screen.draw(
+                &mut surface,
+                &mut fonts,
+                Rect::new(0, 0, 640, 360),
+                &Chrome::default(),
+                Instant::now(),
+            );
+            assert!(
+                pixels.iter().any(|&p| p != 0),
+                "{word}: the screen drew nothing"
+            );
+            pixels.fill(0);
+        }
     }
 
     #[test]
@@ -873,7 +973,10 @@ mod tests {
         // lock the owner out of their own session.
         let hash = hash_of("hunter2");
         let path = credential_file("removed", &shadow("tos", &hash));
-        let mut lock = LockScreen::new(read_credential(&path, "tos").expect("a credential"));
+        let mut lock = LockScreen::new(
+            read_credential(&path, "tos").expect("a credential"),
+            "tos".into(),
+        );
         std::fs::remove_file(&path).expect("remove");
         assert_eq!(
             offer(&mut lock, "hunter2", Instant::now()),

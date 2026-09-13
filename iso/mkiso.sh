@@ -728,21 +728,33 @@ cp "/boot/vmlinuz-$KVER" "$ISODIR/boot/vmlinuz"
 # parameter — the mask is the kernel.sysrq sysctl, set through the generic
 # sysctl.*= form, which the kernel applies just before it starts /init.
 #
-# tos.rescue is what /init wants before it execs a shell when the compositor
-# exits. The live image asks for it: it has no credential, so by the rule in
-# docs/design/screen-lock.md it never locks, and a root shell on an image with
-# no locked session to protect is a rescue tool. The installer's command line
-# does not ask for it. See docs/design/lock-other-doors.md.
+# tos.rescue is what the session wants before it execs a shell when the
+# compositor exits, and it is a menu entry of its own rather than something
+# the ordinary ones carry (#112). Both used to name it, so `ctrl+a q` on a
+# live image landed on an unauthenticated root shell on tty0 — which was the
+# default way to boot the image, on a machine anybody could be standing at.
+# What the ordinary entries do now is what an installed machine does: the
+# session ends and another one starts. A person who wants the shell chooses
+# it, and can see in the menu that they are choosing it.
+#
+# The live image still asks nobody for a password, and that is the credential
+# rule rather than this flag: its only account is Debian's root, which carries
+# `*`. See docs/design/login.md and docs/design/lock-other-doors.md.
 cat >"$ISODIR/boot/grub/grub.cfg" <<'EOF'
 set timeout=10
 set default=0
 
 menuentry "tOS" {
-    linux /boot/vmlinuz console=ttyS0 console=tty0 sysctl.kernel.sysrq=438 tos.rescue quiet
+    linux /boot/vmlinuz console=ttyS0 console=tty0 sysctl.kernel.sysrq=438 quiet
     initrd /boot/initramfs.gz
 }
 
 menuentry "tOS (verbose)" {
+    linux /boot/vmlinuz console=ttyS0 console=tty0 sysctl.kernel.sysrq=438
+    initrd /boot/initramfs.gz
+}
+
+menuentry "tOS (rescue shell)" {
     linux /boot/vmlinuz console=ttyS0 console=tty0 sysctl.kernel.sysrq=438 tos.rescue
     initrd /boot/initramfs.gz
 }

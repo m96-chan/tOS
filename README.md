@@ -713,6 +713,20 @@ along with the rest again when a workspace before it closes. A name belongs to
 the workspace rather than to the position, which is why a named workspace keeps
 its name while its neighbours are renumbered around it.
 
+A machine with a password boots to a **login screen**, and ending a session
+comes back to it (#112). It is the lock screen with nothing behind it: the
+same masked field, the same wait after a wrong password, and a title that says
+which of the two it is and whose password it wants. Nothing is started until
+it is answered — the session is built when the password verifies, not before —
+and what comes back after a log out is a new session with a fresh layout and
+an empty clipboard, not the last person's. A machine with **no** password is
+not gated, because a login screen with nothing to check against is a brick:
+that is the live image, whose only account is Debian's root with `*`, and an
+installed machine whose owner declined a password. `exit` in the last pane and
+the `quit` binding are the same thing, and what they mean depends on that one
+rule: log out where there is a login to come back to, and hand the machine
+back to its init where there is not. `docs/design/login.md` has the rest.
+
 `super+shift+l`, or `ctrl+a` then `L`, locks the screen. The lock is a password
 field, and it is its own type rather than another use of that box for exactly
 that reason: the box echoes what is typed, refilters a list on every keystroke
