@@ -16,7 +16,9 @@ image deliberately does not; busybox init then reads the `/etc/inittab` the
 installer left, runs `/etc/rc` and respawns the session. A live medium carries
 its root as one squashfs file, which `/init` mounts with a tmpfs stacked in
 front so the session can be written to. A machine that finds neither stays in
-the initramfs, which is a rescue session rather than a system.
+the initramfs, which is a rescue session rather than a system — and, since
+GRUB moved into the rootfs, one to look at a broken machine from rather than
+one to install from.
 
 Per the top-level README, tOS targets a **Debian** userspace, and the squashfs
 is it: a minimal bookworm with glibc, dpkg, apt and bash, built by
@@ -63,6 +65,29 @@ installed machine spends the unpacked figure on its disk, a live one only the
 squashed figure on the medium. Trimming `/usr/share/{man,locale,info,doc}`,
 which `mkiso.sh` does, is worth 16,650,240 bytes of that squashfs — most of it
 translations nothing on the image can currently display.
+
+### What carrying them twice cost
+
+The image has two root filesystems, and until #99 the two largest things in
+either were in both. The initramfs carried GRUB for an installer that has run
+from the rootfs since #20, and the rootfs carried the pruned kernel module
+tree for a `modprobe` nothing runs. Measured on the commit before this change
+and the commit after it, same machine, same kernel:
+
+| | before | after | |
+|---|---|---|---|
+| ISO | 109,256,704 | 93,167,616 | −16,089,088 |
+| initramfs (gzip) | 22,176,128 | 9,497,076 | −12,679,052 |
+| rootfs, unpacked | 205,654,526 | 188,674,630 | −16,979,896 |
+| rootfs, squashed (zstd-19) | 58,576,896 | 55,169,024 | −3,407,872 |
+
+The initramfs loses 57 per cent of itself, and it is the one file here that is
+gunzipped into tmpfs on every boot — live, installed and rescue alike — and
+written onto every disk the installer touches. The module tree comes off the
+rootfs at both the sizes that matter: 17 MB of an installed machine's disk and
+3.4 MB of the medium.
+
+Neither copy was free to remove; what each cost is in Known limits below.
 
 ## Running
 
@@ -125,6 +150,13 @@ It will not touch a disk until the disk's own name has been typed, and it
 refuses the medium the live session booted from, anything mounted, and
 anything read only.
 
+It also refuses the session, when the session is a rescue one. GRUB is in the
+rootfs, so a rescue session could partition a disk, format it and fill it and
+still have nothing to make it bootable with — an erased disk in exchange for a
+machine that does not start. `tos-install` looks for a `grub-install` before it
+offers anything, and says what it found at the plan, at the screen where the
+disk's name would be typed, and in the dry run.
+
 ```sh
 tos-install --list       # what it can see
 tos-install --plan       # every command it would run, without running any
@@ -185,6 +217,21 @@ argument in the installer beside `CMDLINE`.
 - An installed machine's PID 1 is busybox `init`, symlinked over the rootfs's
   empty `/sbin`. Debian's essential set contains no init at all — an init
   system is a package, and tOS installs none.
+- A rescue session cannot install. GRUB is in the Debian rootfs, which is the
+  thing a rescue session could not mount, and nothing on the medium carries a
+  second copy any more. `tos-install` refuses from such a session rather than
+  erasing a disk it could not finish with, which is the one place it refuses
+  where it otherwise degrades: a rescue install used to leave the busybox
+  world on the disk, which is a worse tOS but a tOS that boots. A live session
+  and an installed machine are unaffected — both have the rootfs.
+- An installed machine cannot `modprobe`. The kernel modules are in the
+  initramfs and nowhere else, and `switch_root` deletes the initramfs, so
+  every module a machine will ever have is loaded by `/init` before the pivot.
+  That is why the three `nls_` modules are in its list: nothing has a device
+  that needs them, but the kernel asks for a codepage by name the first time a
+  FAT filesystem is mounted, and by then there is nowhere to look. Adding
+  hardware to a running tOS means adding its driver to `MODULES` in `mkiso.sh`
+  and rebuilding the image, which was already true of anything not in it.
 - The installer has not been run against real hardware. Its logic is
   covered by tests, including the whole sequence against a recorded
   backend, but the commands it drives have only been checked for what they
