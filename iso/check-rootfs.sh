@@ -40,6 +40,7 @@ sudo umount "$mount_point"
 # are the other half, that mksquashfs put on the medium what it was given.
 for path in usr/bin/dpkg usr/bin/apt usr/bin/bash usr/bin/mount \
     usr/bin/unsquashfs usr/sbin/sfdisk usr/sbin/mkfs.ext4 usr/sbin/grub-install \
+    usr/bin/ip usr/bin/ps usr/bin/free \
     usr/sbin/init usr/sbin/tos usr/sbin/tos-install \
     usr/sbin/tos-session var/lib/dpkg/status root/.bashrc root/.profile; do
     grep -qx "squashfs-root/$path" "$list" || {

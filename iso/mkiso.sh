@@ -285,6 +285,17 @@ EOF
 #                           session still runs /bin/sh; see iso/live-session.
 #   busybox                 /sbin/init below, and the applets the installer
 #                           and the profile reach for.
+#   iproute2 procps         `ip`, `ps` and `free`: the first things anybody
+#                           types at a machine they cannot see inside (#97).
+#                           busybox carries applets by all three names and
+#                           Debian's package leaves them off PATH; symlinking
+#                           them there is free and was turned down anyway,
+#                           because busybox's `ip` prints a format no recipe
+#                           and no manual page agrees with, and somebody who
+#                           learns this machine's `ip` learns it wrong. 18
+#                           packages and 13,445,033 bytes unpacked, measured
+#                           in a bookworm container with recommends off and
+#                           the excludes above in place.
 #   ncurses-base            the terminfo for the TERM tOS advertises. Without
 #                           it apt's own progress bar has nothing to draw on.
 #   fonts-vlgothic          the face the compositor loads, now dpkg's problem
@@ -299,8 +310,9 @@ EOF
 #   squashfs-tools          how the installer unpacks this very rootfs.
 #   kmod                    modprobe for a machine that has pivoted.
 ROOTFS_PACKAGES="debian-archive-keyring,ca-certificates,bash,busybox,\
-ncurses-base,fonts-vlgothic,e2fsprogs,dosfstools,fdisk,util-linux,mount,kmod,\
-squashfs-tools,grub2-common,$(echo "$GRUB_PKGS" | tr ' ' ',')"
+iproute2,procps,ncurses-base,fonts-vlgothic,e2fsprogs,dosfstools,fdisk,\
+util-linux,mount,kmod,squashfs-tools,grub2-common,\
+$(echo "$GRUB_PKGS" | tr ' ' ',')"
 
 # Three suites and not one. `bookworm` is the frozen release: a point release
 # folds security fixes back into it, so an image built later picks some of them
