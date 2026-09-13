@@ -1,12 +1,20 @@
 //! Drawing surfaces.
 //!
 //! A surface is a borrowed rectangle of XRGB8888 pixels. Borrowing rather than
-//! owning is what lets the renderer draw straight into a DRM dumb buffer with
-//! no intermediate copy, while tests and the nested backend hand it an
-//! ordinary `Vec`.
+//! owning is what lets every backend hand the same renderer whatever memory it
+//! has: a `Vec` under a test, the nested backend's scratch buffer, the DRM
+//! backend's shadow.
+//!
+//! It used to be the DRM dumb buffer itself, mapped, which saved a copy and
+//! cost more than the copy was worth — the blends here read the destination
+//! back, and reading back from a write combining mapping is one to two orders
+//! of magnitude slower than reading RAM. That backend composites into its own
+//! memory now and copies out the rows a frame touched, which is what
+//! [`Damage`](crate::Damage) and [`Surface::with_damage`] are for.
 
 use tos_term::Rgb;
 
+use crate::damage::Damage;
 use crate::texture::Texture;
 
 /// An axis aligned rectangle in pixels.
@@ -68,11 +76,51 @@ pub struct Surface<'a> {
     stride: u32,
     /// Drawing outside this rectangle is discarded.
     clip: Rect,
+    /// Where drawing is being written down, for the backends that need to
+    /// know afterwards which pixels to move somewhere else.
+    ///
+    /// Optional because most surfaces are the final destination and have
+    /// nothing to do with the answer: an [`OwnedFramebuffer`] under a test,
+    /// the nested backend's scratch buffer, the headless screenshot. They
+    /// pass [`Surface::new`] and every `mark` below compiles to a null check
+    /// that is never taken. Only the DRM backend, which composites into
+    /// system RAM and then has to copy the result across a bus, passes
+    /// [`Surface::with_damage`] and pays for the bookkeeping.
+    damage: Option<&'a mut Damage>,
 }
 
 impl<'a> Surface<'a> {
     /// Wrap a pixel buffer. `stride` is in pixels, not bytes.
     pub fn new(pixels: &'a mut [u32], width: u32, height: u32, stride: u32) -> Self {
+        Surface::build(pixels, width, height, stride, None)
+    }
+
+    /// Wrap a pixel buffer and record what gets drawn into it.
+    ///
+    /// `damage` is not cleared here. Accumulating across several frames is a
+    /// use, not a mistake — see the DRM backend, where one buffer of a pair
+    /// is owed every frame the other one was given.
+    pub fn with_damage(
+        pixels: &'a mut [u32],
+        width: u32,
+        height: u32,
+        stride: u32,
+        damage: &'a mut Damage,
+    ) -> Self {
+        assert!(
+            damage.width() >= width && damage.height() >= height,
+            "damage is smaller than the {width}x{height} surface it tracks"
+        );
+        Surface::build(pixels, width, height, stride, Some(damage))
+    }
+
+    fn build(
+        pixels: &'a mut [u32],
+        width: u32,
+        height: u32,
+        stride: u32,
+        damage: Option<&'a mut Damage>,
+    ) -> Self {
         assert!(stride >= width, "stride must cover the visible width");
         assert!(
             pixels.len() >= (stride * height) as usize,
@@ -84,6 +132,21 @@ impl<'a> Surface<'a> {
             height,
             stride,
             clip: Rect::new(0, 0, width, height),
+            damage,
+        }
+    }
+
+    /// Note that `rect` has been drawn on.
+    ///
+    /// Every caller passes a rectangle it has already clipped, and passes it
+    /// once for the whole operation rather than once per pixel. That is the
+    /// deal that makes this free in the inner loops: a glyph marks its cell
+    /// box before rasterising into it, not each of the hundred-odd pixels the
+    /// coverage mask touches.
+    #[inline]
+    fn mark(&mut self, rect: Rect) {
+        if let Some(damage) = self.damage.as_deref_mut() {
+            damage.mark(rect);
         }
     }
 
@@ -131,6 +194,7 @@ impl<'a> Surface<'a> {
             return;
         }
         self.pixels[(y as u32 * self.stride + x as u32) as usize] = color;
+        self.mark(Rect::new(x, y, 1, 1));
     }
 
     #[inline]
@@ -152,6 +216,7 @@ impl<'a> Surface<'a> {
             let end = start + rect.width as usize;
             self.pixels[start..end].fill(packed);
         }
+        self.mark(rect);
     }
 
     pub fn clear(&mut self, color: Rgb) {
@@ -174,28 +239,45 @@ impl<'a> Surface<'a> {
         if width == 0 || height == 0 {
             return;
         }
-        for row in 0..height {
-            let py = y + row as i32;
-            if py < self.clip.y || py >= self.clip.bottom() {
-                continue;
-            }
-            for col in 0..width {
-                let alpha = coverage[(row * width + col) as usize];
+        // The clip is applied to the glyph box once, up front, rather than to
+        // every pixel inside it. It used to be two comparisons per row and two
+        // more per pixel, which for a cell of text is a few hundred tests to
+        // discover what the intersection of two rectangles says in one — and
+        // the intersection has to be worked out anyway now, because it is what
+        // gets written down as damage.
+        let clipped = Rect::new(x, y, width, height).intersect(&self.clip);
+        if clipped.is_empty() {
+            return;
+        }
+        let packed = color.pack();
+        let span = clipped.width as usize;
+        for py in clipped.y..clipped.bottom() {
+            // Both rows taken as slices of exactly the length being walked, so
+            // the loop is a zip over two of them and the bounds checks happen
+            // twice a row rather than twice a pixel. Writing this as index
+            // arithmetic instead costs about three per cent of the frame on a
+            // panel of text, which is the same order as everything else left
+            // in this function.
+            let from = ((py - y) as u32 * width + (clipped.x - x) as u32) as usize;
+            let mask = &coverage[from..from + span];
+            let to = (py as u32 * self.stride + clipped.x as u32) as usize;
+            let row = &mut self.pixels[to..to + span];
+            for (pixel, &alpha) in row.iter_mut().zip(mask) {
                 if alpha == 0 {
                     continue;
                 }
-                let px = x + col as i32;
-                if px < self.clip.x || px >= self.clip.right() {
-                    continue;
-                }
-                let index = (py as u32 * self.stride + px as u32) as usize;
-                self.pixels[index] = if alpha == 0xff {
-                    color.pack()
+                *pixel = if alpha == 0xff {
+                    packed
                 } else {
-                    blend_packed(self.pixels[index], color, alpha)
+                    blend_packed(*pixel, color, alpha)
                 };
             }
         }
+        // The whole box, although the mask left most of it alone. Damage is
+        // recorded at rectangle granularity on purpose: a per-pixel record
+        // would cost more to keep than the pixels it saved from being copied,
+        // and the copy is per row regardless.
+        self.mark(clipped);
     }
 
     /// Composite an RGBA image, scaling it into `dest` with nearest sampling.
@@ -244,6 +326,7 @@ impl<'a> Surface<'a> {
                 };
             }
         }
+        self.mark(clipped);
     }
 
     /// Composite an already-scaled texture with its top left corner at
@@ -276,6 +359,7 @@ impl<'a> Surface<'a> {
                 };
             }
         }
+        self.mark(clipped);
     }
 }
 
@@ -463,6 +547,116 @@ mod tests {
         let ppm = fb.to_ppm();
         assert!(ppm.starts_with(b"P6\n2 2\n255\n"));
         assert_eq!(ppm.len(), b"P6\n2 2\n255\n".len() + 12);
+    }
+
+    /// Draw into a tracked 8x4 surface and return what it says was touched.
+    fn damage_of(draw: impl FnOnce(&mut Surface<'_>)) -> Vec<(u32, u32, u32)> {
+        let mut pixels = vec![0u32; 32];
+        let mut damage = Damage::new(8, 4);
+        {
+            let mut s = Surface::with_damage(&mut pixels, 8, 4, 8, &mut damage);
+            draw(&mut s);
+        }
+        damage.spans().collect()
+    }
+
+    #[test]
+    fn an_untracked_surface_draws_the_same_as_a_tracked_one() {
+        // The tracking must be bookkeeping and nothing else. Every backend but
+        // DRM passes `Surface::new`, and a difference in the picture between
+        // the two would be a difference nobody looking at a screenshot could
+        // see the cause of.
+        fn draw(s: &mut Surface<'_>) {
+            s.clear(Rgb::new(0x11, 0x22, 0x33));
+            s.fill(Rect::new(1, 1, 3, 2), Rgb::new(0, 0x80, 0));
+            s.set_clip(Rect::new(0, 0, 6, 4));
+            // Partial coverage, full coverage and none, so all three arms of
+            // the blend are compared.
+            s.blend_mask(5, 0, 2, 2, &[0u8, 90, 200, 255], Rgb::WHITE);
+            s.reset_clip();
+            s.put(7, 3, 0x00ff00);
+        }
+        let mut plain = vec![0u32; 32];
+        draw(&mut Surface::new(&mut plain, 8, 4, 8));
+        let mut tracked = vec![0u32; 32];
+        let mut damage = Damage::new(8, 4);
+        draw(&mut Surface::with_damage(
+            &mut tracked,
+            8,
+            4,
+            8,
+            &mut damage,
+        ));
+        assert_eq!(plain, tracked);
+        assert!(!damage.is_empty());
+    }
+
+    #[test]
+    fn filling_damages_the_rectangle_it_filled() {
+        assert_eq!(
+            damage_of(|s| s.fill(Rect::new(2, 1, 3, 2), Rgb::WHITE)),
+            vec![(1, 2, 5), (2, 2, 5)]
+        );
+    }
+
+    #[test]
+    fn damage_is_clipped_the_way_drawing_is() {
+        // Whatever the clip threw away was not written, so claiming it was
+        // would have the backend copy pixels that did not change — and, worse
+        // on a surface whose stride exceeds its width, index past the row.
+        assert_eq!(
+            damage_of(|s| {
+                s.set_clip(Rect::new(0, 0, 4, 2));
+                s.fill(Rect::new(0, 0, 8, 4), Rgb::WHITE);
+            }),
+            vec![(0, 0, 4), (1, 0, 4)]
+        );
+        assert_eq!(
+            damage_of(|s| {
+                s.set_clip(Rect::new(0, 0, 4, 2));
+                s.blend_mask(3, 1, 2, 2, &[255, 255, 255, 255], Rgb::WHITE);
+            }),
+            vec![(1, 3, 4)]
+        );
+    }
+
+    #[test]
+    fn a_glyph_damages_its_box_and_not_the_row_it_sits_on() {
+        // Rectangle granularity, both ways: the transparent corners of the
+        // mask are claimed although nothing was written there, and the rest of
+        // the row is not although it is one `memcpy` away.
+        let coverage = [0u8, 255, 255, 0];
+        assert_eq!(
+            damage_of(|s| s.blend_mask(3, 1, 2, 2, &coverage, Rgb::WHITE)),
+            vec![(1, 3, 5), (2, 3, 5)]
+        );
+    }
+
+    #[test]
+    fn an_image_damages_where_it_landed() {
+        let src = vec![255u8, 0, 0, 255, 0, 255, 0, 255];
+        assert_eq!(
+            damage_of(|s| s.blit_rgba(Rect::new(4, 2, 2, 1), &src, 2, 1)),
+            vec![(2, 4, 6)]
+        );
+    }
+
+    #[test]
+    fn a_single_pixel_damages_a_single_pixel() {
+        assert_eq!(damage_of(|s| s.put(5, 2, 0xffffff)), vec![(2, 5, 6)]);
+        // And one outside the clip damages nothing, because nothing was
+        // written.
+        assert!(damage_of(|s| s.put(9, 9, 0xffffff)).is_empty());
+    }
+
+    #[test]
+    fn drawing_nothing_damages_nothing() {
+        // The frame that matters most: the compositor decided every cell was
+        // unchanged, so the backend has nothing to copy and the panel keeps
+        // the frame it has.
+        assert!(damage_of(|_| {}).is_empty());
+        assert!(damage_of(|s| s.fill(Rect::new(0, 0, 0, 4), Rgb::WHITE)).is_empty());
+        assert!(damage_of(|s| s.blend_mask(0, 0, 0, 0, &[], Rgb::WHITE)).is_empty());
     }
 
     #[test]
