@@ -80,6 +80,42 @@ fn eviocgrab() -> u64 {
     )
 }
 
+/// The kernel's `struct input_absinfo`: value, minimum, maximum, fuzz, flat
+/// and resolution, all `__s32`.
+///
+/// An array rather than six named fields because the ioctl needs a buffer of
+/// the size the kernel writes and nothing here will ever look at four of them.
+type AbsInfo = [i32; 6];
+const ABS_MINIMUM: usize = 1;
+const ABS_MAXIMUM: usize = 2;
+
+fn eviocgabs(axis: u64) -> u64 {
+    ioc(
+        IOC_READ,
+        b'E' as u64,
+        0x40 + axis,
+        std::mem::size_of::<AbsInfo>() as u64,
+    )
+}
+
+/// The range one absolute axis reports in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AbsAxis {
+    minimum: i32,
+    maximum: i32,
+}
+
+/// What a device says about the two axes a pointer is made of.
+///
+/// Carried from the device an event was read from to the translation of that
+/// event, because an absolute reading is a number in the device's own units
+/// and means nothing without this.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AbsoluteAxes {
+    x: Option<AbsAxis>,
+    y: Option<AbsAxis>,
+}
+
 /// What a device can produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Capabilities {
@@ -95,6 +131,10 @@ pub struct Device {
     path: PathBuf,
     name: String,
     capabilities: Capabilities,
+    /// The range this device's absolute axes report in, for the devices that
+    /// have them. Read once at open, because it does not change while the
+    /// node is open and asking per event would be an ioctl per mouse move.
+    absolute: AbsoluteAxes,
     grabbed: bool,
 }
 
@@ -117,12 +157,14 @@ impl Device {
         }
 
         let capabilities = probe_capabilities(fd);
+        let absolute = probe_absolute_axes(fd);
         let name = read_name(fd).unwrap_or_else(|| "unknown".to_string());
         Ok(Device {
             fd,
             path,
             name,
             capabilities,
+            absolute,
             grabbed: false,
         })
     }
@@ -141,6 +183,10 @@ impl Device {
 
     pub fn capabilities(&self) -> Capabilities {
         self.capabilities
+    }
+
+    fn absolute_axes(&self) -> AbsoluteAxes {
+        self.absolute
     }
 
     /// Take exclusive ownership, so the kernel's own terminal does not also
@@ -220,6 +266,43 @@ fn probe_capabilities(fd: RawFd) -> Capabilities {
     caps
 }
 
+/// Ask a device what range its absolute axes report in.
+///
+/// A device with no absolute axes fails the ioctl and a device can answer with
+/// a degenerate range; both are `None`, which the scaling reads as "no range
+/// to scale by" rather than as an axis that is zero wide.
+fn probe_absolute_axes(fd: RawFd) -> AbsoluteAxes {
+    let axis = |code: u16| {
+        let mut info = AbsInfo::default();
+        let asked = unsafe { libc::ioctl(fd, eviocgabs(code as u64) as _, info.as_mut_ptr()) };
+        let (minimum, maximum) = (info[ABS_MINIMUM], info[ABS_MAXIMUM]);
+        (asked >= 0 && maximum > minimum).then_some(AbsAxis { minimum, maximum })
+    };
+    AbsoluteAxes {
+        x: axis(ABS_X),
+        y: axis(ABS_Y),
+    }
+}
+
+/// Where an absolute reading lands on the panel.
+///
+/// A tablet reports 0..32767 whatever the display is, so its units are only a
+/// position once they are read against the range they came from. Without a
+/// range there is nothing to read them against and the raw value is all there
+/// is; `clamp_pointer` then keeps it somewhere reachable, which is the weaker
+/// thing this used to do for every device.
+fn scale_absolute(value: i32, axis: Option<AbsAxis>, bound: f64) -> f64 {
+    let Some(axis) = axis else {
+        return value as f64;
+    };
+    let span = f64::from(axis.maximum) - f64::from(axis.minimum);
+    if span <= 0.0 {
+        return value as f64;
+    }
+    let along = (f64::from(value) - f64::from(axis.minimum)) / span;
+    along * (bound - 1.0).max(0.0)
+}
+
 fn read_name(fd: RawFd) -> Option<String> {
     let mut buf = [0u8; 256];
     let n = unsafe { libc::ioctl(fd, eviocgname(buf.len() as u64) as _, buf.as_mut_ptr()) };
@@ -251,6 +334,9 @@ pub struct InputBackend {
     pending: Vec<RawEvent>,
     /// Pointer movement accumulated until the next SYN.
     motion: (f64, f64),
+    /// The position an absolute report is building up, in display pixels,
+    /// until the SYN that completes it.
+    absolute: Option<(f64, f64)>,
 }
 
 impl InputBackend {
@@ -293,6 +379,7 @@ impl InputBackend {
             buttons_down: 0,
             pending: Vec::new(),
             motion: (0.0, 0.0),
+            absolute: None,
         })
     }
 
@@ -375,25 +462,40 @@ impl InputBackend {
         self.pointer.y = self.pointer.y.clamp(0.0, (self.bounds.1 - 1.0).max(0.0));
     }
 
+    /// The position the absolute report being assembled describes so far.
+    ///
+    /// Where the pointer already is until an axis of it arrives, because a
+    /// device leaves an unchanged axis out of its report and the axis it left
+    /// out has not moved.
+    fn pending_absolute(&self) -> (f64, f64) {
+        self.absolute.unwrap_or((self.pointer.x, self.pointer.y))
+    }
+
     /// Read and translate all pending input.
+    ///
+    /// One device at a time, read and then translated, rather than every
+    /// device read into one queue that is translated afterwards. An absolute
+    /// reading is in the device's own units and `EVIOCGABS` is per device, so
+    /// the translation needs to know which device an event came from — and a
+    /// merged queue has nothing left on an event that says. That is what made
+    /// scaling look impossible from here; it was only ever thrown away.
     pub fn poll(&mut self) -> io::Result<Vec<InputEvent>> {
-        self.pending.clear();
-        for device in &mut self.devices {
-            let mut raw = Vec::new();
-            device.read_raw(&mut raw)?;
-            self.pending.append(&mut raw);
-        }
-        let pending = std::mem::take(&mut self.pending);
+        let mut raw = std::mem::take(&mut self.pending);
         let mut events = Vec::new();
-        for raw in &pending {
-            self.translate(*raw, &mut events);
+        for index in 0..self.devices.len() {
+            raw.clear();
+            self.devices[index].read_raw(&mut raw)?;
+            let axes = self.devices[index].absolute_axes();
+            for event in &raw {
+                self.translate(*event, axes, &mut events);
+            }
         }
-        self.pending = pending;
-        self.pending.clear();
+        raw.clear();
+        self.pending = raw;
         Ok(events)
     }
 
-    fn translate(&mut self, raw: RawEvent, out: &mut Vec<InputEvent>) {
+    fn translate(&mut self, raw: RawEvent, axes: AbsoluteAxes, out: &mut Vec<InputEvent>) {
         match raw.kind {
             EV_KEY => self.translate_key(raw, out),
             EV_REL => match raw.code {
@@ -422,44 +524,51 @@ impl InputBackend {
                 _ => {}
             },
             EV_ABS => match raw.code {
-                // Touch panels report absolute positions in their own units;
-                // without the device's axis range this is a direct mapping.
-                //
-                // Clamped rather than left where it lands. A touchscreen or a
-                // VM's emulated tablet reports 0..32767, which taken raw is
-                // thousands of pixels past the edge of any panel: the arrow
-                // clips to nothing and a press lands on no pane, so the device
-                // does not merely point badly, it does nothing at all. On the
-                // edge of the panel is not where the finger was, but it is
-                // where every device whose range is smaller than the display
-                // already ended up, and it cannot put any device further out
-                // than it already was. Scaling by the axis range would be the
-                // real answer and is not this: `EVIOCGABS` is per device, and
-                // `poll` merges every device's events into one stream with
-                // nothing left on them to say which one they came from.
+                // Held until the sync rather than written through to the
+                // pointer as it arrives. The two axes are two events, so
+                // moving on the first would take the pointer out through a
+                // corner and back on every report, and the position a report
+                // describes is not a position until both halves of it are in.
                 ABS_X => {
-                    self.pointer.x = raw.value as f64;
-                    self.clamp_pointer();
+                    let (_, y) = self.pending_absolute();
+                    self.absolute = Some((scale_absolute(raw.value, axes.x, self.bounds.0), y));
                 }
                 ABS_Y => {
-                    self.pointer.y = raw.value as f64;
-                    self.clamp_pointer();
+                    let (x, _) = self.pending_absolute();
+                    self.absolute = Some((x, scale_absolute(raw.value, axes.y, self.bounds.1)));
                 }
                 _ => {}
             },
             // A report is only complete at the sync, and only worth sending
             // when the pointer actually moved.
-            EV_SYN if self.motion != (0.0, 0.0) => {
-                self.pointer.x += self.motion.0;
-                self.pointer.y += self.motion.1;
+            EV_SYN => {
+                let before = (self.pointer.x, self.pointer.y);
+                if let Some((x, y)) = self.absolute.take() {
+                    self.pointer.x = x;
+                    self.pointer.y = y;
+                }
+                let relative = self.motion != (0.0, 0.0);
+                if relative {
+                    self.pointer.x += self.motion.0;
+                    self.pointer.y += self.motion.1;
+                    self.motion = (0.0, 0.0);
+                }
                 self.clamp_pointer();
-                self.motion = (0.0, 0.0);
-                let action = if self.buttons_down > 0 {
-                    MouseAction::Drag
-                } else {
-                    MouseAction::Motion
-                };
-                out.push(self.mouse_event(None, action));
+                // A delta is a movement whether or not the clamp let the
+                // pointer follow it: the arrow is put away while somebody is
+                // typing and a motion event is the thing that brings it back,
+                // so a mouse pushed into the edge of the panel has to keep
+                // speaking. An absolute device instead says where it is, over
+                // and over and mostly unchanged, and that is worth passing on
+                // only when it differs from where the pointer already was.
+                if relative || (self.pointer.x, self.pointer.y) != before {
+                    let action = if self.buttons_down > 0 {
+                        MouseAction::Drag
+                    } else {
+                        MouseAction::Motion
+                    };
+                    out.push(self.mouse_event(None, action));
+                }
             }
             _ => {}
         }
@@ -593,6 +702,10 @@ mod tests {
         assert_eq!(eviocgrab(), 0x4004_4590);
         // EVIOCGNAME(256) is _IOC(_IOC_READ, 'E', 0x06, 256).
         assert_eq!(eviocgname(256), 0x8100_4506);
+        // EVIOCGABS(ABS_X) is _IOR('E', 0x40, struct input_absinfo), and that
+        // struct is six __s32, so 24 bytes.
+        assert_eq!(eviocgabs(ABS_X as u64), 0x8018_4540);
+        assert_eq!(eviocgabs(ABS_Y as u64), 0x8018_4541);
     }
 
     #[test]
@@ -637,36 +750,163 @@ mod tests {
             buttons_down: 0,
             pending: Vec::new(),
             motion: (0.0, 0.0),
+            absolute: None,
+        }
+    }
+
+    fn raw(kind: u16, code: u16, value: i32) -> RawEvent {
+        RawEvent {
+            tv_sec: 0,
+            tv_usec: 0,
+            kind,
+            code,
+            value,
+        }
+    }
+
+    /// What a VirtualBox USB tablet says about itself: both axes 0..32767,
+    /// whatever the panel underneath them is.
+    fn tablet() -> AbsoluteAxes {
+        let axis = Some(AbsAxis {
+            minimum: 0,
+            maximum: 32767,
+        });
+        AbsoluteAxes { x: axis, y: axis }
+    }
+
+    /// One move of a device that reports where it is: the two axes, then the
+    /// sync that completes them.
+    fn report(backend: &mut InputBackend, axes: AbsoluteAxes, x: i32, y: i32) -> Vec<InputEvent> {
+        let mut out = Vec::new();
+        backend.translate(raw(EV_ABS, ABS_X, x), axes, &mut out);
+        backend.translate(raw(EV_ABS, ABS_Y, y), axes, &mut out);
+        backend.translate(raw(EV_SYN, 0, 0), axes, &mut out);
+        out
+    }
+
+    fn pointer_of(event: &InputEvent) -> PointerEvent {
+        match event {
+            InputEvent::Pointer(pointer) => *pointer,
+            other => panic!("expected a pointer event, got {other:?}"),
         }
     }
 
     #[test]
-    fn an_absolute_position_stays_on_the_panel_however_large_the_devices_units_are() {
-        // A touchscreen or a VM's emulated tablet reports 0..32767 in its own
-        // units. Taken raw that is thousands of pixels past the edge of any
-        // panel, and off the panel the pointer is not merely in the wrong
-        // place: the arrow clips away to nothing and a press lands on no pane,
-        // so the device stops doing anything at all. Scaling by the axis range
-        // is the answer this cannot give — `EVIOCGABS` is per device and the
-        // events reaching here have been merged from all of them — so what is
-        // pinned is the weaker thing, that the pointer is somewhere reachable.
+    fn an_absolute_report_emits_one_motion_event() {
+        // The bug this arm had: `EV_ABS` wrote the position down and nothing
+        // ever sent it on, because the only arm that emitted motion was
+        // guarded on the relative delta, which an absolute device never sets.
+        // Every machine whose pointing device is absolute — a VirtualBox guest
+        // with its default `usbtablet`, a touchscreen — had a pointer that
+        // could not be seen, because `Pointer::seen` is set by an event that
+        // arrived and no event ever arrived.
+        //
+        // Asserting on the events rather than on `pointer_position` is the
+        // whole point of this test. The position was always right; the test
+        // that only read it passed the entire time this was broken.
+        let mut backend = backend(1920, 1080);
+        let out = report(&mut backend, tablet(), 16000, 8000);
+        assert_eq!(out.len(), 1);
+        assert_eq!(pointer_of(&out[0]).action, MouseAction::Motion);
+        assert_eq!(pointer_of(&out[0]).button, None);
+    }
+
+    #[test]
+    fn an_absolute_position_is_scaled_by_the_range_the_device_reports_in() {
+        // 0..32767 across a 1920x1080 panel. The ends are the ends, and the
+        // middle of the range is the middle of the panel — rather than, as it
+        // was, the far corner, which is where every reading above 1919 landed
+        // once the clamp had finished with it.
+        let mut backend = backend(1920, 1080);
+        report(&mut backend, tablet(), 0, 0);
+        assert_eq!(backend.pointer_position(), (0.0, 0.0));
+
+        report(&mut backend, tablet(), 32767, 32767);
+        assert_eq!(backend.pointer_position(), (1919.0, 1079.0));
+
+        report(&mut backend, tablet(), 16383, 16383);
+        let (x, y) = backend.pointer_position();
+        assert!((x - 959.5).abs() < 1.0, "x was {x}");
+        assert!((y - 539.5).abs() < 1.0, "y was {y}");
+    }
+
+    #[test]
+    fn an_absolute_report_that_leaves_an_axis_out_leaves_it_where_it_was() {
+        // evdev omits an axis that did not change, and an axis left out of a
+        // report has not moved. Seeding the missing half from where the
+        // pointer already is, rather than from zero, is what keeps a move
+        // along one axis a move along one axis.
+        let mut backend = backend(1920, 1080);
+        report(&mut backend, tablet(), 16383, 16383);
+        let (_, y) = backend.pointer_position();
+
+        let mut out = Vec::new();
+        backend.translate(raw(EV_ABS, ABS_X, 32767), tablet(), &mut out);
+        backend.translate(raw(EV_SYN, 0, 0), tablet(), &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(backend.pointer_position(), (1919.0, y));
+    }
+
+    #[test]
+    fn a_sync_with_nothing_new_says_nothing() {
+        // A device that reports where it is does so over and over and mostly
+        // unchanged. A motion event for every one of those would be a frame
+        // asked for per report for a pointer that is sitting still.
+        let mut backend = backend(1920, 1080);
+        report(&mut backend, tablet(), 16000, 8000);
+        assert!(report(&mut backend, tablet(), 16000, 8000).is_empty());
+
+        let mut out = Vec::new();
+        backend.translate(raw(EV_SYN, 0, 0), tablet(), &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn an_absolute_report_with_a_button_held_is_a_drag() {
         let mut backend = backend(1920, 1080);
         let mut out = Vec::new();
-        let abs = |code, value| RawEvent {
-            tv_sec: 0,
-            tv_usec: 0,
-            kind: EV_ABS,
-            code,
-            value,
-        };
-        backend.translate(abs(ABS_X, 32767), &mut out);
-        backend.translate(abs(ABS_Y, 32767), &mut out);
+        backend.translate(raw(EV_KEY, BTN_LEFT, 1), tablet(), &mut out);
+        let moved = report(&mut backend, tablet(), 16000, 8000);
+        assert_eq!(pointer_of(&moved[0]).action, MouseAction::Drag);
+    }
+
+    #[test]
+    fn a_relative_mouse_pushed_into_the_edge_goes_on_reporting() {
+        // A delta is a movement whether or not the clamp let the pointer
+        // follow it. The arrow is put away while somebody types and a motion
+        // event is what brings it back, so a mouse held against the edge of
+        // the panel that fell silent would be an arrow nobody could get back
+        // without first moving away from the edge.
+        let mut backend = backend(1920, 1080);
+        let none = AbsoluteAxes::default();
+        let mut out = Vec::new();
+        for _ in 0..4 {
+            backend.translate(raw(EV_REL, REL_X, 2000), none, &mut out);
+            backend.translate(raw(EV_SYN, 0, 0), none, &mut out);
+        }
+        assert_eq!(backend.pointer_position().0, 1919.0);
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn an_absolute_position_stays_on_the_panel_when_there_is_no_range_to_scale_by() {
+        // `EVIOCGABS` can fail, and a device can answer with a degenerate
+        // range. With nothing to scale by, the raw value is all there is — and
+        // a tablet's 0..32767 taken raw is thousands of pixels past the edge
+        // of any panel. Off the panel the pointer is not merely in the wrong
+        // place: the arrow clips away to nothing and a press lands on no pane,
+        // so the device stops doing anything at all. The edge is not where the
+        // finger was, but it is somewhere reachable, and it is no further out
+        // than the raw value already was.
+        let mut backend = backend(1920, 1080);
+        let none = AbsoluteAxes::default();
+        report(&mut backend, none, 32767, 32767);
         assert_eq!(backend.pointer_position(), (1919.0, 1079.0));
 
         // And a device that reports below its own minimum is the same case the
         // other way up.
-        backend.translate(abs(ABS_X, -40), &mut out);
-        assert_eq!(backend.pointer_position().0, 0.0);
+        report(&mut backend, none, -40, -40);
+        assert_eq!(backend.pointer_position(), (0.0, 0.0));
     }
 
     #[test]
