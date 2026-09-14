@@ -1399,6 +1399,26 @@ impl Display for DrmDisplay {
             // nothing is about to be drawn, and the disable below clears the
             // pending flip whichever way the wait went.
             let _ = self.wait_for_flip()?;
+        } else if self.scanout.blanked && self.has_frame {
+            // Pay the buffer before the unblank hands it to the CRTC (#108).
+            //
+            // `Shadow` says a dumb buffer holds a whole screen the moment it
+            // has been paid what it is owed, and the unblank below lights the
+            // panel on `front_fb()` without a frame being drawn — so this is
+            // the one path that reaches a buffer without paying it. It is
+            // reachable: a blank, a VT switch away, and the `owe_everything`
+            // in `restore` leave both buffers owed the whole screen, and an
+            // unblank before the next frame then scans out whatever the other
+            // master left in one.
+            //
+            // Writing into it is safe here in a way it is not in general.
+            // `Scanout::blank` has already returned above unless the CRTC was
+            // disabled — `fb_id: 0`, `mode_valid: 0`, no connectors — so
+            // neither buffer is being scanned out and there is nothing to
+            // tear. That is what PR #107 left this out for, and it does not
+            // hold on this path.
+            let front = 1 - self.back;
+            self.shadow.copy_out(front, &mut self.buffers[front]);
         }
         let front = self.front_fb();
         self.scanout.blank(&mut self.card, blank, front)
@@ -1920,6 +1940,21 @@ mod tests {
             index
         }
 
+        /// What `DrmDisplay::blank(false)` does to the buffer it is about to
+        /// hand to the CRTC: pay it, then name it.
+        ///
+        /// A mirror of that sequence rather than the code itself, for the
+        /// same reason [`Panel::frame`] mirrors `DrmDisplay::frame` —
+        /// `DrmDisplay` holds a concrete `Card` and cannot be built without
+        /// a device. What guards the real path against losing the payment is
+        /// `the_unblank_pays_the_buffer_before_handing_it_over` below.
+        fn unblank(&mut self) -> usize {
+            let front = 1 - self.back;
+            self.shadow
+                .pay(front, &mut self.buffers[front], Panel::STRIDE);
+            front
+        }
+
         /// The visible pixels of a buffer, with the padding its stride adds
         /// left out, so it can be compared against the shadow directly.
         fn visible(&self, index: usize) -> Vec<u32> {
@@ -1956,6 +1991,59 @@ mod tests {
                 tos_term::Rgb::new(shade, shade, shade),
             );
         }
+    }
+
+    #[test]
+    fn an_unblank_lights_the_panel_on_a_whole_screen() {
+        // #108. A blank, a VT switch away, and the `owe_everything` that
+        // comes back with it leave both buffers owed the whole screen and
+        // neither known to hold one. The unblank lights the panel itself
+        // rather than waiting for a frame — coming back from blanked is
+        // exactly the case where nothing has changed, so waiting would leave
+        // the screen dark until somebody typed — which makes it the one path
+        // that reaches a buffer without drawing into it first.
+        let mut panel = Panel::new();
+        panel.frame(row(1, 0x40));
+        panel.frame(row(2, 0x80));
+        panel.settle();
+
+        // What another DRM master did with the memory behind these objects is
+        // the kernel's business and is written down nowhere, so `restore`
+        // declares both unknown. The sentinel stands in for whatever it left.
+        panel.poison(0);
+        panel.poison(1);
+        panel.shadow.owe_everything();
+
+        let front = panel.unblank();
+        assert_eq!(
+            panel.visible(front),
+            panel.shadow.pixels,
+            "the CRTC was handed a buffer that is not a whole screen"
+        );
+    }
+
+    #[test]
+    fn the_unblank_pays_the_buffer_before_handing_it_over() {
+        // The invariant above lives in `DrmDisplay::blank`, which needs a
+        // card and so cannot be called from here. This reads the source
+        // instead — the same answer `devices_are_opened_close_on_exec` gives
+        // in `evdev.rs` to the same problem — because what regresses is one
+        // line in one branch, and a mirror in `Panel` would go on passing
+        // without it.
+        let source = include_str!("drm.rs");
+        let blank = source
+            .split_once("fn blank(&mut self, blank: bool)")
+            .expect("DrmDisplay::blank")
+            .1;
+        let body = &blank[..blank.find("fn name(&self)").expect("the end of blank")];
+        let unblank = body
+            .split_once("} else if")
+            .expect("an unblank branch: the CRTC is handed a buffer there")
+            .1;
+        assert!(
+            unblank.contains("copy_out"),
+            "the unblank hands `front_fb()` to `set_crtc` without paying it"
+        );
     }
 
     #[test]
