@@ -396,6 +396,26 @@ EOF
 #                           packages and 13,445,033 bytes unpacked, measured
 #                           in a bookworm container with recommends off and
 #                           the excludes above in place.
+#   iputils-ping wget       whether this machine reaches anything, and whether
+#                           it can fetch (#109). The same argument as the line
+#                           above and the same answer: busybox carries `ping`
+#                           and `wget` and leaves both off PATH, and naming
+#                           them there was turned down again — busybox's
+#                           `wget` segfaults on `-T`, the first flag anybody
+#                           reaches for (#96), which is a `wget` that is not
+#                           the `wget` people know failing in a way no manual
+#                           page describes. 3 packages and 644,402 bytes
+#                           unpacked between them, measured the same way: five
+#                           per cent of what `iproute2 procps` already cost to
+#                           answer the neighbouring question.
+#                           Not `curl`: ten packages and five times `wget` on
+#                           its own, saying nothing `wget` does not for "does
+#                           this reach the network", so it is worth its own
+#                           argument rather than riding in on this one. And
+#                           not an `nslookup`, because names already resolve —
+#                           `getent hosts` is in libc-bin, which is essential,
+#                           so a DNS fault can already be told from the other
+#                           three without adding anything.
 #   ncurses-base            the terminfo for the TERM tOS advertises. Without
 #                           it apt's own progress bar has nothing to draw on.
 #   fonts-vlgothic          the face the compositor loads, now dpkg's problem
@@ -440,7 +460,8 @@ EOF
 #                           whole time, which is what made it look like a
 #                           filesystem problem rather than a missing package.
 ROOTFS_PACKAGES="debian-archive-keyring,ca-certificates,bash,systemd-sysv,udev,\
-busybox,iproute2,procps,ncurses-base,fonts-vlgothic,e2fsprogs,dosfstools,\
+busybox,iproute2,procps,iputils-ping,wget,ncurses-base,fonts-vlgothic,\
+e2fsprogs,dosfstools,\
 fdisk,util-linux,mount,kmod,sudo,squashfs-tools,grub2-common,\
 $(echo "$GRUB_PKGS" | tr ' ' ',')"
 
