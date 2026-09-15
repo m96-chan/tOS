@@ -1,6 +1,7 @@
 //! `tos-install`: put tOS on a disk, from a pane in the live session.
 
 use std::io::{self, Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::process::ExitCode;
 
 use tos_input::host::HostInput;
@@ -46,8 +47,11 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if has("--motd") {
-        // Used by the live image's shell profile.
-        print!("{}", motd::message());
+        // Used by the live image's shell profile. The terminal is asked what
+        // it is before anything is written to it: a pane gets the picture and
+        // everything else gets the banner drawn in cells (#132).
+        let screen = motd::Screen::probe(std::io::stdout().as_raw_fd());
+        print!("{}", motd::greeting(screen));
         return ExitCode::SUCCESS;
     }
 

@@ -148,6 +148,17 @@ the installer, which reads the colours rather than printing them. The installer
 falls back to the built-in banner when the one it finds needs more of the
 screen than the welcome text can spare.
 
+In a pane the banner is not what a shell prints at all. `/etc/tos/splash.png`
+is on the image beside it — the picture the login screen draws — and a shell
+that finds itself in a tOS pane sends the terminal that file's *path* over the
+graphics protocol, so the real picture arrives for the price of a hundred byte
+escape. The drawn banner is what everything else gets: a serial console, the
+kernel VT the rescue session lands on, and anybody logged in from another
+machine. What decides is whether `TOS` is in the environment and whether the
+terminal filled in the pixel fields of its `winsize`, which tOS does for every
+pane and the kernel's VT does not. Replacing `splash.png` changes the login
+screen and the greeting together, which is why there is one file.
+
 `tos-install` is a TUI that runs in a pane, which makes installing tOS the
 first real use of the platform as a platform. It picks a disk, writes a GPT
 with a boot partition and an ext4 root, unpacks the Debian rootfs onto it,

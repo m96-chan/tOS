@@ -1,8 +1,12 @@
-# The picture on the login screen
+# The picture
 
-**Issue #132.** Decided: a picture above the password box, compiled into the
-compositor, drawn in pixels at whole multiples of its own, and only over a
-login screen.
+**Issue #132.** Decided: one picture, on the two screens that open a machine.
+
+Above the password box on the login screen, compiled into the compositor,
+drawn in pixels at whole multiples of its own, and only over a login screen.
+And at the head of every pane, in place of the banner drawn in cells, for the
+terminals that can be sent a picture — which on a tOS machine is the terminal
+tOS runs the shell in.
 
 ## What there was
 
@@ -88,6 +92,76 @@ The compositor holds the picture only while the login screen is up: read in
 `show_login`, dropped in `unlock`. A login happens once, and a megabyte of
 pixels nobody is going to look at again is a megabyte a session could have
 had.
+
+## At the head of every pane
+
+**Issue #132, the second half.** The same picture, at the top of every shell,
+where `.motd_art` has always been.
+
+A banner drawn in cells is what a shell can print anywhere, and it is what a
+serial console, a kernel VT and somebody logged in from another machine will go
+on getting. But the shell tOS actually runs is in a tOS pane, and a tOS pane
+can be sent a picture. Turning this one into coloured blocks to show it there
+would be handing the one terminal that can draw it the version made for the
+ones that cannot.
+
+So the greeting asks the terminal what it is, and there are exactly two
+answers:
+
+| the terminal | the banner |
+|---|---|
+| a tOS pane | `/etc/tos/splash.png`, over the graphics protocol |
+| anything else | the banner drawn in cells, as before |
+
+**A path, not a payload.** The picture goes as `t=f` — the compositor is told
+the file's name and opens it — so the escape is a hundred bytes whether the
+picture is a hundred kilobytes or ten megabytes, and nothing travels through
+the pseudoterminal. `tos-preview` takes the same route for the same reason,
+and the sequence around the command is deliberately the one it builds: `a=T`
+clips at the bottom of the screen rather than scrolling, so the room is
+scrolled up first and the cursor walked back into it.
+
+**How a pane is told from everything else.** Two questions, and both have to
+answer yes:
+
+- `TOS` is in the environment. `iso/live-session` exports it, and it is what
+  starts every tOS session, so it is set for everything a tOS machine runs and
+  for nothing somebody arrived with. Without it this could be a terminal at
+  the far end of an `ssh`, and a graphics command such a terminal does not know
+  is not ignored — it is printed, as the text of its own escape.
+- The terminal filled in the pixel fields of its `winsize`. tOS does that for
+  every pane it spawns (`pane::winsize_for`) and the kernel's own VT leaves
+  them at zero, which is what tells a pane from the console the rescue session
+  lands on — inside a tOS session, and unable to draw a thing. It is also the
+  number the picture has to be sized against, so it had to be asked for
+  anyway.
+
+Querying the terminal instead — sending a graphics command and waiting for the
+reply — is the answer that would work for any terminal, and it is the one
+`tos-preview` already turned down in `fit.rs`: it means raw mode, a write, and
+a timeout that becomes the common path exactly on the terminals that do not
+answer. Paying that at the top of every shell, for a greeting, is worse than
+being wrong about an unusual terminal.
+
+**Sized in whole pixels here too.** The picture gets its own size in cells —
+512x170 in an 8x16 cell is 64 by 11 — so one picture pixel is one screen
+pixel. It narrows with a pane that is narrower and is never more than half the
+pane tall, because the greeting has ten more lines to print underneath and a
+picture that pushed them off the top would be a picture instead of a greeting.
+Below sixteen cells by four there is no picture: the drawn banner says more at
+that size, and it is what such a terminal gets.
+
+**The words the picture does not have.** `.motd_art` ends with "the terminal is
+the desktop"; the picture does not say it, so the greeting does, centred under
+the picture in the colour the art gives that line. It is a copy of a sentence
+that exists in two places, so a test asserts the two still match.
+
+**One file, both screens.** The picture is at `/etc/tos/splash.png` because
+`t=f` needs a path, and it is the *same* path the login screen prefers over
+its compiled-in copy. `iso/mkiso.sh` puts it there beside `motd_art`, and the
+installer carries it onto the disk with the rest of `/etc`. A machine that
+replaces it has replaced both screens at once, which is the point of there
+being one file rather than two.
 
 ## What this is not
 

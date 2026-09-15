@@ -11,7 +11,29 @@
 //! rather than pass them through. [`art_runs`] is that: it turns a banner into
 //! styled runs, which is what makes a picture produced by something like
 //! `chafa` usable as the banner and not just the text of its escapes.
+//!
+//! ## The picture
+//!
+//! A tOS pane can do better than a banner drawn in cells, and since #132 there
+//! is a picture on the machine to show it: `/etc/tos/splash.png`, the same file
+//! the login screen draws. So the greeting asks the terminal what it is, and a
+//! pane gets the picture itself over the graphics protocol while everything
+//! else goes on getting the drawn banner.
+//!
+//! The picture is sent as a *path* (`t=f`) rather than as a payload, which is
+//! what makes this affordable: the escape is a hundred bytes however large the
+//! picture is, and the compositor reads the file it already has open on the
+//! login screen. `tos-preview` takes the same route for the same reason, and
+//! [`place`] is deliberately the sequence its `transmit::sequence` builds —
+//! room scrolled up first, because `a=T` clips at the bottom of the screen
+//! rather than scrolling, and the cursor walked back down afterwards.
 
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::RawFd;
+use std::path::Path;
+
+use tos_platform::tty;
+use tos_term::graphics::encode_base64;
 use tos_term::Palette;
 
 use crate::ui::{Color, Style};
@@ -25,6 +47,32 @@ pub const ART_SMALL: &str = "tOS — the terminal is the desktop";
 
 /// Where the live image keeps the art, so it can be changed without a rebuild.
 pub const ART_PATH: &str = "/etc/tos/motd_art";
+
+/// The picture a pane is shown instead of the drawn banner.
+///
+/// The file the compositor's login screen draws, put on the image by
+/// `iso/mkiso.sh` beside the banner and carried onto a disk by the installer
+/// with the rest of `/etc`. A machine that replaced it replaced both screens
+/// at once, which is the point of there being one file.
+pub const PICTURE_PATH: &str = "/etc/tos/splash.png";
+
+/// What the banner says in words, kept under the picture, which does not.
+///
+/// A copy of the last line of [`ART`], and the test below is what keeps the
+/// two saying the same thing.
+const TAGLINE: &str = "the terminal is the desktop";
+
+/// The colour that line is drawn in, which is the colour it has in the art.
+const TAGLINE_COLOUR: &str = "\x1b[38;2;127;138;154m";
+
+/// The environment variable that says this shell is inside a tOS session.
+///
+/// Exported by `iso/live-session`, which is what starts every tOS session.
+const SESSION_MARK: &str = "TOS";
+
+/// The smallest picture worth showing, in cells. Below this the drawn banner
+/// says more, and it is what a terminal this small gets.
+const MIN_CELLS: (u32, u32) = (16, 4);
 
 /// The command that installs tOS.
 pub const INSTALL_COMMAND: &str = "tos-install";
@@ -206,11 +254,11 @@ const KEYS: &str = "\x20 ctrl+shift+enter  split     ctrl+shift+w  close the pan
 /// compositor: a person who boots the ISO should not have to be told
 /// separately how to install it.
 pub fn live_message() -> String {
-    let mut out = art();
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push('\n');
+    live_message_under(art())
+}
+
+fn live_message_under(banner: String) -> String {
+    let mut out = under(banner);
     out.push_str(&format!(
         "  This is a live session: nothing is written to disk.\n\
          \n\
@@ -228,11 +276,11 @@ pub fn live_message() -> String {
 /// the answer to that question, and inviting somebody to install the machine
 /// they are standing in is worse than saying nothing.
 pub fn installed_message() -> String {
-    let mut out = art();
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push('\n');
+    installed_message_under(art())
+}
+
+fn installed_message_under(banner: String) -> String {
+    let mut out = under(banner);
     out.push_str(&format!(
         "\x20 Type \x1b[1mexit\x1b[0m to close this pane.\n\
          \n\
@@ -241,13 +289,168 @@ pub fn installed_message() -> String {
     out
 }
 
+/// A banner with the blank line after it that everything else is printed
+/// below.
+fn under(mut banner: String) -> String {
+    if !banner.ends_with('\n') {
+        banner.push('\n');
+    }
+    banner.push('\n');
+    banner
+}
+
 /// The greeting for whichever machine this is.
 pub fn message() -> String {
-    if is_installed() {
-        installed_message()
-    } else {
-        live_message()
+    greeting_under(art())
+}
+
+/// The greeting for whichever machine this is, on whichever terminal this is.
+///
+/// A pane gets the picture; everything else — a serial console, a kernel VT,
+/// somebody logged in from another machine — gets the banner drawn in cells,
+/// because it is the one of the two that is certain to arrive.
+pub fn greeting(screen: Option<Screen>) -> String {
+    greeting_from(screen, Path::new(PICTURE_PATH))
+}
+
+/// The same, with the picture named rather than assumed.
+///
+/// A seam for the reason the compositor's paths are seams: a test that could
+/// not say where the picture is would have to put one in `/etc` on the machine
+/// running it. Not a setting — the greeting and the login screen draw the same
+/// file on purpose, and a second way to name it would be a way for them to
+/// disagree.
+pub fn greeting_from(screen: Option<Screen>, path: &Path) -> String {
+    match screen.and_then(|screen| picture(screen, path)) {
+        Some(banner) => greeting_under(banner),
+        None => message(),
     }
+}
+
+fn greeting_under(banner: String) -> String {
+    if is_installed() {
+        installed_message_under(banner)
+    } else {
+        live_message_under(banner)
+    }
+}
+
+/// What a terminal has said about itself, when it has said enough to be sent
+/// a picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Screen {
+    pub cols: u32,
+    pub rows: u32,
+    /// The pixel size of one cell.
+    pub cell: (u32, u32),
+}
+
+impl Screen {
+    /// The terminal on `fd`, if a picture can be put on it.
+    ///
+    /// Two questions, and both have to be answered yes.
+    ///
+    /// **Is this a tOS session?** `TOS` is exported by `iso/live-session`, so
+    /// it is set for everything a tOS machine starts and for nothing somebody
+    /// brought with them. Without it this could be any terminal at the far end
+    /// of an `ssh`, and a graphics command such a terminal does not know is
+    /// not ignored — it is printed, as the text of its own escape.
+    ///
+    /// **Did the terminal say how big a cell is?** `TIOCGWINSZ` carries pixel
+    /// fields, and tOS fills them in for every pane it spawns
+    /// (`tos_compositor::pane::winsize_for`) where the kernel's own VT leaves
+    /// them zero. So this is what tells a pane from the console the rescue
+    /// session lands on, which is inside a tOS session and cannot draw a
+    /// thing. It is also the number the picture has to be sized against, so
+    /// it would have had to be asked for anyway.
+    pub fn probe(fd: RawFd) -> Option<Screen> {
+        std::env::var_os(SESSION_MARK)?;
+        let size = tty::terminal_size(fd).ok()?;
+        if size.width_px == 0 || size.height_px == 0 || size.cols == 0 || size.rows == 0 {
+            return None;
+        }
+        Some(Screen {
+            cols: size.cols as u32,
+            rows: size.rows as u32,
+            cell: (
+                (size.width_px as u32 / size.cols as u32).max(1),
+                (size.height_px as u32 / size.rows as u32).max(1),
+            ),
+        })
+    }
+}
+
+/// The picture at `path` as the bytes that put it on `screen`, with the line
+/// the banner would have said underneath it.
+///
+/// `None` when there is no picture there, when what is there does not have a
+/// PNG header, or when the terminal is too small to be worth one — each of
+/// which is the drawn banner instead, and none of which is an error.
+///
+/// Only the header is read, because only its two numbers are needed and the
+/// greeting is printed by every shell that starts. That leaves one case this
+/// cannot see: a file whose header is good and whose pixels are not, which is
+/// a picture the compositor refuses and so a greeting with a gap where the
+/// picture was. Decoding a hundred kilobytes at every prompt to rule it out
+/// would cost every shell something to save a broken file from looking broken.
+pub fn picture(screen: Screen, path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let size = tos_term::png::dimensions(&bytes).ok()?;
+    let cells = fit(screen, size)?;
+    let indent = " ".repeat(((cells.0.saturating_sub(TAGLINE.len() as u32)) / 2) as usize);
+    Some(format!(
+        "{}{indent}{TAGLINE_COLOUR}{TAGLINE}\x1b[0m\n",
+        place(path, cells)
+    ))
+}
+
+/// How many cells to give the picture.
+///
+/// Its own size where there is room for it, so that one picture pixel is one
+/// screen pixel and the pixel art it is stays pixel art. Narrower where the
+/// pane is narrower, and never more than half the pane tall, because the
+/// greeting has ten more lines to print underneath and a picture that pushed
+/// them off the top would be a picture instead of a greeting.
+fn fit(screen: Screen, picture: (u32, u32)) -> Option<(u32, u32)> {
+    let (cw, ch) = (screen.cell.0.max(1), screen.cell.1.max(1));
+    let mut cols = picture.0.div_ceil(cw).max(1);
+    let mut rows = picture.1.div_ceil(ch).max(1);
+    if cols > screen.cols {
+        rows = (rows * screen.cols / cols).max(1);
+        cols = screen.cols;
+    }
+    let tall = screen.rows / 2;
+    if rows > tall {
+        cols = (cols * tall / rows).max(1);
+        rows = tall;
+    }
+    if cols < MIN_CELLS.0 || rows < MIN_CELLS.1 {
+        return None;
+    }
+    Some((cols, rows))
+}
+
+/// The graphics command that puts the file at `path` on the screen, and the
+/// cursor movement around it.
+///
+/// `a=T` places at the cursor and clips at the bottom of the screen rather
+/// than scrolling to make room, so the room is scrolled up first and the
+/// cursor walked back into it; `C=1` keeps the terminal from moving the
+/// cursor itself, and the walk back down leaves it on the row below the
+/// picture. `q=2` asks for no reply: nothing is reading this program's input,
+/// and an answer would be collected by the shell as typing.
+fn place(path: &Path, (cols, rows): (u32, u32)) -> String {
+    let name = encode_base64(path.as_os_str().as_bytes());
+    let mut out = String::from("\r");
+    for _ in 0..rows {
+        out.push('\n');
+    }
+    out.push_str(&format!("\x1b[{rows}A"));
+    out.push_str(&format!(
+        "\x1b_Ga=T,f=100,t=f,c={cols},r={rows},C=1,q=2;{name}\x1b\\"
+    ));
+    out.push_str(&format!("\x1b[{rows}B\r"));
+    out
 }
 
 /// The same message with no escape sequences, for a console that has none.
@@ -369,6 +572,210 @@ mod tests {
             assert_eq!(line.len(), 1, "plain art is one run per line");
             assert_eq!(line[0].style, Style::default());
         }
+    }
+
+    // ---- the picture (#132) ---------------------------------------------
+
+    /// A terminal that says it is a tOS pane 100 cells wide, with the cell
+    /// size tOS gives a pane at its default font.
+    fn pane(cols: u32, rows: u32) -> Screen {
+        Screen {
+            cols,
+            rows,
+            cell: (8, 16),
+        }
+    }
+
+    /// A file holding a PNG of this size, and its path.
+    fn picture_file(name: &str, width: u32, height: u32) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("tos-motd-{}-{name}.png", std::process::id()));
+        std::fs::write(&path, png_of(width, height)).expect("picture file");
+        path
+    }
+
+    #[test]
+    fn the_line_under_the_picture_is_the_one_the_banner_draws() {
+        // The picture has no words in it, so the greeting says them. Two
+        // copies of one sentence, and this is what keeps them one sentence.
+        assert!(
+            ART.contains(TAGLINE),
+            "the art no longer says {TAGLINE:?}, so the picture should not either"
+        );
+    }
+
+    #[test]
+    fn a_picture_gets_its_own_size_where_there_is_room() {
+        // 512x170 at an 8x16 cell is 64 cells by 11, which is one picture
+        // pixel per screen pixel — the whole reason to ask the terminal how
+        // big a cell is.
+        assert_eq!(fit(pane(100, 40), (512, 170)), Some((64, 11)));
+    }
+
+    #[test]
+    fn a_picture_is_never_wider_than_the_pane() {
+        let (cols, rows) = fit(pane(40, 40), (512, 170)).expect("a picture");
+        assert_eq!(cols, 40);
+        assert!(rows < 11, "a narrowed picture kept its height: {rows}");
+    }
+
+    #[test]
+    fn a_picture_never_takes_more_than_half_the_pane() {
+        // Ten more lines are printed under it, and a greeting whose picture
+        // pushed them off the top would be a picture instead of a greeting.
+        let (_, rows) = fit(pane(100, 12), (512, 170)).expect("a picture");
+        assert_eq!(rows, 6);
+    }
+
+    #[test]
+    fn a_terminal_too_small_for_a_picture_gets_none() {
+        assert_eq!(fit(pane(10, 40), (512, 170)), None);
+        assert_eq!(fit(pane(100, 4), (512, 170)), None);
+    }
+
+    #[test]
+    fn the_picture_is_sent_as_a_path_and_not_as_a_payload() {
+        // The whole point: the escape is the same hundred bytes whatever the
+        // picture weighs, because the compositor opens the file itself.
+        let path = picture_file("path", 512, 170);
+        let sent = picture(pane(100, 40), &path).expect("a picture");
+        assert!(sent.contains("t=f"), "{sent:?} is not a file transmission");
+        assert!(sent.contains("f=100"), "{sent:?} does not say it is a PNG");
+        assert!(sent.contains("c=64,r=11"), "{sent:?} is the wrong size");
+        assert!(
+            sent.contains(&encode_base64(path.as_os_str().as_bytes())),
+            "{sent:?} does not name the file"
+        );
+        assert!(
+            !sent.contains(&encode_base64(&png_of(512, 170))),
+            "the picture itself went through the terminal"
+        );
+        assert!(sent.len() < 400, "{} bytes for one picture", sent.len());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_picture_is_given_room_before_it_is_drawn_and_left_below() {
+        // `a=T` clips at the bottom of the screen rather than scrolling, so
+        // the rows are scrolled up first and the cursor walked back into
+        // them; afterwards it has to be below the picture, or the next prompt
+        // prints over it.
+        let path = picture_file("room", 512, 170);
+        let sent = picture(pane(100, 40), &path).expect("a picture");
+        assert!(sent.starts_with("\r\n\n\n\n\n\n\n\n\n\n\n\x1b[11A"));
+        let after = sent
+            .split("\x1b\\")
+            .nth(1)
+            .expect("something after the command");
+        assert!(after.starts_with("\x1b[11B\r"), "{after:?}");
+        assert!(after.contains(TAGLINE));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_picture_is_no_picture_rather_than_an_error() {
+        let path = std::env::temp_dir().join(format!("tos-motd-bad-{}.png", std::process::id()));
+        std::fs::write(&path, b"this is not a PNG").expect("write");
+        assert_eq!(picture(pane(100, 40), &path), None);
+        assert_eq!(
+            picture(
+                pane(100, 40),
+                std::path::Path::new("/nonexistent/splash.png")
+            ),
+            None
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_terminal_that_cannot_be_asked_is_not_sent_a_picture() {
+        // Nothing is on file descriptor -1, and a greeting has to come out
+        // anyway.
+        assert_eq!(Screen::probe(-1), None);
+        assert_eq!(greeting(None), message());
+    }
+
+    #[test]
+    fn the_greeting_with_a_picture_still_says_everything_it_said() {
+        let path = picture_file("greeting", 512, 170);
+        let sent = picture(pane(100, 40), &path).expect("a picture");
+        let greeting = greeting_under(sent);
+        assert!(greeting.contains(TAGLINE));
+        assert!(greeting.contains("ctrl+shift+enter"));
+        assert!(greeting.contains("Type"));
+        assert!(
+            !greeting.contains('\u{2588}'),
+            "the drawn banner was printed under the picture as well"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A PNG of this size: one stored deflate block of opaque white, written
+    /// out by hand so the tests depend on no encoder.
+    fn png_of(width: u32, height: u32) -> Vec<u8> {
+        let mut raw = Vec::new();
+        for _ in 0..height {
+            raw.push(0u8);
+            raw.extend(std::iter::repeat_n(0xffu8, width as usize * 4));
+        }
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&chunk(b"IHDR", &ihdr));
+        png.extend_from_slice(&chunk(b"IDAT", &zlib_stored(&raw)));
+        png.extend_from_slice(&chunk(b"IEND", &[]));
+        png
+    }
+
+    fn chunk(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = (body.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(body);
+        let mut checked = kind.to_vec();
+        checked.extend_from_slice(body);
+        out.extend_from_slice(&crc32(&checked).to_be_bytes());
+        out
+    }
+
+    /// Deflate that compresses nothing: stored blocks, which is all a test
+    /// needs and the one encoding that can be written in ten lines.
+    fn zlib_stored(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x78, 0x01];
+        let mut blocks = data.chunks(0xffff).peekable();
+        while let Some(block) = blocks.next() {
+            out.push(u8::from(blocks.peek().is_none()));
+            out.extend_from_slice(&(block.len() as u16).to_le_bytes());
+            out.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
+            out.extend_from_slice(block);
+        }
+        out.extend_from_slice(&adler32(data).to_be_bytes());
+        out
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut value = 0xffff_ffffu32;
+        for &byte in data {
+            value ^= byte as u32;
+            for _ in 0..8 {
+                value = if value & 1 != 0 {
+                    (value >> 1) ^ 0xedb8_8320
+                } else {
+                    value >> 1
+                };
+            }
+        }
+        value ^ 0xffff_ffff
+    }
+
+    fn adler32(data: &[u8]) -> u32 {
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in data {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        (b << 16) | a
     }
 
     #[test]
