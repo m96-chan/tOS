@@ -119,6 +119,14 @@ pub struct Config {
     /// configuration file. [`crate::lock::session_user`] is where it comes
     /// from.
     pub credential_user: String,
+    /// The picture the login screen draws above the password box.
+    ///
+    /// A seam for the same reason [`Config::credential`] is, and pointed at a
+    /// file for the reason the banner is (#132): a machine should be able to
+    /// say it is somebody's without being rebuilt. Nothing there is not an
+    /// error — the picture tOS ships is compiled in, and is what a machine
+    /// with no picture of its own shows.
+    pub splash: PathBuf,
     /// Where the accounts are. A seam for the same reason [`Config::credential`]
     /// is: a test writes its own passwd file rather than depending on whoever
     /// happens to exist on the machine running it.
@@ -198,6 +206,7 @@ impl Default for Config {
             chrome: Chrome::default(),
             credential: PathBuf::from(crate::lock::CREDENTIAL_PATH),
             credential_user: crate::lock::session_user(),
+            splash: PathBuf::from(crate::splash::SPLASH_PATH),
             passwd: PathBuf::from(crate::account::PASSWD_PATH),
             group: PathBuf::from(crate::account::GROUP_PATH),
             gated: false,

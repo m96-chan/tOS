@@ -41,6 +41,7 @@ use crate::pane::Pane;
 use crate::pointer::{self, Pointer};
 use crate::power;
 use crate::selection::{Selection, SelectionMode};
+use crate::splash::Splash;
 use crate::status::{self, Bar, Hit, Piece, Segment};
 use crate::system::Machine;
 
@@ -277,6 +278,13 @@ pub struct Compositor {
     /// input — every kind of it, not only the keys — and the screen shows
     /// nothing of the session.
     lock: Option<LockScreen>,
+    /// The picture the login screen draws above its box (#132).
+    ///
+    /// Held only while that screen is up: it is read when the screen goes up
+    /// and let go when somebody logs in, because a login happens once and a
+    /// megabyte of pixels nobody is going to look at again is a megabyte a
+    /// session could have had.
+    splash: Option<Splash>,
     /// Copy mode, and the pane it is selecting in. While it is up it owns the
     /// keyboard: no key reaches the pane and no binding fires.
     ///
@@ -423,6 +431,7 @@ impl Compositor {
             notifications: Notifications::new(),
             overlay: None,
             lock: None,
+            splash: None,
             copy: None,
             session_ended_while_locked: false,
             needs_full_redraw: true,
@@ -503,6 +512,7 @@ impl Compositor {
         self.keymap.cancel_pending();
         self.release_grab();
         self.lock = Some(LockScreen::login(hash, self.config.credential_user.clone()));
+        self.splash = Splash::load(&self.config.splash);
         self.needs_full_redraw = true;
     }
 
@@ -2073,6 +2083,8 @@ impl Compositor {
     /// the screen was locked; then answering it starts one.
     fn unlock(&mut self) {
         self.lock = None;
+        // The picture belonged to the screen that has just been answered.
+        self.splash = None;
         // Nothing under the lock was drawn while it was up, and the damage
         // that would have said what to repaint was thrown away with each
         // locked frame. The whole screen is the only honest answer.
@@ -3467,7 +3479,14 @@ impl Compositor {
         surface.clear(self.chrome.background);
         let area = PixelRect::new(0, 0, self.size.0, self.size.1);
         if let Some(lock) = &self.lock {
-            lock.draw(surface, &mut self.fonts, area, &self.chrome, Instant::now());
+            lock.draw(
+                surface,
+                &mut self.fonts,
+                area,
+                &self.chrome,
+                self.splash.as_ref(),
+                Instant::now(),
+            );
         }
 
         // The clear took the arrow with it, so what is remembered as painted

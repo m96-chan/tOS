@@ -22,6 +22,7 @@ pub mod pane;
 pub mod pointer;
 pub mod power;
 pub mod selection;
+pub mod splash;
 pub mod status;
 pub mod system;
 
@@ -37,4 +38,5 @@ pub use overlay::{Overlay, OverlayItem, OverlayOutcome, Placement};
 pub use pane::Pane;
 pub use pointer::Pointer;
 pub use selection::{Anchor, Selection, SelectionMode};
+pub use splash::Splash;
 pub use status::{Bar, Hit, Segment};

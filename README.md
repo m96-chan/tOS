@@ -727,6 +727,26 @@ the `quit` binding are the same thing, and what they mean depends on that one
 rule: log out where there is a login to come back to, and hand the machine
 back to its init where there is not. `docs/design/login.md` has the rest.
 
+That screen has a **picture** on it (#132). It is the one thing the compositor
+draws in pixels rather than cells: the PNG decoder and the alpha blit the
+graphics protocol already needed, pointed at a picture of its own instead of
+at a program's. It is compiled into the compositor, because the first screen
+on the display should not depend on a file having been installed, and a
+machine that wants its own puts it at `/etc/tos/splash.png` — the door
+`/etc/tos/motd_art` opens for the banner. Nothing there, or something that is
+not a picture, is the one tOS ships rather than an error.
+
+It is drawn at whole multiples of its own pixels, never at a fraction of one:
+nearest sampling at a fractional ratio is what makes scaled pixel art look
+melted, so a display gets `n` screen pixels per picture pixel, or one picture
+pixel in `n`, or no picture at all. A screen too small for the smallest of
+those keeps the box, in the place the box has always been — the picture is the
+part that can give way, the same order the installer's banner already follows.
+A lock does not get it: that screen has a session behind it and somebody in
+front of it who knows what the machine is. `docs/design/splash.md` has the
+rest, and `cargo run --example login_screenshot -- /tmp/tos-login.ppm` is how
+it gets looked at.
+
 `super+shift+l`, or `ctrl+a` then `L`, locks the screen. The lock is a password
 field, and it is its own type rather than another use of that box for exactly
 that reason: the box echoes what is typed, refilters a list on every keystroke
@@ -918,6 +938,7 @@ banner is never erased on a bar with no message segment
 - [x] Debian rootfs tooling ([#20](https://github.com/m96-chan/tOS/issues/20))
 - [ ] hardware abstraction cleanup ([#22](https://github.com/m96-chan/tOS/issues/22))
 - [ ] images scanned out on DRM overlay planes ([#31](https://github.com/m96-chan/tOS/issues/31))
+- [x] a picture on the login screen ([#132](https://github.com/m96-chan/tOS/issues/132))
 
 The name is the test the round is held to: most of this list is about a
 machine somebody installed being one they can actually use — a shell they

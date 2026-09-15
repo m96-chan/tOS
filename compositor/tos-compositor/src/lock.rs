@@ -40,6 +40,7 @@ use tos_render::{Rect, Surface};
 
 use crate::chrome::{clip, draw_text, Chrome};
 use crate::overlay::pad_to;
+use crate::splash::Splash;
 
 /// Where the credential lives when nobody says otherwise.
 ///
@@ -87,6 +88,10 @@ const MAX_WIDTH: usize = 44;
 const BOX_ROWS: usize = 5;
 /// What is written in front of the masked field.
 const PROMPT: &str = "password: ";
+/// Rows the picture leaves to everything that is not the box: one blank row
+/// between the picture and the box, and one above and below the pair of them
+/// so that neither is ever flush against an edge of the display.
+const PICTURE_MARGIN_ROWS: usize = 3;
 /// One of these per character typed. The length of a password is not a secret
 /// worth hiding from the person who can see the hands that typed it, and a
 /// field that shows nothing at all is how people end up convinced that a
@@ -437,15 +442,22 @@ impl LockScreen {
 
     /// Draw the lock centred in `area`, which is in pixels.
     ///
-    /// This draws the box and nothing else. Erasing the session is the
-    /// caller's, because only the caller knows that the whole surface is its
-    /// to erase.
+    /// This draws the box, and over a login the picture above it. Erasing the
+    /// session is the caller's, because only the caller knows that the whole
+    /// surface is its to erase.
+    ///
+    /// The picture is handed in rather than loaded here for the reason at the
+    /// top of this file: nothing here reads a file it is not pointed at. It is
+    /// drawn only over a [`Purpose::Login`] — a lock has a session behind it
+    /// and is asking somebody to come back to what they left, where a login
+    /// screen is the machine opening, which is what a frontispiece is for.
     pub fn draw(
         &self,
         surface: &mut Surface<'_>,
         fonts: &mut FontStack,
         area: Rect,
         chrome: &Chrome,
+        splash: Option<&Splash>,
         now: Instant,
     ) {
         let metrics = fonts.metrics();
@@ -461,7 +473,39 @@ impl LockScreen {
         }
         let inner = box_cols - 2;
         let x0 = area.x + (((cols - box_cols) / 2) * cw as usize) as i32;
-        let y0 = area.y + (((rows - BOX_ROWS) / 2) * ch as usize) as i32;
+
+        // The picture and the box are centred as one thing, so the pair has
+        // the same air above and below it that the box alone used to have.
+        // A display with no room for the picture is the box on its own again,
+        // in the place it has always been.
+        let picture = splash
+            .filter(|_| self.purpose == Purpose::Login)
+            .and_then(|splash| {
+                let over = rows.checked_sub(BOX_ROWS + PICTURE_MARGIN_ROWS)?;
+                let room = (Splash::room_across(area.width), over as u32 * ch);
+                splash.fit(room).map(|size| (splash, size))
+            });
+        let picture_rows = picture
+            .map(|(_, (_, height))| height.div_ceil(ch) as usize)
+            .unwrap_or(0);
+        // The picture, a blank row, and the box — or, with no picture, the box.
+        let stack_rows = if picture_rows == 0 {
+            BOX_ROWS
+        } else {
+            picture_rows + 1 + BOX_ROWS
+        };
+        let y0 = area.y + (((rows - stack_rows) / 2 + stack_rows - BOX_ROWS) * ch as usize) as i32;
+
+        // Above the box, with a blank row between them. The picture carries
+        // its own alpha, so what surrounds it is the field the caller erased
+        // to rather than a rectangle of its own.
+        if let Some((splash, (width, height))) = picture {
+            let x = area.x + ((area.width.saturating_sub(width)) / 2) as i32;
+            splash.draw(
+                surface,
+                Rect::new(x, y0 - ch as i32 - height as i32, width, height),
+            );
+        }
 
         // Nothing of the session is under this, but the box still paints its
         // own background so the border has something to sit on.
@@ -867,6 +911,7 @@ mod tests {
                 &mut fonts,
                 Rect::new(0, 0, 640, 360),
                 &Chrome::default(),
+                None,
                 Instant::now(),
             );
             assert!(
@@ -875,6 +920,91 @@ mod tests {
             );
             pixels.fill(0);
         }
+    }
+
+    /// How many distinct colours a frame holds. A box is a handful of them
+    /// and a picture is thousands, which is the whole of how these tests tell
+    /// one from the other without knowing what the picture is.
+    fn colours(pixels: &[u32]) -> usize {
+        pixels
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
+    /// The first row with anything on it.
+    fn first_drawn_row(pixels: &[u32], width: usize) -> Option<usize> {
+        pixels
+            .chunks_exact(width)
+            .position(|row| row.iter().any(|&p| p != 0))
+    }
+
+    #[test]
+    fn the_picture_goes_over_a_login_and_not_over_a_lock() {
+        // #132. One picture, one display, two purposes. A lock has a session
+        // behind it and somebody in front of it who has already been told
+        // what this machine is; a login screen is the machine opening.
+        let splash = Splash::built_in().expect("the picture tOS ships");
+        let (width, height) = (640usize, 360usize);
+        let mut pixels = vec![0u32; width * height];
+        let mut fonts = FontStack::new(Box::new(tos_font::BitmapFont::new(1)));
+        let mut drawn = Vec::new();
+        for screen in [
+            LockScreen::login(hash_of("hunter2"), "tos".into()),
+            LockScreen::new(hash_of("hunter2"), "tos".into()),
+        ] {
+            let mut surface = Surface::new(&mut pixels, width as u32, height as u32, width as u32);
+            screen.draw(
+                &mut surface,
+                &mut fonts,
+                Rect::new(0, 0, width as u32, height as u32),
+                &Chrome::default(),
+                Some(&splash),
+                Instant::now(),
+            );
+            drawn.push((colours(&pixels), first_drawn_row(&pixels, width)));
+            pixels.fill(0);
+        }
+        let (login_colours, login_top) = drawn[0];
+        let (lock_colours, lock_top) = drawn[1];
+        assert!(
+            login_colours > 1000,
+            "the login screen drew {login_colours} colours, which is no picture"
+        );
+        assert!(
+            lock_colours < 16,
+            "the locked screen drew {lock_colours} colours, which is a picture"
+        );
+        assert!(
+            login_top < lock_top,
+            "the picture should start above where the box alone would ({login_top:?}, {lock_top:?})"
+        );
+    }
+
+    #[test]
+    fn a_display_with_no_room_for_the_picture_still_draws_the_box() {
+        // The box is the part that has to survive: a screen that cannot show
+        // the picture can still be logged into, and a picture drawn where
+        // there was no room for it would be drawn over the field.
+        let splash = Splash::built_in().expect("the picture tOS ships");
+        let (width, height) = (320usize, 120usize);
+        let mut pixels = vec![0u32; width * height];
+        let mut fonts = FontStack::new(Box::new(tos_font::BitmapFont::new(1)));
+        let mut surface = Surface::new(&mut pixels, width as u32, height as u32, width as u32);
+        LockScreen::login(hash_of("hunter2"), "tos".into()).draw(
+            &mut surface,
+            &mut fonts,
+            Rect::new(0, 0, width as u32, height as u32),
+            &Chrome::default(),
+            Some(&splash),
+            Instant::now(),
+        );
+        assert!(
+            pixels.iter().any(|&p| p != 0),
+            "the box went with the picture"
+        );
+        let drawn = colours(&pixels);
+        assert!(drawn < 16, "{drawn} colours on a display too small for one");
     }
 
     #[test]
