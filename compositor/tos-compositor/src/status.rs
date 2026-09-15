@@ -544,10 +544,27 @@ pub fn battery_text(power: &PowerState) -> Option<String> {
 
 /// The link, named by what a person would call it: the network they joined if
 /// it is wireless and associated, and the kernel's name for it otherwise.
+///
+/// Four renderings, because there are four states worth telling apart and the
+/// bare name is the only one that means "this works". `Interface::is_online`
+/// stops at an address, and an address is not a network: a link holding one
+/// with nothing routing off its own subnet reaches the machine next to it and
+/// nothing else, while every name it is asked to resolve fails. That reads as
+/// a DNS fault rather than as a missing route, so it is the state that most
+/// needs the bar to say something — and it was the one state the bar rendered
+/// as though the link were working (#125).
+///
+/// The route is this link's own, not the machine's. It can be: `read_link`
+/// asks `Network::active_interface` first, which is the interface carrying the
+/// default route, so the only way a route-less link reaches here is on a
+/// machine that has no default route at all.
 pub fn network_text(link: &Interface) -> String {
     let name = link.ssid().unwrap_or(&link.name);
     if link.is_online() {
-        return name.to_string();
+        if link.is_default {
+            return name.to_string();
+        }
+        return format!("{name} no route");
     }
     // Being on a link that is not working is worth showing; the `summary()`
     // this leans away from would put an address here, and there isn't one.
@@ -573,7 +590,7 @@ mod tests {
     use super::*;
     use tos_font::BitmapFont;
     use tos_render::OwnedFramebuffer;
-    use tos_system::net::{Kind, LinkState};
+    use tos_system::net::{Address, Kind, LinkState};
     use tos_system::power::{Battery, Supply, SupplyKind};
 
     fn fonts() -> FontStack {
@@ -903,6 +920,17 @@ mod tests {
     fn a_link_that_is_not_working_says_so_rather_than_going_quiet() {
         assert_eq!(network_text(&interface("eth0", true)), "eth0 no ip");
         assert_eq!(network_text(&interface("eth0", false)), "eth0 down");
+    }
+
+    #[test]
+    fn an_address_with_no_default_route_is_not_a_link_that_works() {
+        let mut link = interface("eth0", true);
+        link.addresses = vec![Address::parse("10.0.2.15/24").expect("address")];
+        assert!(!link.is_default);
+        assert_eq!(network_text(&link), "eth0 no route");
+
+        link.is_default = true;
+        assert_eq!(network_text(&link), "eth0");
     }
 
     #[test]
