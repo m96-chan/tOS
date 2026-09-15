@@ -625,9 +625,13 @@ pub struct Placement {
     pub id: u32,
     pub image_id: u32,
     pub placement_id: u32,
-    /// Anchor cell on the screen.
+    /// Anchor cell, counted from the top of the active screen.
     pub col: u16,
-    pub row: u16,
+    /// Signed because the screen is not the whole of the grid: a placement
+    /// that has scrolled into history sits at a negative row, `-1` being the
+    /// newest scrolled-off line. Saturating it at zero was what pinned a
+    /// picture to the top of the pane and hid the text passing behind it.
+    pub row: i32,
     pub cols: u16,
     pub rows: u16,
     pub src_x: u32,
@@ -827,7 +831,7 @@ impl GraphicsStore {
                 image_id,
                 placement_id: cmd.placement_id,
                 col,
-                row,
+                row: row as i32,
                 cols: cols.min(u16::MAX as u32) as u16,
                 rows: rows.min(u16::MAX as u32) as u16,
                 src_x: cmd.src_x,
@@ -874,20 +878,44 @@ impl GraphicsStore {
         self.placements.len() != before
     }
 
-    /// Drop placements that scrolled off or were overwritten.
+    /// Drop placements that fell below the bottom of a shrunken screen.
+    ///
+    /// A negative row is not below anything — it is in history — so this only
+    /// looks downward.
     pub fn retain_rows(&mut self, rows: u16) {
-        self.placements.retain(|_, p| p.row < rows);
+        self.placements.retain(|_, p| p.row < rows as i32);
     }
 
-    /// Shift placements up by `n` rows, dropping those that leave the screen.
-    pub fn scroll(&mut self, n: u16) {
-        self.placements.retain(|_, p| {
-            let bottom = p.row as i32 + p.rows as i32;
-            bottom - n as i32 > 0
-        });
+    /// Move every placement `delta` rows down the screen — negative for the
+    /// ordinary case of text scrolling up — and drop the ones that can no
+    /// longer be reached.
+    ///
+    /// `history` is how many lines of scrollback the grid holds. See
+    /// [`GraphicsStore::retain_in_history`] for what that has to do with it.
+    pub fn shift_rows(&mut self, delta: i32, history: usize) {
         for p in self.placements.values_mut() {
-            p.row = p.row.saturating_sub(n);
+            p.row = p.row.saturating_add(delta);
         }
+        self.retain_in_history(history);
+    }
+
+    /// Drop placements whose last row has fallen out of scrollback.
+    ///
+    /// Leaving the viewport is not the end of a placement: the lines it sat on
+    /// are in history, and somebody scrolling back is owed the picture that
+    /// was on them. Row `-1` is the newest scrolled-off line, so the oldest
+    /// line `history` still holds is row `-history`, and a placement is gone
+    /// once its bottom has passed that.
+    ///
+    /// Which is also why nothing has to sweep history for the [`GraphicsRef`]
+    /// tags the placement left on cells: every row that carried one was
+    /// evicted before the placement was.
+    ///
+    /// [`GraphicsRef`]: crate::cell::GraphicsRef
+    pub fn retain_in_history(&mut self, history: usize) {
+        let floor = -(history as i64);
+        self.placements
+            .retain(|_, p| p.row as i64 + p.rows as i64 > floor);
     }
 
     // ---- animation ------------------------------------------------------
@@ -2276,17 +2304,105 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scrolling_drops_offscreen_placements() {
+    /// Store one image `rows` cells tall, placed at the top of the screen.
+    fn store_with_placement(rows: u32) -> GraphicsStore {
         let mut store = GraphicsStore::new(1 << 20);
-        let data = vec![0u8; 8 * 16 * 4];
+        let height = rows * 16;
+        let data = vec![0u8; (8 * height * 4) as usize];
         let payload = encode_base64(&data);
         let cmd =
-            GraphicsCommand::parse(format!("a=T,f=32,s=8,v=16,i=1;{payload}").as_bytes()).unwrap();
+            GraphicsCommand::parse(format!("a=T,f=32,s=8,v={height},i=1;{payload}").as_bytes())
+                .unwrap();
         let id = store.store(&cmd, &cmd.payload).unwrap();
         store.place(&cmd, id, 0, 0, 8, 16);
         assert_eq!(store.placements().count(), 1);
-        store.scroll(1);
+        store
+    }
+
+    fn rows_of(store: &GraphicsStore) -> Vec<i32> {
+        store.placements().map(|p| p.row).collect()
+    }
+
+    #[test]
+    fn scrolling_drops_offscreen_placements_with_no_history() {
+        // A pane with no scrollback — the alternate screen is one — has
+        // nowhere to keep a picture that has left the top, so it goes.
+        let mut store = store_with_placement(1);
+        store.shift_rows(-1, 0);
+        assert_eq!(store.placements().count(), 0);
+    }
+
+    #[test]
+    fn a_tall_placement_scrolled_a_row_at_a_time_still_leaves() {
+        // The shape of placement the old test stepped around: taller than the
+        // scroll increment. The row saturated at zero, so the drop test kept
+        // reading `0 + 11 - 1`, and the picture was immortal.
+        let mut store = store_with_placement(11);
+        for _ in 0..10 {
+            store.shift_rows(-1, 0);
+            assert_eq!(
+                store.placements().count(),
+                1,
+                "dropped while still on screen"
+            );
+        }
+        assert_eq!(rows_of(&store), vec![-10]);
+        store.shift_rows(-1, 0);
+        assert_eq!(
+            store.placements().count(),
+            0,
+            "the eleventh scroll clears it"
+        );
+    }
+
+    #[test]
+    fn a_placement_stays_as_long_as_its_lines_are_in_history() {
+        // History growing under it is the ordinary case: every line the
+        // picture sat on is still there to scroll back to, so it stays, and
+        // its row keeps counting how far back that is.
+        let mut store = store_with_placement(11);
+        for n in 1..=200 {
+            store.shift_rows(-1, n);
+            assert_eq!(
+                store.placements().count(),
+                1,
+                "lost a picture still in history"
+            );
+        }
+        assert_eq!(rows_of(&store), vec![-200]);
+    }
+
+    #[test]
+    fn a_placement_goes_when_its_last_line_is_evicted() {
+        // A pane holding five lines of history, scrolled a line at a time.
+        // Once history is full the floor stops at -5 while the row keeps
+        // falling, and the 16th scroll is the one that takes the bottom of an
+        // 11-row picture past it: 11 - 16 = -5, no longer above the floor.
+        let mut store = store_with_placement(11);
+        for n in 1..16 {
+            store.shift_rows(-1, n.min(5));
+            assert_eq!(store.placements().count(), 1, "dropped after {n} scrolls");
+        }
+        store.shift_rows(-1, 5);
+        assert_eq!(store.placements().count(), 0);
+    }
+
+    #[test]
+    fn a_shrinking_screen_keeps_what_went_into_history() {
+        // `retain_rows` drops what fell off the bottom. A negative row is not
+        // below anything; it is above everything.
+        let mut store = store_with_placement(2);
+        store.shift_rows(-4, 4);
+        assert_eq!(rows_of(&store), vec![-4]);
+        store.retain_rows(10);
+        assert_eq!(store.placements().count(), 1);
+    }
+
+    #[test]
+    fn erasing_history_takes_the_pictures_in_it() {
+        let mut store = store_with_placement(2);
+        store.shift_rows(-4, 4);
+        store.retain_in_history(0);
         assert_eq!(store.placements().count(), 0);
     }
 }

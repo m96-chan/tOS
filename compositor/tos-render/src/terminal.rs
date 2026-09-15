@@ -449,14 +449,18 @@ fn draw_graphics(
     placements.sort_by_key(|p| (p.z_index, p.id));
 
     // Images belong to screen rows, so scrolling back into history moves them
-    // up with the text rather than leaving them pinned to the display.
+    // with the text rather than leaving them pinned to the display. Scrolling
+    // back pushes the active screen *down* to make room for history above it
+    // — `Grid::display_row` shows screen row `y - offset` at display row `y` —
+    // so a placement's display row is `row + offset`, and a placement already
+    // in history has a negative row that the offset brings back up into view.
     let offset = term.display_offset() as i64;
 
     for placement in placements {
         let Some(image) = store.image(placement.image_id) else {
             continue;
         };
-        let row = placement.row as i64 - offset;
+        let row = placement.row as i64 + offset;
         if row + placement.rows as i64 <= 0 || row >= term.grid().rows() as i64 {
             continue;
         }
