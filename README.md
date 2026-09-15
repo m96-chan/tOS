@@ -1,5 +1,7 @@
 # tOS
 
+![The tOS logo and a shell prompt in green, beside somebody asleep at a laptop with a cat asleep next to them, drawn as pixel art](docs/tos.png)
+
 **tOS is a terminal-native Linux environment where the terminal is the display system.**
 
 The project does not aim to build a conventional desktop and then place a terminal on top of it.
@@ -1273,7 +1275,7 @@ dictionary = /usr/share/skk/SKK-JISYO.L
 [colors]
 background = #101012
 foreground = #d0d0d0
-cursor = #87b7ff
+cursor = #92f980
 cursor-text = #101012
 color0 = #1c1c1c
 color1 = #cc5757
@@ -1283,13 +1285,14 @@ color1 = #cc5757
 background = #18181c
 foreground = #c8c8d0
 dim = #70707c
-accent = #5f87d7
+accent = #92f980
 accent-text = #101014
 divider = #2c2c34
-divider-focused = #5f87d7
-# The block behind selected text. Follows accent unless it is set here, which
-# is worth setting when the palette's own blue is close to the accent.
-selection = #5f87d7
+divider-focused = #92f980
+# The block behind selected text. Follows accent unless it is set here, and
+# the default sets it: a light green block over a program's own output hides
+# what it is highlighting.
+selection = #cd3f73
 
 # What the status bar says, in the order it reads on screen, and what it says
 # it in. Segments: workspaces, panes, title, layout, message, clock, battery,
@@ -1307,10 +1310,19 @@ timezone = local
 # setting accent once still moves the bar's highlight with everything else.
 background = #18181c
 foreground = #70707c
-active = #5f87d7
+active = #92f980
 active-text = #101014
 divider = #2c2c34
 ```
+
+The two colours in that block are the two in the picture the machine opens
+with: the green is the `tOS` and the prompt under it, and the red is the
+streak in the hair beside them. Everything tOS highlights on its own chrome —
+the focused pane's divider, the workspace on the bar, the row under the cursor
+in a menu, the login screen's box — is the green, which makes the brightest
+thing on the screen the thing the session is pointing at. Selected text is the
+red, because that one highlight is drawn *over* somebody else's output and a
+light green block behind it would hide what it was meant to show.
 
 Colours are hex, with or without the `#`, in the three digit shorthand or the
 six digit form. Booleans take `true`, `yes`, `on` and `1` or their opposites.

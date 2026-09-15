@@ -50,12 +50,34 @@ pub struct Chrome {
     ///
     /// Separate from [`accent`] because it is the one highlight that sits on
     /// top of somebody else's colours: a palette whose own blue is close to
-    /// the accent leaves a selection that cannot be seen, and until now there
-    /// was no way to move one without moving the other.
+    /// the accent leaves a selection that cannot be seen, and there has to be
+    /// a way to move one without moving the other.
+    ///
+    /// It is the one of these the default fills in rather than leaving to fall
+    /// back, and the reason is the same one: the accent is a light green, and
+    /// a light green block behind a program's own output is a block that hides
+    /// what it is highlighting. The red it is instead is the other half of the
+    /// pair — see the colours below.
     ///
     /// [`accent`]: Chrome::accent
     pub selection: Option<Rgb>,
 }
+
+/// The colour every highlight in a tOS session is drawn in.
+///
+/// The green of the `tOS` in the picture the machine opens with, and of the
+/// prompt under it: a session that says what it is in the same colour twice
+/// rather than in a blue nothing else on the machine uses. See
+/// `docs/design/splash.md`.
+pub const ACCENT: Rgb = Rgb::new(0x92, 0xf9, 0x80);
+
+/// The other colour in that picture, and what a selection is drawn in.
+///
+/// Two colours rather than one because a highlight tOS draws on its own
+/// chrome and a highlight it draws over a program's output are not the same
+/// job: the first should be the brightest thing on the screen and the second
+/// has to sit behind text without swallowing it.
+pub const ATTENTION: Rgb = Rgb::new(0xcd, 0x3f, 0x73);
 
 impl Default for Chrome {
     fn default() -> Self {
@@ -63,16 +85,16 @@ impl Default for Chrome {
             background: Rgb::new(0x18, 0x18, 0x1c),
             foreground: Rgb::new(0xc8, 0xc8, 0xd0),
             dim: Rgb::new(0x70, 0x70, 0x7c),
-            accent: Rgb::new(0x5f, 0x87, 0xd7),
+            accent: ACCENT,
             accent_text: Rgb::new(0x10, 0x10, 0x14),
             divider: Rgb::new(0x2c, 0x2c, 0x34),
-            divider_focused: Rgb::new(0x5f, 0x87, 0xd7),
+            divider_focused: ACCENT,
             status_background: None,
             status_foreground: None,
             status_active: None,
             status_active_text: None,
             status_divider: None,
-            selection: None,
+            selection: Some(ATTENTION),
         }
     }
 }
