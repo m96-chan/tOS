@@ -649,6 +649,17 @@ impl<'a> Installer<'a> {
     ///
     /// Written directly rather than through `grub-mkconfig`, which needs a
     /// Debian userspace the live image does not have yet.
+    ///
+    /// The quiet entry asks for `loglevel=3` as well, which `quiet` on its own
+    /// does not give: `quiet` leaves the console at 4, and `KERN_ERR` is 3, so
+    /// every driver that logs an error on the way in prints over a boot that
+    /// is meant to be silent. On a VirtualBox guest with the VMSVGA adapter —
+    /// the way most people meet tOS — that is the first line on the screen,
+    /// from `vmwgfx` writing a version string to a host log port VirtualBox
+    /// does not implement (#129). Nothing is lost by not painting it:
+    /// journald reads `/dev/kmsg` whatever the console is set to, so
+    /// `journalctl -b -p err` still has it, and the verbose entry beside this
+    /// one still prints everything.
     fn grub_config(&self) -> String {
         format!(
             "set timeout=2\n\
@@ -656,7 +667,7 @@ impl<'a> Installer<'a> {
              \n\
              menuentry \"tOS\" {{\n\
              \tsearch --no-floppy --label --set=root tos-root\n\
-             \tlinux /boot/vmlinuz {CMDLINE} quiet\n\
+             \tlinux /boot/vmlinuz {CMDLINE} quiet loglevel=3\n\
              \tinitrd /boot/initramfs.gz\n\
              }}\n\
              \n\
@@ -1812,6 +1823,37 @@ mod tests {
         assert!(config.contains("--label --set=root tos-root"));
         assert!(config.contains("root=LABEL=tos-root"));
         assert!(config.contains("menuentry \"tOS\""));
+    }
+
+    #[test]
+    fn only_the_quiet_entry_stops_painting_the_kernel_s_errors() {
+        // `quiet` leaves the console loglevel at 4, and `KERN_ERR` is 3, so a
+        // driver logging an error on the way in prints over a boot that is
+        // meant to be silent (#129). Asking for 3 stops that and keeps
+        // `KERN_CRIT` and worse.
+        //
+        // Exactly one of the two entries, and it is the quiet one. The verbose
+        // entry exists to be watched; an entry that asked for both `quiet` and
+        // everything would be neither.
+        let backend = install(Firmware::Uefi);
+        let config = backend
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                crate::exec::Action::WriteFile { path, contents, .. }
+                    if path.ends_with("grub.cfg") =>
+                {
+                    Some(contents.clone())
+                }
+                _ => None,
+            })
+            .expect("no grub.cfg");
+        assert_eq!(config.matches("loglevel=3").count(), 1);
+        let quiet = config
+            .lines()
+            .find(|line| line.contains("quiet"))
+            .expect("a quiet entry");
+        assert!(quiet.contains("loglevel=3"), "{quiet}");
     }
 
     /// The doors a screen lock cannot close on its own, closed on the command
