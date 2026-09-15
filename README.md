@@ -1451,4 +1451,6 @@ with the machine still up, rather than dropping the display.
 
 ## License
 
-TBD
+MIT — see [LICENSE](LICENSE).
+
+Third-party dependencies and components bundled in the ISO retain their own licenses.
