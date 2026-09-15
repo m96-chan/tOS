@@ -442,24 +442,37 @@ fn draw_graphics(
     if store.is_empty() {
         return;
     }
+    // Images belong to screen rows, so scrolling back into history moves them
+    // with the text rather than leaving them pinned to the display. Scrolling
+    // back pushes the active screen *down* to make room for history above it
+    // — `Grid::display_row` shows screen row `y - offset` at display row `y` —
+    // so a placement's display row is `row + offset`, and a placement already
+    // in history has a negative row that the offset brings back up into view.
+    let offset = term.display_offset() as i64;
+    let height = term.grid().rows() as i64;
+
     // Placements are drawn back to front so z-index is respected. The
     // placement id breaks ties, because the store is a hash map and its
     // iteration order would otherwise change the stacking every frame.
-    let mut placements: Vec<_> = store.placements().collect();
+    //
+    // Only what the viewport can show is worth sorting. A placement now lives
+    // for as long as its lines are in scrollback, so the store holds up to a
+    // history's worth of them rather than a screen's, and sorting all of that
+    // every frame to draw the handful on view would be work for nothing.
+    let mut placements: Vec<_> = store
+        .placements()
+        .filter(|p| {
+            let row = p.row as i64 + offset;
+            row + p.rows as i64 > 0 && row < height
+        })
+        .collect();
     placements.sort_by_key(|p| (p.z_index, p.id));
-
-    // Images belong to screen rows, so scrolling back into history moves them
-    // up with the text rather than leaving them pinned to the display.
-    let offset = term.display_offset() as i64;
 
     for placement in placements {
         let Some(image) = store.image(placement.image_id) else {
             continue;
         };
-        let row = placement.row as i64 - offset;
-        if row + placement.rows as i64 <= 0 || row >= term.grid().rows() as i64 {
-            continue;
-        }
+        let row = placement.row as i64 + offset;
         let dest = Rect::new(
             area.x + (placement.col as u32 * cell_width) as i32,
             area.y + (row * cell_height as i64) as i32,

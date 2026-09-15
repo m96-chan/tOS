@@ -553,13 +553,34 @@ fn images_scroll_with_the_text_they_sit_on() {
         "image should be on row 0"
     );
 
-    // Push the image off the top of the screen, then look at history.
+    // Push the image off the top of the screen. Five newlines on a four-row
+    // pane, from a cursor the placement left on row 0, scroll twice.
     h.feed(b"\r\n\r\n\r\n\r\n\r\n");
-    h.term.scroll_display(2);
     h.draw_with(&options);
-    // Wherever it is now, it must not still be painted on screen row 0.
-    let top_row_is_image = h.cell_pixel(0, 0, 1, 1) == 0x00ff00;
-    assert!(!top_row_is_image, "the image stayed pinned to the display");
+    assert_ne!(
+        h.cell_pixel(0, 0, 1, 1),
+        0x00ff00,
+        "the image stayed pinned to the top of the display"
+    );
+
+    // It is two lines back in history, so scrolling back one is not yet far
+    // enough to see it.
+    assert!(h.term.scroll_display(1));
+    h.draw_with(&options);
+    assert_ne!(
+        h.cell_pixel(0, 0, 1, 1),
+        0x00ff00,
+        "the image came back into view a line early"
+    );
+
+    // One more, and it is exactly back where its text is.
+    assert!(h.term.scroll_display(1));
+    h.draw_with(&options);
+    assert_eq!(
+        h.cell_pixel(0, 0, 1, 1),
+        0x00ff00,
+        "scrolling back over the image's line did not bring it back"
+    );
 }
 
 // ---------------------------------------------------------------------------

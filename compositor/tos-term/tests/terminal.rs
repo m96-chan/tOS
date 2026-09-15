@@ -855,15 +855,275 @@ fn kitty_graphics_rejects_composing_a_frame_that_was_never_sent() {
     assert!(out.contains("EINVAL"), "response should be an error: {out}");
 }
 
+/// A picture `rows` cells tall placed at the cursor, like the pane greeting.
+fn place_tall_image(t: &mut Terminal, rows: u32) {
+    let height = rows * 16;
+    let px = encode_base64(&[255u8, 0, 0, 255].repeat((8 * height) as usize));
+    t.advance(format!("\x1b_Ga=T,f=32,s=8,v={height},i=1;{px}\x1b\\").as_bytes());
+    t.take_output();
+}
+
+/// Every placement a cell still points at, anywhere in the grid — screen and
+/// history both.
+fn referenced_placements(t: &Terminal) -> Vec<u32> {
+    let grid = t.grid();
+    let rows = (0..grid.scrollback_len())
+        .filter_map(|i| grid.history_row(i))
+        .chain((0..grid.rows()).map(|y| grid.row(y)));
+    let mut ids: Vec<u32> = rows
+        .flat_map(|row| row.cells())
+        .filter_map(|cell| cell.attrs.graphics.map(|g| g.placement))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 #[test]
-fn an_animation_scrolled_out_of_view_asks_for_no_repaint() {
-    // A playing animation off the top of the viewport is still playing, but
-    // nothing about the screen changes. Calling that a repaint would flip the
-    // whole page every gap for a picture nobody can see.
-    //
-    // It has to be a tall image to get into that state at all: a placement one
-    // row high is dropped the moment it scrolls off, so it is gone before
-    // there is any history to look back through.
+fn a_picture_scrolls_away_with_the_text_under_it() {
+    // #139 as reported: an eleven-row greeting on a 42-row pane, and enough
+    // output to push it well past the top. The row saturated at zero, so the
+    // picture stayed in the corner on top of whatever scrolled behind it, and
+    // the rows it covered could not be read at all.
+    let mut t = term(40, 42);
+    place_tall_image(&mut t, 11);
+    assert_eq!(placement_rows(&t), vec![0]);
+
+    for _ in 0..200 {
+        t.advance(b"\r\n");
+    }
+
+    // The placement leaves the cursor on its bottom row, row 10, so the first
+    // 31 line feeds walk down to the last row and the other 169 scroll.
+    let scrolled = t.grid().scrollback_len() as i32;
+    assert_eq!(scrolled, 169);
+    assert_eq!(placement_rows(&t), vec![-scrolled]);
+    // Which is nowhere near the screen: the whole picture is behind the top.
+    assert!(-scrolled + 11 <= 0, "the picture is still on screen");
+}
+
+#[test]
+fn a_picture_scrolled_back_to_comes_back_into_view() {
+    // It is kept rather than dropped because the lines it sat on are still in
+    // history. Scrolling back to them brings the picture down with the text.
+    let mut t = term(40, 10);
+    place_tall_image(&mut t, 3);
+    for _ in 0..20 {
+        t.advance(b"\r\n");
+    }
+    let back = t.grid().scrollback_len();
+    assert_eq!(placement_rows(&t), vec![-(back as i32)]);
+
+    t.scroll_display(back as isize);
+    // Screen row `r` is displayed at `r + offset`, so it is back at the top.
+    let displayed = placement_rows(&t)[0] + t.display_offset() as i32;
+    assert_eq!(displayed, 0);
+}
+
+#[test]
+fn a_picture_is_dropped_once_its_lines_leave_history() {
+    // A pane keeping five lines. A three-row picture is reachable for as long
+    // as one of its rows is still in scrollback, and not a line feed longer.
+    let config = TerminalConfig {
+        scrollback: 5,
+        ..TerminalConfig::default()
+    };
+    let mut t = Terminal::new(10, 4, config);
+    place_tall_image(&mut t, 3);
+
+    // The placement leaves the cursor on its bottom row, row 2, so the first
+    // line feed only walks to row 3 and every one after it scrolls. The
+    // picture's bottom has to travel from row 3 to past the oldest line
+    // history holds, which is -5: eight scrolls, so nine line feeds.
+    for _ in 0..8 {
+        t.advance(b"\r\n");
+        assert_eq!(
+            t.graphics().placements().count(),
+            1,
+            "lost a picture that was still in history"
+        );
+    }
+    t.advance(b"\r\n");
+    assert_eq!(t.graphics().placements().count(), 0);
+}
+
+#[test]
+fn an_over_large_scroll_up_moves_a_picture_only_as_far_as_the_text() {
+    // `CSI 500 S` on a ten-row screen scrolls ten lines, because that is all
+    // there is to scroll. A picture that travelled the whole 500 would be
+    // thrown away as out of reach while its text was ten lines back.
+    let mut t = term(10, 10);
+    place_tall_image(&mut t, 2);
+    t.advance(b"\x1b[500S");
+
+    assert_eq!(t.grid().scrollback_len(), 10);
+    assert_eq!(placement_rows(&t), vec![-10]);
+}
+
+#[test]
+fn a_dropped_placement_leaves_no_cell_pointing_at_it() {
+    // `place_at_cursor` tags every covered cell, and those cells travel into
+    // history with their rows. Nothing sweeps history for stale tags, and
+    // nothing has to: a placement is dropped only once every row that carried
+    // one of its tags has been evicted.
+    let config = TerminalConfig {
+        scrollback: 5,
+        ..TerminalConfig::default()
+    };
+    let mut t = Terminal::new(10, 4, config);
+    place_tall_image(&mut t, 3);
+    assert_eq!(referenced_placements(&t).len(), 1);
+
+    for _ in 0..40 {
+        t.advance(b"\r\n");
+        let live: Vec<u32> = t.graphics().placements().map(|p| p.id).collect();
+        for id in referenced_placements(&t) {
+            assert!(
+                live.contains(&id),
+                "a cell still points at dropped placement {id}"
+            );
+        }
+    }
+    assert_eq!(t.graphics().placements().count(), 0);
+    assert!(referenced_placements(&t).is_empty());
+}
+
+#[test]
+fn clearing_the_screen_leaves_the_pictures_in_history_alone() {
+    // ED 2 clears the screen and leaves scrollback alone — that is the whole
+    // point of `clear` keeping history. A picture whose lines are all still
+    // back there was not erased either.
+    let mut t = term(10, 6);
+    place_tall_image(&mut t, 1);
+    for _ in 0..30 {
+        t.advance(b"\r\n");
+    }
+    let before = placement_rows(&t);
+    // One row tall, so a negative row is a row wholly in history.
+    assert!(before[0] < 0, "the picture should be in history by now");
+    let history = t.grid().scrollback_len();
+
+    t.advance(b"\x1b[2J");
+    assert_eq!(
+        t.grid().scrollback_len(),
+        history,
+        "ED 2 must not touch history"
+    );
+    assert_eq!(
+        placement_rows(&t),
+        before,
+        "ED 2 erased a picture it never covered"
+    );
+}
+
+#[test]
+fn clearing_the_screen_takes_the_pictures_on_it() {
+    // The other half: what ED 2 did cover goes with the cells it covered.
+    let mut t = term(10, 6);
+    place_tall_image(&mut t, 2);
+    assert_eq!(placement_rows(&t), vec![0]);
+
+    t.advance(b"\x1b[2J");
+    assert_eq!(t.graphics().placements().count(), 0);
+}
+
+#[test]
+fn a_scroll_region_below_the_top_leaves_the_rows_above_it_alone() {
+    // Text above a scroll region does not move, so a picture on it must not
+    // move either. Moving it slid the picture down into history that had not
+    // grown, where it was drawn over lines it was never placed on.
+    let mut t = term(10, 6);
+    place_tall_image(&mut t, 1);
+
+    t.advance(b"\x1b[2;5r"); // rows 2..5, one-based, so the picture is above it
+    t.advance(b"\x1b[5;1H");
+    for _ in 0..10 {
+        t.advance(b"\r\n");
+    }
+
+    assert_eq!(
+        t.grid().scrollback_len(),
+        0,
+        "a region below the top keeps no history"
+    );
+    assert_eq!(
+        placement_rows(&t),
+        vec![0],
+        "the picture followed a scroll it was not in"
+    );
+}
+
+#[test]
+fn a_picture_scrolled_out_of_a_region_below_the_top_is_gone() {
+    // Inside such a region there is nowhere for it to go: the lines leaving
+    // the top of the region are destroyed rather than archived, so a picture
+    // that follows them out has no text left to scroll back to.
+    let mut t = term(10, 6);
+    t.advance(b"\x1b[2;5r");
+    t.advance(b"\x1b[2;1H");
+    place_tall_image(&mut t, 2); // rows 1 and 2, inside the region
+    assert_eq!(placement_rows(&t), vec![1]);
+
+    t.advance(b"\x1b[5;1H");
+    t.advance(b"\r\n");
+    assert_eq!(placement_rows(&t), vec![0], "still half inside the region");
+    t.advance(b"\r\n");
+    assert_eq!(t.graphics().placements().count(), 0);
+    assert_eq!(t.grid().scrollback_len(), 0);
+}
+
+#[test]
+fn erasing_history_takes_the_pictures_that_were_in_it() {
+    // ED 3 is the one place history shrinks without a row moving.
+    let mut t = term(10, 4);
+    place_tall_image(&mut t, 2);
+    for _ in 0..6 {
+        t.advance(b"\r\n");
+    }
+    assert!(
+        placement_rows(&t)[0] + 2 <= 0,
+        "the picture should be in history"
+    );
+    assert_eq!(t.graphics().placements().count(), 1);
+
+    t.advance(b"\x1b[3J");
+    assert_eq!(t.graphics().placements().count(), 0);
+}
+
+#[test]
+fn a_resized_pane_keeps_a_picture_on_its_text() {
+    // Growing a pane pulls lines back out of history above the text that
+    // stayed, which moves every screen row down — the cursor follows it, and a
+    // picture anchored to a screen row has to follow it too.
+    let mut t = term(10, 4);
+    place_tall_image(&mut t, 1);
+    for _ in 0..6 {
+        t.advance(b"\r\n");
+    }
+    let before = placement_rows(&t)[0];
+    let history = t.grid().scrollback_len();
+    assert!(before < 0);
+
+    t.resize(10, 7);
+    let pulled = (history - t.grid().scrollback_len()) as i32;
+    assert!(
+        pulled > 0,
+        "the test needs history pulled back onto the screen"
+    );
+    assert_eq!(placement_rows(&t), vec![before + pulled]);
+}
+
+/// Screen rows of every placement, which is what #139 is about: negative is
+/// how far into scrollback the picture has gone.
+fn placement_rows(t: &Terminal) -> Vec<i32> {
+    let mut rows: Vec<i32> = t.graphics().placements().map(|p| p.row).collect();
+    rows.sort_unstable();
+    rows
+}
+
+/// A six-row pane with a three-row two-frame animation placed at the top,
+/// then `newlines` line feeds to push it up.
+fn blinking_image_at_the_top(newlines: usize) -> Terminal {
     let mut t = term(10, 6);
     let red = encode_base64(&[255, 0, 0, 255].repeat(8 * 48));
     t.advance(format!("\x1b_Ga=T,f=32,s=8,v=48,i=5;{red}\x1b\\").as_bytes());
@@ -871,17 +1131,28 @@ fn an_animation_scrolled_out_of_view_asks_for_no_repaint() {
     t.advance(format!("\x1b_Ga=f,f=32,s=8,v=48,i=5,z=40;{green}\x1b\\").as_bytes());
     t.advance(b"\x1b_Ga=a,i=5,r=1,z=40,s=3\x1b\\");
     t.take_output();
-
-    for _ in 0..6 {
+    for _ in 0..newlines {
         t.advance(b"\r\n");
     }
-    assert!(t.scroll_display(3), "the test needs scrollback to look at");
-    let placed: Vec<i64> = t
-        .graphics()
-        .placements()
-        .map(|p| p.row as i64 - t.display_offset() as i64)
-        .collect();
-    assert_eq!(placed, vec![-3], "the image should be just off the top");
+    t
+}
+
+#[test]
+fn an_animation_scrolled_out_of_view_asks_for_no_repaint() {
+    // A playing animation off the top of the viewport is still playing, but
+    // nothing about the screen changes. Calling that a repaint would flip the
+    // whole page every gap for a picture nobody can see.
+    let mut t = blinking_image_at_the_top(6);
+
+    // Three of the six newlines scroll, which puts a three-row picture placed
+    // at row 0 exactly at -3: every row of it is in history now.
+    assert_eq!(
+        placement_rows(&t),
+        vec![-3],
+        "the image should be off the top"
+    );
+    assert_eq!(t.grid().scrollback_len(), 3);
+    assert_eq!(t.display_offset(), 0);
 
     let start = Instant::now();
     t.advance_animations(start);
@@ -896,26 +1167,48 @@ fn an_animation_scrolled_out_of_view_asks_for_no_repaint() {
 }
 
 #[test]
+fn scrolling_back_over_an_animation_finds_it_again() {
+    // The other half of the rule above, and the reason a placement that has
+    // left the viewport is kept rather than dropped: the lines it sat on are
+    // in history, so scrolling back to them has to find the picture too.
+    //
+    // Scrolling back pushes the active screen down, so a placement three rows
+    // into history is on display row 0 at an offset of three. Getting that
+    // sign backwards is what #139 was really about.
+    let mut t = blinking_image_at_the_top(6);
+    assert!(t.scroll_display(3), "the test needs scrollback to look at");
+
+    let start = Instant::now();
+    t.advance_animations(start);
+    t.clear_damage();
+    assert!(
+        t.advance_animations(start + Duration::from_millis(40)),
+        "the animation was back in view and did not repaint"
+    );
+    for y in 0..3 {
+        assert!(
+            t.damage().is_row_dirty(y),
+            "row {y} of the image is not dirty"
+        );
+    }
+    assert!(!t.damage().is_row_dirty(3), "damage ran past the image");
+}
+
+#[test]
 fn an_animation_half_on_screen_still_repaints() {
     // The other side of the same rule: one row of it showing is still showing.
-    let mut t = term(10, 6);
-    let red = encode_base64(&[255, 0, 0, 255].repeat(8 * 48));
-    t.advance(format!("\x1b_Ga=T,f=32,s=8,v=48,i=5;{red}\x1b\\").as_bytes());
-    let green = encode_base64(&[0, 255, 0, 255].repeat(8 * 48));
-    t.advance(format!("\x1b_Ga=f,f=32,s=8,v=48,i=5,z=40;{green}\x1b\\").as_bytes());
-    t.advance(b"\x1b_Ga=a,i=5,r=1,z=40,s=3\x1b\\");
-    t.take_output();
-
-    for _ in 0..4 {
-        t.advance(b"\r\n");
-    }
-    assert!(t.scroll_display(1));
+    // Four newlines scroll once, so a three-row picture hangs one row over the
+    // top and two of its rows are on screen.
+    let mut t = blinking_image_at_the_top(4);
+    assert_eq!(placement_rows(&t), vec![-1]);
 
     let start = Instant::now();
     t.advance_animations(start);
     t.clear_damage();
     assert!(t.advance_animations(start + Duration::from_millis(40)));
     assert!(t.damage().is_row_dirty(0));
+    assert!(t.damage().is_row_dirty(1));
+    assert!(!t.damage().is_row_dirty(2), "damage ran past the image");
 }
 
 #[test]

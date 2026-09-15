@@ -309,12 +309,15 @@ impl Grid {
         self.screen[region.top..region.bottom].rotate_right(n);
     }
 
-    /// Resize the grid. Returns how many lines the cursor should move up
-    /// because content was pulled out of scrollback.
+    /// Resize the grid. Returns how far the content that stayed moved down
+    /// the screen: positive when growing pulled lines back out of scrollback
+    /// above it, negative when shrinking pushed lines off the top into
+    /// scrollback. Anything anchored to a screen row — the cursor, an image
+    /// placement — has to follow it.
     ///
     /// Width changes truncate or pad; reflowing wrapped lines is deliberately
     /// left for a later milestone.
-    pub fn resize(&mut self, cols: usize, rows: usize, cursor_y: usize, attrs: &Attrs) -> usize {
+    pub fn resize(&mut self, cols: usize, rows: usize, cursor_y: usize, attrs: &Attrs) -> isize {
         if cols != self.cols {
             for row in &mut self.screen {
                 row.resize(cols, attrs);
@@ -325,7 +328,7 @@ impl Grid {
             self.cols = cols;
         }
 
-        let mut cursor_shift = 0;
+        let mut shift: isize = 0;
         if rows > self.rows {
             let grow = rows - self.rows;
             // Prefer restoring scrolled-off history below the cursor line.
@@ -333,7 +336,7 @@ impl Grid {
             for _ in 0..from_history {
                 let row = self.scrollback.pop_back().unwrap();
                 self.screen.insert(0, row);
-                cursor_shift += 1;
+                shift += 1;
             }
             for _ in from_history..grow {
                 self.screen.push(Row::new(cols, attrs));
@@ -348,11 +351,12 @@ impl Grid {
             for _ in below..shrink {
                 let row = self.screen.remove(0);
                 self.push_history(row);
+                shift -= 1;
             }
         }
         self.rows = rows;
         self.display_offset = self.display_offset.min(self.scrollback.len());
-        cursor_shift
+        shift
     }
 
     /// All displayed rows, top to bottom.

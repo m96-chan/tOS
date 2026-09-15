@@ -178,6 +178,94 @@ impl Shot {
     }
 }
 
+/// #139: a picture put on a pane never scrolled away. The text under it moved,
+/// the picture did not, and it sat on top of whatever scrolled behind it, so
+/// the rows it covered could not be read at all.
+///
+/// Everything below this is covered by unit tests on the placement row, but
+/// the report was about what a person sees in a pane, so this is a pane: the
+/// real binary sends a real picture through a real PTY, a shell prints past
+/// the bottom of the screen, and the frame is counted for the picture's
+/// colours the same way `a_picture_reaches_the_pane` counts them.
+#[test]
+fn a_picture_scrolls_away_and_scrolling_back_finds_it() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("tos-preview");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let source = dir.join("scrolled.png");
+    std::fs::write(&source, encode_png(IMAGE.0, IMAGE.1, &quadrants())).expect("write fixture");
+
+    let mut compositor = compositor(&format!(
+        "{} {}; for i in $(seq 1 200); do echo line $i; done; sleep 30",
+        env!("CARGO_BIN_EXE_tos-preview"),
+        source.display()
+    ));
+    let focus = compositor.session().focus();
+
+    // Wait for the last line the shell prints, which is after both the picture
+    // and everything that scrolls it away.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        compositor.pump_panes();
+        let term = &compositor.pane(focus).unwrap().terminal;
+        let printed = term
+            .grid()
+            .display_rows()
+            .any(|row| row.to_text().contains("line 200"));
+        if printed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let mut framebuffer = OwnedFramebuffer::new(SIZE.0, SIZE.1);
+    let shoot = |compositor: &mut Compositor, framebuffer: &mut OwnedFramebuffer| {
+        let mut surface = framebuffer.surface();
+        compositor.render_frame(&mut surface, false);
+    };
+
+    shoot(&mut compositor, &mut framebuffer);
+    let away = dir.join("scrolled-away.png");
+    std::fs::write(&away, framebuffer_png(&framebuffer)).expect("write snapshot");
+    println!("wrote {}", away.display());
+    for colour in QUADRANTS {
+        let count = count_colour(&framebuffer, colour);
+        assert_eq!(
+            count,
+            0,
+            "{colour:?} covers {count} pixels under 200 lines of output: the picture did not \
+             scroll away; look at {}",
+            away.display()
+        );
+    }
+
+    // It is in history rather than gone, so scrolling back to the top has to
+    // find it. The picture was placed on the first line of the pane, so that
+    // is as far back as the viewport goes.
+    let history = compositor
+        .pane(focus)
+        .unwrap()
+        .terminal
+        .grid()
+        .scrollback_len();
+    assert!(history > 0, "the test needs scrollback to look at");
+    let term = &mut compositor.pane_mut(focus).unwrap().terminal;
+    assert!(term.scroll_display(history as isize));
+    shoot(&mut compositor, &mut framebuffer);
+
+    let snapshot = dir.join("scrolled-back.png");
+    std::fs::write(&snapshot, framebuffer_png(&framebuffer)).expect("write snapshot");
+    println!("wrote {}", snapshot.display());
+    for colour in QUADRANTS {
+        let count = count_colour(&framebuffer, colour);
+        assert!(
+            count > 0,
+            "{colour:?} did not come back when the pane scrolled to the top of its history; \
+             look at {}",
+            snapshot.display()
+        );
+    }
+}
+
 #[test]
 fn a_pipe_is_refused_rather_than_filled_with_escape_sequences() {
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("tos-preview");

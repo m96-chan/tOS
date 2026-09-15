@@ -457,15 +457,23 @@ impl Terminal {
         // display.
         let inactive_y = self.inactive_cursor_y.min(self.inactive.rows() - 1);
         let inactive_shift = self.inactive.resize(cols, rows, inactive_y, &attrs);
-        self.inactive_cursor_y = (inactive_y + inactive_shift).min(rows - 1);
+        self.inactive_cursor_y =
+            (inactive_y as isize + inactive_shift).clamp(0, rows as isize - 1) as usize;
 
-        self.cursor.y = (self.cursor.y + shift).min(rows - 1);
+        self.cursor.y = (self.cursor.y as isize + shift).clamp(0, rows as isize - 1) as usize;
         self.cursor.x = self.cursor.x.min(cols - 1);
         self.cursor.wrap_pending = false;
 
         self.scroll_region = Region::new(0, rows);
         self.tabs = default_tabs(cols);
         self.damage.resize(rows);
+        // Resizing moves the text that stayed: growing pulls lines back out of
+        // history above it, shrinking pushes lines into history. A picture is
+        // anchored to a screen row, so it has to travel the same distance the
+        // cursor just did, or it slides off the text it was placed on.
+        let history = self.screen.scrollback_len();
+        let shift = i32::try_from(shift).unwrap_or(if shift < 0 { i32::MIN } else { i32::MAX });
+        self.graphics.shift_rows(shift, history);
         self.graphics.retain_rows(rows as u16);
         self.events.push(TermEvent::Repaint);
     }
@@ -532,14 +540,28 @@ impl Terminal {
         self.mark_cursor_row();
     }
 
+    /// Scroll the region up, taking the images placed on it along.
+    ///
+    /// The two have to move by the same number or they come apart, and that
+    /// number is not always the one asked for: [`Grid::scroll_up`] clamps to
+    /// the height of the region, so `CSI 65535 S` on a 24-row screen puts 24
+    /// lines into history. A placement that travelled the whole 65535 would be
+    /// dropped as out of reach while its text was 24 lines back.
+    fn scroll_up_with_graphics(&mut self, n: usize) {
+        let attrs = self.cursor.attrs;
+        let region = self.scroll_region;
+        let n = n.min(region.height());
+        self.screen.scroll_up(region, n, &attrs, true);
+        let history = self.screen.scrollback_len();
+        self.graphics.scroll_up(region, n, history);
+        self.damage.mark_all();
+    }
+
     /// Move down one line, scrolling the region if already at the bottom.
     fn linefeed(&mut self) {
         self.mark_cursor_row();
         if self.cursor.y + 1 == self.scroll_region.bottom {
-            let attrs = self.cursor.attrs;
-            self.screen.scroll_up(self.scroll_region, 1, &attrs, true);
-            self.graphics.scroll(1);
-            self.damage.mark_all();
+            self.scroll_up_with_graphics(1);
         } else if self.cursor.y + 1 < self.rows() {
             self.cursor.y += 1;
             self.mark_cursor_row();
@@ -851,11 +873,17 @@ impl Terminal {
             }
             2 => {
                 self.screen.clear_screen(&attrs);
-                self.graphics.clear();
+                // The screen, not the scrollback: a picture whose lines are
+                // all in history was not erased and is still there to scroll
+                // back to. Clearing the whole store took those with it.
+                self.graphics.clear_screen();
                 self.damage.mark_all();
             }
             3 => {
                 self.screen.clear_history();
+                // History is the only thing holding a placement that has
+                // scrolled above the screen; throwing it away throws them out.
+                self.graphics.retain_in_history(0);
                 self.damage.mark_all();
             }
             _ => {}
@@ -1380,13 +1408,7 @@ impl Perform for Terminal {
             (None, b'M') => self.delete_lines(arg(0)),
             (None, b'P') => self.shift_left(arg(0)),
             (None, b'X') => self.erase_chars(arg(0)),
-            (None, b'S') => {
-                let attrs = self.cursor.attrs;
-                self.screen
-                    .scroll_up(self.scroll_region, arg(0), &attrs, true);
-                self.graphics.scroll(arg(0) as u16);
-                self.damage.mark_all();
-            }
+            (None, b'S') => self.scroll_up_with_graphics(arg(0)),
             (None, b'T') => {
                 let attrs = self.cursor.attrs;
                 self.screen.scroll_down(self.scroll_region, arg(0), &attrs);
@@ -1943,12 +1965,14 @@ impl Terminal {
     /// Mark the rows every placement of an image covers. Returns true when the
     /// image is on screen at all, which is the only case a repaint is needed.
     fn damage_image(&mut self, image_id: u32) -> bool {
+        // Scrolling back pushes the active screen down to make room for
+        // history above it, so a screen row is displayed at `row + offset`.
         let offset = self.display_offset() as i64;
         let rows: Vec<(i64, u16)> = self
             .graphics
             .placements()
             .filter(|p| p.image_id == image_id)
-            .map(|p| (p.row as i64 - offset, p.rows))
+            .map(|p| (p.row as i64 + offset, p.rows))
             .collect();
         // Having a placement is not the same as being visible. Scrolled back
         // far enough, a playing animation is off the top of the viewport, and
