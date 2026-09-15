@@ -105,6 +105,121 @@ rootfs at both the sizes that matter: 17 MB of an installed machine's disk and
 
 Neither copy was free to remove; what each cost is in Known limits below.
 
+## Wireless
+
+A radio is the one piece of hardware this image carries a driver for that
+nothing about booting needs, so it is packed the other way round from
+everything else. The display, input, disk and NIC modules are in the
+initramfs and loaded by name in `/init` before the pivot, because a machine
+has to have them to *reach* its root. The wireless ones are in the **rootfs**,
+in a `/lib/modules/<kver>` of its own, and nothing loads them by name at all:
+udev is in there, systemd starts it, and it modprobes whatever the bus's
+modalias asks for, the way it does on any Debian machine. The initramfs does
+not grow by a byte for any of this.
+
+Seventeen names, checked against the kernel in the build container before
+being written down, their closure 44 modules:
+
+| | |
+|---|---|
+| the stack | `cfg80211` `mac80211` |
+| Intel | `iwlwifi` `iwlmvm` `iwldvm` |
+| Realtek | `rtw88_8821ce` `rtw88_8822be` `rtw88_8822ce` `rtw89_8852ae` `rtl8xxxu` |
+| Qualcomm / Atheros | `ath9k` `ath10k_pci` `ath11k_pci` |
+| Broadcom | `brcmfmac` |
+| MediaTek | `mt7921e` `mt7921u` |
+| a radio made out of nothing | `mac80211_hwsim` |
+
+Their firmware comes from Debian's `non-free-firmware` component, which the
+rootfs's sources now name on all three suites — so a machine can also install
+a blob nobody packed: `firmware-iwlwifi`, `firmware-realtek`,
+`firmware-atheros`, `firmware-brcm80211` and `firmware-misc-nonfree`. The last
+of those is the MediaTek one, which is not a mistake: bookworm has no
+`firmware-mediatek` and no `mediatek/WIFI_MT7921*` file either. An MT7921 card
+asks for the blobs of the silicon it is — `WIFI_RAM_CODE_MT7961_1.bin` and
+`WIFI_MT7922_patch_mcu_1_1_hdr.bin` — which is what `modinfo -F firmware
+mt7921e` lists and where `apt-file` finds them.
+
+All five, deliberately. A machine with no network cannot `apt install` the
+firmware that would give it one, so this is the one place on the image where
+the space is the wrong thing to save.
+
+`wpasupplicant` is packed beside them, and four files written by `mkiso.sh`
+are the whole of the wiring:
+
+| file | what it is |
+|---|---|
+| `/etc/systemd/system/tos-supplicant@.service` | one supplicant per radio, `Restart=on-failure`, bound to the interface's device unit. It writes `/etc/wpa_supplicant/tos-<if>.conf` if there is none, with the control socket the compositor connects to and `update_config=1`, which is what makes a joined network survive a reboot |
+| `/etc/udev/rules.d/80-tos-wireless.rules` | what starts it: a `net` device with `DEVTYPE=wlan` gets `tos-supplicant@<name>.service` pulled in. Instantiated from udev rather than enabled by name, because the name of the radio is the machine's to say |
+| `/etc/sysctl.d/80-tos-net.conf` | `net.ipv4.conf.{all,default}.ignore_routes_with_linkdown = 1`, so that a laptop with a cable *and* a radio — two default routes, wired metric 100 and wireless 600 — stops using the cable's route the second the cable is pulled, and uses it again when it is back |
+| `/usr/share/tos/wifi-witness.sh` | `iso/wifi-witness.sh`, on the image because the machine it has to run on is one booted from this image |
+
+Debian's own `wpa_supplicant@.service` is in the same package and is not used:
+it is written for `ifupdown`, and the config path and control directory are
+this design's. `docs/design/wifi.md` has the whole of it, including what the
+compositor says to that socket.
+
+### What wireless costs
+
+Measured on x86_64, bookworm, kernel 6.1.0-53-amd64, by building the ISO at
+the commit before this change and at this one, same machine:
+
+| | before | after | |
+|---|---|---|---|
+| ISO | 105,404,416 | 193,746,944 | +88,342,528 |
+| rootfs, squashed (zstd-19) | 67,145,728 | 155,484,160 | +88,338,432 |
+| rootfs, unpacked | 237,038,226 | 486,468,046 | +249,429,820 |
+| initramfs (gzip) | 9,755,570 | 9,755,144 | −426, gzip noise |
+
+The image nearly doubles, and `docs/design/wifi.md` guessed "roughly 35 MB on
+a 105 MB image" — which was the sum of four `.deb` files, and a `.deb` is
+xz-compressed where this squashfs is zstd. What each package actually costs,
+squashed the way the image squashes it:
+
+| | unpacked | squashed |
+|---|---|---|
+| firmware-iwlwifi | 84,167,644 | 29,749,248 |
+| firmware-atheros | 62,303,820 | 22,552,576 |
+| firmware-misc-nonfree | 52,404,663 | 17,797,120 |
+| firmware-brcm80211 | 18,461,384 | 10,412,032 |
+| firmware-realtek | 6,961,976 | 1,994,752 |
+| the 44 wireless modules | 19,857,339 | 3,923,968 |
+| wpasupplicant | 3,673,298 | 1,413,120 |
+
+The argument for carrying all of it is unchanged by the number being bigger
+than the design expected: a laptop whose radio has no firmware has no network,
+and a machine with no network cannot fetch its firmware. The number that is
+worth looking at twice is the third row. `firmware-misc-nonfree` is packed for
+MediaTek and MediaTek only, its `mediatek/` subtree is 5,898,240 bytes
+squashed of the 17,797,120 it costs, and the two files an MT7921 card actually
+loads are a couple of megabytes of that; the rest is i915, nvidia, cxgb4 and
+every other blob Debian could not find a better home for. Dropping that one
+package would take about 17 MB off the medium and MediaTek off the list of
+radios this image can start.
+
+### The witness
+
+`mac80211_hwsim` is a kernel module that makes radios out of nothing and lets
+them hear each other, which is how any of this is tried on a machine with no
+radio in it. On the booted image, in a pane, as root:
+
+```sh
+/usr/share/tos/wifi-witness.sh
+```
+
+It loads the module with `radios=2`, leaves `wlan0` to the machine, turns
+`wlan1` into an access point (`wpa_supplicant`'s own AP mode: WPA2-PSK, ssid
+`hwsim-ap`, passphrase `correct horse`) with busybox `udhcpd` behind it on
+`10.99.0.1/24`, and prints `SCAN_RESULTS`, `STATUS` and `LIST_NETWORKS` as
+`wpa_cli` read them — to the pane and to `/dev/ttyS0`, so a headless boot's
+serial log has them. That text is what the compositor's three parsers are
+tested against, copied in verbatim rather than typed from memory.
+
+Then `super+shift+n`, `wlan0`, `join a wireless network`, `hwsim-ap`, the
+passphrase — and the same with a wrong one, which has to say so rather than
+time out. `wpa_cli` is used in that script and nowhere else on the image;
+tOS talks to the same socket itself.
+
 ## Running
 
 ```sh
@@ -218,6 +333,7 @@ argument in the installer beside `CMDLINE`.
 | `bashrc`    | `/root/.bashrc` and `/etc/skel/.bashrc`: history, prompt, colour and the banner, for the interactive non-login shell a pane actually runs |
 | `dot-profile` | `/root/.profile` and `/etc/skel/.profile`: hands `~/.bashrc` to a login shell, which is the one kind of shell that does not read it |
 | `run.sh`    | boots `dist/tos-<arch>.iso` in VirtualBox, and cleans up after |
+| `wifi-witness.sh` | run on the booted image: makes two radios out of `mac80211_hwsim`, turns one into an access point, and prints the supplicant's own `SCAN_RESULTS`, `STATUS` and `LIST_NETWORKS` for the compositor's parsers to be tested against |
 
 ## Known limits
 
@@ -225,10 +341,10 @@ argument in the installer beside `CMDLINE`.
   `mkiso.sh` but untested, and arm64 needs a different boot path anyway.
 - The initramfs carries only the virtual machines' display/input modules
   and their dependency closure. Real hardware needs its GPU driver added
-  to the `MODULES` list in `mkiso.sh` (and matching firmware, which is not
-  packed at all yet). Without a driver there is no `/dev/dri/card0`, and
-  the compositor falls back to running inside the console rather than
-  owning the screen.
+  to the `MODULES` list in `mkiso.sh` (and matching firmware, which is packed
+  for the wireless families and for nothing else — see Wireless above).
+  Without a driver there is no `/dev/dri/card0`, and the compositor falls back
+  to running inside the console rather than owning the screen.
 - The rootfs is a package manager, and now a network to reach with it.
   `dpkg` and `apt` are on every installed machine, `apt install ./something.deb`
   works off a local file, and the image carries and loads drivers for virtio,
@@ -237,6 +353,14 @@ argument in the installer beside `CMDLINE`.
   to bind to anything; the rest are packed and untried, and `r8169` ships
   without its `rtl_nic` firmware. `docs/design/network.md` records what was
   actually observed.
+- No radio has been seen to associate. The drivers, the firmware, the
+  supplicant, the unit and the udev rule are on the image and asserted by the
+  build; what has been proved is that they are *packed*. Whether a card comes
+  up, whether udev starts a supplicant on it and whether the menu can join
+  anything is what `iso/wifi-witness.sh` is for, and until that has been run
+  on a booted image the whole of Wireless above is a claim about a directory
+  listing. `firmware-misc-nonfree` is also the largest thing on the image that
+  is mostly not wireless: it is packed for six MediaTek files.
 - The session runs `bash` where the filesystem has one and `/bin/sh` where it
   does not, which is the difference between a Debian rootfs and the initramfs
   rescue session. Both `iso/live-session` and the installer's `SESSION_SCRIPT`
@@ -252,14 +376,16 @@ argument in the installer beside `CMDLINE`.
   where it otherwise degrades: a rescue install used to leave the busybox
   world on the disk, which is a worse tOS but a tOS that boots. A live session
   and an installed machine are unaffected — both have the rootfs.
-- An installed machine cannot `modprobe`. The kernel modules are in the
-  initramfs and nowhere else, and `switch_root` deletes the initramfs, so
-  every module a machine will ever have is loaded by `/init` before the pivot.
+- An installed machine can `modprobe` only the wireless tree. That is the
+  whole of what the rootfs's `/lib/modules` holds; every other module is in
+  the initramfs and nowhere else, and `switch_root` deletes the initramfs, so
+  everything but a radio is loaded by `/init` before the pivot or not at all.
   That is why the three `nls_` modules are in its list: nothing has a device
   that needs them, but the kernel asks for a codepage by name the first time a
   FAT filesystem is mounted, and by then there is nowhere to look. Adding
-  hardware to a running tOS means adding its driver to `MODULES` in `mkiso.sh`
-  and rebuilding the image, which was already true of anything not in it.
+  hardware to a running tOS still means adding its driver to `MODULES` in
+  `mkiso.sh` and rebuilding the image — the two lists are separate, and the
+  one a radio goes in is `WIRELESS_MODULES`.
 - The installer has not been run against real hardware. Its logic is
   covered by tests, including the whole sequence against a recorded
   backend, but the commands it drives have only been checked for what they

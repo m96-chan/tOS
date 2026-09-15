@@ -479,10 +479,48 @@ EOF
 #                           rebooting it; `blkid` could read both labels the
 #                           whole time, which is what made it look like a
 #                           filesystem problem rather than a missing package.
+#   wpasupplicant           the other half of a radio. docs/design/network.md
+#                           chose this supplicant and docs/design/wifi.md
+#                           drives it over its control socket, one datagram
+#                           at a time, with no D-Bus anywhere near it. The
+#                           package also carries `wpa_cli`, which nothing in
+#                           tOS shells out to: it is there for
+#                           iso/wifi-witness.sh, which is where the text the
+#                           three parsers are tested against comes from.
+#   firmware-iwlwifi        Intel, Realtek, Qualcomm/Atheros, Broadcom and
+#   firmware-realtek        MediaTek, out of the `non-free-firmware`
+#   firmware-atheros        component the mmdebstrap call below now names. A
+#   firmware-brcm80211      driver that binds to a radio and then cannot
+#   firmware-misc-nonfree   start it is what these prevent, and it is the one
+#                           failure a machine cannot get itself out of: a
+#                           laptop with no network cannot `apt install` the
+#                           firmware that would give it one. So all five,
+#                           deliberately, and they are not cheap: 222,867,547
+#                           bytes unpacked and 82,505,728 of the squashfs
+#                           between them, which nearly doubles the image. The
+#                           design guessed 35 MB by adding up .deb sizes, and
+#                           a .deb is xz where this squashfs is zstd. The
+#                           per-package split is in iso/README.md.
+#
+#                           The last name is the MediaTek one, and it is not
+#                           a mistake. bookworm has no `firmware-mediatek` —
+#                           trixie introduced that package — and there is no
+#                           `mediatek/WIFI_MT7921*` anywhere in the archive
+#                           either: MT7921 cards ask for the blobs of the
+#                           silicon they are, `WIFI_RAM_CODE_MT7961_1.bin`
+#                           and `WIFI_MT7922_patch_mcu_1_1_hdr.bin`, which is
+#                           what `modinfo -F firmware mt7921e` lists and what
+#                           firmware-misc-nonfree ships. Read out of the
+#                           kernel module and looked up in bookworm's
+#                           Contents with apt-file, rather than guessed from
+#                           the chip's name.
 ROOTFS_PACKAGES="debian-archive-keyring,ca-certificates,bash,systemd-sysv,udev,\
 busybox,iproute2,procps,iputils-ping,wget,ncurses-base,fonts-vlgothic,\
 e2fsprogs,dosfstools,\
 fdisk,util-linux,mount,kmod,sudo,squashfs-tools,grub2-common,\
+wpasupplicant,\
+firmware-iwlwifi,firmware-realtek,firmware-atheros,firmware-brcm80211,\
+firmware-misc-nonfree,\
 $(echo "$GRUB_PKGS" | tr ' ' ',')"
 
 # Three suites and not one. `bookworm` is the frozen release: a point release
@@ -498,6 +536,17 @@ $(echo "$GRUB_PKGS" | tr ' ' ',')"
 # fixed package rather than merely being able to fetch it afterwards. Measured
 # against the package set above that costs no additional packages and 6.7 kB
 # more to download — the whole of it being a newer ca-certificates.
+#
+# And `non-free-firmware` beside `main`, on all three, which is where every
+# blob in the list above lives: bookworm moved firmware out of `non-free` into
+# a component of its own precisely so that an installer could enable it
+# without enabling non-free software in general, and this is that. It is
+# written into the rootfs's sources as well as used to build it, so a machine
+# whose radio wants a firmware package nobody packed can still install one —
+# which is the whole reason the component exists.
+#
+# The suites are spelled out as `deb` lines rather than handed over as bare
+# mirror URLs, because a bare URL is `main` and nothing else.
 mmdebstrap \
     --mode=root \
     --variant=apt \
@@ -505,9 +554,10 @@ mmdebstrap \
     --include="$ROOTFS_PACKAGES" \
     --aptopt='Acquire::Retries "3"' \
     --setup-hook="copy-in $WORK/tos-minimal /etc/dpkg/dpkg.cfg.d" \
-    "$SUITE" "$ROOTFS" "$MIRROR" \
-    "deb $SECURITY_MIRROR $SUITE-security main" \
-    "deb $MIRROR $SUITE-updates main"
+    "$SUITE" "$ROOTFS" \
+    "deb $MIRROR $SUITE main non-free-firmware" \
+    "deb $SECURITY_MIRROR $SUITE-security main non-free-firmware" \
+    "deb $MIRROR $SUITE-updates main non-free-firmware"
 
 # The build has one job and it is this; a rootfs that reached here without the
 # programs the issue is about is not worth putting on an image. The mount and
@@ -596,6 +646,16 @@ cp iso/live-session "$ROOTFS/sbin/tos-session"
 chmod 755 "$ROOTFS/sbin/tos" "$ROOTFS/sbin/tos-install" \
     "$ROOTFS/sbin/tos-preview" "$ROOTFS/sbin/tos-session"
 
+# And the wireless witness, which is a test rather than a part of the system —
+# on the image because the machine it has to run on is one that was booted
+# from this image, and a witness a person has to retype into a pane is one
+# nobody runs. 7 KB, in /usr/share/tos beside the dictionary rather than on
+# PATH, because it is not a thing to reach for by accident: it makes this
+# machine into an access point. See docs/design/wifi.md, "The witness".
+mkdir -p "$ROOTFS/usr/share/tos"
+cp iso/wifi-witness.sh "$ROOTFS/usr/share/tos/wifi-witness.sh"
+chmod 755 "$ROOTFS/usr/share/tos/wifi-witness.sh"
+
 # PID 1 on both images, and what starts the session on both (#110).
 #
 # The unit goes in /etc rather than /lib/systemd/system because tOS writes it
@@ -656,6 +716,79 @@ done
 # multi-user.target is the truth, and it is what the unit above is wanted by.
 ln -sf /lib/systemd/system/multi-user.target "$ROOTFS/etc/systemd/system/default.target"
 
+# The supplicant, one per radio, started by udev when the radio appears.
+#
+# A unit rather than a child of the compositor, for the reason
+# docs/design/init.md gave for having an init at all: supervision is what an
+# init is for, and a supplicant that dies is a machine that quietly stops
+# being able to join anything until somebody notices. Instantiated from a udev
+# rule rather than enabled by name, because the name of the radio is the
+# machine's to say and this image is assembled long before it has one.
+#
+# tOS's own unit and not Debian's `wpa_supplicant@.service`, which is in the
+# same package: Debian's is written for ifupdown, reads
+# /etc/wpa_supplicant/wpa_supplicant-%I.conf, and leaves the control interface
+# to whatever that file says — which is nothing, on a file nobody wrote. This
+# one creates the file if it is not there, with the two lines the compositor's
+# client needs: the control socket it connects to, and `update_config=1`,
+# which is what makes SAVE_CONFIG write a joined network back so the machine
+# rejoins at the next boot without being asked. On the live image /etc is a
+# tmpfs overlay and that file is gone at reboot, which is right for a live
+# image; the installer copies /etc onto the disk, so an installed machine
+# keeps its networks.
+#
+# The socket directory is root's and the compositor is root, so nothing here
+# has to be a member of `netdev`. /sbin/wpa_supplicant is the path dpkg's own
+# file list gives — bookworm's /sbin is the merged-usr symlink to /usr/sbin,
+# and both resolve.
+mkdir -p "$ROOTFS/etc/wpa_supplicant"
+cat >"$ROOTFS/etc/systemd/system/tos-supplicant@.service" <<'EOF'
+# Written by iso/mkiso.sh. One supplicant per radio; see docs/design/wifi.md.
+[Unit]
+Description=tOS wireless supplicant on %I
+BindsTo=sys-subsystem-net-devices-%i.device
+After=sys-subsystem-net-devices-%i.device
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -c 'test -f /etc/wpa_supplicant/tos-%I.conf || \
+    printf "ctrl_interface=/run/wpa_supplicant\nupdate_config=1\n" \
+    > /etc/wpa_supplicant/tos-%I.conf'
+ExecStart=/sbin/wpa_supplicant -Dnl80211 -i%I -c/etc/wpa_supplicant/tos-%I.conf
+Restart=on-failure
+EOF
+
+# What starts it. `DEVTYPE=wlan` is how the kernel's cfg80211 announces a
+# wireless interface and how this rule tells one from the wired cards
+# iso/init's drivers bring up; TAG+="systemd" is what makes systemd create a
+# device unit for it at all, and SYSTEMD_WANTS is the device unit pulling the
+# supplicant in. The number is only an ordering among rule files and nothing
+# here depends on it; 80 leaves room on both sides. /etc/udev/rules.d and not
+# /lib, for the same reason the units go in /etc: dpkg owns the other one.
+mkdir -p "$ROOTFS/etc/udev/rules.d"
+cat >"$ROOTFS/etc/udev/rules.d/80-tos-wireless.rules" <<'EOF'
+# Written by iso/mkiso.sh. A radio appears; its supplicant starts.
+ACTION=="add", SUBSYSTEM=="net", ENV{DEVTYPE}=="wlan", TAG+="systemd", \
+    ENV{SYSTEMD_WANTS}+="tos-supplicant@$name.service"
+EOF
+
+# And the one sysctl a machine with two links needs.
+#
+# A laptop with a cable in it and a radio associated has two default routes,
+# which the compositor now gives different metrics — wired 100, wireless 600,
+# NetworkManager's numbers — so the kernel takes the cable. Pull the cable and
+# that route is still there, still lower, and now goes nowhere. This makes the
+# kernel skip a route whose link has no carrier, so the radio takes over in
+# the same second and hands back when the cable returns, with nobody's address
+# touched. Applied by systemd-sysctl at boot. See "Two default routes" in
+# docs/design/wifi.md.
+mkdir -p "$ROOTFS/etc/sysctl.d"
+cat >"$ROOTFS/etc/sysctl.d/80-tos-net.conf" <<'EOF'
+# Written by iso/mkiso.sh. See docs/design/wifi.md, "Two default routes".
+net.ipv4.conf.all.ignore_routes_with_linkdown = 1
+net.ipv4.conf.default.ignore_routes_with_linkdown = 1
+EOF
+
 # An empty machine-id, which is how that file says "not set yet": systemd
 # generates one on the first boot and commits it. Shipping a filled-in one
 # would give every machine installed from this image the same identity, and
@@ -715,16 +848,113 @@ cat >"$ROOTFS/etc/hosts" <<'EOF'
 ::1	localhost ip6-localhost ip6-loopback
 EOF
 
-# No /lib/modules here either, so the initramfs holds the only copy. The cost
-# is worth saying plainly: a machine that has pivoted cannot modprobe anything
-# ever again — switch_root deletes the initramfs, and this is the directory the
-# modprobe left in the rootfs would have looked in.
+# A /lib/modules of its own, holding the wireless closure and nothing else.
 #
-# What it does not cost is anything the image does by itself. This was a copy
-# of the same pruned tree, so the only modules it could ever have offered are
-# the ones iso/init loads before the pivot, and iso/init now loads all of them.
-# The three NLS modules were the difference, and the note beside them there
-# says why the kernel wanted one after the pivot.
+# What stood here was the note that there was none, and that a machine which
+# had pivoted could therefore never modprobe again: switch_root deletes the
+# initramfs, and this is the directory the modprobe left in the rootfs would
+# have looked in. That was the right trade twice over, and it stays the right
+# trade for everything it covered. A display driver, a disk driver and a
+# filesystem are things the machine has to have to *reach* this rootfs, so
+# they are loaded before it is reached, by the loop in iso/init, out of the
+# initramfs — and carrying a second copy here was 17 MB of an installed
+# machine's disk for a modprobe nothing ran (#99).
+#
+# A radio is none of that. Nothing about it has to work for the rootfs to come
+# up; it is wanted *after* the pivot, by a daemon that lives in here, and the
+# machine it is wanted on is a laptop rather than a VM. So these modules go on
+# this side of the pivot, and the initramfs does not grow by a byte: the list
+# below is separate from MODULES above, is not in iso/init's loop, and is not
+# checked against it by the guard up there — that guard is about what /init
+# reaches for, and /init reaches for none of this.
+#
+# Nothing loads them by name either. udev is in this rootfs, systemd starts it
+# in sysinit.target, and it does here what it does on every Debian machine:
+# reads the modalias out of the device the bus announced and modprobes what
+# matches. The PCI id of an Intel card names iwlwifi, and iwlwifi is here, so
+# the card comes up — and `depmod` below is what makes that lookup possible at
+# all, since a tree with no modules.dep and no modules.alias is a directory
+# modprobe cannot find anything in.
+#
+# Five families and one fake one, which are the radios a laptop actually has:
+# Intel, Realtek (rtw88 and rtw89 for the recent ones, rtl8xxxu for the USB
+# dongles), Qualcomm/Atheros across three generations, Broadcom for Macs and
+# Pis, MediaTek for newer AMD machines, and mac80211_hwsim, which is a radio
+# made out of nothing and is how iso/wifi-witness.sh proves any of this works
+# on a machine with no radio in it. Every name here was checked against this
+# kernel with `modprobe --show-depends` before it was written down; the
+# seventeen pull twenty-seven more between them — mac80211, cfg80211, rfkill,
+# the ath and rtw88 and mt76 cores, mhi, usbcore — and the closure is 44
+# modules, 19,407,460 bytes of .ko and 3,923,968 bytes of the squashfs. The
+# firmware they ask for is the expensive half, and it is in the package list
+# above.
+WIRELESS_MODULES="cfg80211 mac80211 \
+    iwlwifi iwlmvm iwldvm \
+    rtw88_8821ce rtw88_8822be rtw88_8822ce rtw89_8852ae rtl8xxxu \
+    ath9k ath10k_pci ath11k_pci \
+    brcmfmac \
+    mt7921e mt7921u \
+    mac80211_hwsim"
+mkdir -p "$ROOTFS/lib/modules/$KVER"
+# Asked once for its own sake before anything is copied, because the copy
+# below is a pipeline and an `exit` inside one exits a subshell and nothing
+# else: a module renamed by a kernel bump would otherwise be a name that
+# silently packs nothing, which is the shape of fault #84 was.
+for mod in $WIRELESS_MODULES; do
+    if ! modprobe -S "$KVER" --show-depends "$mod" >/dev/null 2>&1; then
+        echo "mkiso: kernel $KVER has no wireless module $mod" >&2
+        exit 1
+    fi
+done
+for mod in $WIRELESS_MODULES; do
+    modprobe -S "$KVER" --show-depends "$mod" 2>/dev/null || true
+done | sed -n 's/^insmod \([^ ]*\).*/\1/p' | sort -u | while read -r path; do
+    rel="${path#/lib/modules/$KVER/}"
+    mkdir -p "$ROOTFS/lib/modules/$KVER/$(dirname "$rel")"
+    cp "$path" "$ROOTFS/lib/modules/$KVER/$rel"
+done
+# The same metadata the initramfs tree gets, and for the same reason: depmod
+# reads modules.builtin to know which names are in the kernel already rather
+# than missing, and writes modules.dep and modules.alias next to the tree.
+cp "/lib/modules/$KVER/modules.order" "/lib/modules/$KVER/modules.builtin" \
+    "$ROOTFS/lib/modules/$KVER/"
+cp "/lib/modules/$KVER/modules.builtin.modinfo" \
+    "$ROOTFS/lib/modules/$KVER/" 2>/dev/null || true
+depmod -b "$ROOTFS" "$KVER"
+
+# And that the pieces a radio needs all landed, because every one of them
+# fails quietly: a missing modules.alias is a card udev never binds, a missing
+# firmware tree is a driver that binds and then times out, and a missing
+# supplicant is a menu that says "no supplicant on wlan0" on a machine that
+# should have had one. None of it is visible from a boot that has no radio,
+# which is every boot CI does.
+#
+# The firmware is checked by family and by pattern rather than by filename,
+# because the filenames carry a version the package bumps — `iwlwifi-cc-a0-72`
+# becomes `-73` and an assertion naming it fails on a good image.
+any_match() {
+    # The argument is a pattern, so it is deliberately unquoted here: an
+    # unmatched glob stays literal and the test below says no.
+    # shellcheck disable=SC2086
+    set -- $1
+    [ -e "$1" ]
+}
+for pattern in \
+    "$ROOTFS/lib/modules/$KVER/modules.dep" \
+    "$ROOTFS/lib/modules/$KVER/modules.alias" \
+    "$ROOTFS/lib/modules/$KVER/kernel/net/wireless/cfg80211.ko" \
+    "$ROOTFS/lib/firmware/iwlwifi-*.ucode" \
+    "$ROOTFS/lib/firmware/rtw88/*.bin" \
+    "$ROOTFS/lib/firmware/ath10k/QCA*" \
+    "$ROOTFS/lib/firmware/brcm/*" \
+    "$ROOTFS/lib/firmware/mediatek/WIFI_RAM_CODE_MT7961_1.bin" \
+    "$ROOTFS/sbin/wpa_supplicant" \
+    "$ROOTFS/sbin/wpa_cli"; do
+    if ! any_match "$pattern"; then
+        echo "mkiso: the rootfs has nothing matching ${pattern#"$ROOTFS"}" >&2
+        exit 1
+    fi
+done
 
 # The dictionary, converted out of the build container's skkdic rather than
 # installed into the rootfs as a package.
