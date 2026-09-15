@@ -339,16 +339,24 @@ Input        evdev via direct reads
 PTY          POSIX pseudoterminals
 Fonts        built-in bitmap face, plus TrueType
 Shaping      not yet; per cell glyph placement
-Rendering    CPU framebuffer
+Rendering    CPU into a shadow buffer, flipped
              GPU acceleration later
 Audio        ALSA control interface via direct ioctls
+Network      sysfs, /proc/net and ioctls; DHCP written in tree
+             wpa_supplicant over its control socket
+Passwords    SHA-512 crypt in tree
+Init         systemd on an installed machine; tOS is its session
 Rootfs       Debian
 ```
 
 The dependency surface is deliberately small: `libc` for the kernel
-interfaces, and `fontdue` for TrueType rasterization. DRM/KMS, evdev and the
-virtual terminal are spoken to directly rather than through a wrapper crate,
-so the first milestone has nothing between tOS and the kernel.
+interfaces, and `fontdue` for TrueType rasterization. DRM/KMS, evdev, the
+virtual terminal, the sound card's control interface and the network stack are
+all spoken to directly rather than through a wrapper crate, so there is
+nothing between tOS and the kernel. The two things tOS does not write itself
+are the two it has no business rewriting: the init that starts it, and the
+supplicant that does the cryptography on a wireless association — and it talks
+to that one over its control socket rather than linking it.
 
 ## Browser
 
@@ -493,9 +501,10 @@ route a file manager takes, so what is exercised is the integration and not
 only the decoder. It has been run in a pane and the resulting frame counted
 pixel by pixel against the picture that went in (`preview/tests/pane.rs`), and
 it has been run on the booted ISO under QEMU with the picture read off a
-second disc — the live image itself still carries no image file to point it
-at, which is the last thing between this and a session that can demonstrate
-itself.
+second disc. The live image carries its own picture now — `/etc/tos/splash.png`
+is what the login screen and the head of every pane draw
+([#132](https://github.com/m96-chan/tOS/issues/132)) — so a booted session
+demonstrates the protocol without being handed anything.
 
 Placements are scaled once and the result is kept, so a repeat frame costs a
 blend instead of a resample. The cache is a plain CPU one, bounded in bytes
@@ -518,6 +527,14 @@ its idle timer, and repaints only the rows the moving image covers.
 thirty frame animation into a real pane and saves ten pictures of it
 playing. Composing between two frames that already exist (`a=c`) works, and a
 frame may arrive as a PNG or a zlib payload rather than only as raw pixels.
+
+A picture belongs to the lines it was placed on, not to the screen. It scrolls
+up with them, off the top, and back down into view when the viewport is scrolled
+over its lines again; it is dropped when the last of those lines leaves
+scrollback. That took a signed row and a rule about when a placement dies, both
+worked out in [`docs/design/image-scrollback.md`](docs/design/image-scrollback.md)
+after [#139](https://github.com/m96-chan/tOS/issues/139) found a picture that
+never moved and sat on top of everything passing behind it.
 
 ### 0.0.5 — System UI
 
@@ -578,10 +595,19 @@ The network is read out of `/sys/class/net` and `/proc/net` with no
 NetworkManager under it: every interface and what sort it is, link and carrier
 state, MAC, MTU, speed, byte counters, IPv4 and IPv6 addresses from
 `getifaddrs`, and which interface holds the default route. It can also bring a
-link administratively up or down, which is one `SIOCSIFFLAGS` ioctl. Joining a
-wireless network is not part of it: an associated interface's SSID and signal
-are reported, but scanning, WPA and DHCP need nl80211 and a supplicant, and
-those are a later item of their own.
+link administratively up or down, which is one `SIOCSIFFLAGS` ioctl.
+
+Joining a network was the later item that phrase promised, and 0.0.8 is where
+it landed. DHCP is written in tree, against a plain UDP socket, rather than
+being a daemon to configure and supervise in order to obtain four numbers —
+and a wired link comes up and asks for an address with nobody logged in. A
+wireless one goes through `wpa_supplicant`, talked to over its control socket
+under `/run/wpa_supplicant` rather than linked or driven over D-Bus: it does
+the cryptography of an association, which is the one part of this tOS has no
+business rewriting. Scanning, the saved networks, and joining one with a
+passphrase all hang off that socket. See
+[`docs/design/network.md`](docs/design/network.md) and
+[`docs/design/wifi.md`](docs/design/wifi.md).
 
 Bluetooth is read out of `/sys/class/bluetooth` and acted on over an
 `AF_BLUETOOTH` socket. `tos-system` lists the adapters, reads each one's
@@ -932,39 +958,76 @@ grab is one thing at a time and is dropped by everything ordinary that
 interrupts it — a lock, a menu, a workspace change, the pane underneath
 closing — which is most of what the milestone's review was about.
 
-Four defects found after the merge were filed rather than fixed, and are
-carried into 0.0.8 below: nested mode reads a host terminal's cell numbers as
-compositor cells, so most clicks in a nested session land nowhere
+Four defects found after the merge were filed rather than allowed to hold the
+milestone up, and all four were fixed in 0.0.8: nested mode read a host
+terminal's cell numbers as compositor cells, so most clicks in a nested
+session landed nowhere
 ([#88](https://github.com/m96-chan/tOS/issues/88)); clicking a pane on the
-status bar drops the zoom without resizing it
+status bar dropped the zoom without resizing it
 ([#87](https://github.com/m96-chan/tOS/issues/87)); an expired notification
-banner is never erased on a bar with no message segment
+banner was never erased on a bar with no message segment
 ([#86](https://github.com/m96-chan/tOS/issues/86)); and a refused
-`MovePaneToWorkspace` orphans the pane
+`MovePaneToWorkspace` orphaned the pane
 ([#85](https://github.com/m96-chan/tOS/issues/85)).
 
 ### 0.0.8 — More useful
 
-- [ ] the four defects 0.0.7 left open ([#85](https://github.com/m96-chan/tOS/issues/85), [#86](https://github.com/m96-chan/tOS/issues/86), [#87](https://github.com/m96-chan/tOS/issues/87), [#88](https://github.com/m96-chan/tOS/issues/88))
-- [ ] networking against a real interface ([#84](https://github.com/m96-chan/tOS/issues/84))
-- [ ] bash as the shell an installed machine gives you ([#82](https://github.com/m96-chan/tOS/issues/82))
-- [x] a way to add anything to an installed machine ([#83](https://github.com/m96-chan/tOS/issues/83))
-- [ ] generic arm64 image ([#21](https://github.com/m96-chan/tOS/issues/21))
+- [x] the four defects 0.0.7 left open ([#85](https://github.com/m96-chan/tOS/issues/85), [#86](https://github.com/m96-chan/tOS/issues/86), [#87](https://github.com/m96-chan/tOS/issues/87), [#88](https://github.com/m96-chan/tOS/issues/88))
+- [x] bash as the shell an installed machine gives you ([#82](https://github.com/m96-chan/tOS/issues/82))
+- [x] a way to add anything to an installed machine ([#83](https://github.com/m96-chan/tOS/issues/83)), and a security update for it afterwards ([#98](https://github.com/m96-chan/tOS/issues/98))
 - [x] Debian rootfs tooling ([#20](https://github.com/m96-chan/tOS/issues/20))
+- [x] networking against a real interface ([#84](https://github.com/m96-chan/tOS/issues/84)), and a booted machine that has one ([#124](https://github.com/m96-chan/tOS/issues/124))
+- [x] Wi-Fi, for a machine whose only radio is one ([#137](https://github.com/m96-chan/tOS/issues/137))
+- [x] an init that can start a second program ([#110](https://github.com/m96-chan/tOS/issues/110))
+- [x] a session to log into and to log out of ([#112](https://github.com/m96-chan/tOS/issues/112)), running as whoever logged in ([#119](https://github.com/m96-chan/tOS/issues/119))
+- [x] a picture on the login screen and at the head of every pane ([#132](https://github.com/m96-chan/tOS/issues/132)), and one that scrolls away with its text ([#139](https://github.com/m96-chan/tOS/issues/139))
+- [x] a frame the panel is not still scanning out ([#102](https://github.com/m96-chan/tOS/issues/102), [#105](https://github.com/m96-chan/tOS/issues/105))
+- [ ] generic arm64 image ([#21](https://github.com/m96-chan/tOS/issues/21))
 - [ ] hardware abstraction cleanup ([#22](https://github.com/m96-chan/tOS/issues/22))
 - [ ] images scanned out on DRM overlay planes ([#31](https://github.com/m96-chan/tOS/issues/31))
-- [x] a picture on the login screen and at the head of every pane ([#132](https://github.com/m96-chan/tOS/issues/132))
 
-The name is the test the round is held to: most of this list is about a
+The name is the test the round was held to: most of this list is about a
 machine somebody installed being one they can actually use — a shell they
-know, a way to add anything to it, a network that has run against real
-hardware — and the defects above are on it because a mouse that clicks
-nowhere is in the way of the same thing.
+know, a way to add anything to it, a network that has carried real packets —
+and the defects above were on it because a mouse that clicks nowhere is in the
+way of the same thing.
 
-This is where the work is tracked now, including everything 0.1 needs: the
-portability items below were moved here rather than waited for, because a
-version before 0.1 lands when its idea has been demonstrated and there is no
-reason to hold a round open for the name of the release it is aimed at.
+The largest thing that changed is what an installed machine *is*. It used to
+be the compositor as PID 1 and nothing else, which meant it could not start a
+second program, could not be logged out of, and had no boundary anywhere in
+it. Now systemd is PID 1, the same init as the rootfs it was installed from,
+and `tos-session.service` runs the session; a login screen is the first thing
+on the display, and leaving the session returns to it with the machine still
+up. A pane runs as the account that answered the screen — `account.rs` reads
+`/etc/passwd` the way `lock.rs` reads `/etc/shadow`, and the credentials are
+applied between the fork and the exec — so a password that is checked now
+grants that person's privileges and not root's. The compositor itself stays
+root, because it holds the VT, DRM master and the evdev devices and nothing
+arbitrates those for anything else; that line is
+[#22](https://github.com/m96-chan/tOS/issues/22) and it is still open. `sudo`
+goes on the machine with it, since dropping the panes otherwise took away its
+only way to be root.
+
+The network is real now in the sense the milestone meant. The initramfs
+carries NIC drivers across the pivot, a wired link comes up and asks for an
+address with nobody logged in, and a machine that has only a radio talks to
+`wpa_supplicant` over its control socket and gets on a network from the status
+bar. A link with an address and no default route is drawn as what it is rather
+than as one that works. All of that has been driven in virtual machines rather
+than against a physical adapter, which is the same gap the rest of the
+kernel-facing code has; design and what was measured are in
+[`docs/design/network.md`](docs/design/network.md) and
+[`docs/design/wifi.md`](docs/design/wifi.md).
+
+The panel stopped flashing. The compositor composites into a shadow buffer and
+hands the display a finished frame instead of drawing into one it is still
+scanning out, and an unblank pays the buffer it lights the panel on rather
+than handing the CRTC one the shadow has already declared unknown.
+
+What is left is the portability round. Those three are tracked here rather
+than waited for under 0.1, because a version before 0.1 lands when its idea
+has been demonstrated and there is no reason to hold a round open for the name
+of the release it is aimed at.
 
 ### 0.1 — Portable tOS
 
@@ -976,9 +1039,10 @@ reason to hold a round open for the name of the release it is aimed at.
 
 `iso/` builds a bootable x86_64 image, and `tos-install` puts it on a disk
 from inside a pane. What lands on the disk is a Debian bookworm rootfs with a
-working `apt`, unpacked from a squashfs on the medium. The unticked boxes here
-are the ones tracked under 0.0.8 above; this section is the release they add
-up to, not a second pile of work.
+working `apt` and a working `systemd`, unpacked from a squashfs on the medium,
+with tOS as the session that init starts. The unticked boxes here are the ones
+tracked under 0.0.8 above; this section is the release they add up to, not a
+second pile of work.
 
 ### Later — Android devices
 
@@ -1059,10 +1123,13 @@ That is tOS.
 
 ## Status
 
-Early, but running. The first milestone is implemented: tOS obtains a DRM/KMS
-display, renders a monospace font into a dumb buffer, creates PTYs, starts
-shells, parses ANSI/VT, and routes evdev input, with no X11, no Wayland, no
-Cage and no Kitty process anywhere in the stack.
+Early, but running, and now something a machine boots into rather than
+something a machine can start. tOS obtains a DRM/KMS display, renders a
+monospace font into a shadow buffer it flips, creates PTYs, starts shells,
+parses ANSI/VT and the Kitty graphics protocol, and routes evdev input, with
+no X11, no Wayland, no Cage and no Kitty process anywhere in the stack. An
+installed disk boots systemd, puts a login screen on the display, and runs the
+session's panes as whoever answered it.
 
 What has been exercised, and how:
 
@@ -1074,10 +1141,15 @@ What has been exercised, and how:
 | PTYs, signals, window size, controlling terminal | tests that fork real processes |
 | Input encoding, both legacy and Kitty | unit tests, plus a decode round trip |
 | Layout, focus, workspaces, key bindings | unit tests |
+| Japanese input: romaji, dictionary, okurigana, learning | unit tests, plus a test that types a sentence through both halves at once |
+| Login, lock and the account a pane runs as | unit tests over the state machines and `/etc/passwd`, `/etc/shadow` and `/etc/group` readers; the privilege drop checked on an EFI install by asking `id` |
+| Audio, power, Bluetooth, network control | unit tests against kernel structures built in the test, every ioctl and socket behind a trait |
 | Whole compositor | tests that run shells in split panes and inspect pixels |
 | Configuration file | unit tests over the parser and the search order, plus a compositor built from a configuration and read back off the framebuffer |
 | DRM/KMS, evdev, VT ownership | compile for x86_64 and arm64 Linux; ioctl numbers and structure layouts are unit-tested against the kernel headers |
 | Installer | the whole sequence against a recorded backend, plus the real binary driven on a pseudoterminal with its output read back through tOS's own terminal emulator |
+| The ISO | built and booted in CI under QEMU on every change: the compositor announces itself on serial, the live session is checked to have reached the Debian rootfs rather than falling back to the initramfs, and the squashfs is checked to carry `dpkg` and `apt` |
+| The installed machine | installs driven by hand in a VM, headless, with the serial log read, screenshots taken and keystrokes injected — which is how the login, the privilege drop and the network were each confirmed on a machine that had actually booted |
 
 Panes refuse to split once they are too small to divide, rather than creating
 a pane with nowhere to go, and a virtual terminal is only taken over once the
@@ -1100,9 +1172,16 @@ the resize and balance keys refuse and say why rather than moving something
 nobody can see. The status bar names the arrangement in force, and says
 nothing at all while it is the tree, which is where every session starts.
 
-The last row is the honest gap: the kernel-facing backends have not yet been
-run on hardware. Everything above them has, through the nested and headless
-backends.
+The honest gap is bare metal. The kernel-facing backends do run — the ISO is
+booted in CI under QEMU and driven by hand under VirtualBox, both of which put
+a real DRM device and a real evdev stream in front of the same code — but no
+part of this has been run on a physical machine, and a virtual GPU is not a
+panel. Audio in particular has never met a sound card: every ioctl it issues is
+tested against a card built out of structures in a test.
+
+The installer is in the same position. Its logic is covered, and it has been
+run end to end against a VM's virtual disk, but not against hardware anybody
+minds losing.
 
 ## Repository layout
 
@@ -1118,14 +1197,18 @@ tOS/
     ├── tos-render/      CPU renderer: surfaces, grid painting
     ├── tos-pty/         pseudoterminals
     ├── tos-input/       key and mouse model, encoders, evdev
+    ├── tos-ime/         Japanese input: romaji, SKK dictionary, okurigana
+    ├── tos-system/      the machine itself: audio, power, network, Bluetooth
     ├── tos-session/     pane tree, focus, workspaces, key bindings
     ├── tos-platform/    display backends: DRM/KMS, nested, headless
     └── tos-compositor/  the `tos` binary
 ```
 
-Only `tos-platform` and `tos-input` contain Linux-specific code. Everything
-else is portable, which is what makes the compositor testable away from the
-target hardware.
+Linux-specific code lives in `tos-platform`, `tos-input` and `tos-system` —
+display, input, and the machine's own knobs. Everything else is portable, which
+is what makes the compositor testable away from the target hardware, and all
+three of those speak to the kernel through traits so that what is above them
+stays testable too.
 
 ## Building and running
 
@@ -1216,10 +1299,10 @@ costs a few rows of one pane per report instead of a frame of the panel.
 
 ## Configuration
 
-An installed machine starts the compositor from `/init`, so anything that can
-only be said on the command line is fixed until the image is rebuilt. tOS
-therefore reads a file, and looks for it in this order, stopping at the first
-one that exists:
+An installed machine starts the compositor from a systemd unit, so anything
+that can only be said on the command line is fixed until the image is rebuilt.
+tOS therefore reads a file, and looks for it in this order, stopping at the
+first one that exists:
 
 ```text
 $XDG_CONFIG_HOME/tos/tos.conf   or ~/.config/tos/tos.conf
@@ -1227,17 +1310,18 @@ $XDG_CONFIG_DIRS/tos/tos.conf   or /etc/xdg/tos/tos.conf
 /etc/tos/tos.conf
 ```
 
-The last of those is not XDG. It is there because `/init` has no home
-directory and often no environment at all, and a machine that boots straight
-into tOS still has to be configurable. `--config <path>` reads one named file
-instead of searching, and `--no-config` skips the file entirely.
+The last of those is not XDG. It is there because a machine that boots
+straight into tOS has to be configurable before anybody has logged into it, and
+because the rescue session — the one path where there is no init at all — has
+no home directory and often no environment. `--config <path>` reads one named
+file instead of searching, and `--no-config` skips the file entirely.
 
 The format is `key = value` lines under `[section]` headers, with `#` starting
 a comment on a line of its own. It is hand-parsed, like the command line, the
-PNG decoder and the DEFLATE decoder before it: the compositor is what an
-installed machine runs as PID 1, and a dependency in that path should earn its
-place. A comment has to be a whole line because values begin with `#` all the
-time — every colour does.
+PNG decoder and the DEFLATE decoder before it: the compositor is the first
+thing a person sees on a machine that has just booted, and a dependency in
+that path should earn its place. A comment has to be a whole line because
+values begin with `#` all the time — every colour does.
 
 ```ini
 # General settings. The [general] heading is optional; this is the top of the
@@ -1354,9 +1438,16 @@ matters:
 
 `tos-install` is a TUI running in a pane — installing tOS is the first real
 use of the platform as a platform. It will not write to a disk until the
-disk's own name has been typed, and it refuses the medium it booted from.
-`tos-install --plan` prints every command it would run without running any.
-See [`iso/README.md`](iso/README.md).
+disk's own name has been typed, and it refuses the medium it booted from. It
+asks for an account and a password, and what it writes is what the login screen
+later checks. `tos-install --plan` prints every command it would run without
+running any. See [`iso/README.md`](iso/README.md).
+
+The installed disk boots systemd, brings up whatever network it can find, and
+puts the login screen on the display with the picture above the password box.
+Answering it starts a session whose panes run as that account; leaving the
+session — `exit` in the last pane, or `super+q` — returns to the login screen
+with the machine still up, rather than dropping the display.
 
 ## License
 
