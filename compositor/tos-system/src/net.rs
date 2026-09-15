@@ -32,6 +32,7 @@ use crate::sysfs::Sysfs;
 
 pub mod auto;
 pub mod dhcp;
+pub mod wpa;
 
 pub use auto::{Autoconfigure, Step};
 pub use dhcp::Lease;
