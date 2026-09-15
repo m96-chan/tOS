@@ -458,7 +458,7 @@ status line.
 | Wired: brought up and addressed at boot | `net::auto`, once per carrier, wired only (#124) |
 | Wired: lease renewal | **not built** — see above for what it takes |
 | Wi-Fi: supplicant decision | wpa_supplicant, recorded above |
-| Wi-Fi: scan / join | **not built**; #20 landed, so what is left is firmware and a radio to test against |
+| Wi-Fi: scan / join | `docs/design/wifi.md` (#137): the client, the policy, the menus and the image |
 | TUI control surface | `super+shift+n`, two overlays |
 | Live ISO needs only status | every privileged step reports its refusal |
 
