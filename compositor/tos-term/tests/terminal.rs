@@ -880,6 +880,112 @@ fn referenced_placements(t: &Terminal) -> Vec<u32> {
 }
 
 #[test]
+fn the_alternate_screen_does_not_take_the_primary_screens_pictures() {
+    // #145: entering the alternate screen emptied the whole graphics store, so
+    // opening an editor destroyed every picture the primary screen had in
+    // history — including the one the greeting puts at the top of every pane.
+    let mut t = term(10, 6);
+    place_tall_image(&mut t, 2);
+    for _ in 0..10 {
+        t.advance(b"\r\n");
+    }
+    let before = placement_rows(&t);
+    assert_eq!(before.len(), 1);
+    assert!(before[0] < 0, "the picture should be in history");
+
+    t.advance(b"\x1b[?1049h");
+    assert_eq!(
+        t.graphics().placements().count(),
+        0,
+        "the alternate screen starts blank"
+    );
+    t.advance(b"\x1b[?1049l");
+
+    assert_eq!(
+        placement_rows(&t),
+        before,
+        "the editor took the picture with it"
+    );
+    assert!(
+        t.graphics().image(1).is_some(),
+        "the pixels went with the placement"
+    );
+}
+
+#[test]
+fn an_image_id_on_the_alternate_screen_is_not_the_primary_screens() {
+    // The reason the two screens get a store each rather than sharing one: a
+    // program on the alternate screen may transmit any id it likes, and the
+    // shell's picture is sitting at `i=1` in the primary screen's scrollback.
+    let mut t = term(10, 6);
+    place_tall_image(&mut t, 2);
+    for _ in 0..10 {
+        t.advance(b"\r\n");
+    }
+    let primary = t.graphics().image(1).unwrap().data.clone();
+
+    t.advance(b"\x1b[?1049h");
+    // The same id, a different picture, on the screen the editor owns.
+    let other = encode_base64(&[0u8, 0, 255, 255].repeat(8 * 16));
+    t.advance(format!("\x1b_Ga=T,f=32,s=8,v=16,i=1;{other}\x1b\\").as_bytes());
+    t.take_output();
+    assert_ne!(t.graphics().image(1).unwrap().data, primary);
+
+    t.advance(b"\x1b[?1049l");
+    assert_eq!(
+        t.graphics().image(1).unwrap().data,
+        primary,
+        "the alternate screen overwrote the primary screen's picture"
+    );
+}
+
+#[test]
+fn leaving_the_alternate_screen_drops_what_was_placed_on_it() {
+    // It has no scrollback for a picture to be scrolled back to, and a program
+    // re-entering it is handed a cleared screen, so nothing it holds can be
+    // looked at again. Keeping it would be a second budget of pixels sitting
+    // where nobody can see them.
+    let mut t = term(10, 6);
+    t.advance(b"\x1b[?1049h");
+    place_tall_image(&mut t, 2);
+    assert_eq!(t.graphics().placements().count(), 1);
+
+    t.advance(b"\x1b[?1049l");
+    t.advance(b"\x1b[?1049h");
+    assert!(
+        t.graphics().is_empty(),
+        "the alternate screen came back with what it had last time"
+    );
+}
+
+#[test]
+fn resizing_moves_the_hidden_screens_pictures_too() {
+    // The hidden grid is resized rather than left alone, so that the newest
+    // primary output survives a resize taken on the alternate screen. Its
+    // pictures have to travel the same distance, or they come back sitting on
+    // the wrong lines.
+    let mut t = term(10, 4);
+    place_tall_image(&mut t, 1);
+    for _ in 0..6 {
+        t.advance(b"\r\n");
+    }
+    let before = placement_rows(&t);
+    let history = t.grid().scrollback_len();
+    assert!(before[0] < 0);
+
+    t.advance(b"\x1b[?1049h");
+    t.resize(10, 7);
+    t.advance(b"\x1b[?1049l");
+
+    let pulled = (history - t.grid().scrollback_len()) as i32;
+    assert!(
+        pulled > 0,
+        "the test needs history pulled back onto the screen"
+    );
+    assert_eq!(placement_rows(&t), vec![before[0] + pulled]);
+}
+
+#[test]
 fn a_picture_scrolls_away_with_the_text_under_it() {
     // #139 as reported: an eleven-row greeting on a 42-row pane, and enough
     // output to push it well past the top. The row saturated at zero, so the
