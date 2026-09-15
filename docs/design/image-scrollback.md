@@ -1,6 +1,8 @@
 # Where a picture is, once the text under it has scrolled
 
-Design for [#139](https://github.com/m96-chan/tOS/issues/139).
+Design for [#139](https://github.com/m96-chan/tOS/issues/139), and for
+[#145](https://github.com/m96-chan/tOS/issues/145), which is the same subject
+one screen over.
 
 Put a picture on a pane and print past the bottom of the screen. The text
 scrolls. The picture does not: it stays in the top left, on top of whatever is
@@ -263,23 +265,82 @@ already above the screen.
 
 ## Not in this change
 
-Three neighbouring gaps are real and not fixed here. They are written down so
-the next person does not read the new code as claiming to have handled them.
+Two neighbouring gaps are real and not fixed by the work above. They are
+written down so the next person does not read the code as claiming to have
+handled them.
 
 - **Scrolling down does not move placements.** `CSI T`, reverse index, `IL` and
   `DL` push text around the screen and leave pictures where they are. This is
   older than the issue and unchanged by it; the rule it needs is the mirror of
   `scroll_up` above, and it belongs with whoever writes it.
-- **The alternate screen still empties the store**
-  ([#145](https://github.com/m96-chan/tOS/issues/145)). `swap_alt_screen` clears
-  every placement, so opening an editor destroys the pictures this change keeps
-  in the primary screen's history. The fix is a graphics store per screen,
-  swapped the way the grid is, and the question it has to answer first is what
-  a byte budget means when there are two of them. That is its own piece of
-  work, not a line in this one.
 - **A placement now lives for the depth of scrollback, not a screenful**
-  ([#146](https://github.com/m96-chan/tOS/issues/146)). Nothing bounds how many an application may stack on one row, so where the old
-  code dropped them within a screen of scrolling, the store can now hold them
-  for ten thousand lines. Each one is a few dozen bytes and one pass of a line
-  feed, and the renderer only sorts the ones on view, so this is a cost rather
-  than a leak — but the implicit cap is gone and nothing replaced it.
+  ([#146](https://github.com/m96-chan/tOS/issues/146)). Nothing bounds how many
+  an application may stack on one row, so where the old code dropped them within
+  a screen of scrolling, the store can now hold them for ten thousand lines.
+  Each one is a few dozen bytes and one pass of a line feed, and the renderer
+  only sorts the ones on view, so this is a cost rather than a leak — but the
+  implicit cap is gone and nothing replaced it.
+
+A third was on this list and has since been dealt with: the alternate screen
+emptying the store, which is the section below.
+
+---
+
+## A store for each screen
+
+**Issue [#145](https://github.com/m96-chan/tOS/issues/145).** Everything above
+makes a placement outlive the screen it was placed on, which is the whole point:
+scroll back over the greeting and the picture is there. Open `vim` and quit, and
+it was not.
+
+`swap_alt_screen` swapped the grid and emptied the graphics store:
+
+```rust
+std::mem::swap(&mut self.screen, &mut self.inactive);
+...
+self.graphics.clear();
+```
+
+The text and its history made the round trip; the pictures did not. That was
+harmless while a placement could only ever be on the visible screen — entering
+the alternate screen hides the visible screen anyway — and stopped being
+harmless the moment placements started living in scrollback. Every full-screen
+program, an editor, a pager, `top`, took them with it.
+
+So the store is swapped too, and `Terminal` holds the other one in
+`inactive_graphics` the way it already holds `inactive`.
+
+### Two stores rather than one
+
+The cheaper shape would be one image store shared between the screens with two
+sets of placements, since the byte budget is charged against images and a
+placement is a few dozen bytes. It is the wrong shape, and the reason is an id.
+
+A program on the alternate screen may transmit `i=1`. The shell's greeting is
+sitting at `i=1` in the primary screen's scrollback. Sharing the image map means
+the second transmission overwrites the first, and scrolling back afterwards
+finds the greeting's placement drawing the editor's pixels. Kitty splits the two
+for the same reason — a `GraphicsManager` per screen buffer — and tOS follows
+Kitty on the protocol it speaks.
+
+### What that costs, and what stops it costing more
+
+A second store is a second ceiling: `graphics_budget` is per store, so a pane's
+peak becomes two of them rather than one.
+
+What stops that being two budgets of pixels sitting idle is that the alternate
+screen's store is emptied on the way out as well as on the way in. It has no
+scrollback for a picture to be scrolled back to, and a program re-entering the
+alternate screen is handed a cleared screen and has to retransmit regardless —
+so nothing it held can ever be looked at again. The peak is therefore the
+primary screen's budget plus whatever an alternate-screen program is showing
+*right now*, and it falls back the moment that program exits. The budget is a
+ceiling rather than a reservation, so an idle second store costs nothing at all.
+
+### Resize moves both
+
+`Grid::resize` is already called on the hidden grid — deliberately, so that a
+resize taken inside an editor does not destroy the shell's newest output behind
+it. Its placements have to travel the same distance, or the primary screen comes
+back with its pictures sitting on the wrong lines. `Terminal::resize` now shifts
+and prunes both stores against their own grid's shift and history.

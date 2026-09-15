@@ -248,6 +248,15 @@ pub struct Terminal {
     title: String,
 
     graphics: GraphicsStore,
+    /// The pictures belonging to the screen that is not on display, swapped
+    /// with [`Terminal::graphics`] by `swap_alt_screen` the way `inactive` is
+    /// swapped with `screen`.
+    ///
+    /// Two stores rather than one, because an image id belongs to a screen:
+    /// a program on the alternate screen transmitting `i=1` must not overwrite
+    /// the picture a shell left at `i=1` in the primary screen's scrollback.
+    /// Kitty splits them for the same reason.
+    inactive_graphics: GraphicsStore,
     /// How a `t=f`, `t=t` or `t=s` transmission gets its bytes.
     ///
     /// Boxed behind the trait because this crate has no filesystem of its
@@ -296,6 +305,7 @@ impl Terminal {
             hyperlinks: Vec::new(),
             title: String::new(),
             graphics: GraphicsStore::new(config.graphics_budget),
+            inactive_graphics: GraphicsStore::new(config.graphics_budget),
             media: Box::new(NoMedia),
             apc_buf: Vec::new(),
             dcs_buf: Vec::new(),
@@ -471,10 +481,24 @@ impl Terminal {
         // history above it, shrinking pushes lines into history. A picture is
         // anchored to a screen row, so it has to travel the same distance the
         // cursor just did, or it slides off the text it was placed on.
-        let history = self.screen.scrollback_len();
-        let shift = i32::try_from(shift).unwrap_or(if shift < 0 { i32::MIN } else { i32::MAX });
-        self.graphics.shift_rows(shift, history);
-        self.graphics.retain_rows(rows as u16);
+        //
+        // Both screens, because both grids were just resized. The hidden one
+        // is resized here precisely so that it is not destroyed while nobody
+        // is looking at it, and a picture left behind at the wrong row would
+        // be the same kind of loss in a different currency.
+        let screens = [
+            (&mut self.graphics, shift, self.screen.scrollback_len()),
+            (
+                &mut self.inactive_graphics,
+                inactive_shift,
+                self.inactive.scrollback_len(),
+            ),
+        ];
+        for (graphics, shift, history) in screens {
+            let shift = i32::try_from(shift).unwrap_or(if shift < 0 { i32::MIN } else { i32::MAX });
+            graphics.shift_rows(shift, history);
+            graphics.retain_rows(rows as u16);
+        }
         self.events.push(TermEvent::Repaint);
     }
 
@@ -782,6 +806,10 @@ impl Terminal {
         // The row the cursor is leaving belongs to the buffer being hidden.
         self.inactive_cursor_y = self.cursor.y;
         std::mem::swap(&mut self.screen, &mut self.inactive);
+        // The pictures go with the screen they were placed on. Emptying the
+        // store here instead is what made opening an editor destroy every
+        // picture in the primary screen's scrollback (#145).
+        std::mem::swap(&mut self.graphics, &mut self.inactive_graphics);
         self.modes.alt_screen = to_alt;
         if to_alt {
             // Entering the alternate screen always starts from a clean slate.
@@ -789,7 +817,17 @@ impl Terminal {
             self.screen.clear_screen(&attrs);
             self.screen.clear_history();
         }
-        self.graphics.clear();
+        // Whichever of the two is now the alternate screen's is emptied, on
+        // the way in and on the way out alike. It has no scrollback for a
+        // picture to be scrolled back to, and a program re-entering it is
+        // handed a cleared screen anyway, so nothing it holds can be looked at
+        // again — which is also what keeps the second store from being a
+        // second budget's worth of pixels sitting idle.
+        if to_alt {
+            self.graphics.clear();
+        } else {
+            self.inactive_graphics.clear();
+        }
         self.damage.mark_all();
         self.events.push(TermEvent::Repaint);
     }
