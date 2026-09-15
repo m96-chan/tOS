@@ -39,6 +39,13 @@ pub use crate::chrome::{clip, pad_to};
 const MAX_WIDTH: usize = 64;
 /// The most list rows shown at once; beyond this it stops being a menu.
 const MAX_LIST_ROWS: usize = 14;
+/// What a secret prompt draws instead of the character that was typed.
+///
+/// The same bullet [`crate::lock`] masks a password with, so that the two
+/// places in tOS where something is typed that nobody else should read look
+/// like the same thing, because they are.
+const MASK: char = '\u{2022}';
+
 /// Rows the overlay spends on itself: two borders, the query and its divider.
 const CHROME_ROWS: usize = 4;
 /// Which row of the box the list starts on: the top border, the query line
@@ -187,6 +194,10 @@ pub struct Overlay {
     /// Whether the line itself is the answer rather than a filter over the
     /// list. A prompt has no list to choose from, so enter takes the text.
     prompt: bool,
+    /// Whether the line is drawn as bullets rather than as itself. What is
+    /// accepted is still the real text: this changes what is on the screen and
+    /// nothing else.
+    secret: bool,
 }
 
 impl Overlay {
@@ -199,6 +210,7 @@ impl Overlay {
             cursor: 0,
             scroll: 0,
             prompt: false,
+            secret: false,
         };
         overlay.refilter();
         overlay
@@ -217,6 +229,19 @@ impl Overlay {
         overlay
     }
 
+    /// The same prompt with the line drawn as one bullet per character.
+    ///
+    /// For a passphrase, which `docs/design/wifi.md` (#137) asks for masked
+    /// the way the lock screen masks a password: a passphrase typed in front
+    /// of somebody is a passphrase. Only the drawing changes — enter still
+    /// reports [`OverlayOutcome::Accepted`] with the real text on it, which is
+    /// the whole point of it being typed.
+    pub fn secret_prompt(title: impl Into<String>, initial: impl Into<String>) -> Self {
+        let mut overlay = Overlay::prompt(title, initial);
+        overlay.secret = true;
+        overlay
+    }
+
     /// Replace the list, keeping the query.
     ///
     /// For a menu whose contents arrive late or change under it: a network
@@ -225,6 +250,16 @@ impl Overlay {
     pub fn set_items(&mut self, items: Vec<OverlayItem>) {
         self.items = items;
         self.refilter();
+    }
+
+    /// Rename the box without disturbing what is in it.
+    ///
+    /// The wireless menu's title carries whether the radio is still listening,
+    /// and it stops being true while the menu is open. Rebuilding the overlay
+    /// to say so would throw away the query and the cursor, which is the thing
+    /// [`Overlay::set_items`] exists to avoid.
+    pub fn set_title(&mut self, title: impl Into<String>) {
+        self.title = title.into();
     }
 
     pub fn title(&self) -> &str {
@@ -237,6 +272,21 @@ impl Overlay {
 
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    /// The query as it is drawn: bullets for a secret prompt, itself
+    /// otherwise.
+    ///
+    /// The renderer measures and clips this rather than [`Overlay::query`], so
+    /// that the cursor lands after the last bullet and a long passphrase
+    /// scrolls the line by the same arithmetic every other prompt uses. A
+    /// multi-byte character is one bullet, because it is one thing that was
+    /// typed and one press of backspace takes it away.
+    pub fn shown_query(&self) -> String {
+        match self.secret {
+            true => MASK.to_string().repeat(self.query.chars().count()),
+            false => self.query.clone(),
+        }
     }
 
     /// Indices into [`Overlay::items`] that the query matches, best first.
@@ -611,7 +661,7 @@ impl Overlay {
             Some(chrome.background),
             true,
         );
-        let shown = clip_end(&self.query, inner.saturating_sub(5));
+        let shown = clip_end(&self.shown_query(), inner.saturating_sub(5));
         x = draw_text(
             surface,
             fonts,
@@ -988,6 +1038,65 @@ mod tests {
             OverlayOutcome::Accepted
         );
         assert_eq!(overlay.query(), "");
+    }
+
+    #[test]
+    fn a_secret_prompt_shows_bullets_and_hands_back_the_real_text() {
+        let mut overlay = Overlay::secret_prompt("kitchen-table — passphrase", "");
+        type_text(&mut overlay, "correct horse");
+        assert_eq!(overlay.shown_query(), "•••••••••••••");
+        assert_eq!(
+            overlay.handle_key(&KeyEvent::new(KeyCode::Enter, Modifiers::NONE)),
+            OverlayOutcome::Accepted
+        );
+        assert_eq!(
+            overlay.query(),
+            "correct horse",
+            "the masking reached the answer and not only the screen"
+        );
+    }
+
+    #[test]
+    fn a_secret_prompt_draws_one_bullet_per_character_and_not_per_byte() {
+        // A character that is three bytes of UTF-8 and one press of backspace
+        // is one bullet, or the line would grow by three every time somebody
+        // pasted a passphrase with anything but ASCII in it.
+        let mut overlay = Overlay::secret_prompt("passphrase", "");
+        type_text(&mut overlay, "あい");
+        assert_eq!(overlay.shown_query(), "••");
+        overlay.handle_key(&KeyEvent::new(KeyCode::Backspace, Modifiers::NONE));
+        assert_eq!(overlay.shown_query(), "•");
+    }
+
+    #[test]
+    fn an_ordinary_prompt_and_an_ordinary_list_are_shown_as_themselves() {
+        let prompt = Overlay::prompt("rename workspace", "build");
+        assert_eq!(prompt.shown_query(), "build");
+        let mut list = overlay(&["ls", "less"]);
+        type_text(&mut list, "le");
+        assert_eq!(list.shown_query(), "le");
+    }
+
+    #[test]
+    fn a_secret_prompt_starts_on_the_text_it_was_given() {
+        // Which is how a refused passphrase keeps what was typed: the prompt
+        // goes back up with the line still on it and the message beside it.
+        let overlay = Overlay::secret_prompt("kitchen-table — passphrase", "short");
+        assert_eq!(overlay.query(), "short");
+        assert_eq!(overlay.shown_query(), "•••••");
+    }
+
+    #[test]
+    fn the_title_can_be_renamed_without_disturbing_the_line() {
+        let mut overlay = overlay(&["kitchen-table", "cafe"]);
+        type_text(&mut overlay, "ca");
+        overlay.set_title("wireless");
+        assert_eq!(overlay.title(), "wireless");
+        assert_eq!(overlay.query(), "ca");
+        assert_eq!(
+            overlay.selected_item().map(|item| item.label.as_str()),
+            Some("cafe")
+        );
     }
 
     #[test]

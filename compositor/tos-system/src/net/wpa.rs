@@ -232,11 +232,18 @@ fn bind_in(dir: &Path, name: &str) -> io::Result<(UnixDatagram, PathBuf)> {
 /// wireless path — menu, scan, passphrase, join, wrong passphrase, tick — is
 /// driven from a test in another crate, on a machine with no radio.
 ///
-/// The table is matched in order and the first exact match wins. A command
-/// with no entry is answered `FAIL`, and is recorded like any other — that
-/// last rule is deliberate: a test that forgot to teach the table a command
-/// sees the command it forgot in the transcript, rather than an `OK` it never
-/// wrote down.
+/// The table is matched in order: the first send of a command is answered by
+/// the first entry for it, the second by the second, and once the entries run
+/// out the last one sticks. So a table with one entry per command is a
+/// constant answer, which is what most of these are, and a table with two is a
+/// reply that changes once — `STATUS` handshaking and then `COMPLETED`,
+/// `LIST_NETWORKS` before and after a wrong passphrase — which is what a join
+/// has to be driven through without a script and without a clock.
+///
+/// A command with no entry is answered `FAIL`, and is recorded like any other
+/// — that last rule is deliberate: a test that forgot to teach the table a
+/// command sees the command it forgot in the transcript, rather than an `OK`
+/// it never wrote down.
 #[derive(Debug, Clone, Default)]
 pub struct RecordingSupplicant {
     /// `(command, reply)`, first match wins.
@@ -273,12 +280,25 @@ impl RecordingSupplicant {
 
 impl Supplicant for RecordingSupplicant {
     fn request(&mut self, command: &str) -> io::Result<String> {
+        // How many times this command has been asked before, which is which of
+        // its entries answers it. Counted out of the transcript rather than
+        // kept in a cursor, so that the table stays a table: nothing about
+        // `replies` has to be reset, cloned or torn down between questions.
+        let asked_before = self.sent.iter().filter(|line| *line == command).count();
         self.sent.push(command.to_string());
-        let reply = self
+        let matching: Vec<&String> = self
             .replies
             .iter()
-            .find(|(asked, _)| asked == command)
-            .map(|(_, reply)| reply.clone())
+            .filter(|(asked, _)| asked == command)
+            .map(|(_, reply)| reply)
+            .collect();
+        // Once a command's entries run out the last one sticks, so a table
+        // only has to write down the answers that change; with no entry at all
+        // there is nothing to clamp to and the answer is `FAIL`.
+        let which = asked_before.min(matching.len().saturating_sub(1));
+        let reply = matching
+            .get(which)
+            .map(|reply| (*reply).clone())
             .unwrap_or_else(|| "FAIL".to_string());
         Ok(reply)
     }
@@ -1278,6 +1298,34 @@ mod tests {
             .answering("PING", "PONG")
             .answering("PING", "FAIL");
         assert_eq!(supplicant.request("PING").expect("a reply"), "PONG");
+    }
+
+    #[test]
+    fn a_second_entry_for_the_same_command_answers_the_second_ask() {
+        // What a join is driven through: the network is being handshaked with
+        // on the first look and has been temporarily disabled by the time of
+        // the second, which is the whole of how a wrong passphrase is found
+        // out without attaching to the event stream.
+        let mut supplicant = RecordingSupplicant::new()
+            .answering("LIST_NETWORKS", "network id / ssid / bssid / flags\n")
+            .answering(
+                "LIST_NETWORKS",
+                "network id / ssid / bssid / flags\n0\tcafe\tany\t[TEMP-DISABLED]\n",
+            );
+        assert!(!supplicant
+            .request("LIST_NETWORKS")
+            .expect("a reply")
+            .contains("TEMP-DISABLED"));
+        assert!(supplicant
+            .request("LIST_NETWORKS")
+            .expect("a reply")
+            .contains("TEMP-DISABLED"));
+        // And once the entries run out, the last one is what the table goes on
+        // saying, so a test only has to write down the answers that change.
+        assert!(supplicant
+            .request("LIST_NETWORKS")
+            .expect("a reply")
+            .contains("TEMP-DISABLED"));
     }
 
     #[test]

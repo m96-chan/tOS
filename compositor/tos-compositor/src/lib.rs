@@ -25,6 +25,7 @@ pub mod selection;
 pub mod splash;
 pub mod status;
 pub mod system;
+pub mod wifi;
 
 pub use compositor::{Compositor, OverlayKind};
 pub use config::{parse_args, usage, Backend, Config, ConfigSource};
@@ -40,3 +41,4 @@ pub use pointer::Pointer;
 pub use selection::{Anchor, Selection, SelectionMode};
 pub use splash::Splash;
 pub use status::{Bar, Hit, Segment};
+pub use wifi::Wifi;
