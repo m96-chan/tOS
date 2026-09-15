@@ -299,15 +299,27 @@ pub trait Kernel {
         netmask: Ipv4Addr,
     ) -> io::Result<()>;
 
-    /// Make `gateway` the default route out of this interface, with
-    /// `SIOCADDRT`.
+    /// Make `gateway` the default route out of this interface at `metric`,
+    /// with `SIOCADDRT`.
     ///
-    /// "Make", not "add": an interface that already has a default route gets
-    /// the old one taken out first. `SIOCADDRT` will not replace a route, it
-    /// answers `EEXIST`, and a second lease on a link whose gateway moved
-    /// would otherwise be refused in favour of a route that no longer goes
-    /// anywhere.
-    fn set_default_route(&mut self, interface: &str, gateway: Ipv4Addr) -> io::Result<()>;
+    /// "Make", not "add": the default route this interface already had at
+    /// this metric gets taken out first. `SIOCADDRT` will not replace a
+    /// route, it answers `EEXIST`, and a second lease on a link whose gateway
+    /// moved would otherwise be refused in favour of a route that no longer
+    /// goes anywhere.
+    ///
+    /// The metric is what lets a laptop with a cable in it and a radio
+    /// associated have a default route through each: two default routes with
+    /// different metrics coexist and the kernel routes by the lower one.
+    /// Which is why the delete is scoped to this metric and this interface —
+    /// a lease on the radio that removed the cable's route would be the whole
+    /// point thrown away.
+    fn set_default_route(
+        &mut self,
+        interface: &str,
+        gateway: Ipv4Addr,
+        metric: u32,
+    ) -> io::Result<()>;
 }
 
 /// The real kernel.
@@ -336,8 +348,13 @@ impl Kernel for SystemKernel {
         set_interface_address(interface, address, netmask)
     }
 
-    fn set_default_route(&mut self, interface: &str, gateway: Ipv4Addr) -> io::Result<()> {
-        set_interface_default_route(interface, gateway)
+    fn set_default_route(
+        &mut self,
+        interface: &str,
+        gateway: Ipv4Addr,
+        metric: u32,
+    ) -> io::Result<()> {
+        set_interface_default_route(interface, gateway, metric)
     }
 }
 
@@ -361,12 +378,15 @@ pub enum LinkChange {
     DefaultRoute {
         interface: String,
         gateway: Ipv4Addr,
+        /// Lower wins, and a test that could not see it could not tell a
+        /// wired route from a wireless one.
+        metric: u32,
     },
 }
 
 impl LinkChange {
     /// One line, which is what a test asserts against: `eth0 up`,
-    /// `eth0 192.168.1.5/24`, `eth0 via 192.168.1.1`.
+    /// `eth0 192.168.1.5/24`, `eth0 via 192.168.1.1 metric 100`.
     pub fn describe(&self) -> String {
         match self {
             LinkChange::Flags { interface, up } => {
@@ -377,9 +397,11 @@ impl LinkChange {
                 address,
                 netmask,
             } => format!("{interface} {address}/{}", u32::from(*netmask).count_ones()),
-            LinkChange::DefaultRoute { interface, gateway } => {
-                format!("{interface} via {gateway}")
-            }
+            LinkChange::DefaultRoute {
+                interface,
+                gateway,
+                metric,
+            } => format!("{interface} via {gateway} metric {metric}"),
         }
     }
 
@@ -498,13 +520,35 @@ impl Kernel for RecordingKernel {
         })
     }
 
-    fn set_default_route(&mut self, interface: &str, gateway: Ipv4Addr) -> io::Result<()> {
+    fn set_default_route(
+        &mut self,
+        interface: &str,
+        gateway: Ipv4Addr,
+        metric: u32,
+    ) -> io::Result<()> {
         self.record(LinkChange::DefaultRoute {
             interface: interface.to_string(),
             gateway,
+            metric,
         })
     }
 }
+
+/// The metric of the default route through a cable, and through anything that
+/// is not a radio.
+///
+/// 100 wired and 600 wireless are NetworkManager's numbers, taken so that
+/// `ip route` on a tOS machine reads the way it does on every other Linux
+/// machine. Lower wins, so a laptop with both uses the cable while the cable
+/// is there and the radio the moment it is not, with neither link's address
+/// touched — and `net.ipv4.conf.all.ignore_routes_with_linkdown`, which the
+/// image sets, is what makes the kernel skip the wired route the second the
+/// cable comes out rather than a minute later.
+const WIRED_ROUTE_METRIC: u32 = 100;
+
+/// The metric of the default route through a radio. See
+/// [`WIRED_ROUTE_METRIC`]: higher, so the cable wins while there is one.
+const WIRELESS_ROUTE_METRIC: u32 = 600;
 
 /// The network, as this machine sees it.
 ///
@@ -605,7 +649,8 @@ impl<K: Kernel> Network<K> {
         self.kernel.set_link_up(interface, false)
     }
 
-    /// Put a lease on a link: address, netmask, default route, resolvers.
+    /// Put a lease on a link: address, netmask, default route at the metric
+    /// its kind earns, resolvers.
     ///
     /// The order is not a matter of taste. `SIOCADDRT` for a gateway on a
     /// subnet this machine is not on yet answers `ENETUNREACH`, so the
@@ -622,9 +667,34 @@ impl<K: Kernel> Network<K> {
         self.kernel
             .set_address(interface, lease.address, lease.netmask)?;
         if let Some(gateway) = lease.router {
-            self.kernel.set_default_route(interface, gateway)?;
+            let metric = match self.kind(interface) {
+                Some(Kind::Wireless) => WIRELESS_ROUTE_METRIC,
+                // A link whose kind cannot be read any more is a link that
+                // has just been unplugged, and the cable's metric is the one
+                // that leaves the table looking ordinary either way.
+                _ => WIRED_ROUTE_METRIC,
+            };
+            self.kernel.set_default_route(interface, gateway, metric)?;
         }
         self.write_resolv_conf(interface, lease)
+    }
+
+    /// What kind of link this is, without reading the rest of it.
+    ///
+    /// [`Self::interface`] would answer the same question, but it reads every
+    /// address on the machine and the whole routing table to do it, and a
+    /// lease being applied only needs to know whether the metric is the
+    /// cable's or the radio's.
+    fn kind(&self, interface: &str) -> Option<Kind> {
+        let flags = parse_flags(
+            &self
+                .sysfs
+                .read(&format!("/sys/class/net/{interface}/flags"))?,
+        )?;
+        let uevent = self
+            .sysfs
+            .read(&format!("/sys/class/net/{interface}/uevent"));
+        Some(self.kind_of(interface, flags, uevent.as_deref()))
     }
 
     /// The MAC a DHCP client would send from, or `None` for an interface with
@@ -1263,8 +1333,8 @@ fn set_interface_address(
     ))
 }
 
-/// `SIOCADDRT` for `0.0.0.0/0 via gateway dev interface`, replacing whatever
-/// default route that interface had.
+/// `SIOCADDRT` for `0.0.0.0/0 via gateway dev interface metric metric`,
+/// replacing the default route that interface had at that metric.
 ///
 /// `SIOCDELRT` runs first and its result is thrown away on purpose: the
 /// ordinary case is that there was no route to delete, which comes back as
@@ -1272,8 +1342,23 @@ fn set_interface_address(
 /// fresh machine could never be applied. A delete that fails for any other
 /// reason shows up immediately as the add failing, with the kernel's own
 /// error on it, so nothing is hidden by ignoring this one.
+///
+/// The delete carries the same `rt_dev` and `rt_metric` as the add, which is
+/// what keeps it to this link's own route: `fib_table_delete` skips every
+/// entry whose priority is not the one asked for when one is asked for, so a
+/// lease on the radio at 600 cannot take out the cable's route at 100. A
+/// delete with the metric left at zero would match the first default route it
+/// found, whoever it belonged to.
+///
+/// `EEXIST` from the add is not a failure. The route it is complaining about
+/// is a default route at this metric that is already in the table — the one
+/// this link was given a moment ago and has just renewed, or the one the
+/// other cable in the machine holds — and in both cases the table already
+/// says what this was asked to make it say. Failing here would abandon the
+/// rest of the lease, `/etc/resolv.conf` included, over a route that is
+/// there.
 #[cfg(target_os = "linux")]
-fn set_interface_default_route(interface: &str, gateway: Ipv4Addr) -> io::Result<()> {
+fn set_interface_default_route(interface: &str, gateway: Ipv4Addr, metric: u32) -> io::Result<()> {
     let socket = IoctlSocket::open()?;
     // NUL terminated and owned by this frame, because `rt_dev` is a pointer
     // the kernel follows rather than a field it copies.
@@ -1297,7 +1382,13 @@ fn set_interface_default_route(interface: &str, gateway: Ipv4Addr) -> io::Result
         tos: 0,
         class: 0,
         pad4: [0; 3],
-        metric: 0,
+        // `rt_metric` is the metric plus one. The kernel takes the one back
+        // off in `rtentry_to_fib_config` (`net/ipv4/fib_frontend.c`), and
+        // `route(8)` and net-tools have added it on since the field existed —
+        // net-tools' `route.c` writes `rt->rt_metric = metric + 1;` with
+        // "+1 for binary compatibility!" next to it. `as _` because the width
+        // of the field is `c_short` here and is not the same on every libc.
+        metric: metric.saturating_add(1) as _,
         dev: device.as_mut_ptr().cast(),
         mtu: 0,
         window: 0,
@@ -1309,14 +1400,21 @@ fn set_interface_default_route(interface: &str, gateway: Ipv4Addr) -> io::Result
     unsafe {
         libc::ioctl(socket.0, SIOCDELRT as _, &route);
         if libc::ioctl(socket.0, SIOCADDRT as _, &mut route) < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
         }
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn set_interface_default_route(interface: &str, _gateway: Ipv4Addr) -> io::Result<()> {
+fn set_interface_default_route(
+    interface: &str,
+    _gateway: Ipv4Addr,
+    _metric: u32,
+) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         format!("SIOCADDRT on {interface} needs a Linux kernel"),
@@ -2004,13 +2102,61 @@ Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE
         // address it goes through is on the interface.
         assert_eq!(
             network.kernel().transcript(),
-            vec!["eth0 192.168.1.50/24", "eth0 via 192.168.1.1"]
+            vec!["eth0 192.168.1.50/24", "eth0 via 192.168.1.1 metric 100"]
         );
         assert_eq!(
             std::fs::read_to_string(tree.sysfs().path("/etc/resolv.conf")).unwrap(),
             "# written by tOS from the DHCP lease on eth0\n\
              search example.lan\n\
              nameserver 192.168.1.1\n"
+        );
+    }
+
+    #[test]
+    fn a_lease_on_a_cable_takes_the_default_route_at_the_cable_metric() {
+        let tree = Tree::new("wiredmetric");
+        add_interface(&tree, "eth0", true, true);
+        make_physical(&tree, "eth0");
+        let mut network = Network::new(tree.sysfs(), RecordingKernel::new());
+        network.configure("eth0", &lease()).expect("configured");
+        assert!(network.kernel().did("eth0 via 192.168.1.1 metric 100"));
+    }
+
+    #[test]
+    fn a_lease_on_a_radio_takes_the_default_route_at_the_radio_metric() {
+        let tree = Tree::new("wirelessmetric");
+        add_interface(&tree, "wlan0", true, true);
+        make_wireless(&tree, "wlan0");
+        let mut network = Network::new(tree.sysfs(), RecordingKernel::new());
+        network.configure("wlan0", &lease()).expect("configured");
+        assert!(network.kernel().did("wlan0 via 192.168.1.1 metric 600"));
+    }
+
+    #[test]
+    fn a_lease_on_the_radio_leaves_the_route_through_the_cable_alone() {
+        // The whole reason for the metric: a laptop with both gets a default
+        // route through each, the cable's the lower of the two, and the radio
+        // being addressed second does not take the cable's route out from
+        // under it — the delete the real kernel does is scoped to the metric
+        // and the device, so there is nothing here that could.
+        let tree = Tree::new("bothroutes");
+        add_interface(&tree, "eth0", true, true);
+        make_physical(&tree, "eth0");
+        add_interface(&tree, "wlan0", true, true);
+        make_wireless(&tree, "wlan0");
+
+        let mut network = Network::new(tree.sysfs(), RecordingKernel::new());
+        network.configure("eth0", &lease()).expect("configured");
+        network.configure("wlan0", &lease()).expect("configured");
+
+        assert_eq!(
+            network.kernel().transcript(),
+            vec![
+                "eth0 192.168.1.50/24",
+                "eth0 via 192.168.1.1 metric 100",
+                "wlan0 192.168.1.50/24",
+                "wlan0 via 192.168.1.1 metric 600",
+            ]
         );
     }
 
@@ -2095,7 +2241,7 @@ Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE
         assert_eq!(server.transcript(), vec!["DISCOVER", "REQUEST"]);
         assert_eq!(
             network.kernel().transcript(),
-            vec!["eth0 192.168.1.50/24", "eth0 via 192.168.1.1"]
+            vec!["eth0 192.168.1.50/24", "eth0 via 192.168.1.1 metric 100"]
         );
     }
 }
