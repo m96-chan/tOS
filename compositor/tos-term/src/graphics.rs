@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use crate::grid::Region;
 use crate::inflate::{self, InflateError};
 use crate::png::{self, PngError};
 
@@ -886,17 +887,60 @@ impl GraphicsStore {
         self.placements.retain(|_, p| p.row < rows as i32);
     }
 
-    /// Move every placement `delta` rows down the screen — negative for the
-    /// ordinary case of text scrolling up — and drop the ones that can no
-    /// longer be reached.
+    /// Move every placement `delta` rows down the screen — history and all —
+    /// and drop the ones that can no longer be reached.
     ///
-    /// `history` is how many lines of scrollback the grid holds. See
-    /// [`GraphicsStore::retain_in_history`] for what that has to do with it.
+    /// This is for a resize, where the whole grid slid past the screen. An
+    /// ordinary scroll moves a region and wants [`GraphicsStore::scroll_up`].
     pub fn shift_rows(&mut self, delta: i32, history: usize) {
         for p in self.placements.values_mut() {
             p.row = p.row.saturating_add(delta);
         }
         self.retain_in_history(history);
+    }
+
+    /// Scroll the placements on `region` up by `n` rows, and drop the ones
+    /// that can no longer be reached.
+    ///
+    /// Only what is in the region moves, because only what is in the region
+    /// scrolled: text above a scroll region that starts below the top of the
+    /// screen sits still, and a picture on it has to sit still too.
+    ///
+    /// Where the lines leaving the top of the region went decides what happens
+    /// to a picture that follows them out. [`Grid::scroll_up`] puts them into
+    /// scrollback only when the region starts at the top of the screen, so
+    /// that is the only case where a placement may go on living at a negative
+    /// row; out of the top of any other region they are simply gone.
+    ///
+    /// [`Grid::scroll_up`]: crate::grid::Grid::scroll_up
+    pub fn scroll_up(&mut self, region: Region, n: usize, history: usize) {
+        let (top, bottom) = (region.top as i64, region.bottom as i64);
+        let n = i32::try_from(n).unwrap_or(i32::MAX);
+        let floor = -(history as i64);
+        self.placements.retain(|_, p| {
+            // What moves is the region — and, when the region starts at the
+            // top of the screen, everything already in history behind it,
+            // because the line leaving the screen is pushed in underneath and
+            // shifts them all one further back.
+            let moved = (p.row as i64) < bottom && (top == 0 || p.row as i64 + p.rows as i64 > top);
+            if moved {
+                p.row = p.row.saturating_sub(n);
+                if top > 0 && p.row as i64 + p.rows as i64 <= top {
+                    return false;
+                }
+            }
+            p.row as i64 + p.rows as i64 > floor
+        });
+    }
+
+    /// Drop the placements `ED 2` erases.
+    ///
+    /// It clears the screen and leaves scrollback alone, so a picture with a
+    /// row on the screen goes with the cells it covered and one that is wholly
+    /// in history stays where it is, along with the lines it was placed on.
+    pub fn clear_screen(&mut self) {
+        self.placements
+            .retain(|_, p| p.row as i64 + p.rows as i64 <= 0);
     }
 
     /// Drop placements whose last row has fallen out of scrollback.

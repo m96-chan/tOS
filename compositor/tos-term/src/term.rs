@@ -549,11 +549,11 @@ impl Terminal {
     /// dropped as out of reach while its text was 24 lines back.
     fn scroll_up_with_graphics(&mut self, n: usize) {
         let attrs = self.cursor.attrs;
-        let n = n.min(self.scroll_region.height());
-        self.screen.scroll_up(self.scroll_region, n, &attrs, true);
+        let region = self.scroll_region;
+        let n = n.min(region.height());
+        self.screen.scroll_up(region, n, &attrs, true);
         let history = self.screen.scrollback_len();
-        self.graphics
-            .shift_rows(-i32::try_from(n).unwrap_or(i32::MAX), history);
+        self.graphics.scroll_up(region, n, history);
         self.damage.mark_all();
     }
 
@@ -873,7 +873,10 @@ impl Terminal {
             }
             2 => {
                 self.screen.clear_screen(&attrs);
-                self.graphics.clear();
+                // The screen, not the scrollback: a picture whose lines are
+                // all in history was not erased and is still there to scroll
+                // back to. Clearing the whole store took those with it.
+                self.graphics.clear_screen();
                 self.damage.mark_all();
             }
             3 => {

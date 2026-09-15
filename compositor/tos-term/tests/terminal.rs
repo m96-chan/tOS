@@ -989,6 +989,90 @@ fn a_dropped_placement_leaves_no_cell_pointing_at_it() {
 }
 
 #[test]
+fn clearing_the_screen_leaves_the_pictures_in_history_alone() {
+    // ED 2 clears the screen and leaves scrollback alone — that is the whole
+    // point of `clear` keeping history. A picture whose lines are all still
+    // back there was not erased either.
+    let mut t = term(10, 6);
+    place_tall_image(&mut t, 1);
+    for _ in 0..30 {
+        t.advance(b"\r\n");
+    }
+    let before = placement_rows(&t);
+    // One row tall, so a negative row is a row wholly in history.
+    assert!(before[0] < 0, "the picture should be in history by now");
+    let history = t.grid().scrollback_len();
+
+    t.advance(b"\x1b[2J");
+    assert_eq!(
+        t.grid().scrollback_len(),
+        history,
+        "ED 2 must not touch history"
+    );
+    assert_eq!(
+        placement_rows(&t),
+        before,
+        "ED 2 erased a picture it never covered"
+    );
+}
+
+#[test]
+fn clearing_the_screen_takes_the_pictures_on_it() {
+    // The other half: what ED 2 did cover goes with the cells it covered.
+    let mut t = term(10, 6);
+    place_tall_image(&mut t, 2);
+    assert_eq!(placement_rows(&t), vec![0]);
+
+    t.advance(b"\x1b[2J");
+    assert_eq!(t.graphics().placements().count(), 0);
+}
+
+#[test]
+fn a_scroll_region_below_the_top_leaves_the_rows_above_it_alone() {
+    // Text above a scroll region does not move, so a picture on it must not
+    // move either. Moving it slid the picture down into history that had not
+    // grown, where it was drawn over lines it was never placed on.
+    let mut t = term(10, 6);
+    place_tall_image(&mut t, 1);
+
+    t.advance(b"\x1b[2;5r"); // rows 2..5, one-based, so the picture is above it
+    t.advance(b"\x1b[5;1H");
+    for _ in 0..10 {
+        t.advance(b"\r\n");
+    }
+
+    assert_eq!(
+        t.grid().scrollback_len(),
+        0,
+        "a region below the top keeps no history"
+    );
+    assert_eq!(
+        placement_rows(&t),
+        vec![0],
+        "the picture followed a scroll it was not in"
+    );
+}
+
+#[test]
+fn a_picture_scrolled_out_of_a_region_below_the_top_is_gone() {
+    // Inside such a region there is nowhere for it to go: the lines leaving
+    // the top of the region are destroyed rather than archived, so a picture
+    // that follows them out has no text left to scroll back to.
+    let mut t = term(10, 6);
+    t.advance(b"\x1b[2;5r");
+    t.advance(b"\x1b[2;1H");
+    place_tall_image(&mut t, 2); // rows 1 and 2, inside the region
+    assert_eq!(placement_rows(&t), vec![1]);
+
+    t.advance(b"\x1b[5;1H");
+    t.advance(b"\r\n");
+    assert_eq!(placement_rows(&t), vec![0], "still half inside the region");
+    t.advance(b"\r\n");
+    assert_eq!(t.graphics().placements().count(), 0);
+    assert_eq!(t.grid().scrollback_len(), 0);
+}
+
+#[test]
 fn erasing_history_takes_the_pictures_that_were_in_it() {
     // ED 3 is the one place history shrinks without a row moving.
     let mut t = term(10, 4);

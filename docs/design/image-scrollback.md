@@ -190,6 +190,52 @@ it is not. `Terminal::scroll_up_with_graphics` does the clamp once and hands the
 same number to both, and is now the only way either line feed or `CSI S`
 scrolls.
 
+---
+
+## Which rows a scroll moves
+
+The old store took a single number and moved everything by it, which was
+survivable only because the row could not pass zero. With a row that can, two
+more things have to be got right, and both were found by measurement.
+
+**Only the region moves.** `CSI 2;5r` puts the scroll region below the top of
+the screen, and row 1 then sits still while rows 2 to 5 scroll under it. A
+picture on row 1 that moved anyway slid into a history that had not grown, and
+came back — drawn over lines it was never placed on — the moment anyone
+scrolled back. Measured before the fix: a picture placed at row 0, ten line
+feeds inside a `2;5` region, and the placement had walked to row −10 with
+scrollback still empty.
+
+**Where the lines went decides whether the picture survives them.**
+`Grid::scroll_up` archives a line only when the region starts at the top of the
+screen; out of any other region the line is destroyed. So a placement leaving
+the top of such a region is dropped rather than going negative — there is no
+text left for it to be scrolled back to.
+
+One case is easy to get backwards: when the region *does* start at the top,
+placements already in history have to move too. The line leaving the screen is
+pushed into scrollback underneath them, which puts every one of them a row
+further back.
+
+```rust
+let moved = (p.row as i64) < bottom
+    && (top == 0 || p.row as i64 + p.rows as i64 > top);
+```
+
+## What `clear` may take with it
+
+`ED 2` clears the screen and leaves scrollback alone — that is what makes
+`clear` a thing you can scroll back through. It used to empty the graphics
+store outright, which was true enough when no placement could be anywhere but
+the screen, and wrong the moment one can be in history: a `clear` between the
+greeting and now would take the greeting's picture with it, off lines it never
+touched. `GraphicsStore::clear_screen` drops the placements with a row on the
+screen and keeps the ones wholly behind it.
+
+It no longer frees the image data along with them. That is the same rule any
+other placement deletion follows — `a=d` frees pixels only when asked in
+capitals — and the pixels are still bounded by the store's byte budget.
+
 ## And the cells
 
 `place_at_cursor` tags every covered cell with a `GraphicsRef`, and those cells
@@ -217,15 +263,22 @@ already above the screen.
 
 ## Not in this change
 
-Two neighbouring gaps are real, older than this issue, and not made worse by
-it. They are noted here so the next person does not read the new code as
-claiming to have handled them.
+Three neighbouring gaps are real and not fixed here. They are written down so
+the next person does not read the new code as claiming to have handled them.
 
-- **Scrolling down does not move placements.** `CSI T` and reverse index push
-  text down the screen and leave pictures where they are. Getting this right
-  means moving only the placements inside the scroll region and leaving the
-  ones already in history alone, which is a rule of its own.
-- **A scroll region that does not start at row 0 moves every placement.**
-  `linefeed` calls into the graphics store whichever region scrolled, so a
-  picture outside the region moves anyway. It is dropped a little later than it
-  should be rather than never, which is the same shape of wrong it was before.
+- **Scrolling down does not move placements.** `CSI T`, reverse index, `IL` and
+  `DL` push text around the screen and leave pictures where they are. This is
+  older than the issue and unchanged by it; the rule it needs is the mirror of
+  `scroll_up` above, and it belongs with whoever writes it.
+- **The alternate screen still empties the store.** `swap_alt_screen` clears
+  every placement, so opening an editor destroys the pictures this change keeps
+  in the primary screen's history. The fix is a graphics store per screen,
+  swapped the way the grid is, and the question it has to answer first is what
+  a byte budget means when there are two of them. That is its own piece of
+  work, not a line in this one.
+- **A placement now lives for the depth of scrollback, not a screenful.**
+  Nothing bounds how many an application may stack on one row, so where the old
+  code dropped them within a screen of scrolling, the store can now hold them
+  for ten thousand lines. Each one is a few dozen bytes and one pass of a line
+  feed, and the renderer only sorts the ones on view, so this is a cost rather
+  than a leak — but the implicit cap is gone and nothing replaced it.
