@@ -21,6 +21,7 @@ use tos_session::{
 };
 use tos_system::audio::Volume;
 use tos_system::bluetooth::{Adapter, Connection, SystemControl};
+use tos_system::net::auto::{Autoconfigure, Step};
 use tos_system::net::{dhcp, Interface, Kind, Lease};
 use tos_system::power::PowerAction;
 use tos_system::Sysfs;
@@ -189,6 +190,27 @@ const BRING_UP: &str = "bring the link up";
 const TAKE_DOWN: &str = "take the link down";
 const REQUEST_ADDRESS: &str = "ask for an address";
 const JOIN: &str = "join a wireless network";
+
+/// How often the links are looked at on the machine's own behalf (#124).
+///
+/// The same second everything else about the machine is read on, for the same
+/// reason: a cable is plugged in by hand, and the loop is awake anyway.
+const AUTO_LOOK: Duration = Duration::from_secs(1);
+
+/// And how often behind a blank.
+///
+/// A blanked machine is left alone everywhere else in tOS — [`Machine::poll`]
+/// does not even read it, and its deadline is kept out of the wait — and this
+/// is the one exception, because the machine this whole path exists for is a
+/// machine with nobody at it, and a screen that blanked ten minutes ago is
+/// what that machine's screen has done. A cable plugged into it would
+/// otherwise wait for a keystroke that is never coming.
+///
+/// A minute, because that is [`BLANKED_TIMEOUT_MS`]: the dark loop already
+/// comes round that often to look at its signal flags, so this rides a
+/// wakeup that was going to happen and adds none. Asking for less would mean
+/// waking a sleeping machine more often to find the same cable still out.
+const AUTO_LOOK_BLANKED: Duration = Duration::from_millis(BLANKED_TIMEOUT_MS as u64);
 
 /// The right hand column of a row in the interface list.
 ///
@@ -359,6 +381,17 @@ pub struct Compositor {
     /// the link happen back here, on the thread that owns the [`Machine`],
     /// which is why nothing has to be shared but the answer.
     dhcp: Option<(String, mpsc::Receiver<io::Result<Lease>>)>,
+    /// The wired links brought up and addressed without anybody asking (#124).
+    ///
+    /// Policy only: what it decides is carried out through the same
+    /// `Network::bring_up` and [`Compositor::request_address`] a person's
+    /// keystroke goes through, so there is one way to get an address on this
+    /// machine and the automatic path is the menu with nobody at it.
+    auto: Autoconfigure,
+    /// When the links were last looked at on the machine's behalf, or `None`
+    /// before the first look — which is due immediately, because a machine
+    /// that has just booted is exactly the machine this is for.
+    auto_looked_at: Option<Instant>,
 }
 
 impl Compositor {
@@ -414,6 +447,8 @@ impl Compositor {
             clock,
             network_target: None,
             dhcp: None,
+            auto: Autoconfigure::new(),
+            auto_looked_at: None,
             // Read before `config` is moved in, and kept even when it says
             // nothing can be dropped to: `credentials_for` is what decides
             // that, at the pane, so that the rule lives in one place.
@@ -2439,6 +2474,58 @@ impl Compositor {
         }
     }
 
+    /// Bring the wired links up and get them addresses, with nobody asking.
+    ///
+    /// #124: `sshd` is listening three seconds into the boot and there is no
+    /// address for anybody to reach it at, because everything in the tree that
+    /// brings a link up is a menu row. This is the same two rows — "bring the
+    /// link up" and "ask for an address" — pressed by the machine itself, in
+    /// the order and on the links [`Autoconfigure`] chooses.
+    ///
+    /// The interfaces are read here rather than taken from the machine
+    /// reading, which holds one link and not the list, and which is not read
+    /// at all behind a blank. Both matter: a second card is a link this has
+    /// to see, and a blanked machine is the machine this is for.
+    fn autoconfigure(&mut self, now: Instant) -> bool {
+        let interval = if self.blanked {
+            AUTO_LOOK_BLANKED
+        } else {
+            AUTO_LOOK
+        };
+        if let Some(last) = self.auto_looked_at {
+            if now.saturating_duration_since(last) < interval {
+                return false;
+            }
+        }
+        self.auto_looked_at = Some(now);
+
+        let interfaces = self.machine.network().visible_interfaces();
+        let Some(step) = self.auto.next(&interfaces, self.dhcp.is_some()) else {
+            return false;
+        };
+        match step {
+            Step::BringUp(interface) => match self.machine.network().bring_up(&interface) {
+                // Said nothing about: nobody asked, so the answer is what is
+                // worth a line and "the switch is on" is not it. The address
+                // it leads to is announced by `collect_address`, exactly as it
+                // is when a person presses the row.
+                Ok(()) => self.machine.refresh(now),
+                // This one is said. A link that cannot be brought up is the
+                // whole reason a machine nobody is at is not on the network,
+                // and it is the only part of this path somebody could do
+                // something about.
+                Err(error) => {
+                    self.report_error(&format!("{interface} up"), error);
+                    true
+                }
+            },
+            Step::Ask(interface) => {
+                self.request_address(&interface);
+                true
+            }
+        }
+    }
+
     /// Start a DHCP acquisition on an interface.
     ///
     /// Everything that can be decided here is decided here, so that the
@@ -2921,6 +3008,14 @@ impl Compositor {
         // asked for and is waiting on, so it is collected even while the
         // screen is dark rather than left in the channel until it is woken.
         if self.collect_address() {
+            changed = true;
+        }
+        // And this is the same thing with nobody waiting on it: the links a
+        // person would have brought up by hand, brought up because nobody is
+        // there to do it. After `collect_address` rather than before it, so a
+        // lease that has just landed frees the client for the next link on
+        // the pass it lands on rather than a second later.
+        if self.autoconfigure(now) {
             changed = true;
         }
         changed
@@ -6362,6 +6457,20 @@ mod tests {
                 .file(&format!("{dir}/device/uevent"), "")
         }
 
+        /// The same interface with the switch on and a cable in it.
+        ///
+        /// `0x1` is `IFF_UP`, which is what `admin_up` reads, and `carrier`
+        /// is the file the kernel will not let anybody read on a link that is
+        /// down — so a fixture that says both is a link somebody has already
+        /// brought up and plugged in.
+        fn with_carrying_link(&self, mac: &str) -> &FakeMachine {
+            self.with_wired_link(mac);
+            let dir = format!("/sys/class/net/{FAKE_LINK}");
+            self.file(&format!("{dir}/flags"), "0x1003\n")
+                .file(&format!("{dir}/operstate"), "up\n")
+                .file(&format!("{dir}/carrier"), "1\n")
+        }
+
         /// A compositor whose every reader is pointed at this directory.
         ///
         /// Not [`compositor_with`], which pins `system_root` at a path that
@@ -6741,6 +6850,114 @@ mod tests {
         assert!(
             said.iter().any(|line| line.starts_with("tosfake0: ")),
             "it never said what happened: {said:?}"
+        );
+    }
+
+    #[test]
+    fn a_link_nobody_is_there_to_bring_up_is_brought_up_by_the_machine() {
+        // #124: the whole point is that no key is pressed. The fixture link
+        // is not a real device, so the ioctl fails — and that failure is the
+        // proof it was attempted, the same way it is for the menu row above.
+        let fake = FakeMachine::new("autoup");
+        fake.with_wired_link("aa:bb:cc:dd:ee:01");
+        let mut compositor = fake.compositor();
+
+        compositor.tick();
+
+        let said = compositor
+            .notifications
+            .status_line()
+            .expect("nothing was tried");
+        assert!(said.starts_with("tosfake0 up failed:"), "unhelpful: {said}");
+    }
+
+    #[test]
+    fn a_link_that_is_up_and_carrying_is_asked_for_an_address_by_the_machine() {
+        let fake = FakeMachine::new("autoask");
+        fake.with_carrying_link("aa:bb:cc:dd:ee:01");
+        let mut compositor = fake.compositor();
+
+        compositor.tick();
+
+        assert!(compositor.dhcp.is_some(), "nobody asked for an address");
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("asking for an address on tosfake0")
+        );
+
+        // Collect the answer rather than leaving the thread to outlive the
+        // test; the bind fails, which is the socket test above.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while compositor.dhcp.is_some() && Instant::now() < deadline {
+            compositor.tick();
+        }
+        assert!(compositor.dhcp.is_none(), "the answer never arrived");
+    }
+
+    #[test]
+    fn a_link_is_only_asked_once_however_many_frames_go_by() {
+        // A machine on a network with no DHCP server would otherwise spend
+        // every second of its life in a fifteen second conversation with
+        // nobody, and say so on the status line every time.
+        let fake = FakeMachine::new("autoonce");
+        fake.with_wired_link("aa:bb:cc:dd:ee:01");
+        let mut compositor = fake.compositor();
+
+        let start = Instant::now();
+        for second in 0..5 {
+            compositor.tick_at(start + Duration::from_secs(second));
+        }
+
+        let tries = compositor
+            .notifications
+            .history()
+            .filter(|notification| notification.text().starts_with("tosfake0 up failed:"))
+            .count();
+        assert_eq!(tries, 1, "it kept asking a kernel that had said no");
+    }
+
+    #[test]
+    fn a_blanked_machine_still_gets_itself_on_to_the_network() {
+        // The one place in tOS that looks at a machine whose screen is dark,
+        // because a machine with nobody at it is what this is for: a cable
+        // plugged into a server ten minutes after it booted must not wait for
+        // a keystroke nobody is coming to make.
+        let fake = FakeMachine::new("autoblank");
+        fake.with_wired_link("aa:bb:cc:dd:ee:01");
+        let mut compositor = fake.compositor();
+        compositor.blanked = true;
+
+        let start = Instant::now();
+        compositor.tick_at(start);
+        let said = compositor
+            .notifications
+            .status_line()
+            .expect("a dark screen meant a machine left off the network");
+        assert!(said.starts_with("tosfake0 up failed:"), "unhelpful: {said}");
+    }
+
+    #[test]
+    fn a_blanked_machine_is_looked_at_once_a_minute_rather_than_every_second() {
+        let fake = FakeMachine::new("autoslow");
+        fake.with_wired_link("aa:bb:cc:dd:ee:01");
+        let mut compositor = fake.compositor();
+        compositor.blanked = true;
+
+        let start = Instant::now();
+        compositor.tick_at(start);
+        compositor.auto_looked_at = Some(start);
+
+        compositor.tick_at(start + Duration::from_secs(59));
+        assert_eq!(
+            compositor.auto_looked_at,
+            Some(start),
+            "a dark screen was read every second after all"
+        );
+        compositor.tick_at(start + Duration::from_secs(60));
+        assert_ne!(
+            compositor.auto_looked_at,
+            Some(start),
+            "a dark screen was never read again"
         );
     }
 

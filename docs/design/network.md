@@ -353,22 +353,54 @@ that `OverlayKind` stays a `Copy` tag: it is copied out of the open overlay on
 every keystroke that closes one, and the other five menus should not start
 paying for a payload they have not got.
 
-### Asking is explicit, and does not happen on its own
+### Asking is explicit at the menu, and automatic for a wired link — [#124](https://github.com/m96-chan/tOS/issues/124)
 
-The issue's wording is "DHCP on link-up is enough to start", which is a
-statement about scope rather than a trigger. Bringing a link up and asking it
-for an address are two rows, not one, and nothing watches the poll for a
-carrier appearing.
+The issue's wording is "DHCP on link-up is enough to start", which was read
+here as a statement about scope rather than a trigger, and for a while nothing
+watched the poll for a carrier appearing: bringing a link up and asking it for
+an address were two rows a person pressed, and a machine nobody pressed them
+on had no network.
 
-Doing it automatically is a policy, and it is the wrong one to take unasked.
-A machine on a segment with no DHCP server would spend fifteen seconds per
-link every time a cable moved; a machine given a static address by hand would
-have it taken away by a cable being replugged; and a laptop with a cable and a
-radio would race to configure both. When there is a reason to add it — the
-obvious one is a first boot that should reach the network without anybody
-learning a key binding — it is a carrier transition seen in `Machine::poll`
-calling the same `request_address` the menu row calls, and the decision to
-make is which links it is allowed to do it to, not how.
+What settled it was [#110](https://github.com/m96-chan/tOS/issues/110) landing.
+A tOS machine can install `openssh-server` now, and it does everything right —
+the unit is enabled, `sshd` is listening three seconds into the boot, nothing
+has failed — on a machine with no address for anybody to reach it at. The only
+way to one was to sit down at the console, log in, and press the two rows. A
+machine that has to be physically logged into before it can be reached over
+the network is not a machine anything can be served from, and a daemon with no
+network is the same as no daemon.
+
+So it happens by itself, in `tos-system`'s `net::auto`. The three objections
+that held it back were real, and each one is a rule rather than a reason not
+to:
+
+| Objection | The rule that answers it |
+|---|---|
+| Fifteen seconds per link every time a cable moves | One acquisition per carrier, not per poll: a server that does not answer costs one conversation, on a thread, and the next one needs the cable pulled out and put back |
+| A static address taken away by a replug | Nothing is ever done to a link that already holds a routable address, wherever it came from |
+| A laptop racing to configure a cable and a radio | Wired links only — there is no supplicant, so a radio brought up has nothing to associate with — and one acquisition at a time |
+
+The policy is separate from the mechanism, which is what makes it a table test
+rather than a machine with two cards in it: `Autoconfigure::next` is handed the
+interfaces as they were last read and answers with at most one step, and the
+compositor carries it out through the same `Network::bring_up` and
+`Compositor::request_address` the menu rows go through. There is one way to
+get an address on this machine, and the automatic path is the menu with nobody
+at it.
+
+Two smaller decisions come with it. Bringing a link up is not announced —
+nobody asked, so the address it leads to is the answer worth a line, and
+`collect_address` says that one exactly as it does for a keystroke — while a
+link the kernel *refuses* to bring up is announced, because that is the whole
+reason the machine is not reachable and the only part of the path a person can
+do anything about. And a blanked screen is looked at anyway, once a minute
+instead of once a second: `Machine::poll` leaves a dark machine alone on the
+grounds that there is nothing on the screen to be out of date, which is right
+for a battery and wrong for the one thing here that is not about the screen at
+all. A cable plugged into a server whose screen went dark ten minutes ago must
+not wait for a keystroke nobody is coming to make. A minute rather than a
+number of its own because the dark loop already wakes on that interval to read
+its signal flags, so this costs no wakeup that was not going to happen.
 
 ### The DHCP request is on a thread
 
@@ -423,6 +455,7 @@ status line.
 |---|---|
 | Interface and link state in the status interface | already done by `system.rs`'s poll (#66) |
 | Wired: DHCP on link-up | acquisition, address, netmask, route, `resolv.conf` |
+| Wired: brought up and addressed at boot | `net::auto`, once per carrier, wired only (#124) |
 | Wired: lease renewal | **not built** — see above for what it takes |
 | Wi-Fi: supplicant decision | wpa_supplicant, recorded above |
 | Wi-Fi: scan / join | **not built**; #20 landed, so what is left is firmware and a radio to test against |
