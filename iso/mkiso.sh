@@ -758,6 +758,26 @@ ExecStart=/sbin/wpa_supplicant -Dnl80211 -i%I -c/etc/wpa_supplicant/tos-%I.conf
 Restart=on-failure
 EOF
 
+# And Debian's own `wpa_supplicant.service` masked, for the same reason the
+# unit above is not Debian's: tOS runs one supplicant per radio, started when
+# the radio appears, and has no use for the singleton the package enables.
+#
+# Left alone it does not merely sit idle — it fails, on every boot, in red.
+# Its `ExecStart` is `wpa_supplicant -u`, the D-Bus interface, and this image
+# ships no D-Bus: `dpkg -l dbus` says `un`, so `/run/dbus/system_bus_socket`
+# is not there and the supplicant exits 255 before it has looked at any
+# hardware. Its `After=dbus.service` is no guard, because ordering against a
+# unit that does not exist is satisfied by there being nothing to wait for.
+#
+# Masking rather than a drop-in that drops the `-u`. A drop-in would leave a
+# second supplicant running beside the per-radio ones, owning the same control
+# sockets under /run/wpa_supplicant that `tos_system::net::wpa` connects to —
+# which is the thing this image already decided it did not want. Nothing here
+# consumes wpa_supplicant's D-Bus API; the client speaks to the control
+# socket. A machine that booted correctly should say nothing on its way in
+# (#129), and this was saying `[FAILED]` (#140).
+ln -sf /dev/null "$ROOTFS/etc/systemd/system/wpa_supplicant.service"
+
 # What starts it. `DEVTYPE=wlan` is how the kernel's cfg80211 announces a
 # wireless interface and how this rule tells one from the wired cards
 # iso/init's drivers bring up; TAG+="systemd" is what makes systemd create a
