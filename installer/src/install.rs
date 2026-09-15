@@ -1826,6 +1826,34 @@ mod tests {
     }
 
     #[test]
+    fn the_prompt_wears_the_session_s_own_green() {
+        // #141. The prompt kept a blue for a release after everything else tOS
+        // draws moved to the picture's green, and it kept it for a plain
+        // reason: the colour lives in a shell file and the theme lives in
+        // Rust, and nothing held the two together. This is the thing that
+        // holds them — not a copy of the number, a comparison against it.
+        let accent = tos_compositor::chrome::ACCENT;
+        let wanted = format!("38;2;{};{};{}", accent.r, accent.g, accent.b);
+        assert!(
+            BASHRC.contains(&wanted),
+            "the prompt should name the accent as {wanted}"
+        );
+        // On the prompt itself, and as a true colour rather than an index:
+        // the 256 are what applications ask for by name and are not tOS's to
+        // theme. Read from the line and not from the file, or the note above
+        // it naming the colour it used to be would answer for it.
+        let prompt = BASHRC
+            .lines()
+            .find(|line| line.starts_with("PS1="))
+            .expect("a prompt");
+        assert!(prompt.contains(&wanted), "{prompt}");
+        assert!(
+            !prompt.contains("38;5;110"),
+            "the prompt still asks for the old blue by palette index: {prompt}"
+        );
+    }
+
+    #[test]
     fn only_the_quiet_entry_stops_painting_the_kernel_s_errors() {
         // `quiet` leaves the console loglevel at 4, and `KERN_ERR` is 3, so a
         // driver logging an error on the way in prints over a boot that is

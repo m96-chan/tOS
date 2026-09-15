@@ -29,7 +29,20 @@ shopt -s checkwinsize
 # with colour in it is safe here in a way it would not be on a terminal that
 # has to be guessed at. Colours are set with \[ \] around them so bash knows
 # they take no width; without that, recalling a long line wraps wrongly.
-PS1='\[\e[38;5;110m\]\u@\h\[\e[0m\]:\[\e[38;5;180m\]\w\[\e[0m\]\$ '
+#
+# The name is the session's own green, #92f980 — `Chrome::ACCENT`, the green of
+# the tOS in the picture a machine opens with, and what every highlight tOS
+# draws is in since #136. Written as a true colour rather than as an index into
+# the 256, because the palette is what applications ask for by name and is not
+# tOS's to theme (`docs/design/splash.md`); this file is tOS's own, shipped as
+# /root/.bashrc and /etc/skel/.bashrc, so the colour in it is tOS choosing one
+# for something tOS ships. It used to be 38;5;110 — #87afd7 — which left the
+# line a person reads all day as the last blue on the machine (#141).
+#
+# The path keeps its own colour. One themed thing and one neutral one is what
+# the rest of the chrome does: the accent marks what the session is pointing
+# at, and a prompt in two accents points at nothing.
+PS1='\[\e[38;2;146;249;128m\]\u@\h\[\e[0m\]:\[\e[38;5;180m\]\w\[\e[0m\]\$ '
 
 alias ls='ls --color=auto'
 alias grep='grep --color=auto'
