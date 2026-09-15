@@ -228,13 +228,28 @@ mknod -m 666 "$ROOT/dev/null" c 1 3
 # at 25,925,814 bytes before and 26,558,126 after. Nothing here is firmware:
 # r8169 asks for rtl_nic blobs this image does not carry, so a Realtek card
 # that needs one gets whatever its PHY does by default, which is untested.
+# And `autofs4`, which is not hardware and is not for /init. systemd loads it
+# itself at startup — `kmod-setup` carries a fixed list, and autofs is on it
+# because automounts have to work before udev has made any device nodes — and
+# it fails, because there is no module tree on the rootfs at all and never will
+# be (see the note beside /lib/modules below). A machine that booted correctly
+# has said `Failed to find module 'autofs4'` on its way in ever since systemd
+# became PID 1, followed by an `[UNSUPP]` for the one automount unit Debian
+# ships (#129).
+#
+# Loading it here is what makes both go away, and it is the only place it can
+# be loaded from: the module exists only while the initramfs does. systemd
+# skips its own load when `/sys/class/misc/autofs` already exists, which is
+# what a loaded autofs creates, so the check passes silently and the automount
+# is supported rather than unsupported. Nothing else changes — the rootfs keeps
+# no modules, and this costs the one module.
 MODULES="bochs virtio_gpu simpledrm cirrus vmwgfx vboxvideo \
     evdev atkbd i8042 psmouse virtio_input hid_generic usbhid virtio_pci \
     sd_mod sr_mod cdrom ata_piix ahci libahci virtio_blk virtio_scsi \
     nvme usb_storage uas xhci_pci ehci_pci ohci_pci sdhci_pci mmc_block \
     virtio_net e1000 e1000e r8169 igb \
     isofs ext4 vfat nls_cp437 nls_iso8859_1 nls_ascii \
-    crc32c_generic crc32c_intel"
+    crc32c_generic crc32c_intel autofs4"
 # The rootfs stack, kept in its own list because it is not about what hardware
 # the machine has: these three are how /init turns one read-only file on the
 # medium into a writable Debian. `loop` makes the squashfs a block device,
@@ -796,7 +811,7 @@ set timeout=10
 set default=0
 
 menuentry "tOS" {
-    linux /boot/vmlinuz console=ttyS0 console=tty0 sysctl.kernel.sysrq=438 quiet
+    linux /boot/vmlinuz console=ttyS0 console=tty0 sysctl.kernel.sysrq=438 quiet loglevel=3
     initrd /boot/initramfs.gz
 }
 

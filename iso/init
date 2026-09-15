@@ -128,7 +128,7 @@ for mod in bochs virtio_gpu simpledrm cirrus vmwgfx vboxvideo \
     nvme usb_storage uas xhci_pci ehci_pci ohci_pci sdhci_pci mmc_block \
     virtio_pci virtio_net e1000 e1000e r8169 igb \
     isofs ext4 vfat nls_cp437 nls_iso8859_1 nls_ascii \
-    crc32c_generic crc32c_intel \
+    crc32c_generic crc32c_intel autofs4 \
     loop squashfs overlay; do
     modprobe "$mod" 2>/dev/null
 done
