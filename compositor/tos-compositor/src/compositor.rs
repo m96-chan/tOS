@@ -4656,12 +4656,24 @@ mod tests {
         });
         let mut framebuffer = tos_render::OwnedFramebuffer::new(640, 360);
         let accent = compositor.chrome.accent.pack();
+        // The top right corner, which is where the banner draws and the one
+        // corner nothing else draws in — see `notify::draw_banner`. The whole
+        // frame would be the wrong place to look: the block cursor in a pane
+        // is the accent colour too, and it sits at the other end of that row.
+        let (_, ch) = compositor.cell_size();
+        let corner = |framebuffer: &tos_render::OwnedFramebuffer| {
+            (0..ch)
+                .flat_map(|y| (320..640).map(move |x| (x, y)))
+                .filter(|&(x, y)| framebuffer.pixel(x, y) == accent)
+                .count()
+        };
         {
             let mut surface = framebuffer.surface();
             compositor.render_frame(&mut surface, false);
         }
-        assert!(
-            !framebuffer.pixels().contains(&accent),
+        assert_eq!(
+            corner(&framebuffer),
+            0,
             "nothing should be in the accent colour yet"
         );
 
@@ -4671,10 +4683,7 @@ mod tests {
             let mut surface = framebuffer.surface();
             compositor.render_frame(&mut surface, false);
         }
-        assert!(
-            framebuffer.pixels().contains(&accent),
-            "the notification was not drawn"
-        );
+        assert!(corner(&framebuffer) > 0, "the notification was not drawn");
     }
 
     // ---- workspace rename -----------------------------------------------

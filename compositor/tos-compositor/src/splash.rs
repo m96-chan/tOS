@@ -218,6 +218,44 @@ mod tests {
     }
 
     #[test]
+    fn the_sessions_colours_are_colours_the_picture_is_drawn_in() {
+        // The accent and the attention colour are not decoration picked to go
+        // with the picture; they are taken out of it — the `tOS` and the
+        // prompt for one, the streak in the hair for the other. Replacing the
+        // picture with something else is allowed and does not have to keep
+        // this true, but replacing *this* picture without moving the colours
+        // would quietly separate the two, and this is what would say so.
+        let splash = shipped();
+        for (name, colour) in [
+            ("accent", crate::chrome::ACCENT),
+            ("attention", crate::chrome::ATTENTION),
+        ] {
+            let nearest = splash
+                .rgba
+                .chunks_exact(4)
+                .filter(|px| px[3] >= 250)
+                .map(|px| {
+                    [
+                        px[0].abs_diff(colour.r),
+                        px[1].abs_diff(colour.g),
+                        px[2].abs_diff(colour.b),
+                    ]
+                    .into_iter()
+                    .max()
+                    .unwrap_or(u8::MAX)
+                })
+                .min()
+                .expect("the picture has opaque pixels");
+            // Eight, because the shipped picture is a resize of the drawing
+            // and a resize moves a colour by a little.
+            assert!(
+                nearest <= 8,
+                "the {name} colour is {nearest} away from anything in the picture"
+            );
+        }
+    }
+
+    #[test]
     fn a_picture_grows_in_whole_multiples() {
         let splash = shipped();
         let (w, h) = (splash.width, splash.height);

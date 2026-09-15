@@ -163,6 +163,39 @@ installer carries it onto the disk with the rest of `/etc`. A machine that
 replaces it has replaced both screens at once, which is the point of there
 being one file rather than two.
 
+## The colours the session is drawn in
+
+The picture is not only on two screens; it is where the session's colours come
+from. tOS was blue — `#5f87d7`, an accent nothing else on the machine used —
+and the picture has two colours of its own that are better answers.
+
+| | | where it is in the picture |
+|---|---|---|
+| accent | `#92f980` | the `tOS`, and the `$ _` under it |
+| attention | `#cd3f73` | the streak in the hair beside them |
+
+**The green is everything tOS highlights on its own chrome**: the focused
+pane's divider, the workspace block on the status bar, the row under the
+cursor in a menu, the login screen's box and its field, the installer's frame
+titles and its ticks, and the block cursor in a pane. One colour, so the
+brightest thing on the screen is always the thing the session is pointing at,
+and it is the colour the machine introduced itself in thirty seconds earlier.
+
+**The red is the one highlight drawn over somebody else's output**: selected
+text. `Chrome::selection` existed for this and had always fallen back to the
+accent; now it is the one field the default fills in, because a light green
+block behind a program's own output hides what it is highlighting. The rule
+that decides which colour a highlight gets is whose pixels are underneath it.
+
+What did *not* change is the sixteen palette entries. Those are what
+applications ask for by name — `\x1b[34m` is blue because the program that
+wrote it means blue — and they are not tOS's to theme. The block under the
+cursor is tOS drawing, which is why that one moved.
+
+The banner in `.motd_art` moved with them: the `tOS` is drawn in a green
+gradient from the picture's green down, in a box the colour of the streak. It
+is the same two colours reaching the terminals that never see the picture.
+
 ## What this is not
 
 Not a boot splash. The kernel messages before the compositor starts are still

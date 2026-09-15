@@ -900,10 +900,18 @@ fn banner_fits(lines: &[Vec<motd::Run>], area: Rect, top: u16) -> bool {
 /// The rows `draw_welcome` needs under the banner, dry run note included.
 const WELCOME_ROWS: u16 = 10;
 
-const ACCENT: Color = Color::rgb(0x5f, 0x87, 0xd7);
+/// The session's own colour, which the installer is a program in: the green
+/// of the `tOS` in the picture a machine opens with, and of the prompt under
+/// it. A copy rather than a use of `tos_compositor::chrome::ACCENT`, because
+/// the installer does not depend on the compositor and should not start to
+/// over one number.
+const ACCENT: Color = Color::rgb(0x92, 0xf9, 0x80);
 const DANGER: Color = Color::rgb(0xff, 0x7b, 0x7b);
 const WARN: Color = Color::rgb(0xc7, 0xa1, 0x4f);
-const GOOD: Color = Color::rgb(0x87, 0xdf, 0x87);
+/// A step that finished. The accent, rather than a second green a shade away
+/// from it: there is one green in a tOS session and a tick is not a different
+/// kind of good news from a heading.
+const GOOD: Color = ACCENT;
 const FIELD: Color = Color::rgb(0x2c, 0x2c, 0x34);
 
 /// Convenience for building a key press.

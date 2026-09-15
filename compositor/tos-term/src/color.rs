@@ -115,7 +115,11 @@ impl Palette {
             colors,
             foreground: Rgb::new(0xd0, 0xd0, 0xd0),
             background: Rgb::new(0x10, 0x10, 0x12),
-            cursor: Rgb::new(0x87, 0xb7, 0xff),
+            // The session's own green, which is the `tOS` and the prompt in
+            // the picture a machine opens with. Not palette entry 12: the
+            // sixteen are what applications ask for by name and are not tOS's
+            // to theme, where the block under the cursor is tOS drawing.
+            cursor: Rgb::new(0x92, 0xf9, 0x80),
             cursor_text: Rgb::new(0x10, 0x10, 0x12),
         }
     }
