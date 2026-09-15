@@ -270,14 +270,15 @@ the next person does not read the new code as claiming to have handled them.
   `DL` push text around the screen and leave pictures where they are. This is
   older than the issue and unchanged by it; the rule it needs is the mirror of
   `scroll_up` above, and it belongs with whoever writes it.
-- **The alternate screen still empties the store.** `swap_alt_screen` clears
+- **The alternate screen still empties the store**
+  ([#145](https://github.com/m96-chan/tOS/issues/145)). `swap_alt_screen` clears
   every placement, so opening an editor destroys the pictures this change keeps
   in the primary screen's history. The fix is a graphics store per screen,
   swapped the way the grid is, and the question it has to answer first is what
   a byte budget means when there are two of them. That is its own piece of
   work, not a line in this one.
-- **A placement now lives for the depth of scrollback, not a screenful.**
-  Nothing bounds how many an application may stack on one row, so where the old
+- **A placement now lives for the depth of scrollback, not a screenful**
+  ([#146](https://github.com/m96-chan/tOS/issues/146)). Nothing bounds how many an application may stack on one row, so where the old
   code dropped them within a screen of scrolling, the store can now hold them
   for ten thousand lines. Each one is a few dozen bytes and one pass of a line
   feed, and the renderer only sorts the ones on view, so this is a cost rather
