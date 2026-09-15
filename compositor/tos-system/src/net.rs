@@ -30,8 +30,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::sysfs::Sysfs;
 
+pub mod auto;
 pub mod dhcp;
 
+pub use auto::{Autoconfigure, Step};
 pub use dhcp::Lease;
 
 /// What an interface is, which is mostly a question of what to show a person.
