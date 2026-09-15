@@ -49,6 +49,9 @@ fn built(name: &str, command: &[&str], gated: bool) -> Compositor {
         inactive_fade: 0,
         credential: path,
         credential_user: ACCOUNT.into(),
+        // The picture tOS ships, never one the machine running the tests
+        // happens to have put in /etc.
+        splash: "/nonexistent".into(),
         gated,
         ..Config::default()
     };
@@ -323,4 +326,53 @@ fn a_locked_screen_paints_no_arrow() {
     move_pointer(&mut c, 20.0, 20.0);
     render_onto(&mut c, &mut framebuffer);
     assert!(!ink_in(&framebuffer, CORNER, CORNER_SIDE, background));
+}
+
+#[test]
+fn the_login_screen_has_the_picture_over_it_and_a_lock_does_not() {
+    // #132. The screen that opens the machine says what the machine is; the
+    // one guarding a session says nothing it did not say before, because
+    // there is a session behind it and its job is to be answered.
+    //
+    // A picture is the one thing on either screen that is drawn in pixels
+    // rather than cells, and that is what this counts: the box, the rule and
+    // the text are three colours between them, and a picture is thousands.
+    let mut framebuffer = OwnedFramebuffer::new(SIZE.0, SIZE.1);
+
+    let mut c = console("picture-login");
+    assert!(
+        c.is_locked(),
+        "a console came up without asking who was there"
+    );
+    render_onto(&mut c, &mut framebuffer);
+    let over_the_box = colours_above_the_box(&framebuffer);
+    assert!(
+        over_the_box > 1000,
+        "the login screen has {over_the_box} colours over its box, so no picture"
+    );
+
+    let mut c = compositor("picture-lock", &["/bin/sh", "-c", "sleep 30"]);
+    c.inject(b"SECRET-IN-A-PANE");
+    assert!(c.lock_session());
+    render_onto(&mut c, &mut framebuffer);
+    let over_the_box = colours_above_the_box(&framebuffer);
+    assert!(
+        over_the_box < 16,
+        "the locked box has {over_the_box} colours over it, which is a picture"
+    );
+}
+
+/// How many distinct colours are on the top half of the display.
+///
+/// The box sits in the middle and the picture goes above it, so this counts
+/// the picture and the top border of the box and nothing else. A box on its
+/// own brings a handful of colours here; a picture brings thousands.
+fn colours_above_the_box(framebuffer: &OwnedFramebuffer) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    for y in 0..SIZE.1 / 2 {
+        for x in 0..SIZE.0 {
+            seen.insert(framebuffer.pixel(x, y));
+        }
+    }
+    seen.len()
 }
