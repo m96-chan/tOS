@@ -265,24 +265,17 @@ already above the screen.
 
 ## Not in this change
 
-Two neighbouring gaps are real and not fixed by the work above. They are
-written down so the next person does not read the code as claiming to have
-handled them.
+One neighbouring gap is real and not fixed by the work above. It is written
+down so the next person does not read the code as claiming to have handled it.
 
 - **Scrolling down does not move placements.** `CSI T`, reverse index, `IL` and
   `DL` push text around the screen and leave pictures where they are. This is
   older than the issue and unchanged by it; the rule it needs is the mirror of
   `scroll_up` above, and it belongs with whoever writes it.
-- **A placement now lives for the depth of scrollback, not a screenful**
-  ([#146](https://github.com/m96-chan/tOS/issues/146)). Nothing bounds how many
-  an application may stack on one row, so where the old code dropped them within
-  a screen of scrolling, the store can now hold them for ten thousand lines.
-  Each one is a few dozen bytes and one pass of a line feed, and the renderer
-  only sorts the ones on view, so this is a cost rather than a leak — but the
-  implicit cap is gone and nothing replaced it.
 
-A third was on this list and has since been dealt with: the alternate screen
-emptying the store, which is the section below.
+Two more were on this list and have since been dealt with, in the two sections
+below: the alternate screen emptying the store, and the cap that keeping
+placements for the depth of scrollback took away.
 
 ---
 
@@ -344,3 +337,65 @@ resize taken inside an editor does not destroy the shell's newest output behind
 it. Its placements have to travel the same distance, or the primary screen comes
 back with its pictures sitting on the wrong lines. `Terminal::resize` now shifts
 and prunes both stores against their own grid's shift and history.
+
+---
+
+## How many placements a pane may hold
+
+**Issue [#146](https://github.com/m96-chan/tOS/issues/146).** Before #139 a
+placement was dropped within a screenful of scrolling, so a pane held at most a
+screen's worth however many an application sent. That cap was an accident of the
+bug — the drop test was "has it left the visible screen" — and fixing the bug
+removed it.
+
+Nothing else replaced it, and nothing says a program may not stack placements on
+one row. `a=p` is about twenty-five bytes, so a few megabytes down a pty buys a
+hundred thousand of them, and they then sit there for ten thousand lines of
+history. Measured on a release build, an 80x24 pane, a thousand line feeds:
+
+```text
+placements=      0    0.92 µs per line feed
+placements=   1000    1.95 µs
+placements=   5000    7.32 µs
+placements=  20000   31.07 µs
+placements= 100000  141.76 µs
+```
+
+About 1.4 ns each, which is cheap and is paid on every line of output for as
+long as the placements live. A hundred and fifty times the cost of a line feed,
+bought with two and a half megabytes, and it does not go away — that is worth a
+bound even though it is neither a leak nor a crash.
+
+### The bound
+
+`MAX_PLACEMENTS` is 8192, chosen as the cost it buys: a line feed stays around
+ten microseconds however hard a program tries. It is also more than any pane has
+cells, so nothing that placed one picture per cell of what is on screen can
+reach it.
+
+What goes is what is furthest from the screen — the lowest bottom row, which is
+the picture nearest to falling out of scrollback on its own. Dropping it is the
+closest thing to what was going to happen anyway. Ties break by placement id,
+which matters because the usual case *is* a tie: stacking happens on one row. So
+the oldest of a pile is the first out of it, and a placement just made can never
+evict the thing that made it.
+
+Pruning goes down to a low-water mark of seven eighths of the cap rather than to
+the cap itself, so the O(n) pass is paid once every eighth of the cap rather
+than on every placement past it.
+
+### What it actually bought
+
+The same measurement with the cap in place:
+
+```text
+sent=      0  held=   0   0.91 µs per line feed
+sent=   1000  held=1000   1.60 µs
+sent=  20000  held=7700  10.78 µs
+sent= 100000  held=7750  13.99 µs
+```
+
+The renderer gets it too. `draw_graphics` filters to what the viewport can show
+before sorting, but a hundred thousand placements stacked on one visible row are
+all on view: that was a sort of a hundred thousand every frame, and is now a
+sort of eight thousand at worst.

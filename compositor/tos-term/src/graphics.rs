@@ -620,6 +620,40 @@ impl Image {
     }
 }
 
+/// How many placements one screen may hold at once.
+///
+/// Until [#139] a placement was dropped within a screenful of scrolling,
+/// which capped the store at however many rows a screen had whatever an
+/// application sent. Keeping them for as long as their lines are in scrollback
+/// removed that cap, and nothing says a program may not stack a thousand of
+/// them on one row: `a=p` is about twenty-five bytes, so a few megabytes down
+/// a pty buys a hundred thousand placements that then sit there for ten
+/// thousand lines of history.
+///
+/// They are cheap individually — 44 bytes, and one pass of a line feed — but
+/// the pass is what matters, because it is paid on every line of output
+/// forever after. Measured on a release build, 80x24, a thousand line feeds:
+///
+/// ```text
+/// placements=      0   0.92 µs per line feed
+/// placements=   1000   1.95 µs
+/// placements=   5000   7.32 µs
+/// placements=  20000  31.07 µs
+/// placements= 100000 141.76 µs
+/// ```
+///
+/// About 1.4 ns each, so this number is chosen as the cost it buys: 8192
+/// holds a line feed to roughly ten microseconds however hard a program tries.
+/// It is also comfortably more than any pane has cells, so nothing that placed
+/// one picture per cell of what is on screen can reach it.
+///
+/// [#139]: https://github.com/m96-chan/tOS/issues/139
+pub const MAX_PLACEMENTS: usize = 8192;
+
+/// What a prune leaves behind, so that the scan is not paid on every placement
+/// past the cap — one pass every `MAX_PLACEMENTS / 8` of them instead.
+const PLACEMENT_LOW_WATER: usize = MAX_PLACEMENTS - MAX_PLACEMENTS / 8;
+
 /// An image placed on the grid.
 #[derive(Debug, Clone)]
 pub struct Placement {
@@ -842,7 +876,37 @@ impl GraphicsStore {
                 z_index: cmd.z_index,
             },
         );
+        self.evict_to_placement_cap();
         Some(id)
+    }
+
+    /// Drop placements until the store is back under [`MAX_PLACEMENTS`].
+    ///
+    /// What goes is what is furthest from the screen — the picture nearest to
+    /// falling out of scrollback on its own, which is the one whose loss is
+    /// closest to what was going to happen anyway. Ties, which are the usual
+    /// case because stacking happens on one row, go by placement id, so the
+    /// oldest of a pile is the first out of it and a placement just made
+    /// cannot evict itself.
+    ///
+    /// Pruning down to a low-water mark rather than to the cap is what keeps
+    /// this from being an O(n) scan on every placement past it: one pass every
+    /// eighth of the cap, which is a handful of operations amortised.
+    fn evict_to_placement_cap(&mut self) {
+        if self.placements.len() <= MAX_PLACEMENTS {
+            return;
+        }
+        // The key is unique, so the nth element is an exact cut rather than a
+        // threshold a run of equal rows could land either side of.
+        let mut keys: Vec<(i64, u32)> = self
+            .placements
+            .values()
+            .map(|p| (p.row as i64 + p.rows as i64, p.id))
+            .collect();
+        let cut = keys.len() - PLACEMENT_LOW_WATER;
+        let (_, &mut keep_from, _) = keys.select_nth_unstable(cut);
+        self.placements
+            .retain(|_, p| (p.row as i64 + p.rows as i64, p.id) >= keep_from);
     }
 
     /// Handle `a=d`. Returns true when the screen needs repainting.
@@ -2440,6 +2504,70 @@ mod tests {
         assert_eq!(rows_of(&store), vec![-4]);
         store.retain_rows(10);
         assert_eq!(store.placements().count(), 1);
+    }
+
+    /// Place `n` more copies of the store's image, each with its own
+    /// placement id so none replaces another, at `row`.
+    fn stack_placements(store: &mut GraphicsStore, n: usize, row: u16) {
+        for k in 0..n {
+            let cmd = GraphicsCommand::parse(
+                format!("a=p,i=1,p={}", store.placements().count() + k + 1).as_bytes(),
+            )
+            .unwrap();
+            store.place(&cmd, 1, 0, row, 8, 16);
+        }
+    }
+
+    #[test]
+    fn a_pane_cannot_be_made_to_hold_unboundedly_many_placements() {
+        // `a=p` is about twenty-five bytes, and since placements started
+        // living for the depth of scrollback nothing dropped them early. A few
+        // megabytes down a pty bought a hundred thousand of them and a line
+        // feed that cost a hundred and fifty times what it should.
+        let mut store = store_with_placement(1);
+        stack_placements(&mut store, MAX_PLACEMENTS * 3, 0);
+        assert!(
+            store.placements().count() <= MAX_PLACEMENTS,
+            "held {} placements",
+            store.placements().count()
+        );
+        assert!(
+            store.placements().count() >= PLACEMENT_LOW_WATER,
+            "pruned further than the low-water mark"
+        );
+    }
+
+    #[test]
+    fn the_cap_drops_what_is_furthest_from_the_screen_first() {
+        // The one nearest to falling out of scrollback on its own, so what the
+        // cap does is what the scrollback was going to do anyway.
+        let mut store = store_with_placement(1);
+        // One in history, well behind everything else, and a screen full.
+        store.shift_rows(-40, 40);
+        let doomed: Vec<u32> = store.placements().map(|p| p.id).collect();
+        assert_eq!(doomed.len(), 1);
+        stack_placements(&mut store, MAX_PLACEMENTS, 5);
+
+        let live: Vec<u32> = store.placements().map(|p| p.id).collect();
+        assert!(
+            !live.contains(&doomed[0]),
+            "the picture furthest back survived a prune"
+        );
+    }
+
+    #[test]
+    fn a_placement_just_made_is_never_the_one_the_cap_drops() {
+        // Everything on one row, so the tie-break decides it all: newest id
+        // wins, which is what stops a program from placing a picture and being
+        // handed an id that no longer exists.
+        let mut store = store_with_placement(1);
+        stack_placements(&mut store, MAX_PLACEMENTS * 2, 0);
+        let cmd = GraphicsCommand::parse(b"a=p,i=1,p=999999").unwrap();
+        let id = store.place(&cmd, 1, 0, 0, 8, 16).unwrap();
+        assert!(
+            store.placement(id).is_some(),
+            "the placement evicted the one that made it"
+        );
     }
 
     #[test]

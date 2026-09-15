@@ -20,7 +20,7 @@ members = [
 version = "0.0.7"
 edition = "2021"
 rust-version = "1.75"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/m96-chan/tOS"
 
 [workspace.dependencies]
