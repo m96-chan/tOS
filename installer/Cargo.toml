@@ -23,4 +23,6 @@ tos-term = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+tos-compositor = { workspace = true }
 tos-pty = { workspace = true }
+tos-render = { workspace = true }

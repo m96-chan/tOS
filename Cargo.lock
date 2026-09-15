@@ -77,10 +77,12 @@ name = "tos-install"
 version = "0.0.7"
 dependencies = [
  "libc",
+ "tos-compositor",
  "tos-crypt",
  "tos-input",
  "tos-platform",
  "tos-pty",
+ "tos-render",
  "tos-term",
 ]
 

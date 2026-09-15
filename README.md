@@ -743,9 +743,22 @@ pixel in `n`, or no picture at all. A screen too small for the smallest of
 those keeps the box, in the place the box has always been — the picture is the
 part that can give way, the same order the installer's banner already follows.
 A lock does not get it: that screen has a session behind it and somebody in
-front of it who knows what the machine is. `docs/design/splash.md` has the
+front of it who knows what the machine is.
+
+The **same picture is at the head of every pane**, where the banner has always
+been. A shell asks the terminal what it is before it greets anybody: a tOS pane
+is sent `/etc/tos/splash.png` over the graphics protocol and everything else —
+a serial console, the kernel VT the rescue session lands on, somebody logged in
+from another machine — goes on getting the banner drawn in cells. What decides
+is whether `TOS` is in the environment and whether the terminal filled in the
+pixel fields of its `winsize`, which tOS does for every pane it spawns and the
+kernel's VT does not; querying the terminal and waiting for a reply is the
+answer `tos-preview` already turned down, and paying for it at the top of every
+shell would be worse. The picture goes as a path (`t=f`) rather than as a
+payload, so the escape is a hundred bytes however large the picture is and
+nothing travels through the pseudoterminal. `docs/design/splash.md` has the
 rest, and `cargo run --example login_screenshot -- /tmp/tos-login.ppm` is how
-it gets looked at.
+the login screen gets looked at.
 
 `super+shift+l`, or `ctrl+a` then `L`, locks the screen. The lock is a password
 field, and it is its own type rather than another use of that box for exactly
@@ -938,7 +951,7 @@ banner is never erased on a bar with no message segment
 - [x] Debian rootfs tooling ([#20](https://github.com/m96-chan/tOS/issues/20))
 - [ ] hardware abstraction cleanup ([#22](https://github.com/m96-chan/tOS/issues/22))
 - [ ] images scanned out on DRM overlay planes ([#31](https://github.com/m96-chan/tOS/issues/31))
-- [x] a picture on the login screen ([#132](https://github.com/m96-chan/tOS/issues/132))
+- [x] a picture on the login screen and at the head of every pane ([#132](https://github.com/m96-chan/tOS/issues/132))
 
 The name is the test the round is held to: most of this list is about a
 machine somebody installed being one they can actually use — a shell they
@@ -1319,7 +1332,9 @@ what it had.
 ## Installing
 
 `iso/build.sh` builds a bootable image. Booting it gives a live session whose
-every shell prints the banner from `.motd_art` and the one line that matters:
+every shell prints the picture from `/etc/tos/splash.png` — or, on a terminal
+that cannot be sent one, the banner from `.motd_art` — and the one line that
+matters:
 
 ```text
   Type tos-install to install tOS on this machine.

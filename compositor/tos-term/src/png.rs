@@ -72,6 +72,26 @@ pub struct PngImage {
 
 const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
+/// How big a PNG is, without decoding it.
+///
+/// Everything this reads is in the first chunk, so a caller that only needs
+/// the shape of a picture — how many cells to give it, say — pays for the
+/// header rather than for the pixels. A file this refuses is one
+/// [`decode`] would refuse too: the same header check stands behind both.
+pub fn dimensions(data: &[u8]) -> Result<(u32, u32), PngError> {
+    if data.get(..8) != Some(&SIGNATURE[..]) {
+        return Err(PngError::BadSignature);
+    }
+    let chunk = Chunk::read(data, 8)?;
+    if &chunk.kind != b"IHDR" {
+        return Err(PngError::BadHeader);
+    }
+    // No budget, because nothing here allocates: how big a picture is has to
+    // be answerable before anybody decides whether it is too big.
+    let header = Header::parse(chunk.body, usize::MAX)?;
+    Ok((header.width as u32, header.height as u32))
+}
+
 /// Decode a PNG into RGBA8.
 ///
 /// `limit` is the largest RGBA output accepted, in bytes; an image whose
@@ -710,6 +730,34 @@ pub(crate) mod tests {
     }
 
     const LIMIT: usize = 1 << 20;
+
+    #[test]
+    fn the_size_is_readable_without_decoding() {
+        let data = rgba_png(3, 2, &[0xff; 3 * 2 * 4]);
+        assert_eq!(dimensions(&data).expect("a size"), (3, 2));
+    }
+
+    #[test]
+    fn a_size_is_read_from_the_header_and_not_from_the_pixels() {
+        // Everything after IHDR cut away: the size is still there, and a
+        // decode of the same bytes is not.
+        let data = rgba_png(64, 32, &[0; 64 * 32 * 4]);
+        let header_only = &data[..8 + 12 + 13];
+        assert_eq!(dimensions(header_only).expect("a size"), (64, 32));
+        assert!(decode(header_only, LIMIT).is_err());
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_png_has_no_size() {
+        assert!(matches!(
+            dimensions(b"this is not a PNG at all"),
+            Err(PngError::BadSignature)
+        ));
+        let mut data = rgba_png(2, 2, &[0; 2 * 2 * 4]);
+        // A first chunk that is not IHDR is not a PNG this can measure.
+        data[12] = b'j';
+        assert!(dimensions(&data).is_err());
+    }
 
     #[test]
     fn the_scanlines_count_against_the_budget_too() {
