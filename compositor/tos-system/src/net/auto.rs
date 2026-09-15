@@ -1,4 +1,4 @@
-//! What a machine with nobody sitting at it does about its wired links.
+//! What a machine with nobody sitting at it does about its links.
 //!
 //! [#124](https://github.com/m96-chan/tOS/issues/124): a tOS machine with
 //! `openssh-server` on it has `sshd` listening three seconds into the boot and
@@ -22,14 +22,19 @@
 //!
 //! Four rules, and it does nothing else:
 //!
-//! * **Wired links only.** Joining a wireless network needs a supplicant that
-//!   does not exist yet, and a radio brought up with nothing to associate with
-//!   is not closer to being on a network. Loopback and virtual devices are not
-//!   anybody's idea of "the network" either.
+//! * **A radio is never brought up and never scanned by this.** The
+//!   supplicant owns the link's administrative state and does its own
+//!   scanning; a radio with no supplicant on it is a radio nothing here can do
+//!   anything with. **A radio that is associated asks for an address**, once
+//!   per association, exactly as a cable asks once per carrier — because
+//!   association *is* carrier on a wireless link: `/sys/class/net/wlan0/carrier`
+//!   reads `1` the moment the four-way handshake completes and `0` when it
+//!   drops. Loopback and virtual devices are nobody's idea of "the network"
+//!   and are left out of all of it.
 //! * **Never over an address.** A link that already has a routable address is
 //!   left exactly as it is, whoever gave it one — the menu, a previous lease,
 //!   or a static address somebody wrote in by hand.
-//! * **Once per cable.** An address is asked for once per carrier, so a server
+//! * **Once per carrier.** An address is asked for once per carrier, so a server
 //!   that does not answer costs one DHCP conversation rather than one every
 //!   second forever. Pulling the cable out and putting it back is a new
 //!   carrier and a new ask, which is also what a person means by it.
@@ -73,7 +78,7 @@ struct Attempts {
     asked: bool,
 }
 
-/// The wired links, brought up and addressed without anybody asking.
+/// The links, brought up and addressed without anybody asking.
 ///
 /// Keeps only what it has already done. Everything else it needs is in the
 /// interfaces it is handed, so a machine whose cards changed underneath it —
@@ -109,7 +114,7 @@ impl Autoconfigure {
 
         let mut step = None;
         for interface in interfaces {
-            if interface.kind != Kind::Wired {
+            if interface.kind != Kind::Wired && interface.kind != Kind::Wireless {
                 continue;
             }
             let attempts = self.attempts.entry(interface.name.clone()).or_default();
@@ -123,15 +128,21 @@ impl Autoconfigure {
                 continue;
             }
             if !interface.admin_up {
-                if !attempts.brought_up {
+                // A radio that is down is left down. `IFF_UP` on a wireless
+                // link is the supplicant's to set — it needs the interface up
+                // to scan and to associate, and it puts it back down when it
+                // stops — so a radio brought up from here is a radio taken
+                // away from whoever is driving it, with nothing to associate
+                // with to show for it.
+                if interface.kind == Kind::Wired && !attempts.brought_up {
                     attempts.brought_up = true;
                     step = Some(Step::BringUp(interface.name.clone()));
                 }
                 continue;
             }
-            // Up but with no cable in it: there is nothing to ask, and asking
-            // anyway would spend the one ask this carrier gets on a DISCOVER
-            // that goes nowhere.
+            // Up but with no cable in it — or a radio associated with nothing:
+            // there is nothing to ask, and asking anyway would spend the one
+            // ask this carrier gets on a DISCOVER that goes nowhere.
             if interface.carrier && !attempts.asked && !asking {
                 attempts.asked = true;
                 step = Some(Step::Ask(interface.name.clone()));
@@ -174,6 +185,28 @@ mod tests {
             carrier: true,
             admin_up: true,
             ..wired(name)
+        }
+    }
+
+    /// A radio with no supplicant on it yet: switched off, associated with
+    /// nothing.
+    fn radio(name: &str) -> Interface {
+        Interface {
+            kind: Kind::Wireless,
+            wireless: Some(Wireless::default()),
+            ..wired(name)
+        }
+    }
+
+    /// The same radio once the supplicant has brought it up and the four-way
+    /// handshake has completed, which is what `carrier` reads as `1` means on
+    /// a wireless link.
+    fn associated(name: &str) -> Interface {
+        Interface {
+            state: LinkState::Up,
+            carrier: true,
+            admin_up: true,
+            ..radio(name)
         }
     }
 
@@ -244,14 +277,9 @@ mod tests {
     }
 
     #[test]
-    fn nothing_that_is_not_a_cable_is_touched() {
+    fn nothing_that_is_not_a_cable_or_a_radio_is_touched() {
         let mut auto = Autoconfigure::new();
         let others = [
-            Interface {
-                kind: Kind::Wireless,
-                wireless: Some(Wireless::default()),
-                ..wired("wlan0")
-            },
             Interface {
                 kind: Kind::Loopback,
                 ..wired("lo")
@@ -262,6 +290,83 @@ mod tests {
             },
         ];
         assert_eq!(auto.next(&others, false), None);
+    }
+
+    #[test]
+    fn an_associated_radio_with_no_address_is_asked_for_an_address() {
+        // Association is carrier on a wireless link, and a link that is
+        // carrying with nothing to show for it is the case this exists for,
+        // whether what it is carrying arrived on a cable or over the air.
+        let mut auto = Autoconfigure::new();
+        assert_eq!(
+            auto.next(&[associated("wlan0")], false),
+            Some(Step::Ask("wlan0".to_string()))
+        );
+        assert_eq!(auto.next(&[associated("wlan0")], false), None);
+    }
+
+    #[test]
+    fn a_radio_that_is_down_is_not_brought_up() {
+        // The supplicant owns `IFF_UP` on a radio: it needs the link up to
+        // scan and puts it back down when it stops. A radio brought up from
+        // here is one taken off whoever is driving it, with nothing to
+        // associate with to show for it.
+        let mut auto = Autoconfigure::new();
+        assert_eq!(auto.next(&[radio("wlan0")], false), None);
+    }
+
+    #[test]
+    fn a_radio_that_is_up_and_associated_with_nothing_is_not_asked() {
+        let mut auto = Autoconfigure::new();
+        let scanning = Interface {
+            admin_up: true,
+            ..radio("wlan0")
+        };
+        assert_eq!(auto.next(&[scanning], false), None);
+    }
+
+    #[test]
+    fn a_radio_that_associated_again_is_asked_again() {
+        // The supplicant lost the network and found it again; that is a new
+        // association, and a new association is a new lease to ask for.
+        let mut auto = Autoconfigure::new();
+        assert!(auto.next(&[associated("wlan0")], false).is_some());
+
+        let dropped = Interface {
+            admin_up: true,
+            ..radio("wlan0")
+        };
+        assert_eq!(auto.next(&[dropped], false), None);
+
+        assert_eq!(
+            auto.next(&[associated("wlan0")], false),
+            Some(Step::Ask("wlan0".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_radio_that_already_has_an_address_is_not_touched() {
+        let mut auto = Autoconfigure::new();
+        let configured = with_address(associated("wlan0"), "192.168.1.5/24");
+        assert_eq!(auto.next(&[configured], false), None);
+    }
+
+    #[test]
+    fn a_cable_and_a_radio_that_both_carry_are_asked_one_at_a_time() {
+        // There is still one DHCP client. The kernel's order decides which
+        // goes first, and the other gets the pass after the first one is
+        // finished rather than a race for one `/etc/resolv.conf`.
+        let mut auto = Autoconfigure::new();
+        let links = [carrying("eth0"), associated("wlan0")];
+        assert_eq!(
+            auto.next(&links, false),
+            Some(Step::Ask("eth0".to_string()))
+        );
+        assert_eq!(auto.next(&links, true), None);
+        assert_eq!(
+            auto.next(&links, false),
+            Some(Step::Ask("wlan0".to_string()))
+        );
     }
 
     #[test]
