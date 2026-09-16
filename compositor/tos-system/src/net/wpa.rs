@@ -797,6 +797,81 @@ mod tests {
         "2\toffice\tany\t[TEMP-DISABLED]\n",
     );
 
+    /// What a running supplicant actually wrote, copied out of the serial log
+    /// of the `mac80211_hwsim` witness in `docs/design/wifi.md` — wpa_supplicant
+    /// v2.10 on the image built from this tree, 2026-09-16. The examples above
+    /// are what the format is documented to be; this is what it was.
+    mod captured {
+        use super::super::*;
+
+        const SCAN_RESULTS: &str = "bssid / frequency / signal level / flags / ssid\n\
+            02:00:00:00:01:00\t2412\t-30\t[WPA2-PSK-CCMP][WPS][ESS]\thwsim-ap\n";
+
+        /// The supplicant with nothing configured, which is what a fresh boot
+        /// looks like: `INACTIVE`, and three fields no parser here wants.
+        const STATUS_INACTIVE: &str = "wpa_state=INACTIVE\n\
+            p2p_device_address=42:00:00:00:00:00\n\
+            address=02:00:00:00:00:00\n\
+            uuid=362db47b-a53a-5191-88fb-5458b986b2e4\n";
+
+        /// Joined, from the menu, with the right passphrase.
+        const STATUS_COMPLETED: &str = "bssid=02:00:00:00:01:00\n\
+            freq=2412\n\
+            ssid=hwsim-ap\n\
+            id=0\n\
+            mode=station\n\
+            wifi_generation=4\n\
+            pairwise_cipher=CCMP\n\
+            group_cipher=CCMP\n\
+            key_mgmt=WPA2-PSK\n\
+            wpa_state=COMPLETED\n\
+            p2p_device_address=42:00:00:00:00:00\n\
+            address=02:00:00:00:00:00\n\
+            uuid=362db47b-a53a-5191-88fb-5458b986b2e4\n";
+
+        const NETWORKS_CURRENT: &str =
+            "network id / ssid / bssid / flags\n0\thwsim-ap\tany\t[CURRENT]\n";
+        const NETWORKS_NONE: &str = "network id / ssid / bssid / flags\n";
+
+        #[test]
+        fn the_scan_a_real_supplicant_wrote_parses_to_the_access_point() {
+            let found = parse_scan_results(SCAN_RESULTS);
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].bssid, "02:00:00:00:01:00");
+            assert_eq!(found[0].frequency_mhz, 2412);
+            assert_eq!(found[0].signal_dbm, -30);
+            // `[WPS]` beside the security flags, which the benign list has
+            // to know about or every access point with WPS on would be
+            // "unknown security".
+            assert_eq!(found[0].security, Security::Psk);
+            assert_eq!(found[0].ssid, "hwsim-ap");
+        }
+
+        #[test]
+        fn the_status_a_real_supplicant_wrote_parses_in_both_states() {
+            let inactive = parse_status(STATUS_INACTIVE);
+            assert_eq!(inactive.state, State::Inactive);
+            assert_eq!(inactive.ssid, None);
+            assert_eq!(inactive.id, None);
+
+            let completed = parse_status(STATUS_COMPLETED);
+            assert_eq!(completed.state, State::Completed);
+            assert_eq!(completed.ssid.as_deref(), Some("hwsim-ap"));
+            assert_eq!(completed.id, Some(0));
+        }
+
+        #[test]
+        fn the_network_list_a_real_supplicant_wrote_parses_full_and_empty() {
+            let known = parse_networks(NETWORKS_CURRENT);
+            assert_eq!(known.len(), 1);
+            assert_eq!(known[0].id, 0);
+            assert_eq!(known[0].ssid, "hwsim-ap");
+            assert!(known[0].current);
+            assert!(!known[0].disabled && !known[0].temp_disabled);
+            assert!(parse_networks(NETWORKS_NONE).is_empty());
+        }
+    }
+
     #[test]
     fn a_scan_result_line_becomes_a_network_in_range() {
         let found = parse_scan_results(SCAN_RESULTS);

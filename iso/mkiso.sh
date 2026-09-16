@@ -482,6 +482,12 @@ EOF
 #                           rebooting it; `blkid` could read both labels the
 #                           whole time, which is what made it look like a
 #                           filesystem problem rather than a missing package.
+#   iw                      the one wireless diagnostic a person reaches for
+#                           (`iw dev`, `iw wlan0 link`), 95 kB, and the only
+#                           thing that can move a radio into a network
+#                           namespace — which is how iso/wifi-witness.sh makes
+#                           its access point a different host from the client
+#                           it is testing, on a machine that has one kernel.
 #   wpasupplicant           the other half of a radio. docs/design/network.md
 #                           chose this supplicant and docs/design/wifi.md
 #                           drives it over its control socket, one datagram
@@ -521,7 +527,7 @@ ROOTFS_PACKAGES="debian-archive-keyring,ca-certificates,bash,systemd-sysv,udev,\
 busybox,iproute2,procps,iputils-ping,wget,ncurses-base,fonts-vlgothic,\
 e2fsprogs,dosfstools,\
 fdisk,util-linux,mount,kmod,sudo,squashfs-tools,grub2-common,\
-wpasupplicant,\
+wpasupplicant,iw,\
 firmware-iwlwifi,firmware-realtek,firmware-atheros,firmware-brcm80211,\
 firmware-misc-nonfree,\
 $(echo "$GRUB_PKGS" | tr ' ' ',')"
@@ -989,7 +995,8 @@ for pattern in \
     "$ROOTFS/lib/firmware/brcm/*" \
     "$ROOTFS/lib/firmware/mediatek/WIFI_RAM_CODE_MT7961_1.bin" \
     "$ROOTFS/sbin/wpa_supplicant" \
-    "$ROOTFS/sbin/wpa_cli"; do
+    "$ROOTFS/sbin/wpa_cli" \
+    "$ROOTFS/sbin/iw"; do
     if ! any_match "$pattern"; then
         echo "mkiso: the rootfs has nothing matching ${pattern#"$ROOTFS"}" >&2
         exit 1
