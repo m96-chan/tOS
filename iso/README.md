@@ -274,6 +274,11 @@ terminal filled in the pixel fields of its `winsize`, which tOS does for every
 pane and the kernel's VT does not. Replacing `splash.png` changes the login
 screen and the greeting together, which is why there is one file.
 
+`/etc/tos/lock.png` is beside it and is the other picture: the one in the
+bottom right corner of a locked screen. It is a second file rather than a
+second use of the first because it is composed for a different place, and
+because replacing one screen's picture should not silently replace two.
+
 `tos-install` is a TUI that runs in a pane, which makes installing tOS the
 first real use of the platform as a platform. It picks a disk, writes a GPT
 with a boot partition and an ext4 root, unpacks the Debian rootfs onto it,

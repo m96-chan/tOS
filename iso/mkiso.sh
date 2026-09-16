@@ -114,14 +114,17 @@ chmod 755 "$ROOT/init" "$ROOT/sbin/tos" "$ROOT/sbin/tos-install" \
     "$ROOT/sbin/tos-preview" "$ROOT/sbin/tos-session"
 
 # The message of the day, which is where a person is told that this is a live
-# session and how to put it on a disk, and the picture beside it. The picture
-# is compiled into tos as well, so the login screen has one whatever happens
-# to /etc; the file is what a pane is shown over the graphics protocol, which
-# needs a path rather than a payload, and what a machine replaces to make both
-# screens its own (#132).
+# session and how to put it on a disk, and the pictures beside it. Both are
+# compiled into tos as well, so the screens have one whatever happens to /etc;
+# splash.png is additionally what a pane is shown over the graphics protocol,
+# which needs a path rather than a payload. They are two files because they are
+# two screens: splash.png is the frontispiece over the login box and the
+# greeting at the head of a pane (#132), and lock.png is the picture in the
+# corner of a locked screen. A machine can replace either on its own.
 mkdir -p "$ROOT/etc/tos" "$ROOT/run/live/medium"
 cp .motd_art "$ROOT/etc/tos/motd_art"
 cp compositor/tos-compositor/assets/splash.png "$ROOT/etc/tos/splash.png"
+cp compositor/tos-compositor/assets/lock.png "$ROOT/etc/tos/lock.png"
 cp iso/profile "$ROOT/etc/profile"
 
 # Every name this machine can resolve without asking a nameserver. Debian gets
@@ -822,6 +825,7 @@ EOF
 mkdir -p "$ROOTFS/etc/tos" "$ROOTFS/etc/profile.d" "$ROOTFS/run/live/medium"
 cp .motd_art "$ROOTFS/etc/tos/motd_art"
 cp compositor/tos-compositor/assets/splash.png "$ROOTFS/etc/tos/splash.png"
+cp compositor/tos-compositor/assets/lock.png "$ROOTFS/etc/tos/lock.png"
 cp iso/profile "$ROOTFS/etc/profile.d/tos.sh"
 
 # And through ~/.bashrc for the shell a pane actually runs, which is an

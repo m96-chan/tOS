@@ -278,13 +278,17 @@ pub struct Compositor {
     /// input — every kind of it, not only the keys — and the screen shows
     /// nothing of the session.
     lock: Option<LockScreen>,
-    /// The picture the login screen draws above its box (#132).
+    /// The picture that goes with whichever screen is up (#132): the login
+    /// screen's, above its box, or the lock screen's, in the corner.
+    ///
+    /// One slot and not two, because the two screens are never up at once.
+    /// Which file filled it is decided where the screen goes up, and where it
+    /// is drawn by [`LockScreen::draw`] from the screen's own purpose.
     ///
     /// Held only while that screen is up: it is read when the screen goes up
-    /// and let go when somebody logs in, because a login happens once and a
-    /// megabyte of pixels nobody is going to look at again is a megabyte a
-    /// session could have had.
-    splash: Option<Splash>,
+    /// and let go when it is answered, because a megabyte of pixels nobody is
+    /// going to look at again is a megabyte a session could have had.
+    picture: Option<Splash>,
     /// Copy mode, and the pane it is selecting in. While it is up it owns the
     /// keyboard: no key reaches the pane and no binding fires.
     ///
@@ -431,7 +435,7 @@ impl Compositor {
             notifications: Notifications::new(),
             overlay: None,
             lock: None,
-            splash: None,
+            picture: None,
             copy: None,
             session_ended_while_locked: false,
             needs_full_redraw: true,
@@ -512,7 +516,7 @@ impl Compositor {
         self.keymap.cancel_pending();
         self.release_grab();
         self.lock = Some(LockScreen::login(hash, self.config.credential_user.clone()));
-        self.splash = Splash::load(&self.config.splash);
+        self.picture = Splash::load(&self.config.splash);
         self.needs_full_redraw = true;
     }
 
@@ -2059,6 +2063,10 @@ impl Compositor {
         self.keymap.cancel_pending();
         self.release_grab();
         self.lock = Some(LockScreen::new(hash, self.config.credential_user.clone()));
+        // Read here rather than held across the session for the reason on the
+        // field: a lock is up for as long as somebody is away from the
+        // machine, and the pixels are worth having only then.
+        self.picture = Splash::load_lock(&self.config.lock_picture);
         // An open overlay is left exactly as it was, under the lock rather
         // than closed by it. Nothing of it is drawn while the lock is up, and
         // the person who gets it back is the person who left it there.
@@ -2084,7 +2092,7 @@ impl Compositor {
     fn unlock(&mut self) {
         self.lock = None;
         // The picture belonged to the screen that has just been answered.
-        self.splash = None;
+        self.picture = None;
         // Nothing under the lock was drawn while it was up, and the damage
         // that would have said what to repaint was thrown away with each
         // locked frame. The whole screen is the only honest answer.
@@ -3484,7 +3492,7 @@ impl Compositor {
                 &mut self.fonts,
                 area,
                 &self.chrome,
-                self.splash.as_ref(),
+                self.picture.as_ref(),
                 Instant::now(),
             );
         }

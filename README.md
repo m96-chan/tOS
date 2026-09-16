@@ -770,8 +770,15 @@ melted, so a display gets `n` screen pixels per picture pixel, or one picture
 pixel in `n`, or no picture at all. A screen too small for the smallest of
 those keeps the box, in the place the box has always been — the picture is the
 part that can give way, the same order the installer's banner already follows.
-A lock does not get it: that screen has a session behind it and somebody in
-front of it who knows what the machine is.
+
+A **locked** screen has a picture of its own, `/etc/tos/lock.png`, in its
+bottom right corner. It does not get the frontispiece, and the reason it does
+not is the reason it gets this instead: that screen has a session behind it and
+somebody in front of it who knows what the machine is and wants their session
+back, so nothing should stand between them and the field — but a corner does
+not. It is a second file because it is a different picture for a different
+place, and either can be replaced without the other. Same whole-pixel rule,
+and it gives way to the box on a display where the two would meet.
 
 The **same picture is at the head of every pane**, where the banner has always
 been. A shell asks the terminal what it is before it greets anybody: a tOS pane
@@ -786,7 +793,8 @@ shell would be worse. The picture goes as a path (`t=f`) rather than as a
 payload, so the escape is a hundred bytes however large the picture is and
 nothing travels through the pseudoterminal. `docs/design/splash.md` has the
 rest, and `cargo run --example login_screenshot -- /tmp/tos-login.ppm` is how
-the login screen gets looked at.
+the login screen gets looked at — `lock_screenshot` is the same for the locked
+one.
 
 `super+shift+l`, or `ctrl+a` then `L`, locks the screen. The lock is a password
 field, and it is its own type rather than another use of that box for exactly

@@ -442,15 +442,24 @@ impl LockScreen {
 
     /// Draw the lock centred in `area`, which is in pixels.
     ///
-    /// This draws the box, and over a login the picture above it. Erasing the
+    /// This draws the box and the picture that goes with it. Erasing the
     /// session is the caller's, because only the caller knows that the whole
     /// surface is its to erase.
     ///
     /// The picture is handed in rather than loaded here for the reason at the
-    /// top of this file: nothing here reads a file it is not pointed at. It is
-    /// drawn only over a [`Purpose::Login`] — a lock has a session behind it
-    /// and is asking somebody to come back to what they left, where a login
-    /// screen is the machine opening, which is what a frontispiece is for.
+    /// top of this file: nothing here reads a file it is not pointed at. Where
+    /// it goes is this screen's purpose:
+    ///
+    /// | | the picture |
+    /// |---|---|
+    /// | [`Purpose::Login`] | centred above the box, laid out with it as one stack |
+    /// | [`Purpose::Lock`] | in the bottom right corner, clear of the box |
+    ///
+    /// A login screen is the machine opening, which is what a frontispiece is
+    /// for. A lock is somebody's own session waiting behind it, and they have
+    /// already been told what this machine is — so the picture keeps to a
+    /// corner, where it is something to rest the eye on rather than the thing
+    /// between them and the field they came to type in.
     pub fn draw(
         &self,
         surface: &mut Surface<'_>,
@@ -507,12 +516,37 @@ impl LockScreen {
             );
         }
 
+        let box_rect = Rect::new(x0, y0, box_cols as u32 * cw, BOX_ROWS as u32 * ch);
+
+        // And over a lock, in the bottom right corner instead, a row of margin
+        // in from each edge. Nothing lays out around it: the box is where it
+        // would have been on an empty field, and this is drawn before the box
+        // so that on a display where the two do meet the box is the one left
+        // whole — the same order the frontispiece already follows, for the
+        // same reason that the box is the part somebody cannot do without.
+        if self.purpose == Purpose::Lock {
+            if let Some((splash, (width, height))) = splash.and_then(|splash| {
+                let room = Splash::room_in_corner((area.width, area.height));
+                splash.fit(room).map(|size| (splash, size))
+            }) {
+                // One row of margin on both axes rather than a row down and a
+                // cell across: the margin is a distance from the corner, and a
+                // cell is half as wide as it is tall.
+                let corner = Rect::new(
+                    area.x + area.width.saturating_sub(width + ch) as i32,
+                    area.y + area.height.saturating_sub(height + ch) as i32,
+                    width,
+                    height,
+                );
+                if corner.intersect(&box_rect).is_empty() {
+                    splash.draw(surface, corner);
+                }
+            }
+        }
+
         // Nothing of the session is under this, but the box still paints its
         // own background so the border has something to sit on.
-        surface.fill(
-            Rect::new(x0, y0, box_cols as u32 * cw, BOX_ROWS as u32 * ch),
-            chrome.background,
-        );
+        surface.fill(box_rect, chrome.background);
 
         let border = chrome.divider_focused;
         let row_y = |row: usize| y0 + (row as u32 * ch) as i32;
@@ -939,45 +973,115 @@ mod tests {
             .position(|row| row.iter().any(|&p| p != 0))
     }
 
-    #[test]
-    fn the_picture_goes_over_a_login_and_not_over_a_lock() {
-        // #132. One picture, one display, two purposes. A lock has a session
-        // behind it and somebody in front of it who has already been told
-        // what this machine is; a login screen is the machine opening.
-        let splash = Splash::built_in().expect("the picture tOS ships");
-        let (width, height) = (640usize, 360usize);
+    /// One quarter of a frame, named by the corner it is in. Which quarter a
+    /// picture's thousands of colours land in is how these tests tell where it
+    /// was drawn without knowing what it is a picture of.
+    fn quadrant(pixels: &[u32], width: usize, right: bool, bottom: bool) -> Vec<u32> {
+        let height = pixels.len() / width;
+        let rows = if bottom {
+            height / 2..height
+        } else {
+            0..height / 2
+        };
+        let cols = if right {
+            width / 2..width
+        } else {
+            0..width / 2
+        };
+        rows.flat_map(|row| pixels[row * width..][cols.clone()].to_vec())
+            .collect()
+    }
+
+    /// Draw one screen on a frame of its own and hand back the pixels.
+    fn frame(screen: &LockScreen, picture: &Splash, size: (usize, usize)) -> Vec<u32> {
+        let (width, height) = size;
         let mut pixels = vec![0u32; width * height];
         let mut fonts = FontStack::new(Box::new(tos_font::BitmapFont::new(1)));
-        let mut drawn = Vec::new();
-        for screen in [
-            LockScreen::login(hash_of("hunter2"), "tos".into()),
-            LockScreen::new(hash_of("hunter2"), "tos".into()),
-        ] {
-            let mut surface = Surface::new(&mut pixels, width as u32, height as u32, width as u32);
-            screen.draw(
-                &mut surface,
-                &mut fonts,
-                Rect::new(0, 0, width as u32, height as u32),
-                &Chrome::default(),
-                Some(&splash),
-                Instant::now(),
+        let mut surface = Surface::new(&mut pixels, width as u32, height as u32, width as u32);
+        screen.draw(
+            &mut surface,
+            &mut fonts,
+            Rect::new(0, 0, width as u32, height as u32),
+            &Chrome::default(),
+            Some(picture),
+            Instant::now(),
+        );
+        pixels
+    }
+
+    #[test]
+    fn the_login_picture_is_above_the_box_and_the_locks_is_in_the_corner() {
+        // #132 gave the login screen a frontispiece and deliberately left the
+        // lock without one: what somebody at a locked screen came for is the
+        // field, and a picture over it would be decoration in the way of that.
+        // A lock has a picture again now, and that argument is why it is in a
+        // corner rather than over the box — the placement is the whole of the
+        // difference, so it is the thing asserted here.
+        let size = (640usize, 360usize);
+        let login = frame(
+            &LockScreen::login(hash_of("hunter2"), "tos".into()),
+            &Splash::built_in().expect("the login picture tOS ships"),
+            size,
+        );
+        let lock = frame(
+            &LockScreen::new(hash_of("hunter2"), "tos".into()),
+            &Splash::built_in_lock().expect("the lock picture tOS ships"),
+            size,
+        );
+        for (word, pixels) in [("login", &login), ("locked", &lock)] {
+            let drawn = colours(pixels);
+            assert!(
+                drawn > 1000,
+                "the {word} screen drew {drawn} colours, which is no picture"
             );
-            drawn.push((colours(&pixels), first_drawn_row(&pixels, width)));
-            pixels.fill(0);
         }
-        let (login_colours, login_top) = drawn[0];
-        let (lock_colours, lock_top) = drawn[1];
-        assert!(
-            login_colours > 1000,
-            "the login screen drew {login_colours} colours, which is no picture"
-        );
-        assert!(
-            lock_colours < 16,
-            "the locked screen drew {lock_colours} colours, which is a picture"
-        );
+
+        // The frontispiece starts above where the box alone would.
+        let login_top = first_drawn_row(&login, size.0);
+        let lock_top = first_drawn_row(&lock, size.0);
         assert!(
             login_top < lock_top,
-            "the picture should start above where the box alone would ({login_top:?}, {lock_top:?})"
+            "the login picture should start above the box ({login_top:?}, {lock_top:?})"
+        );
+
+        // And the lock's picture is in one corner and no other.
+        let bottom_right = colours(&quadrant(&lock, size.0, true, true));
+        assert!(
+            bottom_right > 1000,
+            "the lock drew {bottom_right} colours in the bottom right, which is no picture"
+        );
+        for (word, right, bottom) in [
+            ("bottom left", false, true),
+            ("top right", true, false),
+            ("top left", false, false),
+        ] {
+            let drawn = colours(&quadrant(&lock, size.0, right, bottom));
+            assert!(
+                drawn < 16,
+                "the lock drew {drawn} colours in the {word}, which is a picture"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lock_picture_that_would_reach_the_box_gives_way_to_it() {
+        // The corner is laid out against the corner rather than around the
+        // box, so on a display short enough the two meet. The box is the part
+        // somebody cannot do without, so it is the picture that goes.
+        let size = (400usize, 120usize);
+        let pixels = frame(
+            &LockScreen::new(hash_of("hunter2"), "tos".into()),
+            &Splash::built_in_lock().expect("the lock picture tOS ships"),
+            size,
+        );
+        assert!(
+            pixels.iter().any(|&p| p != 0),
+            "the box went with the picture"
+        );
+        let drawn = colours(&pixels);
+        assert!(
+            drawn < 16,
+            "{drawn} colours on a display the picture should have left"
         );
     }
 

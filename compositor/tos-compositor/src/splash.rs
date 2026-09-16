@@ -1,4 +1,4 @@
-//! The picture on the login screen.
+//! The pictures on the login and lock screens.
 //!
 //! A machine that has been turned on shows the login screen before it shows
 //! anything else, and until #132 that screen was a box on an empty field.
@@ -21,7 +21,9 @@
 //! whole number of screen pixels per picture pixel — `n` of them going up, one
 //! in `n` coming down — and a display with no room for even the smallest of
 //! those gets no picture rather than a smeared one. [`Splash::fit`] is that
-//! rule and nothing else.
+//! rule and nothing else. What differs between the two screens is only the
+//! room handed to it: [`Splash::room_across`] for the frontispiece over a
+//! login, [`Splash::room_in_corner`] for the picture beside a lock.
 //!
 //! ## Nothing here draws to a display it is not given
 //!
@@ -35,7 +37,7 @@ use std::path::Path;
 
 use tos_render::{Rect, Surface};
 
-/// The picture as it ships, compiled into the compositor.
+/// The login screen's picture as it ships, compiled into the compositor.
 ///
 /// Compiled in rather than read from the filesystem because the login screen
 /// is the first thing on the display: a picture that lived only in `/etc`
@@ -44,7 +46,16 @@ use tos_render::{Rect, Surface};
 /// the installer.
 const BUILT_IN: &[u8] = include_bytes!("../assets/splash.png");
 
-/// Where a machine keeps a picture of its own.
+/// The lock screen's picture, likewise, and a different file.
+///
+/// The two screens are one type asking one account for one password, and this
+/// is the one thing about them that is genuinely not shared: a login screen is
+/// the machine opening and wants a frontispiece, where a lock is somebody's
+/// own session waiting behind it and wants a corner. One file each, so
+/// replacing either does not silently change the other.
+const BUILT_IN_LOCK: &[u8] = include_bytes!("../assets/lock.png");
+
+/// Where a machine keeps a login picture of its own.
 ///
 /// The same door `/etc/tos/motd_art` opens for the banner, for the same
 /// reason: a machine should be able to say it is somebody's without being
@@ -52,6 +63,9 @@ const BUILT_IN: &[u8] = include_bytes!("../assets/splash.png");
 /// not an error — it is the built-in picture, which is what the screen would
 /// have shown anyway.
 pub const SPLASH_PATH: &str = "/etc/tos/splash.png";
+
+/// And where it keeps a lock picture of its own, on the same terms.
+pub const LOCK_PATH: &str = "/etc/tos/lock.png";
 
 /// The largest decoded picture accepted, in bytes.
 ///
@@ -71,6 +85,13 @@ const BUDGET: usize = 16 << 20;
 /// screen to type into.
 const WIDTH_NUMERATOR: u32 = 4;
 const WIDTH_DENOMINATOR: u32 = 5;
+
+/// How much of the display a picture in a corner may take: a third each way.
+///
+/// Wider than that and it stops being something the eye finds after the box
+/// and starts being the thing on the screen — which over a lock is the wrong
+/// way round, because the box is what the person in front of it came for.
+const CORNER_DENOMINATOR: u32 = 3;
 
 /// The smallest fraction the picture is drawn at before it is dropped.
 ///
@@ -97,12 +118,25 @@ impl Splash {
         decode(BUILT_IN)
     }
 
-    /// The picture on this machine, falling back to the one tOS ships.
+    /// The lock screen's picture as tOS ships it, on the same terms.
+    pub fn built_in_lock() -> Option<Splash> {
+        decode(BUILT_IN_LOCK)
+    }
+
+    /// The login picture on this machine, falling back to the one tOS ships.
     pub fn load(path: &Path) -> Option<Splash> {
-        std::fs::read(path)
-            .ok()
-            .and_then(|bytes| decode(&bytes))
-            .or_else(Splash::built_in)
+        Splash::at(path).or_else(Splash::built_in)
+    }
+
+    /// The lock picture on this machine, likewise.
+    pub fn load_lock(path: &Path) -> Option<Splash> {
+        Splash::at(path).or_else(Splash::built_in_lock)
+    }
+
+    /// Whatever is at `path`, or nothing — the fallback is the caller's,
+    /// because it is the only half of this that differs between the two.
+    fn at(path: &Path) -> Option<Splash> {
+        std::fs::read(path).ok().and_then(|bytes| decode(&bytes))
     }
 
     pub fn width(&self) -> u32 {
@@ -147,6 +181,15 @@ impl Splash {
         width / WIDTH_DENOMINATOR * WIDTH_NUMERATOR
     }
 
+    /// The room a picture tucked into a corner of a display this size gets.
+    ///
+    /// Both axes, unlike the frontispiece: that one is centred above the box
+    /// and so is bounded across by a share and down by whatever the box left,
+    /// where a corner is bounded by the corner.
+    pub fn room_in_corner(size: (u32, u32)) -> (u32, u32) {
+        (size.0 / CORNER_DENOMINATOR, size.1 / CORNER_DENOMINATOR)
+    }
+
     /// Composite the picture into `dest`.
     ///
     /// The alpha is the picture's own: what tOS ships is drawn on nothing, so
@@ -177,6 +220,61 @@ mod tests {
 
     fn shipped() -> Splash {
         Splash::built_in().expect("the picture tOS ships should decode")
+    }
+
+    fn shipped_lock() -> Splash {
+        Splash::built_in_lock().expect("the lock picture tOS ships should decode")
+    }
+
+    #[test]
+    fn the_lock_picture_that_ships_decodes_and_is_not_the_login_one() {
+        let lock = shipped_lock();
+        assert!(lock.width > 0 && lock.height > 0);
+        assert_eq!(
+            lock.rgba.len(),
+            (lock.width * lock.height * 4) as usize,
+            "the picture should be RGBA8"
+        );
+        assert_ne!(lock, shipped(), "the two screens ship two pictures");
+    }
+
+    #[test]
+    fn the_lock_picture_is_drawn_pixel_for_pixel_on_the_displays_that_matter() {
+        // This one is not pixel art the way the frontispiece is — it is a
+        // render, so a whole fraction of it is soft and a whole multiple of it
+        // is blocky, and it only looks like what it is at 1:1. That is what
+        // decided its size: 426 across is a third of 1280 exactly, so it lands
+        // pixel for pixel on the display tOS runs headless at and on the one
+        // it runs on a laptop. A picture swapped for a wider one would still
+        // draw, at half size and softly, and nothing else here would notice.
+        let lock = shipped_lock();
+        for display in [(1280u32, 720u32), (1920, 1080)] {
+            let fitted = lock
+                .fit(Splash::room_in_corner(display))
+                .expect("the corner should have room");
+            assert_eq!(
+                fitted,
+                (lock.width, lock.height),
+                "on {display:?} the picture is not drawn at its own size"
+            );
+        }
+    }
+
+    #[test]
+    fn a_corner_is_a_third_of_the_display_each_way() {
+        assert_eq!(Splash::room_in_corner((1920, 1080)), (640, 360));
+    }
+
+    #[test]
+    fn a_bad_lock_picture_falls_back_to_the_lock_one_and_not_the_login_one() {
+        // The two fallbacks are the only thing `load` and `load_lock` do
+        // differently, so it is the thing worth a test: a machine with an
+        // unreadable /etc/tos/lock.png should get a lock picture back.
+        let path = std::env::temp_dir().join(format!("tos-lock-bad-{}.png", std::process::id()));
+        std::fs::write(&path, b"not a png").expect("write");
+        assert_eq!(Splash::load_lock(&path), Some(shipped_lock()));
+        assert_eq!(Splash::load(&path), Some(shipped()));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
