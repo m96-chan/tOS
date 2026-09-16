@@ -67,8 +67,11 @@
 #     (SAVE_CONFIG wrote the network into /etc/wpa_supplicant/tos-wlan0.conf,
 #     and on the live image's tmpfs /etc that only holds until the reboot —
 #     so this one is a test for an installed machine);
-#   this script's AP killed — `ip netns exec tos-ap pkill wpa_supplicant` —
-#     which has to show wlan0 losing its carrier in the menu.
+#   this script's AP killed — `pkill -f 'wpa_supplicant.*ap.conf'`, and by
+#     that pattern rather than by name: pids are not namespaced the way the
+#     network is, and a bare `pkill wpa_supplicant` takes wlan0's own
+#     supplicant with it, which the first run of this found out — after which
+#     the link menu has to show wlan0 without its network.
 #
 # Running it again after each of those is the point: it leaves the access
 # point and the lease server where they are and re-prints the three dumps, so

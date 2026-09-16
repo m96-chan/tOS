@@ -7609,7 +7609,10 @@ mod tests {
 
         let opened = Instant::now();
         open_the_list(&mut compositor);
-        compositor.tick_at(opened + Duration::from_millis(600));
+        // A second and a half on: the list asks the supplicant again once a
+        // second and not once a frame, and `open_the_list` took its own
+        // `Instant::now()` a moment after `opened`.
+        compositor.tick_at(opened + Duration::from_millis(1500));
 
         let overlay = compositor.overlay().expect("the wireless menu");
         assert_eq!(overlay.title(), "wireless");

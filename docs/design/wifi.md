@@ -524,3 +524,152 @@ it goes into `wpa.rs`'s tests verbatim, labelled with the supplicant version
 that produced it. What was seen goes at the end of this document in the shape
 `network.md` used for #84 — specific enough that somebody can tell whether it
 was really run.
+
+---
+
+## What was seen — the witness, run
+
+Everything above this line was designed, built and unit tested against
+tables, and had never met a radio. This is the record of the runs that did:
+the ISO built from this tree, booted in VirtualBox with a NAT `virtio-net`
+adapter for the cable, and `mac80211_hwsim` for the radios, driven headless —
+the serial line to a file, the compositor by `keyboardputscancode` and
+`keyboardputstring`, the screen read back with `screenshotpng` every second
+or two, because a status line lives a few seconds and a screenshot is the
+only way to read it. Measured 2026-09-16: Debian bookworm, kernel
+6.1.0-53-amd64, wpa_supplicant v2.10, busybox 1.35.0.
+
+### Three faults, in the order they were found, each only visible past the last
+
+**The image had every radio driver and no cipher.** The first run: hwsim
+loaded out of the rootfs's own module tree, udev started
+`tos-supplicant@wlan0` and `tos-supplicant@wlan1`, the witness took the
+second one off its radio and started an access point on it — and the access
+point failed to come up, with the supplicant's debug log reading
+`nl80211: NEW_KEY`, `kernel reports: key addition failed`, `WPA: group state
+machine entering state FATAL_FAILURE`. `ls /lib/modules/*/kernel/crypto/`
+answered `No such file or directory`. mac80211 depends on none of the
+ciphers; it asks the crypto API for `ccm(aes)` by name at the moment the
+first key is set, which is the shape of #84 again, and a real WPA2 join on a
+real radio would have died in the same line. `ccm gcm cmac ctr ghash_generic`
+are in the tree now and the build asserts `ccm.ko` is there.
+
+**The witness was one host pretending to be two, and the kernel knew.** With
+the cipher in, the access point came up, the list showed
+`hwsim-ap  -30 dBm  WPA2`, the passphrase prompt drew bullets, the four-way
+handshake completed, the link menu grew `leave hwsim-ap` and
+`forget hwsim-ap`, `net::auto` said `asking for an address on wlan0` — and
+fifteen seconds later `wlan0: no DHCP server answered in 15 seconds`, while
+busybox's `udhcpc` on the same radio got `10.99.0.49` at once. `tcpdump` on
+the access point's radio:
+
+```text
+02:00:00:00:00:00 > ff:ff:ff:ff:ff:ff, ethertype IPv4, length 342:
+    10.0.2.15.68 > 255.255.255.255.67: BOOTP/DHCP, Request from 02:00:00:00:00:00
+```
+
+`10.0.2.15` is the cable's address. `wlan0` had none, so the kernel chose one
+from another link — and a packet whose source is one of the receiving host's
+own addresses is a martian, dropped before `udhcpd` saw it. Allowing it
+(`accept_local=1`) got the lease onto `wlan0` and then
+`cannot take 10.99.0.49/24 via 10.99.0.1: Network unreachable`, because the
+gateway was an address of the same host. Neither is what a laptop meets. The
+first is a real finding about the client on its own and is #156; the second
+is the witness's construction. The fix for the witness was to make the access
+point a different host: its radio is moved into a network namespace by its
+phy (`iw phy ... set netns`, which is why `iw` is on the image now), and the
+supplicant, the address and `udhcpd` run in there.
+
+**`pkill wpa_supplicant` in the namespace killed both supplicants.** Pids are
+not namespaced the way the network is. The link menu answered with its third
+shape — `no supplicant on wlan0 / is wpasupplicant installed?` — which was
+the right thing to say and the wrong test; the instruction in the script's
+header now kills by config-file pattern.
+
+### What was seen, from the script the image ships
+
+`/usr/share/tos/wifi-witness.sh` from a pane, then the keystrokes in its
+header, on a fresh boot of the image:
+
+```text
+super+shift+n, wlan0, join a wireless network
+                          wireless — scanning   ->   wireless
+                          hwsim-ap              -30 dBm  WPA2
+hwsim-ap                  hwsim-ap — passphrase   > ••••••••••••••
+correct horse             status bar: joining hwsim-ap
+                          status bar, ~8 s later: wlan0 10.99.0.49/24 via 10.99.0.1
+```
+
+and from a pane afterwards, on the serial line:
+
+```text
+wpa_state=COMPLETED      key_mgmt=WPA2-PSK     0  hwsim-ap  any  [CURRENT]
+wlan0  UP  10.99.0.49/24 fe80::ff:fe00:0/64
+default via 10.0.2.2 dev enp0s3 metric 100
+default via 10.99.0.1 dev wlan0 metric 600
+10.0.2.0/24 dev enp0s3 proto kernel scope link src 10.0.2.15
+10.99.0.0/24 dev wlan0 proto kernel scope link src 10.99.0.49
+# written by tOS from the DHCP lease on wlan0
+nameserver 10.99.0.1
+ping 10.99.0.1: 3 packets transmitted, 3 received, 0% packet loss, rtt avg 2.204 ms
+ip route get 8.8.8.8:  8.8.8.8 via 10.0.2.2 dev enp0s3 src 10.0.2.15
+```
+
+Two default routes, the cable's the lower, and the ping is two milliseconds
+across a simulated air rather than the sixty microseconds of loopback the
+first witness measured. The link menu for `wlan0` then reads
+`wlan0  hwsim-ap  up` over `take the link down / ask for an address /
+leave hwsim-ap / forget hwsim-ap / join a wireless network`.
+
+**The cable pulled** — `VBoxManage controlvm ... setlinkstate1 off`:
+
+```text
+/sys/class/net/enp0s3/carrier: 0
+ip route get 8.8.8.8:  8.8.8.8 via 10.99.0.1 dev wlan0 src 10.99.0.49
+ping 10.99.0.1: 2 received, 0% packet loss
+```
+
+and put back: carrier `1`, `via 10.0.2.2 dev enp0s3` again. The stale wired
+route was in the table throughout, as the design said it would be, and
+`ignore_routes_with_linkdown` is what made the kernel step over it.
+
+**The wrong passphrase** — `forget hwsim-ap` from the link menu, the same
+join with `wrong horse battery`: `joining hwsim-ap`, and about twelve seconds
+later `hwsim-ap: wrong passphrase`. `LIST_NETWORKS` afterwards is the header
+alone and `wpa_state=INACTIVE`: the network was removed and not saved, so a
+wrong key is not tried again at every boot.
+
+**The access point taken down** — `pkill -f 'wpa_supplicant.*ap.conf'`: the
+link's carrier goes and the menu offers `bring the link up` and no network
+to leave.
+
+### What the supplicant wrote
+
+Copied out of the serial line into `wpa.rs`'s tests verbatim, labelled
+`captured`:
+
+```text
+bssid / frequency / signal level / flags / ssid
+02:00:00:00:01:00	2412	-30	[WPA2-PSK-CCMP][WPS][ESS]	hwsim-ap
+```
+
+`[WPS]` beside the security flags on the first real scan line ever parsed —
+which is why the flag reader treats the WPS family as saying nothing about
+security — and a `STATUS` carrying `p2p_device_address`, `address`, `uuid`
+and, once a lease has been held, `ip_address`, none of which the parser
+wants and all of which it now has been shown to step over.
+
+### What was not seen
+
+- **A reboot rejoining.** The live image's `/etc` is a tmpfs, so the network
+  `SAVE_CONFIG` wrote is gone at reboot by design; this is an installed
+  machine's test and was not run on one.
+- **A real radio.** Everything here is `mac80211_hwsim`, which is mac80211
+  with no hardware under it. The five driver families and their firmware are
+  packed and have never bound to anything; whether Intel's `iwlmvm` finds
+  its `.ucode` on this image is the next machine's question.
+- **Hidden networks, EAP, WEP** — deliberately outside this milestone, and
+  the list says so on the row.
+- **Two access points with one name.** Folding to the strongest is unit
+  tested and was not exercised; hwsim had one.
+
