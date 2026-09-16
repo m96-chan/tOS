@@ -127,6 +127,13 @@ pub struct Config {
     /// error — the picture tOS ships is compiled in, and is what a machine
     /// with no picture of its own shows.
     pub splash: PathBuf,
+    /// The picture the lock screen draws in its bottom right corner.
+    ///
+    /// A second file rather than the same one, on the same terms: the two
+    /// screens want different pictures because they are drawn in different
+    /// places for different reasons, and a machine should be able to replace
+    /// either without touching the other.
+    pub lock_picture: PathBuf,
     /// Where the accounts are. A seam for the same reason [`Config::credential`]
     /// is: a test writes its own passwd file rather than depending on whoever
     /// happens to exist on the machine running it.
@@ -207,6 +214,7 @@ impl Default for Config {
             credential: PathBuf::from(crate::lock::CREDENTIAL_PATH),
             credential_user: crate::lock::session_user(),
             splash: PathBuf::from(crate::splash::SPLASH_PATH),
+            lock_picture: PathBuf::from(crate::splash::LOCK_PATH),
             passwd: PathBuf::from(crate::account::PASSWD_PATH),
             group: PathBuf::from(crate::account::GROUP_PATH),
             gated: false,

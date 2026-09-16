@@ -8,6 +8,11 @@ And at the head of every pane, in place of the banner drawn in cells, for the
 terminals that can be sent a picture — which on a tOS machine is the terminal
 tOS runs the shell in.
 
+**Since.** A second picture, `lock.png`, in the bottom right corner of a
+locked screen. Same machinery, same whole-pixel rule, its own file and its own
+place — see *And the lock gets one in the corner* below, which is decided out
+of the argument that kept the frontispiece off a lock rather than against it.
+
 ## What there was
 
 A box on an empty field. `LockScreen::draw` drew the box and
@@ -72,13 +77,54 @@ and a display that does not is the box exactly where it has always been. A
 quarter of the shipped picture is the smallest fraction drawn; below that it
 would be a smudge rather than a picture.
 
-## Only over a login
+## The frontispiece is only over a login
 
-`Purpose::Lock` does not get it. A lock has a session behind it and somebody
-in front of it who has already been told what this machine is; what they want
-is their session back, and a picture over it would be decoration in the way of
-that. A login screen is the machine opening, which is what a frontispiece is
-for.
+`Purpose::Lock` does not get *this* picture, in *this* place. A lock has a
+session behind it and somebody in front of it who has already been told what
+this machine is; what they want is their session back, and a picture over the
+box would be decoration in the way of that. A login screen is the machine
+opening, which is what a frontispiece is for.
+
+## And the lock gets one in the corner
+
+**Decided after the above, and out of it.** The argument against a frontispiece
+over a lock is an argument about *where*, not about *whether*: what it says is
+that nothing should come between somebody and the field they walked back to.
+A picture in the bottom right corner does not, and a locked screen is the one
+tOS leaves up for hours at a time.
+
+So it gets one, on the terms the frontispiece already set and with all three
+of them different:
+
+| | login | lock |
+|---|---|---|
+| the file | `assets/splash.png`, `/etc/tos/splash.png` | `assets/lock.png`, `/etc/tos/lock.png` |
+| the room | four fifths of the width, whatever height the box left | a third of the display each way (`room_in_corner`) |
+| where | centred above the box, laid out with it as one stack | the corner, a row of margin in from each edge |
+
+**Two files and not one.** The pictures are different shapes for different
+places, so one file would mean one of the two screens showing a picture
+composed for the other. It also means a machine can replace either without
+touching the other — and `/etc/tos/splash.png` is already spoken for twice
+over, since it is what a pane is sent at the head of every shell.
+
+**Nothing lays out around the corner.** The box sits where it would on an
+empty field; the picture is placed against the corner afterwards. On a display
+short enough that the two would meet, the picture goes — the same order the
+frontispiece follows, and for the same reason: the box is the part somebody
+cannot do without. `Rect::intersect` is that check, and the corner is drawn
+before the box so that a miss in it costs a corner of a picture rather than
+the field.
+
+**Sized to land at 1:1.** The shipped `lock.png` is 426x142, and 426 is a
+third of 1280 exactly, so it is drawn pixel for pixel on the display tOS runs
+headless at and on the one it runs on a laptop. That matters more here than it
+does for the frontispiece: `splash.png` is real pixel art and a whole multiple
+of it is still pixel art — the login screen draws it at 3x on a 1080p panel —
+where `lock.png` is a render, which is soft at a whole fraction and blocky at a
+whole multiple and looks like itself only at its own size. A unit test asserts
+the 1:1, because a picture swapped for a wider one would still draw, at half
+size and softly, and nothing else would notice.
 
 ## Nothing in `lock.rs` reads a file
 
@@ -86,12 +132,14 @@ The rule at the top of that module — nothing there draws to a display it is
 not given, reads a file it is not pointed at, or asks what time it is — is
 what lets its tests drive the whole state machine with no display. A picture
 is a file, so the loading is `splash.rs` and the compositor hands the result
-in, the same shape the clock already has.
+in, the same shape the clock already has. Which of the two files was loaded is
+decided where the screen goes up; where the result is *drawn* is decided by the
+screen's own `Purpose`, which `draw` already has.
 
-The compositor holds the picture only while the login screen is up: read in
-`show_login`, dropped in `unlock`. A login happens once, and a megabyte of
-pixels nobody is going to look at again is a megabyte a session could have
-had.
+The compositor holds one picture and not two, because the two screens are
+never up at once: read in `show_login` or `engage_lock`, dropped in `unlock`.
+A megabyte of pixels nobody is going to look at again is a megabyte a session
+could have had.
 
 ## At the head of every pane
 

@@ -49,9 +49,10 @@ fn built(name: &str, command: &[&str], gated: bool) -> Compositor {
         inactive_fade: 0,
         credential: path,
         credential_user: ACCOUNT.into(),
-        // The picture tOS ships, never one the machine running the tests
+        // The pictures tOS ships, never ones the machine running the tests
         // happens to have put in /etc.
         splash: "/nonexistent".into(),
+        lock_picture: "/nonexistent".into(),
         gated,
         ..Config::default()
     };
@@ -101,6 +102,18 @@ fn row_has_ink(framebuffer: &OwnedFramebuffer, y: u32, background: u32) -> bool 
     (0..SIZE.0).any(|x| framebuffer.pixel(x, y) != background)
 }
 
+/// The same, over the part of a row the lock's own picture cannot reach.
+///
+/// That picture is in the bottom right corner and is given a third of the
+/// display each way (`Splash::room_in_corner`), so the rest of the row is the
+/// session's or nobody's. It is needed for the status bar and for nothing
+/// else: the bar is the one thing of a session drawn low enough to share a row
+/// with a corner, and asking about the whole row there would be asking whether
+/// the lock drew its own picture.
+fn session_row_has_ink(framebuffer: &OwnedFramebuffer, y: u32, background: u32) -> bool {
+    (0..SIZE.0 - SIZE.0 / 3).any(|x| framebuffer.pixel(x, y) != background)
+}
+
 /// Whether anything but the background is inside this square of pixels.
 fn ink_in(framebuffer: &OwnedFramebuffer, at: (u32, u32), side: u32, background: u32) -> bool {
     (at.1..at.1 + side).any(|y| (at.0..at.0 + side).any(|x| framebuffer.pixel(x, y) != background))
@@ -143,7 +156,7 @@ fn a_locked_screen_shows_nothing_of_the_session() {
         "the pane never drew anything to hide"
     );
     assert!(
-        row_has_ink(&framebuffer, bar_row, background),
+        session_row_has_ink(&framebuffer, bar_row, background),
         "the status bar never drew anything to hide"
     );
 
@@ -154,7 +167,7 @@ fn a_locked_screen_shows_nothing_of_the_session() {
         "the pane is still on the screen under the lock"
     );
     assert!(
-        !row_has_ink(&framebuffer, bar_row, background),
+        !session_row_has_ink(&framebuffer, bar_row, background),
         "the status bar is still on the screen under the lock"
     );
     // The box itself is drawn, so the lock is visible rather than the screen
@@ -329,10 +342,13 @@ fn a_locked_screen_paints_no_arrow() {
 }
 
 #[test]
-fn the_login_screen_has_the_picture_over_it_and_a_lock_does_not() {
-    // #132. The screen that opens the machine says what the machine is; the
-    // one guarding a session says nothing it did not say before, because
-    // there is a session behind it and its job is to be answered.
+fn the_login_picture_is_over_the_box_and_the_locks_is_in_the_corner() {
+    // #132. The screen that opens the machine says what the machine is over
+    // its box; the one guarding a session keeps out of the way of its box,
+    // because there is a session behind it and its job is to be answered. So
+    // the lock has a picture too, in the bottom right corner — the placement
+    // is the whole of the difference, and this asserts it through a real
+    // compositor rather than against `LockScreen::draw` alone.
     //
     // A picture is the one thing on either screen that is drawn in pixels
     // rather than cells, and that is what this counts: the box, the rule and
@@ -345,7 +361,11 @@ fn the_login_screen_has_the_picture_over_it_and_a_lock_does_not() {
         "a console came up without asking who was there"
     );
     render_onto(&mut c, &mut framebuffer);
-    let over_the_box = colours_above_the_box(&framebuffer);
+    let over_the_box = colours_in(&framebuffer, Half::Top, Half::Left).max(colours_in(
+        &framebuffer,
+        Half::Top,
+        Half::Right,
+    ));
     assert!(
         over_the_box > 1000,
         "the login screen has {over_the_box} colours over its box, so no picture"
@@ -355,22 +375,50 @@ fn the_login_screen_has_the_picture_over_it_and_a_lock_does_not() {
     c.inject(b"SECRET-IN-A-PANE");
     assert!(c.lock_session());
     render_onto(&mut c, &mut framebuffer);
-    let over_the_box = colours_above_the_box(&framebuffer);
+    let corner = colours_in(&framebuffer, Half::Bottom, Half::Right);
     assert!(
-        over_the_box < 16,
-        "the locked box has {over_the_box} colours over it, which is a picture"
+        corner > 1000,
+        "the locked screen has {corner} colours in its bottom right, so no picture"
     );
+    for (word, down, across) in [
+        ("top left", Half::Top, Half::Left),
+        ("top right", Half::Top, Half::Right),
+        ("bottom left", Half::Bottom, Half::Left),
+    ] {
+        let drawn = colours_in(&framebuffer, down, across);
+        assert!(
+            drawn < 16,
+            "the locked screen has {drawn} colours in its {word}, which is a picture"
+        );
+    }
 }
 
-/// How many distinct colours are on the top half of the display.
+/// Which half of the display a count is over, on each axis.
+#[derive(Clone, Copy)]
+enum Half {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// How many distinct colours are in one quarter of the display.
 ///
-/// The box sits in the middle and the picture goes above it, so this counts
-/// the picture and the top border of the box and nothing else. A box on its
-/// own brings a handful of colours here; a picture brings thousands.
-fn colours_above_the_box(framebuffer: &OwnedFramebuffer) -> usize {
+/// Where a picture's thousands of colours land is how these tests tell where
+/// it was drawn without knowing what it is a picture of. A quarter with only
+/// chrome in it brings a handful.
+fn colours_in(framebuffer: &OwnedFramebuffer, down: Half, across: Half) -> usize {
+    let rows = match down {
+        Half::Top => 0..SIZE.1 / 2,
+        _ => SIZE.1 / 2..SIZE.1,
+    };
+    let cols = match across {
+        Half::Left => 0..SIZE.0 / 2,
+        _ => SIZE.0 / 2..SIZE.0,
+    };
     let mut seen = std::collections::HashSet::new();
-    for y in 0..SIZE.1 / 2 {
-        for x in 0..SIZE.0 {
+    for y in rows {
+        for x in cols.clone() {
             seen.insert(framebuffer.pixel(x, y));
         }
     }
