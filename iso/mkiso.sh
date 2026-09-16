@@ -912,13 +912,28 @@ EOF
 # modules, 19,407,460 bytes of .ko and 3,923,968 bytes of the squashfs. The
 # firmware they ask for is the expensive half, and it is in the package list
 # above.
+#
+# And the ciphers, which no driver depends on and every association needs.
+# WPA2 is CCMP and WPA3 is GCMP; the kernel does not link either into
+# mac80211 but asks the crypto API for `ccm(aes)` or `gcm(aes)` *by name*, at
+# the moment the first key is set — which is the #84 shape again, a module
+# nothing depends on and something asks for mid-syscall. The first run of
+# iso/wifi-witness.sh found it: the access point came up, the four-way
+# handshake ran, and the group key failed with `kernel reports: key addition
+# failed`, because the rootfs had every radio driver and no `ccm.ko`. A real
+# radio joining a real WPA2 network would have died in the same line. `cmac`
+# is what the handshake's key derivation wants and `ctr` and `ghash` are what
+# the two AEAD modes are built from; `aes_generic` is named in case this
+# kernel makes it a module rather than a builtin, and `modprobe` answers
+# `builtin` for one that is not, which the copy below simply skips.
 WIRELESS_MODULES="cfg80211 mac80211 \
     iwlwifi iwlmvm iwldvm \
     rtw88_8821ce rtw88_8822be rtw88_8822ce rtw89_8852ae rtl8xxxu \
     ath9k ath10k_pci ath11k_pci \
     brcmfmac \
     mt7921e mt7921u \
-    mac80211_hwsim"
+    mac80211_hwsim \
+    ccm gcm cmac ctr ghash_generic aes_generic"
 mkdir -p "$ROOTFS/lib/modules/$KVER"
 # Asked once for its own sake before anything is copied, because the copy
 # below is a pipeline and an `exit` inside one exits a subshell and nothing
@@ -967,6 +982,7 @@ for pattern in \
     "$ROOTFS/lib/modules/$KVER/modules.dep" \
     "$ROOTFS/lib/modules/$KVER/modules.alias" \
     "$ROOTFS/lib/modules/$KVER/kernel/net/wireless/cfg80211.ko" \
+    "$ROOTFS/lib/modules/$KVER/kernel/crypto/ccm.ko" \
     "$ROOTFS/lib/firmware/iwlwifi-*.ucode" \
     "$ROOTFS/lib/firmware/rtw88/*.bin" \
     "$ROOTFS/lib/firmware/ath10k/QCA*" \
