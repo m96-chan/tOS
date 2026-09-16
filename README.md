@@ -1067,21 +1067,55 @@ second pile of work.
 - graphical web surfaces
 - keyboard / pointer / touch web interaction
 
-## Candidate Applications
+## Applications
 
-Existing TUI applications can provide most of the initial userspace.
+Existing TUI applications provide the initial userspace, and
+[#151](https://github.com/m96-chan/tOS/issues/151) settled which ones a fresh
+machine has. `docs/design/applications.md` is the reasoning and the measured
+cost; this is the list.
 
-| Purpose | Candidate |
-| --- | --- |
-| Shell | Bash / Zsh / Fish |
-| Editor | Neovim / Helix |
-| File manager | Yazi |
-| Git UI | lazygit |
-| Process monitor | btop |
-| Network configuration | nmtui |
-| Bluetooth | bluetuith |
-| Media | terminal-native / Kitty Graphics aware tools |
-| Web browser | tOS browser, TBD |
+| Purpose | On every image | From |
+| --- | --- | --- |
+| Shell | bash | Debian |
+| Editor | neovim | Debian (0.7.2; see below) |
+| File manager | yazi | upstream `.deb`, pinned |
+| Git | git | Debian |
+| Resource monitor | btop | Debian |
+| Search and selection | ripgrep, fzf | Debian |
+| Fetching | curl, wget | Debian |
+| Basic tools | less, openssh-client, rsync, unzip, file | Debian |
+| Face | HackGen Console NF | upstream zip, pinned |
+| Network, Bluetooth | tOS's own menus | tOS |
+| Web browser | tOS browser, TBD | [#147](https://github.com/m96-chan/tOS/issues/147) |
+
+**Bash is the shell**, and installing Homebrew does not change that: Homebrew
+is a package manager that came from macOS, and the shell macOS defaults to is
+a fact about Apple rather than about `brew`. Another shell is an `apt install`
+and a `chsh` away, which is what a shell being a choice looks like.
+
+**Not preinstalled, deliberately**: `tmux`, because tOS's own panes are what a
+session that survives a detach is for ([#6](https://github.com/m96-chan/tOS/issues/6));
+`lazygit`, because it is a taste over git rather than something git cannot do;
+and `nmtui` or `bluetuith`, because they would be a second answer to a question
+the compositor already answers.
+
+**Neovim is bookworm's 0.7.2**, which is old, and it is the distribution's
+copy on purpose: an editor is what somebody points their own configuration at,
+and one that gets bookworm's security updates is worth more than a newer one
+that nothing updates after the image is built. Current neovim is one line away
+from Homebrew or from upstream's tarball, and then it is theirs.
+
+**Two things do not come from Debian** — the file manager and the face — and
+both are fetched at build time against a sha256 written beside the URL, so a
+release that moved under its tag stops the build. Neither has a line in the
+package database, which means `apt upgrade` will never touch them and a fix in
+either is a commit here and a new image. That cost is why the list of things
+arriving this way is two long.
+
+Yazi earns it by being the first program on the image that tOS did not write
+and that draws pictures through tOS's own graphics protocol. It was never told
+what tOS is; it asks the terminal whether it can show a picture, tOS answers,
+and a photograph appears in a pane.
 
 Applications are replaceable.
 

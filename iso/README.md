@@ -78,9 +78,10 @@ pair at 4,539,466 bytes uncompressed.
 
 203 MB unpacked against 58 MB squashed is the ratio worth knowing: an
 installed machine spends the unpacked figure on its disk, a live one only the
-squashed figure on the medium. Trimming `/usr/share/{man,locale,info,doc}`,
-which `mkiso.sh` does, is worth 16,650,240 bytes of that squashfs — most of it
-translations nothing on the image can currently display.
+squashed figure on the medium. Trimming `/usr/share/{man,locale,info,doc}` was
+worth 16,650,240 bytes of that squashfs — most of it translations nothing on
+the image can currently display. `man` came back off that list in #151; the
+other three are still trimmed.
 
 ### What carrying them twice cost
 
@@ -196,6 +197,47 @@ loads are a couple of megabytes of that; the rest is i915, nvidia, cxgb4 and
 every other blob Debian could not find a better home for. Dropping that one
 package would take about 17 MB off the medium and MediaTek off the list of
 radios this image can start.
+
+### What the applications cost
+
+**#151.** The image had everything it needed to boot, install itself and join a
+network, and nothing to work in once it had. Thirteen Debian packages, a file
+manager and a face later, measured by building the ISO at `origin/main` and at
+that change on the same machine:
+
+| | before | after | |
+|---|---|---|---|
+| ISO | 194,025,472 | 240,781,312 | +46,755,840 |
+| rootfs, squashed (zstd-19) | 155,623,424 | 202,375,168 | +46,751,744 |
+| rootfs, unpacked | 486,614,158 | 623,082,598 | +136,468,440 |
+| initramfs (gzip) | 9,893,959 | 9,893,964 | +5, gzip noise |
+
+About a quarter more image. The initramfs is untouched, which is the shape this
+was always meant to have: the few megabytes that find the medium do not care
+what is on it. Where the rest goes, each measured on its own:
+
+| | unpacked | squashed |
+|---|---|---|
+| git, curl, less, neovim, ripgrep, fzf, btop, openssh-client, rsync, unzip, file, libatomic1 | 84,098,952 | 23,908,352 |
+| yazi | 33,929,663 | 12,378,112 |
+| the manual pages | 7,938,894 | 7,876,608 |
+| HackGen Console NF, less the `fonts-vlgothic` it replaces | 8,834,072 | 3,428,352 |
+
+Two rows are worth a second look.
+
+**The manual pages do not compress**, because they arrive gzipped: the squashfs
+gains nothing on them and the unpacked and squashed figures are the same number
+twice. They are on the image because the `path-exclude` that kept them off it
+was not a statement about the image — it was a line in the installed machine's
+dpkg configuration, so it meant that machine could never have a manual page for
+anything it installed afterwards either.
+
+**Two things here do not come from Debian**, and both are fetched at build time
+against a sha256 written into `mkiso.sh` beside the URL. That buys integrity
+and nothing else: neither has a line in the package database, so `apt upgrade`
+will never touch them and a fix in either is a commit and a new image.
+`docs/design/applications.md` has the whole argument, including why the list of
+things arriving this way is two long and not ten.
 
 ### The witness
 

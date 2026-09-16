@@ -49,9 +49,40 @@ apt-get update
 apt-get install -y --no-install-recommends \
     musl-tools busybox-static cpio kmod skkdic \
     mmdebstrap squashfs-tools \
+    curl ca-certificates unzip \
     "$KERNEL_PKG" \
     grub-common grub2-common $GRUB_PKGS xorriso mtools \
     fdisk dosfstools e2fsprogs
+
+# Two things on the image do not come from the Debian archive — the face the
+# compositor draws with and the file manager — so there is one way to fetch
+# them and it verifies what it got before anything uses it.
+#
+# The Debian mirror above is plain http on purpose: apt checks the archive's
+# signature whatever transport carried it, and https would add a dependency on
+# a clock this machine may not have (see the MIRROR note below). Neither of
+# these two has a signature to check, so the checksum written beside the URL is
+# the whole of the integrity, and it is why the fetch is https *and* pinned: a
+# mirror that serves something else, an upstream that moves a tag, and a
+# release whose bytes changed under it all stop the build here rather than
+# shipping. Updating either of them means changing a version and a hash
+# together, in one commit, which is the review this arrangement is for.
+fetch_pinned() {
+    url=$1
+    want=$2
+    out=$3
+    curl -fsSL --retry 3 -o "$out" "$url" || {
+        echo "mkiso: cannot fetch $url" >&2
+        exit 1
+    }
+    got=$(sha256sum "$out" | cut -d' ' -f1)
+    if [ "$got" != "$want" ]; then
+        echo "mkiso: $url is not the file this build was written against" >&2
+        echo "mkiso:   expected $want" >&2
+        echo "mkiso:   got      $got" >&2
+        exit 1
+    fi
+}
 
 # Fully static binaries: they run as PID 1's children with no libc on disk.
 rustup target add "$RUST_TARGET" 2>/dev/null || true
@@ -366,15 +397,31 @@ SECURITY_MIRROR=${SECURITY_MIRROR:-http://security.debian.org/debian-security}
 SUITE=${SUITE:-bookworm}
 
 # Never unpacked rather than deleted afterwards, so the rule also governs
-# everything apt installs later: a machine whose whole disk is a squashfs
-# should not spend it on manual pages it has no pager story for. Copyright
-# files stay — they are the terms under which this image may be handed to
-# anybody at all.
+# everything apt installs later. Copyright files stay — they are the terms
+# under which this image may be handed to anybody at all.
+#
+# The manual pages used to be on this list, and came off it in #151. The line
+# that put them there said a squashfs "should not spend it on manual pages it
+# has no pager story for", and that reason expired the moment `less` went on
+# the image. What remained was the size, and the size turned out to be
+# 7,876,608 bytes of the squashfs — measured by building this rootfs both ways,
+# rather than the much larger number it was assumed to be.
+#
+# The argument for paying it is not really about the image at all. A
+# `path-exclude` here is not "this image has no manuals"; it is a line in the
+# installed machine's dpkg configuration, so it is "this machine can never have
+# manuals" — `apt install` a package on a tOS laptop a year from now and its
+# manual is thrown away on the way in. That is a property somebody discovers
+# the first time they type `man git`, cannot explain, and cannot easily undo,
+# and it is not worth 3% of the medium.
+#
+# /usr/share/locale stays excluded and the reason is intact: the rootfs has no
+# `locales` package, so no locale is generated and every program falls back to
+# C. Those 31.8 MB are translations nothing can display.
 cat >"$WORK/tos-minimal" <<'EOF'
 # Written by iso/mkiso.sh. See the note there.
 path-exclude=/usr/share/doc/*
 path-include=/usr/share/doc/*/copyright
-path-exclude=/usr/share/man/*
 path-exclude=/usr/share/locale/*
 path-exclude=/usr/share/info/*
 EOF
@@ -441,8 +488,6 @@ EOF
 #                           three without adding anything.
 #   ncurses-base            the terminfo for the TERM tOS advertises. Without
 #                           it apt's own progress bar has nothing to draw on.
-#   fonts-vlgothic          the face the compositor loads, now dpkg's problem
-#                           rather than a file copied past it.
 #   e2fsprogs dosfstools    the installer makes these filesystems, and it now
 #   fdisk util-linux        runs here rather than in the initramfs.
 #   mount                   and so it needs a mount(8): Debian split it out of
@@ -517,13 +562,80 @@ EOF
 #                           kernel module and looked up in bookworm's
 #                           Contents with apt-file, rather than guessed from
 #                           the chip's name.
+#
+# And then the applications, which are #151 and are a different kind of
+# argument from everything above. Nothing up to here is on the image because
+# somebody would enjoy it; each of those is a thing without which the machine
+# does not boot, does not install itself, or cannot reach a network. These are
+# on it because a machine that boots to a shell and has no editor is a machine
+# nobody can do anything on, and `apt install` is not an answer on the first
+# day of a laptop whose network is the thing you were going to configure.
+#
+# docs/design/applications.md is the decision and the reasoning; the one-line
+# versions:
+#
+#   git                     "must git." — the issue's own words, and the only
+#                           name on it that arrived that way. Pulls
+#                           libcurl3-gnutls and perl's liberror, which is
+#                           where most of its cost is.
+#   curl                    the other thing the issue asked for by name, and
+#                           the tool every install-this-shell-script expects,
+#                           Homebrew's included. `wget` is already here for
+#                           "does this reach the network"; curl is here
+#                           because it is what a `curl | sh` line says, and
+#                           what a program that wants an API speaks.
+#   less                    the pager. git needs one, and without it `git log`
+#                           writes a repository's history at the screen and
+#                           keeps going. It is also what reopened the
+#                           manual-page decision above: the exclusion's stated
+#                           reason was that there was no pager to read them
+#                           with, and now there is.
+#   neovim                  the editor. bookworm has 0.7.2, which is old, and
+#                           it is shipped anyway: see applications.md, where
+#                           the alternative — an upstream tarball nothing
+#                           updates — is the thing being turned down.
+#   ripgrep fzf             search, and choosing from what it found. Both are
+#                           a single static-ish binary with no dependencies,
+#                           and both are what the file manager below reaches
+#                           for when they are there.
+#   btop                    what is this machine doing. `ps` and `free` are
+#                           already here and answer a narrower question; this
+#                           is the one somebody actually opens.
+#   openssh-client rsync    off this machine and onto another one.
+#   unzip file              what a downloaded archive is, and how to open it.
+#                           `file` is also yazi's one hard dependency.
+#   man-db                  and the manual pages it reads, which the dpkg
+#                           configuration above stopped throwing away for it.
+#                           Both halves or neither: a man(1) with nothing to
+#                           show answers every question with "No manual entry",
+#                           which is worse than a machine that plainly has
+#                           none. 7,876,608 bytes of the squashfs for the
+#                           pages, and the note above the dpkg configuration is
+#                           why they are worth it.
+#   libatomic1              nothing in Debian's set pulls it, and Node from
+#                           v25 links it: a `nvm install node` on a tOS
+#                           machine gets to 100%, unpacks, and then dies with
+#                           `libatomic.so.1: cannot open shared object file`.
+#                           45 kB, no dependencies of its own. It is here and
+#                           not left to the person because the failure names a
+#                           *file* and not a package, so apt cannot tell them
+#                           what to type — see applications.md, which is also
+#                           where Homebrew's place on this machine is settled.
+#
+# Not here, and on purpose: `tmux`, which #6 already decided is the person's to
+# install, since a session that survives a detach is what tOS's own panes are
+# for; and `lazygit`, which is a taste over git rather than a thing git cannot
+# do, and which unlike yazi has no .deb to pin. applications.md has both in
+# full, along with where Homebrew stands.
 ROOTFS_PACKAGES="debian-archive-keyring,ca-certificates,bash,systemd-sysv,udev,\
-busybox,iproute2,procps,iputils-ping,wget,ncurses-base,fonts-vlgothic,\
+busybox,iproute2,procps,iputils-ping,wget,ncurses-base,\
 e2fsprogs,dosfstools,\
 fdisk,util-linux,mount,kmod,sudo,squashfs-tools,grub2-common,\
 wpasupplicant,\
 firmware-iwlwifi,firmware-realtek,firmware-atheros,firmware-brcm80211,\
 firmware-misc-nonfree,\
+git,curl,less,neovim,ripgrep,fzf,btop,openssh-client,rsync,unzip,file,\
+man-db,libatomic1,\
 $(echo "$GRUB_PKGS" | tr ' ' ',')"
 
 # Three suites and not one. `bookworm` is the frozen release: a point release
@@ -576,12 +688,117 @@ for program in /usr/bin/apt /usr/bin/dpkg /bin/bash /bin/busybox \
     fi
 done
 
-# The face the compositor loads is a package in here now rather than a file
-# copied past dpkg, which means nothing in the tree fails if it goes missing:
-# the compositor falls back to its built-in ASCII face and every kana becomes
-# a hollow box, with the boot and every other assertion still green.
-if [ ! -f "$ROOTFS/usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf" ]; then
+# And the applications, for the same reason (#151): an image that reached here
+# without them is one somebody boots and cannot work on, and finding that out
+# at the login screen is finding it out too late.
+for program in /usr/bin/git /usr/bin/curl /usr/bin/less /usr/bin/nvim \
+    /usr/bin/rg /usr/bin/fzf /usr/bin/btop /usr/bin/ssh /usr/bin/rsync \
+    /usr/bin/unzip /usr/bin/file /usr/bin/man; do
+    if [ ! -x "$ROOTFS$program" ]; then
+        echo "mkiso: the rootfs has no $program" >&2
+        exit 1
+    fi
+done
+
+# The face the compositor draws with.
+#
+# It was fonts-vlgothic until #151, which is where somebody asked for this one
+# by name. The swap is not only taste: HackGen Console NF is a Nerd Font, so
+# the private-use glyphs that a modern TUI draws its icons out of are in the
+# face rather than being the hollow box they were, and the file manager below
+# is full of them.
+#
+# A file copied in rather than a package, because Debian has no HackGen and is
+# not going to. That reverses what the vlgothic line used to say for itself —
+# that a face dpkg owns is one whose absence is survivable, since the
+# compositor falls back to its built-in ASCII face and only Japanese breaks.
+# The trade is taken on purpose: a fetch that does not produce exactly the
+# bytes this build was written against stops the build (`fetch_pinned`), so
+# there is no image that quietly shipped without a face, and carrying
+# vlgothic as well would be 2,318,336 bytes of squashfs against a case that
+# cannot happen. It is the arrangement `splash.png`, `lock.png` and the SKK
+# dictionary are already on.
+#
+# The plain `HackGen`, not `HackGen35`: tOS's width table says a wide
+# character is exactly two cells, and only the 1:2 cut is. HackGen35 is 3:5,
+# which would put every kana half a cell wrong across a line. `Console` is the
+# cut without the programming ligatures, which a terminal that composites its
+# own cells cannot use anyway. `Regular` alone, no `Bold`: tos-font
+# synthesizes bold from the regular face when a cut is missing, which is what
+# it already did for vlgothic, and the Bold file is another 13,464,288 bytes.
+#
+# 12,922,800 bytes on disk, 5,746,688 of the squashfs — against vlgothic's
+# 2,318,336, so the face costs 3,428,352 more than the one it replaces.
+#
+# Licence: SIL Open Font License 1.1 (Hack, MIT; GenJyuu Gothic, OFL),
+# redistributable. The copyright file goes beside it, because shipping an OFL
+# face without its licence is not something an ISO may do.
+HACKGEN_VERSION=2.10.0
+HACKGEN_SHA256=f8abd483d5edfad88a78ed511978f43c83b43c48e364aa29ebe4a68217474428
+fetch_pinned \
+    "https://github.com/yuru7/HackGen/releases/download/v$HACKGEN_VERSION/HackGen_NF_v$HACKGEN_VERSION.zip" \
+    "$HACKGEN_SHA256" "$WORK/hackgen.zip"
+mkdir -p "$ROOTFS/usr/share/fonts/truetype/hackgen" "$WORK/hackgen"
+unzip -q -j -o "$WORK/hackgen.zip" "*/HackGenConsoleNF-Regular.ttf" -d "$WORK/hackgen"
+cp "$WORK/hackgen/HackGenConsoleNF-Regular.ttf" \
+    "$ROOTFS/usr/share/fonts/truetype/hackgen/HackGenConsoleNF-Regular.ttf"
+mkdir -p "$ROOTFS/usr/share/doc/hackgen"
+cat >"$ROOTFS/usr/share/doc/hackgen/copyright" <<EOF
+HackGen Console NF $HACKGEN_VERSION
+https://github.com/yuru7/HackGen
+
+SIL Open Font License 1.1. Built from Hack (MIT) and GenJyuu Gothic (OFL).
+Fetched by iso/mkiso.sh against sha256 $HACKGEN_SHA256.
+EOF
+
+if [ ! -f "$ROOTFS/usr/share/fonts/truetype/hackgen/HackGenConsoleNF-Regular.ttf" ]; then
     echo "mkiso: the rootfs carries no Japanese face" >&2
+    exit 1
+fi
+
+# The file manager (#151), and the first program on this image that tOS did
+# not write and that draws pictures through tOS's own graphics protocol.
+#
+# That is most of why it is here rather than left to the person. The protocol
+# has been exercised by `tos-preview`, which tOS wrote, and by its own tests;
+# a third-party program that was never told what tOS is, previewing a photo in
+# a pane because the pane answered like a terminal that can show one, is the
+# protocol being a protocol. `docs/design/graphics-file-transmission.md` is
+# what it is speaking.
+#
+# Upstream's own .deb, unpacked rather than installed: it carries no
+# maintainer scripts, so `dpkg-deb -x` puts exactly what `dpkg -i` would have
+# and needs no chroot to run in. What it does not get is a line in the package
+# database, which is the honest cost of every name on this image that Debian
+# does not have — see applications.md, where who owns its updates is written
+# down.
+#
+# The musl build, which is statically linked: it then does not care what libc
+# the rootfs has, and the rootfs is not asked to carry a second one.
+#
+# `Depends: file`, which is above. Everything else in its control file is a
+# Recommends — ffmpeg, 7zip, poppler-utils, imagemagick, zoxide — and stays
+# off: image previews are decoded by yazi itself and go over the graphics
+# protocol, so the previewers a terminal without one needs are previewers this
+# terminal does not. `ripgrep` and `fzf` are on that Recommends list too, and
+# are here for their own reasons above.
+#
+# 33,929,663 bytes unpacked, 12,378,112 of the squashfs — the single largest
+# thing #151 adds, and the one most likely to be argued with.
+#
+# Licence: MIT, redistributable.
+YAZI_VERSION=26.9.1
+case "$ARCH" in
+x86_64) YAZI_SHA256=77d9d41441eaa8f17a555ccd3961ea128321dceac5fc06cf53db131aa60fde8a ;;
+aarch64) YAZI_SHA256=39ae427eb0f0275c4302429b7a8fd48d1b862a2ee40d68d37b23f336be025164 ;;
+esac
+fetch_pinned \
+    "https://github.com/sxyazi/yazi/releases/download/v$YAZI_VERSION/yazi-$ARCH-unknown-linux-musl.deb" \
+    "$YAZI_SHA256" "$WORK/yazi.deb"
+dpkg-deb -x "$WORK/yazi.deb" "$ROOTFS"
+
+if [ ! -x "$ROOTFS/usr/bin/yazi" ]; then
+    echo "mkiso: the rootfs has no /usr/bin/yazi" >&2
     exit 1
 fi
 
@@ -843,6 +1060,14 @@ cp iso/bashrc "$ROOTFS/etc/skel/.bashrc"
 cp iso/dot-profile "$ROOTFS/root/.profile"
 cp iso/dot-profile "$ROOTFS/etc/skel/.profile"
 
+# The one application on the image that needs a setting before it looks like
+# itself. btop has no /etc default to write, so it goes in both homes the way
+# the two files above do; the file says why it is there.
+for home in "$ROOTFS/root" "$ROOTFS/etc/skel"; do
+    mkdir -p "$home/.config/btop"
+    cp iso/btop.conf "$home/.config/btop/btop.conf"
+done
+
 # mmdebstrap leaves the build machine's own /etc/resolv.conf in the rootfs. On
 # a container host that is the container's: a resolver address that means
 # nothing on any machine this image is carried to, and a search domain that
@@ -1007,15 +1232,20 @@ iconv -f EUC-JP -t UTF-8 "$SKKDIC" >"$ROOTFS/usr/share/tos/SKK-JISYO.L"
 # dpkg has been told. Take it out by hand to match, or the rule would be one
 # that applies only to packages somebody adds later.
 #
-# Worth 16,650,240 bytes of the squashfs, measured by compressing the same
-# rootfs both ways: 74,674,176 with these trees and 58,023,936 without. Most
-# of it is /usr/share/locale, 31.8 MB of translated messages that nothing can
-# currently display — the rootfs has no `locales` package, so no locale is
-# generated and every program falls back to C. Installing `locales` and
-# deleting the locale line from the dpkg configuration is the pair of changes
-# that would make them worth carrying.
-rm -rf "$ROOTFS/usr/share/man" "$ROOTFS/usr/share/locale" \
-    "$ROOTFS/usr/share/info"
+# Worth 16,650,240 bytes of the squashfs when this was written and all three
+# trees went, measured by compressing the same rootfs both ways: 74,674,176
+# with them and 58,023,936 without. Most of it is /usr/share/locale, 31.8 MB of
+# translated messages that nothing can currently display — the rootfs has no
+# `locales` package, so no locale is generated and every program falls back to
+# C. Installing `locales` and deleting the locale line from the dpkg
+# configuration is the pair of changes that would make them worth carrying.
+#
+# /usr/share/man is no longer one of the three. It came off the dpkg exclusion
+# in #151, and a line here that deleted it anyway would be the essential set's
+# manuals — bash's, coreutils', dpkg's, the ones somebody is most likely to
+# reach for — going missing while every package installed afterwards kept
+# theirs. The note above the dpkg configuration has the argument.
+rm -rf "$ROOTFS/usr/share/locale" "$ROOTFS/usr/share/info"
 find "$ROOTFS/usr/share/doc" -mindepth 2 ! -name copyright -delete 2>/dev/null ||
     true
 # grub-install opens this directory to find its translations and warns on the
