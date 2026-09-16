@@ -581,7 +581,11 @@ impl Security {
             if token.is_empty() {
                 continue;
             }
-            if !benign.contains(&token) {
+            // `[WPS-PBC]`, `[WPS-PIN]` and `[WPS-AUTH]` are what an access
+            // point advertises while its button is pressed, and they say
+            // nothing about what it wants from a station that is not using
+            // them: an open network with its button pressed is still open.
+            if !benign.contains(&token) && !token.starts_with("WPS") {
                 return Security::Unknown;
             }
         }
@@ -869,6 +873,16 @@ mod tests {
         let found = parse_scan_results(text);
         assert_eq!(found.len(), 1, "the menu decides not to show it, not this");
         assert_eq!(found[0].ssid, "");
+    }
+
+    #[test]
+    fn an_access_point_with_its_wps_button_pressed_is_still_what_it_was() {
+        assert_eq!(Security::from_flags("[WPS-PBC][ESS]"), Security::Open);
+        assert_eq!(Security::from_flags("[ESS][WPS-PIN]"), Security::Open);
+        assert_eq!(
+            Security::from_flags("[WPA2-PSK-CCMP][WPS-AUTH][ESS]"),
+            Security::Psk
+        );
     }
 
     #[test]

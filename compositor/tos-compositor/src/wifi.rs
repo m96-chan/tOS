@@ -80,6 +80,13 @@ pub const JOIN_DEADLINE: Duration = Duration::from_secs(30);
 /// on a battery.
 const JOIN_POLL: Duration = Duration::from_secs(1);
 
+/// How often an open list asks `SCAN_RESULTS` again.
+///
+/// The same cadence as a join, for the same reason: the compositor ticks more
+/// than once a second, every ask is a socket bound, connected and unlinked,
+/// and a scan does not finish any sooner for being asked about more often.
+const SCAN_POLL: Duration = Duration::from_secs(1);
+
 /// The scan behind an open [`OverlayKind::Wireless`] menu.
 ///
 /// [`OverlayKind::Wireless`]: crate::OverlayKind::Wireless
@@ -96,6 +103,8 @@ struct Scanning {
     started: Instant,
     /// Whether the title still says `— scanning`.
     scanning: bool,
+    /// When `SCAN_RESULTS` was last asked, which `begin_scan` counts as one.
+    polled: Instant,
 }
 
 /// A join that has been asked for and has not settled.
@@ -189,6 +198,7 @@ impl Wifi {
             results,
             started: now,
             scanning: true,
+            polled: now,
         });
         Ok((items, title(true)))
     }
@@ -210,7 +220,14 @@ impl Wifi {
     /// had to say it would say several times a second, and what it would be
     /// saying is that a list somebody is reading is a moment out of date.
     pub fn refresh_scan(&mut self, now: Instant) -> Option<(Vec<OverlayItem>, String)> {
-        let interface = self.scan.as_ref()?.interface.clone();
+        let interface = {
+            let scan = self.scan.as_mut()?;
+            if now.saturating_duration_since(scan.polled) < SCAN_POLL {
+                return None;
+            }
+            scan.polled = now;
+            scan.interface.clone()
+        };
         let mut client = self.client(&interface).ok()?;
         let found = rows(client.scan_results().ok()?);
         let scan = self.scan.as_mut()?;
@@ -700,10 +717,37 @@ mod tests {
         wifi.begin_scan("wlan0", now).expect("the scan");
 
         let (items, title) = wifi
-            .refresh_scan(now + Duration::from_millis(500))
+            .refresh_scan(now + Duration::from_secs(1))
             .expect("the answer moved");
         assert_eq!(title, "wireless");
         assert_eq!(items.len(), 4);
+    }
+
+    #[test]
+    fn an_open_list_asks_the_supplicant_once_a_second_and_not_once_a_frame() {
+        // The compositor ticks more than once a second and every ask is a
+        // socket bound, connected and unlinked; a list that asked on every
+        // frame would be the busiest thing on the machine for the price of
+        // nothing, since a scan does not finish sooner for being watched.
+        let (mut wifi, shared) = wifi(
+            RecordingSupplicant::new()
+                .answering("SCAN_RESULTS", SCAN_RESULTS)
+                .ok("SCAN"),
+        );
+        let now = Instant::now();
+        wifi.begin_scan("wlan0", now).expect("the scan");
+        let asked = |shared: &Rc<RefCell<RecordingSupplicant>>| {
+            transcript(shared)
+                .iter()
+                .filter(|line| *line == "SCAN_RESULTS")
+                .count()
+        };
+        assert_eq!(asked(&shared), 1);
+        wifi.refresh_scan(now + Duration::from_millis(300));
+        wifi.refresh_scan(now + Duration::from_millis(600));
+        assert_eq!(asked(&shared), 1, "asked again inside the same second");
+        wifi.refresh_scan(now + Duration::from_secs(1));
+        assert_eq!(asked(&shared), 2);
     }
 
     #[test]
@@ -740,9 +784,7 @@ mod tests {
         );
         let now = Instant::now();
         wifi.begin_scan("wlan0", now).expect("the scan");
-        assert!(wifi
-            .refresh_scan(now + Duration::from_millis(500))
-            .is_none());
+        assert!(wifi.refresh_scan(now + Duration::from_secs(1)).is_none());
         assert_eq!(
             wifi.found("kitchen-table").map(|(_, security)| security),
             Some(Security::Psk),

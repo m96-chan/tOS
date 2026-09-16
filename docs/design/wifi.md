@@ -391,18 +391,27 @@ and the rootfs carries the hardware that is wanted after the pivot.
 Firmware goes to `/lib/firmware` in the rootfs the same way, from Debian's
 `non-free-firmware` component, which the rootfs's sources gain:
 
-| package | .deb | for |
+| package | of the squashfs | for |
 |---|---|---|
-| firmware-iwlwifi | 9.3 MB | Intel — most laptops |
-| firmware-realtek | 1.5 MB | Realtek — most cheap laptops and USB dongles |
-| firmware-atheros | 16.8 MB | Qualcomm ath9k/ath10k/ath11k — most AMD laptops |
-| firmware-brcm80211 | 5.4 MB | Broadcom — Macs, Raspberry Pi |
-| the package holding `mediatek/WIFI_MT7921*` | measured by the build | MediaTek — newer AMD laptops |
+| firmware-iwlwifi | 29.7 MB | Intel — most laptops |
+| firmware-atheros | 22.6 MB | Qualcomm ath9k/ath10k/ath11k — most AMD laptops |
+| firmware-misc-nonfree | 17.8 MB | MediaTek MT7921/MT7922 — newer AMD laptops (5.9 MB of it; bookworm has no `firmware-mediatek`, and the blobs `mt7921e` asks for by name are in this package) |
+| firmware-brcm80211 | 10.4 MB | Broadcom — Macs, Raspberry Pi |
+| firmware-realtek | 2.0 MB | Realtek — most cheap laptops and USB dongles |
 
-Roughly 35 MB on a 105 MB image. All five, deliberately: a machine with no
-network cannot `apt install` the firmware that would give it one, so the
-place to save this space is not here. The build prints the squashfs size
-before and after so the number is measured rather than estimated.
+**Measured, not estimated — and the estimate was wrong.** The first draft of
+this document said "roughly 35 MB", which was the sum of the `.deb` sizes; a
+`.deb` is xz and this squashfs is zstd, and the difference is 2.5×. Built and
+counted (2026-09-15, kernel 6.1.0-53-amd64): the squashfs goes from
+67,145,728 to 155,484,160 bytes and the ISO from 105,404,416 to
+193,746,944 — **+88 MB, and the image nearly doubles**. The module tree is
+3.9 MB of that and `wpasupplicant` 1.4 MB; the firmware is the rest.
+
+All five anyway, decided with that number on the table rather than the wrong
+one: a machine with no network cannot `apt install` the firmware that would
+give it one, so the place to save this space is not here. The lever, should
+it ever be pulled, is `firmware-misc-nonfree` — 17.8 MB carried for a 5.9 MB
+`mediatek/` subtree — and `iso/README.md` says so next to the numbers.
 
 ### The supplicant is a unit, started by udev
 
@@ -443,6 +452,20 @@ disk, so an installed machine keeps its networks.
 
 The socket directory is root's. The compositor is root. The live image is
 root. Nothing has to be a member of `netdev`.
+
+**Debian's own `wpa_supplicant.service` is masked.** The package enables a
+singleton beside the per-radio units, and its `ExecStart` is `wpa_supplicant
+-u` — the D-Bus interface, on an image that ships no D-Bus — so it failed, in
+red, on every boot (#140), before it had looked at any hardware. Masked
+rather than given a drop-in without the `-u`, because a second supplicant
+owning the same sockets under `/run/wpa_supplicant` is the thing this design
+already decided it did not want.
+
+**The witness is on the image.** `iso/wifi-witness.sh` is copied to
+`/usr/share/tos/wifi-witness.sh`, because the machine it has to run on is one
+that was booted from this image, and a witness a person has to retype into a
+pane is one nobody runs. Off `PATH`, because it turns the machine into an
+access point.
 
 ### The sysctl
 
