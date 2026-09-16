@@ -287,8 +287,8 @@ fn search_path_from(data_home: Option<&str>, home: Option<&str>) -> Vec<PathBuf>
             }
         }
     }
-    // What `iso/mkiso.sh` writes today, beside the VL Gothic copy it already
-    // makes.
+    // What `iso/mkiso.sh` writes today, beside the face it copies in — VL
+    // Gothic when this was written, HackGen Console NF since #151.
     paths.push(PathBuf::from("/usr/share/tos/SKK-JISYO.L"));
     // Where Debian's `skkdic` package puts it, which is what takes over once
     // tOS has a rootfs and the initramfs copy goes away.

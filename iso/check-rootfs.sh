@@ -39,9 +39,20 @@ sudo umount "$mount_point"
 # down the copy path — after Partition, FormatEsp and FormatRoot have already
 # run over somebody's disk. mkiso.sh asserts them against the tree; these lines
 # are the other half, that mksquashfs put on the medium what it was given.
+# The applications are in this list for a reason of their own (#151): the two
+# that do not come from Debian arrive by a route apt knows nothing about — a
+# pinned download and `dpkg-deb -x` for yazi, an unzip for the face — so a
+# rootfs that lost either would be one nothing else on the build complains
+# about. The Debian names are here for symmetry, and because a package set
+# edited in mkiso.sh should fail here rather than at somebody's login screen.
 for path in usr/bin/dpkg usr/bin/apt usr/bin/bash usr/bin/mount \
     usr/bin/unsquashfs usr/sbin/sfdisk usr/sbin/mkfs.ext4 usr/sbin/grub-install \
     usr/bin/ip usr/bin/ps usr/bin/free \
+    usr/bin/git usr/bin/curl usr/bin/less usr/bin/nvim usr/bin/rg usr/bin/fzf \
+    usr/bin/btop usr/bin/ssh usr/bin/rsync usr/bin/unzip usr/bin/file \
+    usr/bin/man usr/share/man/man1/git.1.gz \
+    usr/bin/yazi usr/share/fonts/truetype/hackgen/HackGenConsoleNF-Regular.ttf \
+    root/.config/btop/btop.conf \
     usr/sbin/init usr/lib/systemd/systemd usr/sbin/tos usr/sbin/tos-install \
     usr/sbin/tos-session var/lib/dpkg/status root/.bashrc root/.profile \
     etc/hosts etc/systemd/system/tos-session.service \
@@ -70,7 +81,12 @@ done
 # The Japanese face, which nothing else here would miss: the compositor falls
 # back to its built-in bitmap and every kana turns into a hollow box, with the
 # boot and every assertion above still green.
-grep -q "^squashfs-root/usr/share/fonts/truetype/vlgothic/" "$list" || {
+#
+# It was fonts-vlgothic and is HackGen Console NF since #151, which also makes
+# this the one assertion here about a file no package owns: the face is fetched
+# and unzipped by mkiso.sh rather than unpacked by dpkg, so `var/lib/dpkg/status`
+# above says nothing about whether it arrived.
+grep -q "^squashfs-root/usr/share/fonts/truetype/hackgen/" "$list" || {
     echo "the rootfs carries no Japanese face" >&2
     exit 1
 }

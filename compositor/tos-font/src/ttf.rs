@@ -35,6 +35,7 @@ const FONT_SEARCH_PATHS: &[&str] = &[
     // ships the first of them and is the better for it, since halfwidth is
     // exactly half of fullwidth in these faces and a wide character then lands
     // on two cells with nothing rescaled.
+    "/usr/share/fonts/truetype/hackgen/HackGenConsoleNF-Regular.ttf",
     "/usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf",
     "/usr/share/fonts/vlgothic/VL-Gothic-Regular.ttf",
     "/usr/share/fonts/truetype/ipafont-gothic/ipag.ttf",
@@ -47,7 +48,11 @@ const FONT_SEARCH_PATHS: &[&str] = &[
 /// even though it would be a poor primary: the terminal borrows nothing from
 /// it but wide glyphs, and every wide glyph is one em regardless.
 const CJK_SEARCH_PATHS: &[&str] = &[
-    // What the tOS ISO ships; see iso/mkiso.sh.
+    // What the tOS ISO ships; see iso/mkiso.sh. It was the vlgothic line below
+    // until #151 asked for this face by name, and the ISO carries one Japanese
+    // face rather than two — the other paths here are for the machines tOS is
+    // merely running on.
+    "/usr/share/fonts/truetype/hackgen/HackGenConsoleNF-Regular.ttf",
     "/usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf",
     "/usr/share/fonts/vlgothic/VL-Gothic-Regular.ttf",
     "/usr/share/fonts/truetype/ipafont-gothic/ipag.ttf",
