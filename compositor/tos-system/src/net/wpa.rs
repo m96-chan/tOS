@@ -232,11 +232,18 @@ fn bind_in(dir: &Path, name: &str) -> io::Result<(UnixDatagram, PathBuf)> {
 /// wireless path — menu, scan, passphrase, join, wrong passphrase, tick — is
 /// driven from a test in another crate, on a machine with no radio.
 ///
-/// The table is matched in order and the first exact match wins. A command
-/// with no entry is answered `FAIL`, and is recorded like any other — that
-/// last rule is deliberate: a test that forgot to teach the table a command
-/// sees the command it forgot in the transcript, rather than an `OK` it never
-/// wrote down.
+/// The table is matched in order: the first send of a command is answered by
+/// the first entry for it, the second by the second, and once the entries run
+/// out the last one sticks. So a table with one entry per command is a
+/// constant answer, which is what most of these are, and a table with two is a
+/// reply that changes once — `STATUS` handshaking and then `COMPLETED`,
+/// `LIST_NETWORKS` before and after a wrong passphrase — which is what a join
+/// has to be driven through without a script and without a clock.
+///
+/// A command with no entry is answered `FAIL`, and is recorded like any other
+/// — that last rule is deliberate: a test that forgot to teach the table a
+/// command sees the command it forgot in the transcript, rather than an `OK`
+/// it never wrote down.
 #[derive(Debug, Clone, Default)]
 pub struct RecordingSupplicant {
     /// `(command, reply)`, first match wins.
@@ -273,12 +280,25 @@ impl RecordingSupplicant {
 
 impl Supplicant for RecordingSupplicant {
     fn request(&mut self, command: &str) -> io::Result<String> {
+        // How many times this command has been asked before, which is which of
+        // its entries answers it. Counted out of the transcript rather than
+        // kept in a cursor, so that the table stays a table: nothing about
+        // `replies` has to be reset, cloned or torn down between questions.
+        let asked_before = self.sent.iter().filter(|line| *line == command).count();
         self.sent.push(command.to_string());
-        let reply = self
+        let matching: Vec<&String> = self
             .replies
             .iter()
-            .find(|(asked, _)| asked == command)
-            .map(|(_, reply)| reply.clone())
+            .filter(|(asked, _)| asked == command)
+            .map(|(_, reply)| reply)
+            .collect();
+        // Once a command's entries run out the last one sticks, so a table
+        // only has to write down the answers that change; with no entry at all
+        // there is nothing to clamp to and the answer is `FAIL`.
+        let which = asked_before.min(matching.len().saturating_sub(1));
+        let reply = matching
+            .get(which)
+            .map(|reply| (*reply).clone())
             .unwrap_or_else(|| "FAIL".to_string());
         Ok(reply)
     }
@@ -561,7 +581,11 @@ impl Security {
             if token.is_empty() {
                 continue;
             }
-            if !benign.contains(&token) {
+            // `[WPS-PBC]`, `[WPS-PIN]` and `[WPS-AUTH]` are what an access
+            // point advertises while its button is pressed, and they say
+            // nothing about what it wants from a station that is not using
+            // them: an open network with its button pressed is still open.
+            if !benign.contains(&token) && !token.starts_with("WPS") {
                 return Security::Unknown;
             }
         }
@@ -773,6 +797,81 @@ mod tests {
         "2\toffice\tany\t[TEMP-DISABLED]\n",
     );
 
+    /// What a running supplicant actually wrote, copied out of the serial log
+    /// of the `mac80211_hwsim` witness in `docs/design/wifi.md` — wpa_supplicant
+    /// v2.10 on the image built from this tree, 2026-09-16. The examples above
+    /// are what the format is documented to be; this is what it was.
+    mod captured {
+        use super::super::*;
+
+        const SCAN_RESULTS: &str = "bssid / frequency / signal level / flags / ssid\n\
+            02:00:00:00:01:00\t2412\t-30\t[WPA2-PSK-CCMP][WPS][ESS]\thwsim-ap\n";
+
+        /// The supplicant with nothing configured, which is what a fresh boot
+        /// looks like: `INACTIVE`, and three fields no parser here wants.
+        const STATUS_INACTIVE: &str = "wpa_state=INACTIVE\n\
+            p2p_device_address=42:00:00:00:00:00\n\
+            address=02:00:00:00:00:00\n\
+            uuid=362db47b-a53a-5191-88fb-5458b986b2e4\n";
+
+        /// Joined, from the menu, with the right passphrase.
+        const STATUS_COMPLETED: &str = "bssid=02:00:00:00:01:00\n\
+            freq=2412\n\
+            ssid=hwsim-ap\n\
+            id=0\n\
+            mode=station\n\
+            wifi_generation=4\n\
+            pairwise_cipher=CCMP\n\
+            group_cipher=CCMP\n\
+            key_mgmt=WPA2-PSK\n\
+            wpa_state=COMPLETED\n\
+            p2p_device_address=42:00:00:00:00:00\n\
+            address=02:00:00:00:00:00\n\
+            uuid=362db47b-a53a-5191-88fb-5458b986b2e4\n";
+
+        const NETWORKS_CURRENT: &str =
+            "network id / ssid / bssid / flags\n0\thwsim-ap\tany\t[CURRENT]\n";
+        const NETWORKS_NONE: &str = "network id / ssid / bssid / flags\n";
+
+        #[test]
+        fn the_scan_a_real_supplicant_wrote_parses_to_the_access_point() {
+            let found = parse_scan_results(SCAN_RESULTS);
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].bssid, "02:00:00:00:01:00");
+            assert_eq!(found[0].frequency_mhz, 2412);
+            assert_eq!(found[0].signal_dbm, -30);
+            // `[WPS]` beside the security flags, which the benign list has
+            // to know about or every access point with WPS on would be
+            // "unknown security".
+            assert_eq!(found[0].security, Security::Psk);
+            assert_eq!(found[0].ssid, "hwsim-ap");
+        }
+
+        #[test]
+        fn the_status_a_real_supplicant_wrote_parses_in_both_states() {
+            let inactive = parse_status(STATUS_INACTIVE);
+            assert_eq!(inactive.state, State::Inactive);
+            assert_eq!(inactive.ssid, None);
+            assert_eq!(inactive.id, None);
+
+            let completed = parse_status(STATUS_COMPLETED);
+            assert_eq!(completed.state, State::Completed);
+            assert_eq!(completed.ssid.as_deref(), Some("hwsim-ap"));
+            assert_eq!(completed.id, Some(0));
+        }
+
+        #[test]
+        fn the_network_list_a_real_supplicant_wrote_parses_full_and_empty() {
+            let known = parse_networks(NETWORKS_CURRENT);
+            assert_eq!(known.len(), 1);
+            assert_eq!(known[0].id, 0);
+            assert_eq!(known[0].ssid, "hwsim-ap");
+            assert!(known[0].current);
+            assert!(!known[0].disabled && !known[0].temp_disabled);
+            assert!(parse_networks(NETWORKS_NONE).is_empty());
+        }
+    }
+
     #[test]
     fn a_scan_result_line_becomes_a_network_in_range() {
         let found = parse_scan_results(SCAN_RESULTS);
@@ -849,6 +948,16 @@ mod tests {
         let found = parse_scan_results(text);
         assert_eq!(found.len(), 1, "the menu decides not to show it, not this");
         assert_eq!(found[0].ssid, "");
+    }
+
+    #[test]
+    fn an_access_point_with_its_wps_button_pressed_is_still_what_it_was() {
+        assert_eq!(Security::from_flags("[WPS-PBC][ESS]"), Security::Open);
+        assert_eq!(Security::from_flags("[ESS][WPS-PIN]"), Security::Open);
+        assert_eq!(
+            Security::from_flags("[WPA2-PSK-CCMP][WPS-AUTH][ESS]"),
+            Security::Psk
+        );
     }
 
     #[test]
@@ -1278,6 +1387,34 @@ mod tests {
             .answering("PING", "PONG")
             .answering("PING", "FAIL");
         assert_eq!(supplicant.request("PING").expect("a reply"), "PONG");
+    }
+
+    #[test]
+    fn a_second_entry_for_the_same_command_answers_the_second_ask() {
+        // What a join is driven through: the network is being handshaked with
+        // on the first look and has been temporarily disabled by the time of
+        // the second, which is the whole of how a wrong passphrase is found
+        // out without attaching to the event stream.
+        let mut supplicant = RecordingSupplicant::new()
+            .answering("LIST_NETWORKS", "network id / ssid / bssid / flags\n")
+            .answering(
+                "LIST_NETWORKS",
+                "network id / ssid / bssid / flags\n0\tcafe\tany\t[TEMP-DISABLED]\n",
+            );
+        assert!(!supplicant
+            .request("LIST_NETWORKS")
+            .expect("a reply")
+            .contains("TEMP-DISABLED"));
+        assert!(supplicant
+            .request("LIST_NETWORKS")
+            .expect("a reply")
+            .contains("TEMP-DISABLED"));
+        // And once the entries run out, the last one is what the table goes on
+        // saying, so a test only has to write down the answers that change.
+        assert!(supplicant
+            .request("LIST_NETWORKS")
+            .expect("a reply")
+            .contains("TEMP-DISABLED"));
     }
 
     #[test]

@@ -22,6 +22,7 @@ use tos_session::{
 use tos_system::audio::Volume;
 use tos_system::bluetooth::{Adapter, Connection, SystemControl};
 use tos_system::net::auto::{Autoconfigure, Step};
+use tos_system::net::wpa::Security;
 use tos_system::net::{dhcp, Interface, Kind, Lease};
 use tos_system::power::PowerAction;
 use tos_system::Sysfs;
@@ -44,6 +45,7 @@ use crate::selection::{Selection, SelectionMode};
 use crate::splash::Splash;
 use crate::status::{self, Bar, Hit, Piece, Segment};
 use crate::system::Machine;
+use crate::wifi::{self, Wifi};
 
 /// How often the cursor and blinking text change phase.
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
@@ -149,6 +151,13 @@ pub enum OverlayKind {
     /// open overlay on every keystroke that closes one, and every other menu
     /// would start paying for a payload it has not got.
     Link,
+    /// The wireless networks in range of the radio named by
+    /// [`crate::wifi::Wifi::scanning_on`], refreshed under the user while the
+    /// scan runs. Payload-free for the reason [`OverlayKind::Link`] is.
+    Wireless,
+    /// The passphrase for the network [`crate::wifi::Wifi::take_choice`]
+    /// names, typed behind bullets. Payload-free for the same reason again.
+    Passphrase,
 }
 
 /// Which way a volume binding turns the knob.
@@ -191,6 +200,20 @@ const BRING_UP: &str = "bring the link up";
 const TAKE_DOWN: &str = "take the link down";
 const REQUEST_ADDRESS: &str = "ask for an address";
 const JOIN: &str = "join a wireless network";
+
+/// The two rows that name the network a radio is on, and the row that says
+/// there is nothing to ask.
+///
+/// Prefixes rather than whole labels, because the SSID is on the end of each
+/// of them: `leave kitchen-table` is the row, and what it is matched by when
+/// it is chosen is everything up to the name.
+const LEAVE: &str = "leave ";
+const FORGET: &str = "forget ";
+const NO_SUPPLICANT: &str = "no supplicant on ";
+
+/// What the row above says when it is chosen, which is the only thing anybody
+/// can do about it.
+const INSTALL_SUPPLICANT: &str = "is wpasupplicant installed?";
 
 /// How often the links are looked at on the machine's own behalf (#124).
 ///
@@ -404,6 +427,16 @@ pub struct Compositor {
     /// before the first look — which is due immediately, because a machine
     /// that has just booted is exactly the machine this is for.
     auto_looked_at: Option<Instant>,
+    /// The wireless menus' state: the scan under an open list, the network a
+    /// passphrase is being typed for, and a join waiting on a handshake (#137).
+    ///
+    /// On the compositor rather than in the `OverlayKind` for the reason
+    /// `network_target` is, and on the compositor rather than in the overlay
+    /// for the reason [`Compositor::bluetooth`] is: a join outlives the menu
+    /// that started it, and the answer still has somewhere to land.
+    ///
+    /// [`Compositor::bluetooth`]: Compositor::bluetooth
+    wifi: Wifi,
 }
 
 impl Compositor {
@@ -462,6 +495,7 @@ impl Compositor {
             dhcp: None,
             auto: Autoconfigure::new(),
             auto_looked_at: None,
+            wifi: Wifi::new(),
             // Read before `config` is moved in, and kept even when it says
             // nothing can be dropped to: `credentials_for` is what decides
             // that, at the pane, so that the rule lives in one place.
@@ -2324,6 +2358,16 @@ impl Compositor {
             }
             OverlayOutcome::Accepted => Some((None, overlay.query().to_string())),
         };
+        // Escape. The wireless menus are the two that keep something behind
+        // them, and both keep it only for as long as the box is up: nothing is
+        // held open, so letting go is the whole of closing them.
+        if answer.is_none() {
+            match kind {
+                OverlayKind::Wireless => self.wifi.forget_scan(),
+                OverlayKind::Passphrase => drop(self.wifi.take_choice()),
+                _ => {}
+            }
+        }
         self.close_overlay();
         if let Some((row, label)) = answer {
             self.choose(kind, row, &label);
@@ -2397,6 +2441,13 @@ impl Compositor {
             // longer knows, and every arm below already has to cope with that.
             OverlayKind::Networks => self.open_link_menu(label),
             OverlayKind::Link => self.act_on_link(label),
+            // By name and not by position, for the reason the interface list
+            // above is: the rows are replaced under the menu on every tick
+            // while the radio is listening, and duplicates have been folded,
+            // so an SSID is both unique among the rows and still the same
+            // network however the list has been shuffled since it was drawn.
+            OverlayKind::Wireless => self.join_network(label),
+            OverlayKind::Passphrase => self.accept_passphrase(label),
         }
     }
 
@@ -2447,11 +2498,7 @@ impl Compositor {
             OverlayItem::with_detail(REQUEST_ADDRESS, "DHCP, and the route and resolvers with it"),
         ];
         if found.kind == Kind::Wireless {
-            // A row that does nothing, on purpose. A wireless interface in
-            // this menu with no mention of joining reads as a bug; a line
-            // saying what is missing and where the reasoning is written down
-            // reads as a decision.
-            items.push(OverlayItem::with_detail(JOIN, "not yet — see the note"));
+            items.extend(self.wireless_rows(&found.name));
         }
         self.network_target = Some(found.name.clone());
         self.open_overlay(OverlayKind::Link, Overlay::new(found.summary(), items));
@@ -2485,13 +2532,216 @@ impl Compositor {
                 }
             }
             REQUEST_ADDRESS => self.request_address(&interface),
-            JOIN => {
-                self.notifications.status(
-                    "joining a wireless network needs a supplicant; see docs/design/network.md",
-                );
+            JOIN => self.open_wireless(&interface),
+            // The SSID is on the end of the label, which is where it has to be
+            // read from: the menu was built from a `STATUS` that is now a
+            // keystroke old, and the network it named is the one somebody
+            // pressed a row about.
+            _ if label.starts_with(LEAVE) => {
+                self.leave_network(&interface, &label[LEAVE.len()..], false)
             }
+            _ if label.starts_with(FORGET) => {
+                self.leave_network(&interface, &label[FORGET.len()..], true)
+            }
+            // The one row in tOS whose whole purpose is to be pressed and say
+            // why it cannot do anything. See [`Compositor::wireless_rows`].
+            _ if label.starts_with(NO_SUPPLICANT) => self.notifications.status(INSTALL_SUPPLICANT),
             _ => {}
         }
+    }
+
+    /// The rows a radio adds to the link menu.
+    ///
+    /// Three shapes, which is what `docs/design/wifi.md` (#137) writes down:
+    /// associated, and the network it is on can be left or forgotten by name;
+    /// not associated, and there is only the list to open; or no supplicant
+    /// answering on the socket at all, which is what a machine gets after
+    /// `apt remove wpasupplicant` and on the initramfs rescue session, and
+    /// which says so rather than offering a row that fails.
+    ///
+    /// `STATUS` is asked here rather than taken from the machine reading,
+    /// which knows the SSID the kernel reports and not the network id the
+    /// supplicant hands out — and it is the id that `leave` and `forget` act
+    /// on.
+    fn wireless_rows(&mut self, interface: &str) -> Vec<OverlayItem> {
+        let mut client = match self.wifi.client(interface) {
+            Ok(client) => client,
+            Err(_) => {
+                return vec![OverlayItem::with_detail(
+                    format!("{NO_SUPPLICANT}{interface}"),
+                    INSTALL_SUPPLICANT,
+                )]
+            }
+        };
+        let mut rows = Vec::new();
+        // A `STATUS` that was refused is still a supplicant that answered, so
+        // the socket is there and the list can be opened; what cannot be said
+        // is which network it is on, and `leave` on a network nobody can name
+        // is the row this is here to avoid offering.
+        if let Ok(status) = client.status() {
+            if let (Some(_), Some(ssid)) = (status.id, status.ssid.as_deref()) {
+                rows.push(OverlayItem::with_detail(
+                    format!("{LEAVE}{ssid}"),
+                    "stop using it, without forgetting it",
+                ));
+                rows.push(OverlayItem::with_detail(
+                    format!("{FORGET}{ssid}"),
+                    "forget it, so the next boot does not rejoin it",
+                ));
+            }
+        }
+        rows.push(OverlayItem::with_detail(JOIN, "the networks in range"));
+        rows
+    }
+
+    /// Stop using the network this radio is on, and optionally forget it.
+    ///
+    /// `STATUS` again rather than an id remembered when the menu was built:
+    /// the supplicant may have moved between the two keystrokes, and acting on
+    /// a stale id is how somebody forgets the network they were on last week
+    /// instead of the one in front of them.
+    fn leave_network(&mut self, interface: &str, ssid: &str, forget: bool) {
+        let mut client = match self.wifi.client(interface) {
+            Ok(client) => client,
+            Err(error) => {
+                self.notifications.status(format!("{interface}: {error}"));
+                return;
+            }
+        };
+        let id = match client.status() {
+            Ok(status) => match status.id {
+                Some(id) => id,
+                None => {
+                    self.notifications
+                        .status(format!("{interface} is not on a network"));
+                    return;
+                }
+            },
+            Err(error) => {
+                self.notifications.status(format!("{interface}: {error}"));
+                return;
+            }
+        };
+        let outcome = match forget {
+            true => client.remove(id).and_then(|()| client.save()),
+            false => client.disable(id).and_then(|()| client.disconnect()),
+        };
+        match outcome {
+            Ok(()) => {
+                // The link has just moved, so the poll interval is not the
+                // right amount of time to wait before the bar agrees with it.
+                self.machine.refresh(Instant::now());
+                self.notifications.status(match forget {
+                    true => format!("forgot {ssid}"),
+                    false => format!("left {ssid}"),
+                });
+            }
+            Err(error) => self.notifications.status(format!("{ssid}: {error}")),
+        }
+    }
+
+    /// Put the networks in range up, and ask for a fresh scan behind them.
+    fn open_wireless(&mut self, interface: &str) {
+        match self.wifi.begin_scan(interface, Instant::now()) {
+            Ok((items, title)) => {
+                self.open_overlay(OverlayKind::Wireless, Overlay::new(title, items))
+            }
+            Err(error) => self.notifications.status(format!("{interface}: {error}")),
+        }
+    }
+
+    /// A row of the wireless list was chosen.
+    ///
+    /// The scan is let go first, whatever happens next: the menu it belonged
+    /// to has already been closed by [`Compositor::overlay_outcome`], and a
+    /// scan nothing is showing is a scan nothing should be refreshing.
+    fn join_network(&mut self, ssid: &str) {
+        let found = self.wifi.found(ssid);
+        self.wifi.forget_scan();
+        // The list was replaced under the keystroke, which the tick can do
+        // while the radio is listening. Saying nothing is right: the menu has
+        // closed, and there is no network of that name to say anything about.
+        let Some((interface, security)) = found else {
+            return;
+        };
+        if let Some(why) = wifi::refusal(ssid, security) {
+            self.notifications.status(why);
+            return;
+        }
+        if security == Security::Psk {
+            self.wifi.choose(&interface, ssid);
+            self.open_overlay(
+                OverlayKind::Passphrase,
+                Overlay::secret_prompt(format!("{ssid} — passphrase"), ""),
+            );
+            return;
+        }
+        self.begin_join(&interface, ssid, None);
+    }
+
+    /// A passphrase was typed and accepted.
+    fn accept_passphrase(&mut self, passphrase: &str) {
+        let Some((interface, ssid)) = self.wifi.take_choice() else {
+            return;
+        };
+        self.begin_join(&interface, &ssid, Some(passphrase));
+    }
+
+    /// Configure and select a network, and say what happened.
+    ///
+    /// A passphrase the client refuses — too short, too long, a `"` in it, a
+    /// newline that came along with a paste — is the one error that puts the
+    /// prompt back up. The message goes on the status line verbatim, because
+    /// it already names the rule that was broken, and the line keeps what was
+    /// typed, because the fix is nearly always one character.
+    fn begin_join(&mut self, interface: &str, ssid: &str, passphrase: Option<&str>) {
+        match self
+            .wifi
+            .begin_join(interface, ssid, passphrase, Instant::now())
+        {
+            Ok(said) => self.notifications.status(said),
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                self.notifications.status(error.to_string());
+                self.wifi.choose(interface, ssid);
+                self.open_overlay(
+                    OverlayKind::Passphrase,
+                    Overlay::secret_prompt(
+                        format!("{ssid} — passphrase"),
+                        passphrase.unwrap_or_default(),
+                    ),
+                );
+            }
+            Err(error) => self.notifications.status(format!("{ssid}: {error}")),
+        }
+    }
+
+    /// The wireless menus' own tick: a list refreshed under the user while the
+    /// radio is listening, and a join watched to wherever it ends up.
+    ///
+    /// Both are polls rather than waits, which is the whole of why nothing
+    /// here is on a thread: every request is a local datagram answered in
+    /// microseconds, and the waiting — for a scan to finish, for a handshake
+    /// to complete — is done by the tick that was going to happen anyway.
+    fn poll_wireless(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        if matches!(self.overlay, Some((OverlayKind::Wireless, _))) {
+            // `set_items` rather than reopening, the way the Bluetooth menu
+            // takes in an inquiry, so that a query typed while the radio was
+            // listening survives the answer.
+            if let Some((items, title)) = self.wifi.refresh_scan(now) {
+                if let Some((_, overlay)) = &mut self.overlay {
+                    overlay.set_items(items);
+                    overlay.set_title(title);
+                }
+                self.needs_full_redraw = true;
+                changed = true;
+            }
+        }
+        if let Some(said) = self.wifi.tick(now) {
+            self.notifications.status(said);
+            changed = true;
+        }
+        changed
     }
 
     /// Bring the wired links up and get them addresses, with nobody asking.
@@ -3028,6 +3278,16 @@ impl Compositor {
         // asked for and is waiting on, so it is collected even while the
         // screen is dark rather than left in the channel until it is woken.
         if self.collect_address() {
+            changed = true;
+        }
+        // The scan under an open wireless menu, and the join waiting on a
+        // handshake; both asked about here for the reason the DHCP answer
+        // above is collected here, which is that the loop is awake anyway.
+        // Before `autoconfigure`, so that a join which has just completed is a
+        // radio with carrier by the time the policy looks at the links, and
+        // its address is asked for on the same pass rather than a second
+        // later.
+        if self.poll_wireless(now) {
             changed = true;
         }
         // And this is the same thing with nobody waiting on it: the links a
@@ -6453,6 +6713,11 @@ mod tests {
     /// safe on a machine with an `eth0` on it.
     const FAKE_LINK: &str = "tosfake0";
 
+    /// And the radio, for the same reason: no machine has one of these either,
+    /// so every ioctl aimed at it fails with `ENODEV` before it touches
+    /// anything.
+    const FAKE_RADIO: &str = "tosfakewl0";
+
     /// A directory laid out like a machine with one wired interface in it,
     /// which cleans up after itself.
     struct FakeMachine {
@@ -6491,6 +6756,28 @@ mod tests {
                 .file(&format!("{dir}/carrier"), "0\n")
                 .file(&format!("{dir}/address"), &format!("{mac}\n"))
                 .file(&format!("{dir}/device/uevent"), "")
+        }
+
+        /// A radio, administratively down and associated with nothing.
+        ///
+        /// `DEVTYPE=wlan` in `uevent` is one of the three things
+        /// `net::kind_of` reads a wireless interface out of — the other two
+        /// are a `wireless/` and a `phy80211/` directory — and it is the one
+        /// that is a file, which is what this fixture can write. A separate
+        /// name from [`FAKE_LINK`], so that a machine can have a cable and a
+        /// radio in it and a test can say which menu it means.
+        fn with_wireless_link(&self, mac: &str) -> &FakeMachine {
+            let dir = format!("/sys/class/net/{FAKE_RADIO}");
+            self.file(&format!("{dir}/flags"), "0x1002\n")
+                .file(&format!("{dir}/type"), "1\n")
+                .file(&format!("{dir}/operstate"), "down\n")
+                .file(&format!("{dir}/carrier"), "0\n")
+                .file(&format!("{dir}/address"), &format!("{mac}\n"))
+                .file(&format!("{dir}/device/uevent"), "DRIVER=iwlwifi\n")
+                .file(
+                    &format!("{dir}/uevent"),
+                    &format!("DEVTYPE=wlan\nINTERFACE={FAKE_RADIO}\n"),
+                )
         }
 
         /// The same interface with the switch on and a cable in it.
@@ -7060,5 +7347,566 @@ mod tests {
             ..interface
         };
         assert_eq!(link_detail(&unplugged), "wired  no carrier");
+    }
+
+    // ---- the wireless menus (#137) ---------------------------------------
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use tos_system::net::wpa::{RecordingSupplicant, Supplicant};
+
+    /// `SCAN_RESULTS` as the `mac80211_hwsim` witness in `docs/design/wifi.md`
+    /// dumps it, with everything the rows have to cope with in it: a network
+    /// on two bands, one that wants nothing, one that wants an identity and a
+    /// certificate, and one that is not broadcasting its name.
+    const IN_RANGE: &str = concat!(
+        "bssid / frequency / signal level / flags / ssid\n",
+        "02:00:00:00:01:00\t2412\t-30\t[WPA2-PSK-CCMP][ESS]\tkitchen-table\n",
+        "02:00:00:00:02:00\t5180\t-52\t[ESS]\tcafe\n",
+        "02:00:00:00:03:00\t5220\t-45\t[WPA2-PSK-CCMP][ESS]\tkitchen-table\n",
+        "02:00:00:00:04:00\t2437\t-67\t[WPA2-EAP-CCMP][ESS]\toffice\n",
+        "02:00:00:00:05:00\t2462\t-40\t[WPA2-PSK-CCMP][ESS]\t\n",
+    );
+
+    /// `STATUS` on a radio that is on `kitchen-table`.
+    const ON_A_NETWORK: &str = concat!(
+        "bssid=02:00:00:00:01:00\n",
+        "freq=2412\n",
+        "ssid=kitchen-table\n",
+        "id=0\n",
+        "wpa_state=COMPLETED\n",
+    );
+
+    /// And on one that is on nothing, which has no `id=` line at all.
+    const ON_NOTHING: &str = "wpa_state=DISCONNECTED\n";
+
+    /// `STATUS` half way through a join, which is where a wrong passphrase is
+    /// found out.
+    const HANDSHAKING: &str = "ssid=kitchen-table\nid=0\nwpa_state=4WAY_HANDSHAKE\n";
+
+    const NO_NETWORKS: &str = "network id / ssid / bssid / flags\n";
+
+    /// A supplicant the compositor's several short conversations all share.
+    ///
+    /// Every row that needs one opens a client and drops it again, so a table
+    /// handed over once would be four tables and four empty transcripts. This
+    /// is one table behind an `Rc`, which the opener hands out a fresh box of
+    /// each time and the test reads the whole transcript out of at the end.
+    struct SharedSupplicant(Rc<RefCell<RecordingSupplicant>>);
+
+    impl Supplicant for SharedSupplicant {
+        fn request(&mut self, command: &str) -> io::Result<String> {
+            self.0.borrow_mut().request(command)
+        }
+    }
+
+    /// Point a compositor's radio at `table`, and hand back the table.
+    fn talking_to(
+        compositor: &mut Compositor,
+        table: RecordingSupplicant,
+    ) -> Rc<RefCell<RecordingSupplicant>> {
+        let shared = Rc::new(RefCell::new(table));
+        let opener = shared.clone();
+        compositor.wifi.set_opener(Box::new(move |_| {
+            Ok(Box::new(SharedSupplicant(opener.clone())) as Box<dyn Supplicant>)
+        }));
+        shared
+    }
+
+    /// A machine where `apt remove wpasupplicant` has happened.
+    fn with_no_supplicant(compositor: &mut Compositor) {
+        compositor.wifi.set_opener(Box::new(|interface| {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("/run/wpa_supplicant/{interface}: no such file or directory"),
+            ))
+        }));
+    }
+
+    fn said(shared: &Rc<RefCell<RecordingSupplicant>>) -> Vec<String> {
+        shared.borrow().transcript()
+    }
+
+    fn labels(compositor: &Compositor) -> Vec<String> {
+        compositor
+            .overlay()
+            .expect("a menu")
+            .items()
+            .iter()
+            .map(|item| item.label.clone())
+            .collect()
+    }
+
+    /// A machine with a radio in it, talking to `table`.
+    fn on_the_radio(
+        fake: &FakeMachine,
+        table: RecordingSupplicant,
+    ) -> (Compositor, Rc<RefCell<RecordingSupplicant>>) {
+        fake.with_wireless_link("aa:bb:cc:dd:ee:02");
+        let mut compositor = fake.compositor();
+        let shared = talking_to(&mut compositor, table);
+        (compositor, shared)
+    }
+
+    /// A table that answers a scan and then the whole of a join of
+    /// `kitchen-table`.
+    fn joining_table() -> RecordingSupplicant {
+        RecordingSupplicant::new()
+            .answering("SCAN_RESULTS", IN_RANGE)
+            .ok("SCAN")
+            .answering("LIST_NETWORKS", NO_NETWORKS)
+            .answering("ADD_NETWORK", "0")
+            .ok("SET_NETWORK 0 ssid 6b69746368656e2d7461626c65")
+            .ok("SET_NETWORK 0 psk \"correct horse battery staple\"")
+            .ok("ENABLE_NETWORK 0")
+            .ok("SELECT_NETWORK 0")
+            .ok("SAVE_CONFIG")
+    }
+
+    /// Press the join row of the radio's link menu.
+    fn open_the_list(compositor: &mut Compositor) {
+        compositor.network_target = Some(FAKE_RADIO.to_string());
+        compositor.choose(OverlayKind::Link, Some(0), JOIN);
+    }
+
+    /// Press enter on row `index` of the open menu.
+    ///
+    /// Through [`Compositor::overlay_outcome`] rather than straight into
+    /// `choose`, because closing the box is half of what choosing a row does:
+    /// a test that skipped it would be asserting about a menu the keystroke
+    /// had already taken down.
+    fn press(compositor: &mut Compositor, index: usize) {
+        compositor.overlay_outcome(OverlayOutcome::Chosen(index));
+    }
+
+    /// Type a passphrase into the prompt that is up, and press enter.
+    fn answer_the_prompt(compositor: &mut Compositor, passphrase: &str) {
+        for character in passphrase.chars() {
+            compositor.overlay_key(&KeyEvent::new(
+                KeyCode::Char(character),
+                tos_input::Modifiers::NONE,
+            ));
+        }
+        compositor.overlay_key(&KeyEvent::new(KeyCode::Enter, tos_input::Modifiers::NONE));
+    }
+
+    #[test]
+    fn a_radio_that_is_on_a_network_can_leave_it_or_forget_it_by_name() {
+        let fake = FakeMachine::new("wifi-associated");
+        let (mut compositor, _shared) = on_the_radio(
+            &fake,
+            RecordingSupplicant::new().answering("STATUS", ON_A_NETWORK),
+        );
+
+        compositor.choose(OverlayKind::Networks, Some(0), FAKE_RADIO);
+        assert_eq!(
+            labels(&compositor),
+            vec![
+                BRING_UP,
+                REQUEST_ADDRESS,
+                "leave kitchen-table",
+                "forget kitchen-table",
+                JOIN,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_radio_that_is_on_nothing_is_offered_the_list_and_nothing_else() {
+        let fake = FakeMachine::new("wifi-idle");
+        let (mut compositor, _shared) = on_the_radio(
+            &fake,
+            RecordingSupplicant::new().answering("STATUS", ON_NOTHING),
+        );
+
+        compositor.choose(OverlayKind::Networks, Some(0), FAKE_RADIO);
+        assert_eq!(labels(&compositor), vec![BRING_UP, REQUEST_ADDRESS, JOIN]);
+    }
+
+    #[test]
+    fn a_machine_with_no_supplicant_says_so_rather_than_offering_a_row_that_fails() {
+        let fake = FakeMachine::new("wifi-nodaemon");
+        fake.with_wireless_link("aa:bb:cc:dd:ee:02");
+        let mut compositor = fake.compositor();
+        with_no_supplicant(&mut compositor);
+
+        compositor.choose(OverlayKind::Networks, Some(0), FAKE_RADIO);
+        let (label, detail) = {
+            let row = compositor
+                .overlay()
+                .expect("the link menu")
+                .items()
+                .last()
+                .expect("a row");
+            (row.label.clone(), row.detail.clone())
+        };
+        assert_eq!(label, "no supplicant on tosfakewl0");
+        assert_eq!(detail, "is wpasupplicant installed?");
+
+        // And pressing it says the one thing anybody can do about it.
+        compositor.network_target = Some(FAKE_RADIO.to_string());
+        compositor.choose(OverlayKind::Link, Some(2), &label);
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("is wpasupplicant installed?")
+        );
+    }
+
+    #[test]
+    fn the_wired_rows_are_untouched_by_any_of_this() {
+        let fake = FakeMachine::new("wifi-wired");
+        fake.with_wired_link("aa:bb:cc:dd:ee:01");
+        let mut compositor = fake.compositor();
+        talking_to(&mut compositor, RecordingSupplicant::new());
+
+        compositor.choose(OverlayKind::Networks, Some(0), FAKE_LINK);
+        assert_eq!(labels(&compositor), vec![BRING_UP, REQUEST_ADDRESS]);
+    }
+
+    #[test]
+    fn opening_the_list_asks_for_a_scan_and_shows_what_the_radio_already_heard() {
+        let fake = FakeMachine::new("wifi-scan");
+        let (mut compositor, shared) = on_the_radio(
+            &fake,
+            RecordingSupplicant::new()
+                .answering("SCAN_RESULTS", IN_RANGE)
+                .ok("SCAN"),
+        );
+
+        open_the_list(&mut compositor);
+
+        let overlay = compositor.overlay().expect("the wireless menu");
+        assert_eq!(overlay.title(), "wireless — scanning");
+        let rows: Vec<(&str, &str)> = overlay
+            .items()
+            .iter()
+            .map(|item| (item.label.as_str(), item.detail.as_str()))
+            .collect();
+        // Strongest first, the two kitchen-tables folded into the -30, and the
+        // hidden network not a row at all.
+        assert_eq!(
+            rows,
+            vec![
+                ("kitchen-table", "-30 dBm  WPA2"),
+                ("cafe", "-52 dBm  open"),
+                ("office", "-67 dBm  enterprise — cannot join"),
+            ]
+        );
+        assert_eq!(said(&shared), vec!["SCAN_RESULTS", "SCAN"]);
+    }
+
+    #[test]
+    fn the_title_stops_saying_scanning_when_the_answer_changes() {
+        let fake = FakeMachine::new("wifi-title");
+        let more = format!("{IN_RANGE}02:00:00:00:06:00\t2412\t-70\t[ESS]\tnext-door\n");
+        let (mut compositor, _shared) = on_the_radio(
+            &fake,
+            RecordingSupplicant::new()
+                .answering("SCAN_RESULTS", IN_RANGE)
+                .answering("SCAN_RESULTS", &more)
+                .ok("SCAN"),
+        );
+
+        let opened = Instant::now();
+        open_the_list(&mut compositor);
+        // A second and a half on: the list asks the supplicant again once a
+        // second and not once a frame, and `open_the_list` took its own
+        // `Instant::now()` a moment after `opened`.
+        compositor.tick_at(opened + Duration::from_millis(1500));
+
+        let overlay = compositor.overlay().expect("the wireless menu");
+        assert_eq!(overlay.title(), "wireless");
+        assert_eq!(
+            overlay.items().len(),
+            4,
+            "the new access point is not a row"
+        );
+    }
+
+    #[test]
+    fn escape_on_the_list_lets_the_scan_go() {
+        let fake = FakeMachine::new("wifi-escape");
+        let (mut compositor, _shared) = on_the_radio(
+            &fake,
+            RecordingSupplicant::new()
+                .answering("SCAN_RESULTS", IN_RANGE)
+                .ok("SCAN"),
+        );
+
+        open_the_list(&mut compositor);
+        assert_eq!(compositor.wifi.scanning_on(), Some(FAKE_RADIO));
+        compositor.overlay_key(&KeyEvent::new(KeyCode::Escape, tos_input::Modifiers::NONE));
+        assert!(compositor.overlay().is_none());
+        assert_eq!(compositor.wifi.scanning_on(), None);
+    }
+
+    #[test]
+    fn a_network_with_a_key_asks_for_it_behind_bullets() {
+        let fake = FakeMachine::new("wifi-prompt");
+        let (mut compositor, _shared) = on_the_radio(&fake, joining_table());
+
+        open_the_list(&mut compositor);
+        press(&mut compositor, 0);
+
+        let overlay = compositor.overlay().expect("the passphrase prompt");
+        assert_eq!(overlay.title(), "kitchen-table — passphrase");
+        assert_eq!(overlay.shown_query(), "");
+        assert!(overlay.items().is_empty(), "a prompt has no list");
+    }
+
+    #[test]
+    fn a_passphrase_sends_the_sequence_the_design_writes_down() {
+        let fake = FakeMachine::new("wifi-join");
+        let (mut compositor, shared) = on_the_radio(&fake, joining_table());
+
+        open_the_list(&mut compositor);
+        press(&mut compositor, 0);
+        answer_the_prompt(&mut compositor, "correct horse battery staple");
+
+        assert_eq!(
+            said(&shared),
+            vec![
+                "SCAN_RESULTS",
+                "SCAN",
+                "LIST_NETWORKS",
+                "ADD_NETWORK",
+                "SET_NETWORK 0 ssid 6b69746368656e2d7461626c65",
+                "SET_NETWORK 0 psk \"correct horse battery staple\"",
+                "ENABLE_NETWORK 0",
+                "SELECT_NETWORK 0",
+                "SAVE_CONFIG",
+            ]
+        );
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("joining kitchen-table")
+        );
+        assert!(compositor.overlay().is_none(), "the prompt is still up");
+    }
+
+    #[test]
+    fn an_ssid_the_supplicant_already_knows_keeps_the_id_it_had() {
+        let fake = FakeMachine::new("wifi-rejoin");
+        let (mut compositor, shared) = on_the_radio(
+            &fake,
+            RecordingSupplicant::new()
+                .answering("SCAN_RESULTS", IN_RANGE)
+                .ok("SCAN")
+                .answering(
+                    "LIST_NETWORKS",
+                    "network id / ssid / bssid / flags\n3\tkitchen-table\tany\t[DISABLED]\n",
+                )
+                .ok("SET_NETWORK 3 ssid 6b69746368656e2d7461626c65")
+                .ok("SET_NETWORK 3 psk \"correct horse battery staple\"")
+                .ok("ENABLE_NETWORK 3")
+                .ok("SELECT_NETWORK 3")
+                .ok("SAVE_CONFIG"),
+        );
+
+        open_the_list(&mut compositor);
+        press(&mut compositor, 0);
+        answer_the_prompt(&mut compositor, "correct horse battery staple");
+
+        let transcript = said(&shared);
+        assert!(
+            !transcript.iter().any(|line| line == "ADD_NETWORK"),
+            "the network is in the file twice now: {transcript:?}"
+        );
+        assert!(transcript.iter().any(|line| line == "SELECT_NETWORK 3"));
+    }
+
+    #[test]
+    fn a_status_that_reaches_completed_is_a_join() {
+        let fake = FakeMachine::new("wifi-joined");
+        let (mut compositor, _shared) =
+            on_the_radio(&fake, joining_table().answering("STATUS", ON_A_NETWORK));
+
+        let started = Instant::now();
+        open_the_list(&mut compositor);
+        press(&mut compositor, 0);
+        answer_the_prompt(&mut compositor, "correct horse battery staple");
+        // "joining" has the line and has not been up long enough to be
+        // retired; taking it off is what lets the next answer be read.
+        compositor.notifications.dismiss();
+        compositor.tick_at(started + Duration::from_secs(1));
+
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("joined kitchen-table")
+        );
+    }
+
+    #[test]
+    fn a_network_that_goes_temp_disabled_is_a_wrong_passphrase_and_is_not_kept() {
+        let fake = FakeMachine::new("wifi-wrongkey");
+        let (mut compositor, shared) = on_the_radio(
+            &fake,
+            joining_table()
+                .answering("STATUS", HANDSHAKING)
+                .answering(
+                    "LIST_NETWORKS",
+                    "network id / ssid / bssid / flags\n0\tkitchen-table\tany\t[TEMP-DISABLED]\n",
+                )
+                .ok("REMOVE_NETWORK 0")
+                .ok("SAVE_CONFIG"),
+        );
+
+        let started = Instant::now();
+        open_the_list(&mut compositor);
+        press(&mut compositor, 0);
+        answer_the_prompt(&mut compositor, "correct horse battery staple");
+        compositor.notifications.dismiss();
+        compositor.tick_at(started + Duration::from_secs(1));
+
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("kitchen-table: wrong passphrase")
+        );
+        let transcript = said(&shared);
+        assert_eq!(
+            &transcript[transcript.len() - 2..],
+            ["REMOVE_NETWORK 0", "SAVE_CONFIG"],
+            "a key that is wrong was left to be tried again at every boot: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn a_join_that_never_settles_is_called_off_and_the_network_is_left_alone() {
+        let fake = FakeMachine::new("wifi-deadline");
+        let (mut compositor, shared) =
+            on_the_radio(&fake, joining_table().answering("STATUS", HANDSHAKING));
+
+        let started = Instant::now();
+        open_the_list(&mut compositor);
+        press(&mut compositor, 0);
+        answer_the_prompt(&mut compositor, "correct horse battery staple");
+        compositor.notifications.dismiss();
+        compositor.tick_at(started + Duration::from_secs(31));
+
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("kitchen-table: could not join")
+        );
+        let transcript = said(&shared);
+        assert!(
+            !transcript.iter().any(|line| line == "REMOVE_NETWORK 0"),
+            "a network that was only out of range was forgotten: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn an_open_network_is_joined_without_anybody_being_asked_for_a_key() {
+        let fake = FakeMachine::new("wifi-open");
+        let (mut compositor, shared) = on_the_radio(
+            &fake,
+            RecordingSupplicant::new()
+                .answering("SCAN_RESULTS", IN_RANGE)
+                .ok("SCAN")
+                .answering("LIST_NETWORKS", NO_NETWORKS)
+                .answering("ADD_NETWORK", "0")
+                .ok("SET_NETWORK 0 ssid 63616665")
+                .ok("SET_NETWORK 0 key_mgmt NONE")
+                .ok("ENABLE_NETWORK 0")
+                .ok("SELECT_NETWORK 0")
+                .ok("SAVE_CONFIG"),
+        );
+
+        open_the_list(&mut compositor);
+        press(&mut compositor, 1);
+
+        assert!(compositor.overlay().is_none(), "it asked for a passphrase");
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("joining cafe")
+        );
+        let transcript = said(&shared);
+        assert!(transcript
+            .iter()
+            .any(|line| line == "SET_NETWORK 0 key_mgmt NONE"));
+    }
+
+    #[test]
+    fn an_enterprise_network_says_why_it_cannot_be_joined() {
+        let fake = FakeMachine::new("wifi-eap");
+        let (mut compositor, shared) = on_the_radio(
+            &fake,
+            RecordingSupplicant::new()
+                .answering("SCAN_RESULTS", IN_RANGE)
+                .ok("SCAN"),
+        );
+
+        open_the_list(&mut compositor);
+        press(&mut compositor, 2);
+
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("cannot join office: enterprise networks are not supported")
+        );
+        assert_eq!(
+            said(&shared),
+            vec!["SCAN_RESULTS", "SCAN"],
+            "a row that says it cannot be joined tried anyway"
+        );
+    }
+
+    #[test]
+    fn leaving_and_forgetting_each_send_their_two_commands() {
+        let fake = FakeMachine::new("wifi-leave");
+        let (mut compositor, shared) = on_the_radio(
+            &fake,
+            RecordingSupplicant::new()
+                .answering("STATUS", ON_A_NETWORK)
+                .ok("DISABLE_NETWORK 0")
+                .ok("DISCONNECT")
+                .ok("REMOVE_NETWORK 0")
+                .ok("SAVE_CONFIG"),
+        );
+
+        compositor.network_target = Some(FAKE_RADIO.to_string());
+        compositor.choose(OverlayKind::Link, Some(2), "leave kitchen-table");
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("left kitchen-table")
+        );
+
+        compositor.network_target = Some(FAKE_RADIO.to_string());
+        compositor.choose(OverlayKind::Link, Some(3), "forget kitchen-table");
+
+        assert_eq!(
+            said(&shared),
+            vec![
+                "STATUS",
+                "DISABLE_NETWORK 0",
+                "DISCONNECT",
+                "STATUS",
+                "REMOVE_NETWORK 0",
+                "SAVE_CONFIG",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_passphrase_the_client_refuses_keeps_the_prompt_and_says_which_rule_it_broke() {
+        let fake = FakeMachine::new("wifi-short");
+        let (mut compositor, shared) = on_the_radio(&fake, joining_table());
+
+        open_the_list(&mut compositor);
+        press(&mut compositor, 0);
+        answer_the_prompt(&mut compositor, "short");
+
+        assert_eq!(
+            compositor.notifications.status_line().as_deref(),
+            Some("a passphrase is 8 to 63 characters, and this one is 5")
+        );
+        let overlay = compositor.overlay().expect("the prompt closed on a typo");
+        assert_eq!(overlay.title(), "kitchen-table — passphrase");
+        assert_eq!(overlay.query(), "short", "what was typed was thrown away");
+        assert_eq!(overlay.shown_query(), "•••••");
+        let transcript = said(&shared);
+        assert!(
+            !transcript.iter().any(|line| line.contains(" psk ")),
+            "a passphrase that was refused here reached the daemon anyway: {transcript:?}"
+        );
+        assert!(compositor.wifi.joining().is_none());
     }
 }
