@@ -94,9 +94,11 @@ fn screen(c: &Compositor) -> String {
 /// a caller naming a count the screen already holds has written no wait at all
 /// — and, worse, one that returns before the thing it was waiting for. It is
 /// also the *first* write to reach that count that ends the wait, which is not
-/// always the last write the round trip makes: see #166 and the comment in
-/// `japanese_and_more_than_one_line_survive_the_round_trip`, where the echo
-/// arrives one write before `cat`'s copy does.
+/// always the last write the round trip makes: #166 was a paste whose echo
+/// landed one write ahead of `cat`'s copy, with the assertion under the wait
+/// racing the rest. Where more than one write is coming, wait on all of them —
+/// `japanese_and_more_than_one_line_survive_the_round_trip` uses [`wait_for`]
+/// with a predicate over both counts rather than this.
 fn wait_for_echo(c: &mut Compositor, text: &str, times: usize) -> bool {
     wait_for(c, Duration::from_secs(5), |c| {
         screen(c).matches(text).count() >= times
@@ -445,12 +447,21 @@ fn japanese_and_more_than_one_line_survive_the_round_trip() {
     // | 日本語のテキスト | 1 | 1 | 1 |
     // | と二行目 | 1 | 1 | — |
     //
-    // The wait is on cat's copy, which is the **last** of the three to land.
-    // It used to be on the echo of the second line, which is the first — so it
-    // returned with the screen one write short of settled and the count below
-    // raced the scheduler for it, losing about one run in five (#166).
+    // The wait is on the whole settled screen rather than on any one write of
+    // it. It used to be on the echo of the second line, which is the first of
+    // the three to land, so it returned with the screen one write short and
+    // the count below raced the scheduler for the rest — about one run in five
+    // (#166). Waiting on cat's copy alone would be the same mistake with a
+    // longer fuse: the order those two writes reach the master is the line
+    // discipline's business and not something to infer, since it wakes the
+    // reader at the newline in the middle of the buffer and flushes the echo
+    // of what follows afterwards.
     assert!(
-        wait_for_echo(&mut c, "日本語のテキスト", 3),
+        wait_for(&mut c, Duration::from_secs(5), |c| {
+            let screen = screen(c);
+            screen.matches("日本語のテキスト").count() >= 3
+                && screen.matches("と二行目").count() >= 2
+        }),
         "the paste never came back: {:?}",
         screen(&c)
     );
