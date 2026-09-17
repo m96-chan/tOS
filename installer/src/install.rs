@@ -27,6 +27,16 @@ pub const SHADOW_FILE: &str = "/etc/shadow";
 /// group- or world-writable is skipped, and skipped quietly.
 const SUDOERS_MODE: u32 = 0o440;
 
+/// The programs that end this machine, which the drop-in below lets the
+/// person run without a password (#158).
+///
+/// All four are `systemd-sysv` symlinks to `systemctl` on an installed
+/// machine, and the shim in `/usr/local/sbin` runs them through `sudo -n` by
+/// exactly these paths. `halt` is in the list because `shutdown -H` is it, and
+/// leaving it out would be a flag of `shutdown` that asks for a password when
+/// the other three do not.
+const POWER_PROGRAMS: &str = "/sbin/shutdown, /sbin/poweroff, /sbin/reboot, /sbin/halt";
+
 /// Debian's mode for that file, and what this writes when it is the one
 /// creating it: root writes it, the `shadow` group reads it, nobody else sees
 /// a hash at all. A hash anyone can read is a hash anyone can attack offline,
@@ -455,12 +465,42 @@ impl<'a> Installer<'a> {
     /// would ask for one that cannot exist — `*` authenticates nobody — and
     /// leave the machine locked out of itself while protecting nothing that
     /// anyone at its keyboard does not already have.
+    ///
+    /// **And `NOPASSWD` for the four programs that turn the machine off**
+    /// (#158). `/sbin/shutdown` on this image is `systemd-sysv`'s symlink to
+    /// `systemctl`, which has to reach PID 1 — and since #119 a pane runs as
+    /// the person, who can reach it by neither route this image leaves open:
+    /// there is no D-Bus, so no `logind` and no polkit, and
+    /// `/run/systemd/private` is `srwx------ root root`. So `shutdown -h now`
+    /// said `Failed to connect to bus`, exited 1, and the machine stayed up.
+    /// `/usr/local/sbin/shutdown` — `iso/shutdown`, first on the session's
+    /// PATH — is what hands the real program to `sudo -n`, and this is the
+    /// line that lets it through.
+    ///
+    /// It gives away nothing that was being kept. The person standing at this
+    /// machine can already power it off without a password from the
+    /// compositor's power menu, and by holding the power button in; a
+    /// password on `shutdown` alone guarded a door with no wall beside it,
+    /// while making the one command everybody knows the only way that did not
+    /// work.
     fn add_sudo(&mut self, root: &str, settings: &Settings) -> Result<(), String> {
         let user = &settings.username;
         let rule = if settings.password.is_empty() {
             format!("{user} ALL=(ALL:ALL) NOPASSWD: ALL\n")
         } else {
-            format!("{user} ALL=(ALL:ALL) ALL\n")
+            // Named by the path `sudo` is handed, which is the path the shim
+            // hands it: /sbin, not /usr/sbin, though usr-merge makes them the
+            // same file. A second line rather than one with two tags on it,
+            // because a `NOPASSWD:` and a `PASSWD:` in one rule is a sudoers
+            // line nobody reads correctly twice; the later line wins for the
+            // commands it names and the earlier one still covers everything
+            // else, with a password.
+            format!(
+                "{user} ALL=(ALL:ALL) ALL\n\
+                 # Turning the machine off, without a password: the power menu\n\
+                 # and the power button already do that much. See #158.\n\
+                 {user} ALL=(ALL:ALL) NOPASSWD: {POWER_PROGRAMS}\n"
+            )
         };
         let path = format!("{root}/etc/sudoers.d/{user}");
         self.progress
@@ -1349,10 +1389,64 @@ mod tests {
         installer.run();
 
         let (rule, mode) = file(&backend, "/mnt/target/etc/sudoers.d/yusuke");
-        assert_eq!(rule, "yusuke ALL=(ALL:ALL) ALL\n");
+        assert_eq!(
+            rule,
+            "yusuke ALL=(ALL:ALL) ALL\n\
+             # Turning the machine off, without a password: the power menu\n\
+             # and the power button already do that much. See #158.\n\
+             yusuke ALL=(ALL:ALL) NOPASSWD: \
+             /sbin/shutdown, /sbin/poweroff, /sbin/reboot, /sbin/halt\n"
+        );
         // sudo skips a drop-in anybody but root can write, and skips it
         // silently — a 0644 here would be a machine that still cannot.
         assert_eq!(mode, Some(0o440), "sudo ignores a writable drop-in");
+    }
+
+    #[test]
+    fn turning_the_machine_off_costs_no_password() {
+        // #158: `shutdown -h now` in a pane could not turn an installed
+        // machine off at all — the pane is the person since #119, and
+        // `systemctl` reaches PID 1 through a bus this image does not ship
+        // and a socket only root can open. The shim on PATH hands the real
+        // program to `sudo -n`, and this is the line that lets it through.
+        //
+        // Asserted by the path `sudo` matches against, one program at a time,
+        // because a rule that named three of the four would be a machine
+        // where one flag of `shutdown` asks for a password and the rest do
+        // not — and nothing but this would say so.
+        let mut backend = live_backend();
+        let settings = Settings {
+            username: "yusuke".into(),
+            password: "hunter2".into(),
+            ..Settings::default()
+        };
+        let mut installer = Installer::new(
+            Plan::new(disk(), Firmware::Uefi, Bootloader::Present, settings),
+            &mut backend,
+        );
+        installer.run();
+
+        let (rule, _) = file(&backend, "/mnt/target/etc/sudoers.d/yusuke");
+        let nopasswd = rule
+            .lines()
+            .find(|line| line.contains("NOPASSWD:"))
+            .expect("the drop-in grants the power programs without a password");
+        for program in [
+            "/sbin/shutdown",
+            "/sbin/poweroff",
+            "/sbin/reboot",
+            "/sbin/halt",
+        ] {
+            assert!(nopasswd.contains(program), "{nopasswd} omits {program}");
+        }
+        // And everything else still costs one. A machine that asked for no
+        // password anywhere is a different decision from this one, and the
+        // login screen's rule — no password set, no boundary — is the only
+        // thing that makes it.
+        assert!(
+            rule.contains("yusuke ALL=(ALL:ALL) ALL\n"),
+            "the person is still root for everything else, with a password: {rule}"
+        );
     }
 
     #[test]

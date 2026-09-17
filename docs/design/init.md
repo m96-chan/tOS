@@ -166,10 +166,37 @@ There is one copy now.
 - **The login boundary.** A session is still entered without anybody being
   asked and can still be fallen out of. That is #112, which depends on this and
   on #111 but not on how either was done.
-- **Shutting down cleanly.** The compositor's power actions still call
-  `reboot(2)` directly, so an installed machine never unmounts its ext4 root.
-  There is an init to ask now, and the rescue session is the one path where
-  there still is not.
+- **Shutting down cleanly.** Half of this is decided now; half is not.
+
+  What is decided is the words a person types. `shutdown -h now` in a pane
+  could not turn an installed machine off at all — a pane runs as the person
+  since #119, `/sbin/shutdown` is `systemd-sysv`'s symlink to `systemctl`, and
+  neither way to PID 1 is open to anybody but root on this image: no D-Bus, so
+  no `logind` to ask and no polkit to ask it, and `/run/systemd/private` is
+  `srwx------ root root`. The command said `Failed to connect to bus`, exited
+  1, and the machine stayed up, while the same command on the live image
+  worked because that session happens to be root. #158 answered it with two
+  small things rather than a daemon: `/usr/local/sbin/shutdown`
+  (`iso/shutdown`, with `poweroff`, `reboot` and `halt` beside it), which is
+  first on the PATH `iso/live-session` exports and hands the real program to
+  `sudo -n`; and a line in the installer's `/etc/sudoers.d` drop-in letting
+  exactly those four through without a password, which gives away nothing the
+  power menu and the power button do not already give. The rescue session has
+  no init to reach at all and busybox has no `shutdown` applet, so the same
+  file maps `-h` to `poweroff` and `-r` to `reboot` there. Shipping D-Bus and
+  polkit — what every other systemd machine does, and what would make these
+  programs behave as their manual pages say — was turned down for now: it
+  needs a `logind` session tOS does not create, and the seat it would
+  arbitrate is #22's question as much as this one.
+
+  What is still open is the other half: the compositor's power actions still
+  call `reboot(2)` directly, so a machine ended from the power menu never
+  unmounts its ext4 root and `sync(2)` is all that stands in for a shutdown.
+  The menu should ask the init that is now there, the way the command above
+  does. That is a change to `tos_system::power` and it is deliberately not
+  part of #158 — one is a program on `PATH`, the other is the compositor's own
+  path to the kernel, and whatever replaces it still has to answer for the
+  rescue session, where there is no init to ask.
 - **busybox.** It is no longer PID 1 and nothing else in the rootfs needs it:
   the installer runs Debian's `sfdisk`, `mkfs.ext4`, `mount`, `unsquashfs` and
   `grub-install`, and a pane's shell is bash or dash. It stays on the image

@@ -1,0 +1,179 @@
+#!/bin/sh
+# shellcheck shell=dash
+# `shutdown`, and `poweroff`, `reboot` and `halt` beside it: the words a person
+# turns a computer off with, made to work as typed on every tOS machine.
+#
+# Installed by iso/mkiso.sh as /usr/local/sbin/shutdown with the other three as
+# symlinks to it, on both sides of the pivot, and it dispatches on the name it
+# was called by. /usr/local/sbin because that is the first entry of the PATH
+# iso/live-session exports and so comes before /sbin, where the real programs
+# are; nothing a session runs puts PATH back — a pane's bash is an interactive
+# shell that is not a login shell, so it reads ~/.bashrc and neither
+# /etc/profile nor $ENV, and iso/bashrc, iso/dot-profile and iso/profile all
+# leave PATH alone. iso/check-rootfs.sh asserts that, because a shim that is
+# not found first does nothing and says nothing.
+#
+# Why this file exists at all (#158). On an installed machine a pane runs as
+# the person rather than as root (#119), and /sbin/shutdown there is
+# systemd-sysv's symlink to systemctl, which has to reach PID 1 to do
+# anything. Both ways in are shut to anybody who is not root on this image:
+# there is no D-Bus — see the note beside the masked wpa_supplicant.service in
+# iso/mkiso.sh — so there is no logind to ask and no polkit to ask it, and
+# PID 1's fallback socket /run/systemd/private is `srwx------ root root`. So
+# the command exited 1 with `Failed to connect to bus: No such file or
+# directory`, which is about a bus rather than about the person or the
+# machine, and the machine stayed up.
+#
+# The three machines this runs on, and what it does on each:
+#
+#   live image        the session is root, so it execs the real program and is
+#                     not in the way. `shutdown -h now` worked there already.
+#   installed disk    the session is the person, so it re-runs the real
+#                     program under `sudo -n`. The installer's
+#                     /etc/sudoers.d drop-in grants exactly these four
+#                     without a password; see `add_sudo` in
+#                     installer/src/install.rs for why that costs nothing.
+#   rescue session    out of the initramfs, where busybox has halt, poweroff
+#                     and reboot applets and no shutdown one at all, and
+#                     PID 1 is iso/live-session rather than an init. See
+#                     `no_init` below.
+#
+# Not a shell function or an alias: `shutdown` is typed by things that are not
+# a person's interactive bash — a script, a `sudo -i`, `ssh host shutdown -h
+# now` — and a file on PATH is the only place all of them look.
+
+name=${0##*/}
+case "$name" in
+shutdown | poweroff | reboot | halt) ;;
+*)
+    echo "tos: $0: this is tOS's shutdown shim and it answers to four names" >&2
+    exit 1
+    ;;
+esac
+
+# The real program, looked for in the system directories only. /usr/local is
+# deliberately not among them: that is where this file is, and a search that
+# could find it would find itself. Debian is usr-merged, so /sbin and
+# /usr/sbin are the same directory there and the first hit is the same file;
+# /sbin is named first anyway because it is the path the sudoers drop-in
+# grants, and sudo matches what it is handed.
+real_program() {
+    for dir in /sbin /usr/sbin /bin /usr/bin; do
+        if [ -x "$dir/$1" ]; then
+            echo "$dir/$1"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Whether this machine has an init to ask at all, which decides two things
+# below. A real /sbin/shutdown is the marker: systemd-sysv puts one there and
+# the initramfs has none, and it is the same file whose absence the fallback
+# is for, so one question answers both.
+no_init=
+[ -x /sbin/shutdown ] || no_init=1
+
+target=$(real_program "$name") || target=
+
+# The rescue session's `shutdown`. busybox carries no such applet, so without
+# this the one word this file exists for is the one word that is still missing
+# there — and it is the machine that needs it most, since a rescue session is
+# usually somebody at a console with no other way out.
+#
+# Only the flags that decide which of busybox's three applets to use are
+# honoured. A schedule is not: busybox has nothing that could hold one, and a
+# `shutdown -h +5` that powered the machine off at once would be worse than
+# one that says it cannot.
+if [ "$name" = shutdown ] && [ -z "$target" ]; then
+    action=poweroff
+    when=
+    for arg in "$@"; do
+        case "$arg" in
+        -h | -P | --poweroff) action=poweroff ;;
+        -r | --reboot) action=reboot ;;
+        -H | --halt) action=halt ;;
+        -c | --cancel)
+            echo "tos: nothing to cancel: this session has no init to have scheduled anything with" >&2
+            exit 1
+            ;;
+        -*)
+            printf 'tos: %s: %s means nothing here: this session has busybox halt, poweroff and reboot and no more\n' \
+                "$name" "$arg" >&2
+            exit 1
+            ;;
+        *)
+            # The first thing that is not a flag is the time; everything
+            # after it is shutdown(8)'s wall message, and a rescue session
+            # is one person at one console with nobody to send one to.
+            [ -n "$when" ] && continue
+            when=$arg
+            case "$arg" in
+            now | +0) ;;
+            *)
+                printf 'tos: %s: cannot shut down at %s: this session has no init to schedule it with. Say: %s -h now\n' \
+                    "$name" "$arg" "$name" >&2
+                exit 1
+                ;;
+            esac
+            ;;
+        esac
+    done
+    target=$(real_program "$action") || target=
+    set -- # busybox's applets take none of shutdown(8)'s arguments
+    name=$action
+fi
+
+if [ -z "$target" ]; then
+    echo "tos: $name: this machine has no such program" >&2
+    exit 1
+fi
+
+# busybox's halt, poweroff and reboot do not act by themselves: unless they
+# are given -f they send PID 1 a signal and expect busybox's init to be the
+# one receiving it. PID 1 in the rescue session is iso/live-session, a shell,
+# and a shell that installed no handler is a PID 1 the kernel discards the
+# signal for — so the applet returns 0 and the machine stays up, silently.
+# That is not a guess: it is the bug the installer's own reboot had, written
+# down at `Backend::reboot` in installer/src/exec.rs — the key that restarts
+# a finished install had never worked on any machine, and the discarded exit
+# status was 0 every time. -f is the applet calling reboot(2) itself, which
+# is the only thing that can work where there is no init, and it is why the
+# sync is here: nothing else will flush what a rescue session mounted by
+# hand.
+#
+# Gated on there being no init, so that the machines which have one keep the
+# clean shutdown their init does. /sbin/shutdown exists on both of those, so
+# neither ever reaches this.
+if [ -n "$no_init" ]; then
+    sync
+    set -- -f "$@"
+fi
+
+# Already root — the live image and the rescue session — so there is nothing
+# to ask and nothing to be refused. Every argument goes through untouched, so
+# `shutdown -h +5` and `shutdown -c` still mean what shutdown(8) says they do.
+if [ "$(id -u)" = 0 ]; then
+    exec "$target" "$@"
+fi
+
+if ! command -v sudo >/dev/null 2>&1; then
+    echo "tos: $name: this has to be root and there is no sudo on this machine" >&2
+    exit 1
+fi
+
+# Asked before it is done, because `sudo -n` that is going to refuse prints a
+# line about a password and exits 1, and this file's whole job is to replace
+# an unhelpful failure rather than to swap one for another. `sudo -l CMND`
+# answers exactly the question "would this be allowed", and with -n it answers
+# without prompting for anything.
+if ! sudo -n -l "$target" >/dev/null 2>&1; then
+    typed="sudo $name"
+    [ $# -gt 0 ] && typed="$typed $*"
+    printf 'tos: %s: this has to be root, and sudo will not do it without a password.\n' "$name" >&2
+    printf 'tos: type: %s\n' "$typed" >&2
+    printf 'tos: or use the power menu the session already has: ctrl+a, then the power entry.\n' >&2
+    exit 1
+fi
+
+exec sudo -n "$target" "$@"
