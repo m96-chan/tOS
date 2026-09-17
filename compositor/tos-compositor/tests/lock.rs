@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use tos_compositor::{Compositor, Config};
 use tos_input::{InputEvent, KeyCode, KeyEvent, Modifiers, MouseAction, PointerEvent};
-use tos_render::OwnedFramebuffer;
+use tos_render::{OwnedFramebuffer, Rect};
+use tos_term::Rgb;
 
 const SIZE: (u32, u32) = (800, 480);
 /// What every test here unlocks with.
@@ -82,6 +83,13 @@ fn wait_for(
 fn render_onto(compositor: &mut Compositor, framebuffer: &mut OwnedFramebuffer) {
     let mut surface = framebuffer.surface();
     compositor.render_frame(&mut surface, true);
+}
+
+/// Paint into a framebuffer the compositor has been told nothing about, which
+/// is what a backend that does not retain its contents hands out.
+fn render_onto_unknown(compositor: &mut Compositor, framebuffer: &mut OwnedFramebuffer) {
+    let mut surface = framebuffer.surface();
+    compositor.render_frame(&mut surface, false);
 }
 
 fn type_password(compositor: &mut Compositor, password: &str) {
@@ -179,10 +187,17 @@ fn a_locked_screen_shows_nothing_of_the_session() {
 }
 
 #[test]
-fn every_locked_frame_erases_the_one_it_is_given() {
-    // A DRM display has two buffers and hands out the one it is not showing,
-    // so a clear that ran once cleared one of them. Two framebuffers, used in
-    // turn, is what that looks like from here.
+fn a_locked_frame_erases_a_surface_it_has_not_been_promised() {
+    // A display that hands out a surface without saying what is on it — two
+    // buffers used in turn, which is what `retained` being false means — gets
+    // the whole screen erased on every locked frame, session and all.
+    //
+    // The DRM backend is not that display and has not been since #105: it
+    // composites into one shadow and copies out what changed, and the second
+    // dumb buffer is squared by `Shadow::owed` rather than by a clear that
+    // runs twice (`tos_platform::drm`'s own tests say so). That is what lets a
+    // locked frame be a partial repaint at all — #164, where every locked
+    // frame repainting every pixel is what was making the screen blink.
     let mut c = compositor("buffers", &["/bin/sh", "-c", "sleep 30"]);
     let background = Config::default().chrome.background.pack();
     let (_, ch) = c.cell_size();
@@ -194,18 +209,63 @@ fn every_locked_frame_erases_the_one_it_is_given() {
         OwnedFramebuffer::new(SIZE.0, SIZE.1),
     ];
     for buffer in &mut buffers {
-        render_onto(&mut c, buffer);
+        render_onto_unknown(&mut c, buffer);
         assert!(row_has_ink(buffer, text_row, background));
     }
 
     c.lock_session();
     for buffer in &mut buffers {
-        render_onto(&mut c, buffer);
+        render_onto_unknown(&mut c, buffer);
         assert!(
             !row_has_ink(buffer, text_row, background),
             "the buffer that was not shown first still holds the session"
         );
     }
+}
+
+#[test]
+fn a_retained_locked_frame_repaints_the_box_and_leaves_the_rest() {
+    // The frames that made the screen blink: a caret that does not blink, a
+    // reading that moved, a minute turning over — a whole display repainted
+    // for something nobody could see (#164). What a locked frame costs now is
+    // the box, and what an idle locked screen costs is nothing at all.
+    let mut c = compositor("retained", &["/bin/sh", "-c", "sleep 30"]);
+    let background = Config::default().chrome.background.pack();
+    let (_, ch) = c.cell_size();
+    let text_row = ch / 2;
+
+    c.inject("SECRET-IN-A-PANE".repeat(4).as_bytes());
+    let mut framebuffer = OwnedFramebuffer::new(SIZE.0, SIZE.1);
+    wait_for(&mut c, Duration::from_secs(5), |c| c.needs_render());
+    render_onto(&mut c, &mut framebuffer);
+    assert!(row_has_ink(&framebuffer, text_row, background));
+
+    assert!(c.lock_session());
+    render_onto(&mut c, &mut framebuffer);
+    assert!(
+        !row_has_ink(&framebuffer, text_row, background),
+        "the first locked frame has to erase the session"
+    );
+
+    // The second one is asked for a frame it should not be able to fill with
+    // anything but the box. Painted over a surface that is deliberately not
+    // the one the lock last drew: everything outside the box has to come back
+    // untouched, which is what makes this a partial repaint and not a clear.
+    let marker = 0x00ff_00ffu32;
+    let mut scribbled = OwnedFramebuffer::new(SIZE.0, SIZE.1);
+    scribbled
+        .surface()
+        .fill(Rect::new(0, 0, SIZE.0, SIZE.1), Rgb::new(255, 0, 255));
+    render_onto(&mut c, &mut scribbled);
+    assert_eq!(
+        scribbled.pixel(0, 0),
+        marker,
+        "the corner of a retained locked frame should not have been touched"
+    );
+    assert!(
+        (0..SIZE.0).any(|x| scribbled.pixel(x, SIZE.1 / 2) != marker),
+        "the box itself should have been drawn"
+    );
 }
 
 #[test]

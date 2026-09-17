@@ -35,7 +35,7 @@ use crate::config::Config;
 use crate::copymode::{CopyMode, CopyOutcome};
 use crate::ime::{self, Ime, ImeOutcome};
 use crate::launcher;
-use crate::lock::{self, LockOutcome, LockScreen};
+use crate::lock::{self, Backdrop, LockOutcome, LockScreen, Repaint};
 use crate::notify::{self, Chosen, Notifications};
 use crate::overlay::{Overlay, OverlayItem, OverlayOutcome, Placement};
 use crate::pane::Pane;
@@ -2156,6 +2156,14 @@ impl Compositor {
         // that would have said what to repaint was thrown away with each
         // locked frame. The whole screen is the only honest answer.
         self.needs_full_redraw = true;
+        // The phase stood still while the lock was up (#164), so it is
+        // whatever it was when the screen went away — and a phase that has
+        // been still for an hour would flip on the first tick after this.
+        // Started again here instead, lit, for the reason an unblank starts
+        // it lit: where the caret is, is the first thing anybody looks for on
+        // a screen they have just got back.
+        self.blink_visible = true;
+        self.last_blink = Instant::now();
         self.session_ended_while_locked = false;
         if !self.panes.is_empty() {
             return;
@@ -3230,6 +3238,13 @@ impl Compositor {
     /// happened at the same instant.
     fn tick_at(&mut self, now: Instant) -> bool {
         let mut changed = false;
+        // What the lock itself has to be repainted for, which is the only
+        // thing that can reach the display while one is up. Everything else
+        // this function finds — an animation, a reading that moved, a minute
+        // turning over, a lease landing — belongs to a screen that is behind
+        // the lock and is not being drawn, so it accumulates into `changed`
+        // and is dropped at the end (#164).
+        let mut lock_changed = false;
         // Animated images move on their own clock. The compositor owns that
         // clock and hands the time to each terminal, which keeps the terminal
         // model free of time of its own.
@@ -3242,10 +3257,28 @@ impl Compositor {
         // reason the queue below does: a cursor nobody can see does not need
         // to be somewhere in particular, and flipping it would repaint the
         // whole session behind the blank twice a second.
+        //
+        // And it stands still behind a lock, which is the same rule arriving
+        // from the other side (#164). A lock draws its own caret and draws it
+        // solid — `LockScreen::draw_field` has never been handed this phase —
+        // so flipping it there was a change to nothing, and `render_locked`
+        // repaints every pixel of the display for any change at all: a whole
+        // screen, twice a second, for as long as a machine sat at a login
+        // screen, to put back the image that was already on it.
+        //
+        // What does move on that screen is the wait after a wrong password
+        // counting itself down, and nothing else in tOS would ever ask for
+        // the frame that turns "try again in 12s" into 11. So the metronome
+        // is kept and only what it means changes.
         if !self.blanked && now.saturating_duration_since(self.last_blink) >= BLINK_INTERVAL {
-            self.blink_visible = !self.blink_visible;
             self.last_blink = now;
-            changed = true;
+            match self.lock.as_ref().map(|lock| lock.wait_left(now).is_some()) {
+                Some(counting_down) => lock_changed |= counting_down,
+                None => {
+                    self.blink_visible = !self.blink_visible;
+                    changed = true;
+                }
+            }
         }
         // A notification only spends its time on screen while it is on screen:
         // the leader indicator has the slot while the leader is armed, and one
@@ -3323,6 +3356,17 @@ impl Compositor {
         if self.autoconfigure(now) {
             changed = true;
         }
+        // And none of it is on the screen while a lock is up. The work above
+        // is all still done — the machine goes on reading itself, a link
+        // brought up by nobody goes on being brought up (#124), a scan goes
+        // on being collected — because a locked machine is still a machine.
+        // What changes is only whether any of it is a reason to paint, and
+        // over a lock it is not: no bar is drawn, the queue stands still, and
+        // the panes are behind a screen that covers them. Reporting it drew
+        // the whole display, twice a second, for something nobody could see.
+        if self.lock.is_some() {
+            return lock_changed;
+        }
         changed
     }
 
@@ -3397,7 +3441,7 @@ impl Compositor {
     /// Paint a frame.
     pub fn render_frame(&mut self, surface: &mut Surface<'_>, retained: bool) {
         if self.lock.is_some() {
-            self.render_locked(surface);
+            self.render_locked(surface, retained);
             return;
         }
         let force = self.needs_full_redraw || !retained;
@@ -3768,8 +3812,32 @@ impl Compositor {
     /// The clear happens on every locked frame and not only the first, because
     /// a display with two buffers hands out the other one next time and a
     /// clear that ran once cleared one of them.
-    fn render_locked(&mut self, surface: &mut Surface<'_>) {
-        surface.clear(self.chrome.background);
+    fn render_locked(&mut self, surface: &mut Surface<'_>, retained: bool) {
+        // The locked screen is retained like every other one (#164). It used
+        // to erase the display and draw the box again for every frame,
+        // including the ones where nothing had changed, which is how a screen
+        // with nothing moving on it came to repaint 384,000 pixels twice a
+        // second — and, on a driver whose flips are not reported and whose
+        // every present is therefore a mode set, to blink twice a second with
+        // it.
+        //
+        // Three things still need the whole screen:
+        //
+        // - **`needs_full_redraw`**, which is the lock arriving over a
+        //   session, a resize, a screen coming back from blanked, and a VT
+        //   switch back. Each is a surface holding something that is not this
+        //   screen.
+        // - **A surface that is not retained**, the same condition the
+        //   session path takes `force` from.
+        // - **An arrow that has moved.** What it uncovered is not always the
+        //   background: over a login screen it can be the picture, which
+        //   composites with alpha and so cannot be painted a second time to
+        //   cover the hole. Whoever is moving a mouse over a lock is not the
+        //   case this is protecting, which is a machine nobody is at.
+        let full = self.needs_full_redraw || !retained || self.pointer_moved_since_it_was_drawn();
+        if full {
+            surface.clear(self.chrome.background);
+        }
         let area = PixelRect::new(0, 0, self.size.0, self.size.1);
         if let Some(lock) = &self.lock {
             lock.draw(
@@ -3777,7 +3845,14 @@ impl Compositor {
                 &mut self.fonts,
                 area,
                 &self.chrome,
-                self.picture.as_ref(),
+                Backdrop {
+                    splash: self.picture.as_ref(),
+                    repaint: if full {
+                        Repaint::Everything
+                    } else {
+                        Repaint::TheBox
+                    },
+                },
                 Instant::now(),
             );
         }
@@ -5529,6 +5604,69 @@ mod tests {
         assert_eq!(compositor.lock_screen().unwrap().attempts(), 1);
         // And the field is empty again, ready to be retyped.
         assert_eq!(compositor.lock_screen().unwrap().typed_len(), 0);
+    }
+
+    #[test]
+    fn a_locked_screen_with_nothing_moving_on_it_asks_for_no_frames() {
+        // #164. The caret in that box is drawn solid — `draw_field` has never
+        // been given the blink phase — and nothing else on the screen moves,
+        // so every frame this used to ask for repainted the whole display to
+        // put back the image already on it. The readings, the clock and the
+        // leases go on happening behind it and none of them is on the screen.
+        let mut compositor = compositor_with_password("still");
+        assert!(compositor.lock_session());
+        let start = Instant::now();
+        for interval in 1..=8 {
+            let now = start + BLINK_INTERVAL * interval;
+            assert!(
+                !compositor.tick_at(now),
+                "a locked screen asked for a frame {interval} intervals in"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lock_counting_down_asks_for_the_frame_that_moves_the_count() {
+        // The one thing on that screen that moves by itself: "try again in
+        // 12s" has to become 11, and the blink frame that used to carry it is
+        // the frame above that no longer happens.
+        let mut compositor = compositor_with_password("countdown");
+        assert!(compositor.lock_session());
+        answer(&mut compositor, "not it");
+        let start = Instant::now();
+        assert!(
+            compositor.tick_at(start + BLINK_INTERVAL),
+            "the countdown stopped counting"
+        );
+        // And it stops again once the wait is over, rather than leaving a
+        // locked screen drawing forever because somebody mistyped once.
+        assert!(
+            !compositor.tick_at(start + Duration::from_secs(30)),
+            "the screen went on asking after the wait ran out"
+        );
+    }
+
+    #[test]
+    fn a_session_still_blinks() {
+        // The phase standing still is the lock's rule and not a new default.
+        let mut compositor = compositor_with(Config::default());
+        let before = compositor.blink_visible;
+        assert!(compositor.tick_at(Instant::now() + BLINK_INTERVAL));
+        assert_ne!(compositor.blink_visible, before, "the caret stopped");
+    }
+
+    #[test]
+    fn the_caret_comes_back_lit_when_the_lock_is_answered() {
+        // The phase is whatever it was when the screen went away, which for a
+        // machine locked all night is an hour stale. The same thing an unblank
+        // does, for the same reason: where the caret is, is the first thing
+        // anybody looks for on a screen they have just got back.
+        let mut compositor = compositor_with_password("lit");
+        assert!(compositor.lock_session());
+        compositor.blink_visible = false;
+        answer(&mut compositor, "tos");
+        assert!(!compositor.is_locked());
+        assert!(compositor.blink_visible, "the caret came back dark");
     }
 
     #[test]

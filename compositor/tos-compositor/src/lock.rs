@@ -261,6 +261,45 @@ impl Purpose {
     }
 }
 
+/// How much of this screen a frame is putting on the surface (#164).
+///
+/// A locked screen used to be erased and drawn again for every frame it was
+/// asked for, and it was asked for twice a second whether or not anything had
+/// happened — so a machine nobody was at repainted its whole display all
+/// night. It is retained now, like every other screen in tOS, and this is what
+/// the frame says it is doing.
+///
+/// The split is not the box against the picture by taste. The box **paints its
+/// own background** before it draws its border, so putting it down again over
+/// the frame that is already there gives the same pixels as erasing first
+/// would. The picture does not: it carries alpha and is composited over
+/// whatever it lands on, so a second pass over its own result is a different
+/// picture. That is the whole reason there are two of these and not a
+/// rectangle of damage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Repaint {
+    /// All of it, onto a surface that has just been erased to the background.
+    /// What a frame does when it cannot know what is already there.
+    Everything,
+    /// The box alone, over a frame that still holds the rest of this screen.
+    TheBox,
+}
+
+/// What is behind the box this frame, and whether this frame is putting it
+/// there.
+///
+/// One argument rather than two because it is one question. The picture is
+/// named whichever way [`Repaint`] falls: the box is laid out *around* it —
+/// centred with it as one stack over a login screen — so a frame that left it
+/// out to say "do not paint this" would move the box instead.
+#[derive(Debug, Clone, Copy)]
+pub struct Backdrop<'a> {
+    /// The picture this screen is laid out around, where there is one.
+    pub splash: Option<&'a Splash>,
+    /// How much of the screen this frame is painting.
+    pub repaint: Repaint,
+}
+
 pub struct LockScreen {
     /// The credential line, read once when the lock engaged.
     ///
@@ -442,6 +481,9 @@ impl LockScreen {
 
     /// Draw the lock centred in `area`, which is in pixels.
     ///
+    /// `backdrop` says what is behind the box and how much of this screen the
+    /// frame is putting on the surface.
+    ///
     /// This draws the box and the picture that goes with it. Erasing the
     /// session is the caller's, because only the caller knows that the whole
     /// surface is its to erase.
@@ -466,9 +508,10 @@ impl LockScreen {
         fonts: &mut FontStack,
         area: Rect,
         chrome: &Chrome,
-        splash: Option<&Splash>,
+        backdrop: Backdrop<'_>,
         now: Instant,
     ) {
+        let Backdrop { splash, repaint } = backdrop;
         let metrics = fonts.metrics();
         let (cw, ch) = (metrics.cell_width.max(1), metrics.cell_height.max(1));
         let cols = (area.width / cw) as usize;
@@ -508,7 +551,13 @@ impl LockScreen {
         // Above the box, with a blank row between them. The picture carries
         // its own alpha, so what surrounds it is the field the caller erased
         // to rather than a rectangle of its own.
-        if let Some((splash, (width, height))) = picture {
+        //
+        // Only where the whole screen is being painted. The layout above is
+        // worked out either way — the box sits under the picture and has to
+        // stay where it was — but the pixels are not put down twice: alpha
+        // composited over its own last result is a different picture, and a
+        // retained frame already holds the right one.
+        if let (Some((splash, (width, height))), Repaint::Everything) = (picture, repaint) {
             let x = area.x + ((area.width.saturating_sub(width)) / 2) as i32;
             splash.draw(
                 surface,
@@ -524,7 +573,7 @@ impl LockScreen {
         // so that on a display where the two do meet the box is the one left
         // whole — the same order the frontispiece already follows, for the
         // same reason that the box is the part somebody cannot do without.
-        if self.purpose == Purpose::Lock {
+        if self.purpose == Purpose::Lock && repaint == Repaint::Everything {
             if let Some((splash, (width, height))) = splash.and_then(|splash| {
                 let room = Splash::room_in_corner((area.width, area.height));
                 splash.fit(room).map(|size| (splash, size))
@@ -945,7 +994,10 @@ mod tests {
                 &mut fonts,
                 Rect::new(0, 0, 640, 360),
                 &Chrome::default(),
-                None,
+                Backdrop {
+                    splash: None,
+                    repaint: Repaint::Everything,
+                },
                 Instant::now(),
             );
             assert!(
@@ -1003,7 +1055,10 @@ mod tests {
             &mut fonts,
             Rect::new(0, 0, width as u32, height as u32),
             &Chrome::default(),
-            Some(picture),
+            Backdrop {
+                splash: Some(picture),
+                repaint: Repaint::Everything,
+            },
             Instant::now(),
         );
         pixels
@@ -1100,7 +1155,10 @@ mod tests {
             &mut fonts,
             Rect::new(0, 0, width as u32, height as u32),
             &Chrome::default(),
-            Some(&splash),
+            Backdrop {
+                splash: Some(&splash),
+                repaint: Repaint::Everything,
+            },
             Instant::now(),
         );
         assert!(
