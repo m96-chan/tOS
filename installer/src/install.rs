@@ -27,15 +27,28 @@ pub const SHADOW_FILE: &str = "/etc/shadow";
 /// group- or world-writable is skipped, and skipped quietly.
 const SUDOERS_MODE: u32 = 0o440;
 
-/// The programs that end this machine, which the drop-in below lets the
-/// person run without a password (#158).
+/// The one program the drop-in below lets the person run without a password
+/// (#158): `iso/shutdown`, the shim `iso/mkiso.sh` installs here.
 ///
-/// All four are `systemd-sysv` symlinks to `systemctl` on an installed
-/// machine, and the shim in `/usr/local/sbin` runs them through `sudo -n` by
-/// exactly these paths. `halt` is in the list because `shutdown -H` is it, and
-/// leaving it out would be a flag of `shutdown` that asks for a password when
-/// the other three do not.
-const POWER_PROGRAMS: &str = "/sbin/shutdown, /sbin/poweroff, /sbin/reboot, /sbin/halt";
+/// **Not `/sbin/shutdown`, and this is the part to leave alone.** `sudo`
+/// matches a command by device and inode as well as by pathname — where the
+/// pathnames differ, `command_matches_normal` stats both and compares
+/// `st_dev` and `st_ino` — and `/sbin/shutdown`, `/sbin/poweroff`,
+/// `/sbin/reboot` and `/sbin/halt` are four `systemd-sysv` symlinks to one
+/// file, `systemctl`. A rule naming any of them, with no argument spec, is
+/// therefore a rule that matches `sudo systemctl <anything>` without a
+/// password: every unit on the machine started, stopped, masked or enabled,
+/// and `systemctl edit` is `$SYSTEMD_EDITOR` running as root. That is a great
+/// deal more than "the person at this console may turn their own machine
+/// off", which is all #158 decided to give away.
+///
+/// The shim is its own root-owned file with an inode nothing else shares, so
+/// naming it grants exactly what it will do with the arguments it is handed
+/// and nothing beside it. One rule covers all four verbs because the other
+/// three names in that directory are symlinks to this one, and the same inode
+/// rule that made `/sbin` too wide makes `/usr/local/sbin` exactly wide
+/// enough.
+const POWER_PROGRAM: &str = "/usr/local/sbin/shutdown";
 
 /// Debian's mode for that file, and what this writes when it is the one
 /// creating it: root writes it, the `shadow` group reads it, nobody else sees
@@ -466,16 +479,18 @@ impl<'a> Installer<'a> {
     /// leave the machine locked out of itself while protecting nothing that
     /// anyone at its keyboard does not already have.
     ///
-    /// **And `NOPASSWD` for the four programs that turn the machine off**
-    /// (#158). `/sbin/shutdown` on this image is `systemd-sysv`'s symlink to
+    /// **And `NOPASSWD` for the program that turns the machine off** (#158).
+    /// `/sbin/shutdown` on this image is `systemd-sysv`'s symlink to
     /// `systemctl`, which has to reach PID 1 — and since #119 a pane runs as
     /// the person, who can reach it by neither route this image leaves open:
     /// there is no D-Bus, so no `logind` and no polkit, and
     /// `/run/systemd/private` is `srwx------ root root`. So `shutdown -h now`
     /// said `Failed to connect to bus`, exited 1, and the machine stayed up.
     /// `/usr/local/sbin/shutdown` — `iso/shutdown`, first on the session's
-    /// PATH — is what hands the real program to `sudo -n`, and this is the
-    /// line that lets it through.
+    /// PATH — is what re-runs itself under `sudo -n` and then hands over to
+    /// the real program, and this is the line that lets it through. It names
+    /// the shim rather than the `/sbin` programs on purpose; `POWER_PROGRAM`
+    /// says why, and it is not a detail to tidy.
     ///
     /// It gives away nothing that was being kept. The person standing at this
     /// machine can already power it off without a password from the
@@ -488,18 +503,23 @@ impl<'a> Installer<'a> {
         let rule = if settings.password.is_empty() {
             format!("{user} ALL=(ALL:ALL) NOPASSWD: ALL\n")
         } else {
-            // Named by the path `sudo` is handed, which is the path the shim
-            // hands it: /sbin, not /usr/sbin, though usr-merge makes them the
-            // same file. A second line rather than one with two tags on it,
-            // because a `NOPASSWD:` and a `PASSWD:` in one rule is a sudoers
-            // line nobody reads correctly twice; the later line wins for the
-            // commands it names and the earlier one still covers everything
-            // else, with a password.
+            // A second line rather than one rule with two tags on it: a
+            // `NOPASSWD:` and a `PASSWD:` in one line is sudoers nobody reads
+            // correctly twice. The later line wins for the command it names
+            // and the earlier one still covers everything else, with a
+            // password.
+            //
+            // The comment goes in the file as well as here, because the file
+            // is where somebody will be standing when they wonder why this
+            // names a program in /usr/local rather than the /sbin one they
+            // were looking for.
             format!(
                 "{user} ALL=(ALL:ALL) ALL\n\
                  # Turning the machine off, without a password: the power menu\n\
-                 # and the power button already do that much. See #158.\n\
-                 {user} ALL=(ALL:ALL) NOPASSWD: {POWER_PROGRAMS}\n"
+                 # and the power button already do that much. The shim is named\n\
+                 # rather than /sbin/shutdown because sudo matches by inode too,\n\
+                 # and /sbin/shutdown is a symlink to systemctl. See #158.\n\
+                 {user} ALL=(ALL:ALL) NOPASSWD: {POWER_PROGRAM}\n"
             )
         };
         let path = format!("{root}/etc/sudoers.d/{user}");
@@ -1393,9 +1413,10 @@ mod tests {
             rule,
             "yusuke ALL=(ALL:ALL) ALL\n\
              # Turning the machine off, without a password: the power menu\n\
-             # and the power button already do that much. See #158.\n\
-             yusuke ALL=(ALL:ALL) NOPASSWD: \
-             /sbin/shutdown, /sbin/poweroff, /sbin/reboot, /sbin/halt\n"
+             # and the power button already do that much. The shim is named\n\
+             # rather than /sbin/shutdown because sudo matches by inode too,\n\
+             # and /sbin/shutdown is a symlink to systemctl. See #158.\n\
+             yusuke ALL=(ALL:ALL) NOPASSWD: /usr/local/sbin/shutdown\n"
         );
         // sudo skips a drop-in anybody but root can write, and skips it
         // silently — a 0644 here would be a machine that still cannot.
@@ -1407,13 +1428,16 @@ mod tests {
         // #158: `shutdown -h now` in a pane could not turn an installed
         // machine off at all — the pane is the person since #119, and
         // `systemctl` reaches PID 1 through a bus this image does not ship
-        // and a socket only root can open. The shim on PATH hands the real
-        // program to `sudo -n`, and this is the line that lets it through.
+        // and a socket only root can open. The shim on PATH re-runs itself
+        // under `sudo -n`, and this is the line that lets it through.
         //
-        // Asserted by the path `sudo` matches against, one program at a time,
-        // because a rule that named three of the four would be a machine
-        // where one flag of `shutdown` asks for a password and the rest do
-        // not — and nothing but this would say so.
+        // Asserted by the path `sudo` matches against, and asserted the other
+        // way round as well: the /sbin names must *not* be in this file. They
+        // are four symlinks to systemctl, and sudo matches by inode as well as
+        // by name, so a rule naming one of them is passwordless `sudo
+        // systemctl <anything>` — a machine given away rather than a machine
+        // turned off. It is a one-word edit to make by accident, so it is a
+        // test rather than only a comment.
         let mut backend = live_backend();
         let settings = Settings {
             username: "yusuke".into(),
@@ -1430,15 +1454,17 @@ mod tests {
         let nopasswd = rule
             .lines()
             .find(|line| line.contains("NOPASSWD:"))
-            .expect("the drop-in grants the power programs without a password");
-        for program in [
-            "/sbin/shutdown",
-            "/sbin/poweroff",
-            "/sbin/reboot",
-            "/sbin/halt",
-        ] {
-            assert!(nopasswd.contains(program), "{nopasswd} omits {program}");
-        }
+            .expect("the drop-in grants the shim without a password");
+        let granted = nopasswd
+            .split_once("NOPASSWD:")
+            .map(|(_, commands)| commands.trim())
+            .expect("the NOPASSWD line grants something");
+        // Equality, and one command. Not `contains`: `/usr/local/sbin/shutdown`
+        // ends in `/sbin/shutdown`, so a test that asked whether the /sbin name
+        // was absent would pass on a rule that granted nothing else and on one
+        // that granted systemctl too. What is asserted is the whole of what
+        // this machine hands out for free.
+        assert_eq!(granted, "/usr/local/sbin/shutdown");
         // And everything else still costs one. A machine that asked for no
         // password anywhere is a different decision from this one, and the
         // login screen's rule — no password set, no boundary — is the only

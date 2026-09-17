@@ -906,7 +906,13 @@ chmod 755 "$ROOTFS/sbin/tos" "$ROOTFS/sbin/tos-install" \
 # iso/live-session exports.
 #
 # It is half the answer; the other half is the installer's sudoers drop-in,
-# which is what this hands the real program to. Neither is D-Bus and polkit,
+# which names this very file — not /sbin/shutdown, because sudo matches a
+# command by inode as well as by name and those four /sbin names are one
+# systemctl, so granting them would be granting `sudo systemctl <anything>`.
+# The shim re-runs itself under `sudo -n` and the root pass hands over to
+# /sbin, which keeps the passwordless part bounded by what this file will do.
+# `POWER_PROGRAM` in installer/src/install.rs is the whole of it. Neither is
+# D-Bus and polkit,
 # which is what the rest of the world does and what #158 turned down for now:
 # that needs a logind session this compositor does not create, and the seat
 # is #22's question as well.

@@ -177,11 +177,18 @@ There is one copy now.
   1, and the machine stayed up, while the same command on the live image
   worked because that session happens to be root. #158 answered it with two
   small things rather than a daemon: `/usr/local/sbin/shutdown`
-  (`iso/shutdown`, with `poweroff`, `reboot` and `halt` beside it), which is
-  first on the PATH `iso/live-session` exports and hands the real program to
-  `sudo -n`; and a line in the installer's `/etc/sudoers.d` drop-in letting
-  exactly those four through without a password, which gives away nothing the
-  power menu and the power button do not already give. The rescue session has
+  (`iso/shutdown`, with `poweroff`, `reboot` and `halt` symlinked to it),
+  which is first on the PATH `iso/live-session` exports, re-runs itself under
+  `sudo -n`, and as root hands over to the real program; and a line in the
+  installer's `/etc/sudoers.d` drop-in letting *that file* through without a
+  password, which gives away nothing the power menu and the power button do
+  not already give. The rule names the shim rather than `/sbin/shutdown`
+  because `sudo` matches a command by device and inode as well as by pathname,
+  and those four `/sbin` names are four symlinks to one `systemctl`: a rule
+  naming any of them would be passwordless `sudo systemctl <anything>`, which
+  is a machine given away rather than a machine turned off. The shim's own
+  inode is shared with nothing, so what the grant is worth is bounded by what
+  the shim will do with its arguments. The rescue session has
   no init to reach at all and busybox has no `shutdown` applet, so the same
   file maps `-h` to `poweroff` and `-r` to `reboot` there. Shipping D-Bus and
   polkit — what every other systemd machine does, and what would make these

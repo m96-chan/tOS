@@ -28,11 +28,12 @@
 #
 #   live image        the session is root, so it execs the real program and is
 #                     not in the way. `shutdown -h now` worked there already.
-#   installed disk    the session is the person, so it re-runs the real
-#                     program under `sudo -n`. The installer's
-#                     /etc/sudoers.d drop-in grants exactly these four
-#                     without a password; see `add_sudo` in
-#                     installer/src/install.rs for why that costs nothing.
+#   installed disk    the session is the person, so it re-runs *itself* under
+#                     `sudo -n` and the root pass below hands over to the real
+#                     program. The installer's /etc/sudoers.d drop-in grants
+#                     this file without a password; see `add_sudo` in
+#                     installer/src/install.rs for why that costs nothing and
+#                     why the rule names this file rather than /sbin.
 #   rescue session    out of the initramfs, where busybox has halt, poweroff
 #                     and reboot applets and no shutdown one at all, and
 #                     PID 1 is iso/live-session rather than an init. See
@@ -51,12 +52,66 @@ shutdown | poweroff | reboot | halt) ;;
     ;;
 esac
 
+# Where this file is, which is both the name the sudoers drop-in grants and
+# the name the other three verbs are symlinks to. Written out rather than
+# taken from $0, because it is what one particular line in one particular
+# file says, and the two have to agree: see `POWER_PROGRAM` in
+# installer/src/install.rs.
+SHIM_DIR=/usr/local/sbin
+
+# Not root, which is an installed machine's session and nothing else. Ask
+# sudo to run this same file again, and let the pass below do the work.
+#
+# Itself rather than /sbin/$name — which is the shorter thing to write and is
+# wrong. sudo matches a command by device and inode as well as by pathname,
+# and all four of those /sbin names are symlinks to /bin/systemctl, so a rule
+# naming /sbin/shutdown is a rule that matches `sudo systemctl <anything>`
+# with no password: every unit on the machine started, stopped or masked, and
+# `systemctl edit` is an editor running as root. This file is its own
+# root-owned inode and nothing else on the machine shares it, so granting it
+# grants what it will do with its arguments and no more — which is the whole
+# of what #158 decided a person at their own console should get for free.
+# Keep it that way.
+#
+# This is above everything else on purpose: the arguments go to sudo exactly
+# as they were typed, and every decision below — which program, the busybox
+# fallback, -f — is made once, by the pass that is root and can act on it.
+if [ "$(id -u)" != 0 ]; then
+    self=$SHIM_DIR/$name
+    if [ ! -x "$self" ]; then
+        echo "tos: $name: this has to be root, and $self is not there to ask sudo for" >&2
+        exit 1
+    fi
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "tos: $name: this has to be root and there is no sudo on this machine" >&2
+        exit 1
+    fi
+    # Asked before it is done, because a `sudo -n` that is going to refuse
+    # prints a line about a password and exits 1, and this file's whole job is
+    # to replace an unhelpful failure rather than to swap one for another.
+    # `sudo -l CMND` answers exactly the question "would this be allowed", and
+    # with -n it answers without prompting for anything.
+    if ! sudo -n -l "$self" >/dev/null 2>&1; then
+        typed="sudo $name"
+        [ $# -gt 0 ] && typed="$typed $*"
+        printf 'tos: %s: this has to be root, and sudo will not do it without a password.\n' "$name" >&2
+        printf 'tos: type: %s\n' "$typed" >&2
+        printf 'tos: or use the power menu the session already has: ctrl+a, then the power entry.\n' >&2
+        exit 1
+    fi
+    exec sudo -n "$self" "$@"
+fi
+
+# Everything from here down is root: the live image, the rescue session, and
+# the sudo pass the branch above asks for.
+
 # The real program, looked for in the system directories only. /usr/local is
 # deliberately not among them: that is where this file is, and a search that
-# could find it would find itself. Debian is usr-merged, so /sbin and
-# /usr/sbin are the same directory there and the first hit is the same file;
-# /sbin is named first anyway because it is the path the sudoers drop-in
-# grants, and sudo matches what it is handed.
+# could find it would find itself — which is what stops the re-exec through
+# sudo above from being a loop: the pass sudo starts is root, takes the branch
+# it never reaches twice, and hands over to /sbin. Debian is usr-merged, so
+# /sbin and /usr/sbin are the same directory there and the first hit is the
+# same file.
 real_program() {
     for dir in /sbin /usr/sbin /bin /usr/bin; do
         if [ -x "$dir/$1" ]; then
@@ -150,30 +205,6 @@ if [ -n "$no_init" ]; then
     set -- -f "$@"
 fi
 
-# Already root — the live image and the rescue session — so there is nothing
-# to ask and nothing to be refused. Every argument goes through untouched, so
-# `shutdown -h +5` and `shutdown -c` still mean what shutdown(8) says they do.
-if [ "$(id -u)" = 0 ]; then
-    exec "$target" "$@"
-fi
-
-if ! command -v sudo >/dev/null 2>&1; then
-    echo "tos: $name: this has to be root and there is no sudo on this machine" >&2
-    exit 1
-fi
-
-# Asked before it is done, because `sudo -n` that is going to refuse prints a
-# line about a password and exits 1, and this file's whole job is to replace
-# an unhelpful failure rather than to swap one for another. `sudo -l CMND`
-# answers exactly the question "would this be allowed", and with -n it answers
-# without prompting for anything.
-if ! sudo -n -l "$target" >/dev/null 2>&1; then
-    typed="sudo $name"
-    [ $# -gt 0 ] && typed="$typed $*"
-    printf 'tos: %s: this has to be root, and sudo will not do it without a password.\n' "$name" >&2
-    printf 'tos: type: %s\n' "$typed" >&2
-    printf 'tos: or use the power menu the session already has: ctrl+a, then the power entry.\n' >&2
-    exit 1
-fi
-
-exec sudo -n "$target" "$@"
+# Every argument goes through untouched, so `shutdown -h +5` and `shutdown -c`
+# still mean what shutdown(8) says they do.
+exec "$target" "$@"
