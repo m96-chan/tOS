@@ -642,6 +642,22 @@ mod tests {
     }
 
     #[test]
+    fn the_clipboard_rows_lead_with_the_keys_a_terminal_user_already_has() {
+        // Nothing here had to be told about #153: the sheet is read out of the
+        // live keymap, so binding ctrl+shift+c renamed its own row. This is
+        // the assertion that says the row is worth reading — the new key first
+        // because it is the one a hand already does, and the leader alias kept
+        // beside it because a nested session has nothing else.
+        let sheet = cheat_sheet(&Keymap::default_bindings());
+        let copy = &row(&sheet, "copy the selection").keys;
+        assert!(copy.starts_with("ctrl+shift+c"), "{copy:?}");
+        assert!(copy.contains("leader y"), "{copy:?}");
+        let paste = &row(&sheet, "paste the clipboard").keys;
+        assert!(paste.starts_with("ctrl+shift+v"), "{paste:?}");
+        assert!(paste.contains("leader ]"), "{paste:?}");
+    }
+
+    #[test]
     fn shifted_punctuation_is_named_by_the_character_it_types() {
         assert_eq!(
             key_name(&Binding::new(KeyCode::Char('/'), Modifiers::SHIFT)),

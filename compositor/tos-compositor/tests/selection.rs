@@ -4,7 +4,7 @@
 use std::time::{Duration, Instant};
 
 use tos_compositor::{Compositor, Config};
-use tos_input::{InputEvent, Modifiers, MouseAction, MouseButton, PointerEvent};
+use tos_input::{InputEvent, KeyCode, KeyEvent, Modifiers, MouseAction, MouseButton, PointerEvent};
 use tos_session::{Action, Axis, Direction};
 
 const SIZE: (u32, u32) = (800, 480);
@@ -59,6 +59,41 @@ fn click(c: &mut Compositor, cell: (u32, u32), times: usize) {
         pointer(c, cell, MouseButton::Left, MouseAction::Press);
         pointer(c, cell, MouseButton::Left, MouseAction::Release);
     }
+}
+
+/// Press a key at the compositor, the way a keyboard does.
+fn key(c: &mut Compositor, code: KeyCode, modifiers: Modifiers) -> bool {
+    c.handle_input(InputEvent::Key(KeyEvent::new(code, modifiers)))
+}
+
+/// One of the two combinations #153 is about.
+fn ctrl_shift(c: &mut Compositor, ch: char) -> bool {
+    key(
+        c,
+        KeyCode::Char(ch),
+        Modifiers::CTRL.union(Modifiers::SHIFT),
+    )
+}
+
+/// The leader key and then a key, which is the other way to reach the
+/// clipboard and the only one a nested session has.
+fn leader(c: &mut Compositor, ch: char) -> bool {
+    key(c, KeyCode::Char('a'), Modifiers::CTRL);
+    key(c, KeyCode::Char(ch), Modifiers::NONE)
+}
+
+/// What the focused pane has on screen, rows and all.
+fn screen(c: &Compositor) -> String {
+    let focus = c.session().focus();
+    c.pane(focus).unwrap().terminal.grid().to_text()
+}
+
+/// Wait for `text` to appear in the focused pane more times than it already
+/// does, which is how a paste echoed by the line discipline shows up.
+fn wait_for_echo(c: &mut Compositor, text: &str, times: usize) -> bool {
+    wait_for(c, Duration::from_secs(5), |c| {
+        screen(c).matches(text).count() >= times
+    })
 }
 
 fn primary(c: &Compositor) -> String {
@@ -333,4 +368,177 @@ fn clicking_in_another_pane_drops_the_first_pane_s_selection() {
     pointer(&mut c, (0, 0), MouseButton::Left, MouseAction::Release);
     assert_ne!(c.session().focus(), right);
     assert!(c.pane(right).unwrap().selection.is_none());
+}
+
+// ---- ctrl+shift+c and ctrl+shift+v, which are #153 ----------------------
+
+#[test]
+fn ctrl_shift_c_copies_the_selection_and_ctrl_shift_v_pastes_it() {
+    // The gesture the issue is about, done in one go: drag over a word, press
+    // the two combinations every terminal emulator on the machine uses, and
+    // the word is typed back into the pane. cat echoes what it is given, so
+    // what the paste sent shows up on screen.
+    let mut c = compositor(&["/bin/cat"]);
+    c.inject(b"zulu\r\n");
+    drag(&mut c, (0, 0), (3, 0));
+
+    assert!(ctrl_shift(&mut c, 'c'));
+    assert_eq!(clipboard(&c), "zulu");
+
+    assert!(ctrl_shift(&mut c, 'v'));
+    assert!(wait_for_echo(&mut c, "zulu", 2), "the paste never arrived");
+}
+
+#[test]
+fn what_one_pane_copies_another_pane_can_paste() {
+    let mut c = compositor(&["/bin/cat"]);
+    c.inject(b"yankee\r\n");
+    drag(&mut c, (0, 0), (5, 0));
+    let copied_in = c.session().focus();
+    assert!(ctrl_shift(&mut c, 'c'));
+    assert_eq!(clipboard(&c), "yankee");
+
+    // The split focuses the new pane, so this is the clipboard crossing from
+    // one program to another and not a pane pasting to itself.
+    c.perform(Action::Split(Axis::Columns));
+    assert_ne!(c.session().focus(), copied_in);
+    assert!(ctrl_shift(&mut c, 'v'));
+    assert!(
+        wait_for_echo(&mut c, "yankee", 1),
+        "the clipboard did not cross the split"
+    );
+}
+
+#[test]
+fn japanese_and_more_than_one_line_survive_the_round_trip() {
+    // Two things at once, because they break in the same place: a selection
+    // is a run of cells, and both a kana and a newline are worth more than one
+    // cell — the first because it is two columns wide, the second because it
+    // is not a column at all.
+    let mut c = compositor(&["/bin/cat"]);
+    c.inject("日本語のテキスト\r\nと二行目\r\n".as_bytes());
+    // The first line is eight characters in sixteen columns and the second
+    // four in eight, so this covers both lines entirely.
+    drag(&mut c, (0, 0), (7, 1));
+
+    assert!(ctrl_shift(&mut c, 'c'));
+    assert_eq!(clipboard(&c), "日本語のテキスト\nと二行目");
+
+    assert!(ctrl_shift(&mut c, 'v'));
+    // The newline in the middle arrives as a carriage return, which is what
+    // `encode_paste` makes of it, so the second line lands under the first.
+    assert!(
+        wait_for_echo(&mut c, "と二行目", 2),
+        "the paste never came back: {:?}",
+        screen(&c)
+    );
+    assert_eq!(screen(&c).matches("日本語のテキスト").count(), 2);
+}
+
+#[test]
+fn a_selection_made_in_the_scrollback_copies_on_the_same_keys() {
+    // The selection remembers the line it was made over rather than the row
+    // it was drawn on, so a copy is worth asserting from history as well as
+    // from the live screen.
+    let mut c = quiet();
+    c.inject(b"alpha beta\r\n");
+    scroll_the_screen_away(&mut c);
+    let focus = c.session().focus();
+    let history = c.pane(focus).unwrap().terminal.grid().scrollback_len();
+    c.perform(Action::Scroll(-(history as i32)));
+    assert_eq!(display_row(&c, 0), "alpha beta");
+
+    drag(&mut c, (0, 0), (9, 0));
+    assert!(ctrl_shift(&mut c, 'c'));
+    assert_eq!(clipboard(&c), "alpha beta");
+}
+
+#[test]
+fn copying_with_nothing_selected_leaves_the_clipboard_as_it_was() {
+    // The miss this protects against: the clipboard is where somebody
+    // deliberately put something, and a key pressed with no selection must
+    // not empty it.
+    let mut c = quiet();
+    c.inject(b"alpha beta\r\n");
+    // Nothing is selected yet, and the key says so rather than looking broken.
+    ctrl_shift(&mut c, 'c');
+    assert_eq!(
+        c.notifications().status_line().as_deref(),
+        Some("nothing to copy")
+    );
+    assert!(clipboard(&c).is_empty());
+
+    drag(&mut c, (0, 0), (4, 0));
+    assert!(ctrl_shift(&mut c, 'c'));
+    assert_eq!(clipboard(&c), "alpha");
+
+    // A resize is one of the things that drops a selection; any of them would
+    // do, and this one needs no second pane.
+    c.resize((640, 400));
+    assert!(!has_selection(&c));
+    ctrl_shift(&mut c, 'c');
+    assert_eq!(
+        clipboard(&c),
+        "alpha",
+        "an empty hand emptied the clipboard"
+    );
+}
+
+#[test]
+fn pasting_an_empty_clipboard_does_nothing_at_all() {
+    let mut c = compositor(&["/bin/cat"]);
+    assert!(clipboard(&c).is_empty());
+    assert!(
+        !ctrl_shift(&mut c, 'v'),
+        "an empty clipboard asked for a frame"
+    );
+    // Not even the brackets: a program that has asked for bracketed paste
+    // would otherwise be walked into paste mode and out of it around nothing.
+    wait_for(&mut c, Duration::from_millis(200), |_| false);
+    assert_eq!(screen(&c).trim(), "", "something reached the pane");
+}
+
+#[test]
+fn neither_combination_reaches_the_program_in_the_pane() {
+    // What being consumed means, from the outside. Under the legacy encoding
+    // shift is dropped, so a ctrl+shift+c that got through would arrive as ^C
+    // — an interrupt, which cat answers by dying — and the line discipline
+    // would echo "^C" on the way. This is the cost #153 accepted, written
+    // down as the thing that has to go on happening.
+    let mut c = compositor(&["/bin/cat"]);
+    ctrl_shift(&mut c, 'c');
+    ctrl_shift(&mut c, 'v');
+    wait_for(&mut c, Duration::from_millis(200), |_| false);
+    assert!(
+        !screen(&c).contains("^C"),
+        "the interrupt reached the pane: {:?}",
+        screen(&c)
+    );
+
+    // And the child is still there reading, which is the other half of not
+    // having been interrupted.
+    c.inject(b"still here\r\n");
+    drag(&mut c, (0, 0), (9, 0));
+    ctrl_shift(&mut c, 'c');
+    ctrl_shift(&mut c, 'v');
+    assert!(
+        wait_for_echo(&mut c, "still here", 2),
+        "cat stopped reading: {:?}",
+        screen(&c)
+    );
+}
+
+#[test]
+fn the_leader_bindings_copy_and_paste_the_way_they_always_did() {
+    // #153 added keys rather than moving them. A nested session needs that:
+    // the host terminal takes ctrl+shift+c for its own clipboard before tOS is
+    // ever offered the key, so leader y is the only way to copy inside one.
+    let mut c = compositor(&["/bin/cat"]);
+    c.inject(b"xray\r\n");
+    drag(&mut c, (0, 0), (3, 0));
+
+    assert!(leader(&mut c, 'y'));
+    assert_eq!(clipboard(&c), "xray");
+    assert!(leader(&mut c, ']'));
+    assert!(wait_for_echo(&mut c, "xray", 2), "leader ] pasted nothing");
 }

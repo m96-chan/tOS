@@ -1588,6 +1588,15 @@ impl Compositor {
     }
 
     fn paste_text(&mut self, text: &str) {
+        // Nothing to paste is nothing to do. Without this an empty clipboard
+        // still sent `\x1b[200~\x1b[201~` to a program that had asked for
+        // bracketed paste — a paste mode entered and left around no text at
+        // all, which some readline configurations answer by redrawing the
+        // prompt — and still snapped the viewport back to the live screen. A
+        // key that does nothing has to do nothing visible either.
+        if text.is_empty() {
+            return;
+        }
         let focus = self.session.focus();
         let Some(pane) = self.panes.get_mut(&focus) else {
             return;
@@ -1778,15 +1787,31 @@ impl Compositor {
             }
             Action::Copy => {
                 let focus = self.session.focus();
-                if let Some(text) = self.panes.get(&focus).and_then(|p| p.selected_text()) {
-                    self.clipboard.insert(CLIPBOARD, text.into_bytes());
-                    self.notifications.status("copied");
-                    return true;
+                match self.panes.get(&focus).and_then(|p| p.selected_text()) {
+                    Some(text) => {
+                        self.clipboard.insert(CLIPBOARD, text.into_bytes());
+                        self.notifications.status("copied");
+                    }
+                    // The clipboard is left exactly as it was: what somebody
+                    // copied a minute ago is worth more than the nothing that
+                    // is selected now, and a key pressed with no selection is
+                    // far more often a miss than a request to forget. Saying
+                    // so out loud is what copy mode's yank does with the same
+                    // empty hands, and a binding that looks broken when it is
+                    // only empty-handed is worth one line of status.
+                    None => self.notifications.status("nothing to copy"),
                 }
-                false
+                true
             }
             Action::Paste => {
                 let data = self.clipboard.get(&CLIPBOARD).cloned().unwrap_or_default();
+                // An empty clipboard is a no-op down to the frame: nothing
+                // goes to the pane, so there is nothing to redraw either, and
+                // nothing to say about it — a session that has copied nothing
+                // yet is not a session that has gone wrong.
+                if data.is_empty() {
+                    return false;
+                }
                 let text = String::from_utf8_lossy(&data).into_owned();
                 self.paste_text(&text);
                 true
