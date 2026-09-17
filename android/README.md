@@ -125,6 +125,7 @@ SELinux, hidden-API settings, the bootloader or the stock Terminal's data.
 | **⌨** | Show/hide the Android keyboard and resize the guest PTY |
 | Tap a pane | Focus it |
 | Swipe vertically | Terminal wheel events |
+| Soft keyboard | ASCII types straight through; CJK keyboards compose above the extra keys |
 | **Esc / Ctrl / Alt / Tab / arrows** | Terminal keys; modifiers apply to the next input |
 | Long press and drag | Select text; lifting copies it to the Android clipboard |
 | Long press and lift | Clipboard menu: paste, copy the selection, or **More…** |
@@ -132,8 +133,19 @@ SELinux, hidden-API settings, the bootloader or the stock Terminal's data.
 
 Text defaults to 10.5 sp and is adjustable from 8 to 24 sp. The top bar shows
 columns and rows. Rendering uses the surface's pixels, without half-block
-scaling. IME composing text appears above the extra keys and enters Debian
-when committed. Hardware-keyboard `Ctrl+A` prefix shortcuts also work.
+scaling. Hardware-keyboard `Ctrl+A` prefix shortcuts also work.
+
+ASCII from the soft keyboard reaches the pane as it is typed rather than
+waiting for the keyboard to commit a word: a shell answers a character at a
+time, and completion, history search and `^C` all happen before a word is
+finished. What the keyboard later changes its mind about — an autocorrection,
+a glide typing correction — is reconciled with backspaces, so the pane ends
+up with what the keyboard finally says. A keyboard whose current language
+composes Japanese, Chinese or Korean is the exception and keeps the
+composition bar above the extra keys: its romaji are on their way to becoming
+something else, and typing them through would put a `k` in the pane that has
+to be taken back a keystroke later. Switching that keyboard to its Latin
+language (Gboard's globe key) switches the pane back to direct input.
 
 Long press is the clipboard rather than the session menu: a phone has no
 `Ctrl+Shift+V`, and a `PATH` typed by hand on a soft keyboard is a typo

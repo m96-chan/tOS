@@ -29,6 +29,7 @@ import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
+import android.view.inputmethod.InputMethodSubtype;
 import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
@@ -226,6 +227,38 @@ public final class MainActivity extends Activity {
     private void special(int code) {
         int mods = takeModifiers();
         session(h -> NativeSession.key(h, code, 0, mods, false));
+    }
+    /** A backspace of this side's own, which no armed modifier belongs to. */
+    private void backspace() {
+        session(h -> NativeSession.key(h, KeyEvent.KEYCODE_DEL, 0, 0, false));
+    }
+    /**
+     * Whether what the keyboard composes should go straight into the pane.
+     *
+     * A shell answers a character at a time — completion, history search and
+     * ^C all happen long before a word is finished — so ASCII has no reason
+     * to wait in the composition bar for a commit a Latin keyboard was only
+     * going to send at the space bar. A keyboard composing Japanese, Chinese
+     * or Korean is the one case where the wait is the point: its romaji are
+     * on their way to becoming something else, and typing them through would
+     * put a `k` in the pane that has to be taken back a keystroke later.
+     */
+    private boolean directKeyboard() {
+        InputMethodManager ime = (InputMethodManager)getSystemService(INPUT_METHOD_SERVICE);
+        InputMethodSubtype subtype = ime == null ? null : ime.getCurrentInputMethodSubtype();
+        if (subtype == null) return true;
+        String language = subtype.getLanguageTag();
+        if (language == null || language.isEmpty()) language = subtype.getLocale();
+        if (language == null) return true;
+        language = language.toLowerCase(Locale.ROOT);
+        return !(language.startsWith("ja") || language.startsWith("zh") || language.startsWith("ko"));
+    }
+    private static boolean ascii(CharSequence text) {
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c < ' ' || c > '~') return false;
+        }
+        return text.length() > 0;
     }
     private void commit(String text) {
         if (text.isEmpty()) return;
@@ -437,17 +470,55 @@ public final class MainActivity extends Activity {
             info.initialSelStart = info.initialSelEnd = 0;
             return new BaseInputConnection(this, true) {
                 private final Editable editable = new SpannableStringBuilder();
+                // How much of the composition in progress the pane already
+                // has, which is nothing unless it is going straight through.
+                private String typed = "";
+                // Decided once per composition: asking the keyboard what
+                // language it is in the middle of one would answer about the
+                // keyboard the user has since switched to.
+                private boolean direct;
                 @Override public Editable getEditable() { return editable; }
                 private void clear() { editable.clear(); removeComposingSpans(editable); composition.setText(""); }
+                /** Send the difference between what the pane has and what the keyboard now says. */
+                private void typeThrough(String text) {
+                    int same = 0;
+                    while (same < typed.length() && same < text.length() && typed.charAt(same) == text.charAt(same)) same++;
+                    for (int i = typed.length(); i > same; i--) backspace();
+                    if (text.length() > same) commit(text.substring(same));
+                    typed = text;
+                }
+                /** Take back what the keyboard has since changed its mind about. */
+                private void retract() { typeThrough(""); typed = ""; }
                 @Override public boolean setComposingText(CharSequence text, int cursor) {
+                    if (typed.isEmpty() && editable.length() == 0) direct = directKeyboard();
+                    if (direct && ascii(text)) {
+                        if (editable.length() > 0) clear();
+                        typeThrough(text.toString());
+                        return true;
+                    }
+                    retract();
                     super.setComposingText(text, cursor); composition.setText(editable); return true;
                 }
-                @Override public boolean commitText(CharSequence text, int cursor) { commit(text.toString()); clear(); return true; }
+                @Override public boolean commitText(CharSequence text, int cursor) {
+                    if (!typed.isEmpty()) {
+                        if (ascii(text)) { typeThrough(text.toString()); typed = ""; clear(); return true; }
+                        // A keyboard that commits a newline or an emoji on top
+                        // of what it already typed through is adding to the
+                        // line, not replacing it: taking the line back here
+                        // would erase a command the user can see and meant.
+                        typed = "";
+                    }
+                    commit(text.toString()); clear(); return true;
+                }
                 @Override public boolean finishComposingText() {
+                    // A composition that went straight through is already in
+                    // the pane; committing it again would type it twice.
+                    if (!typed.isEmpty()) { typed = ""; clear(); return true; }
                     if (editable.length() > 0) commit(editable.toString());
                     clear(); return true;
                 }
                 @Override public boolean deleteSurroundingText(int before, int after) {
+                    if (!typed.isEmpty()) typed = typed.substring(0, Math.max(0, typed.length() - before));
                     if (editable.length() > 0) { super.deleteSurroundingText(before, after); composition.setText(editable); }
                     else {
                         for (int i = 0; i < Math.min(before, 1024); i++) special(KeyEvent.KEYCODE_DEL);
@@ -456,13 +527,15 @@ public final class MainActivity extends Activity {
                     return true;
                 }
                 @Override public boolean deleteSurroundingTextInCodePoints(int before, int after) {
-                    if (editable.length() > 0) {
+                    if (typed.isEmpty() && editable.length() > 0) {
                         super.deleteSurroundingTextInCodePoints(before, after); composition.setText(editable); return true;
                     }
                     return deleteSurroundingText(before, after);
                 }
-                @Override public boolean sendKeyEvent(KeyEvent e) { return handleKey(e); }
-                @Override public boolean performEditorAction(int action) { special(KeyEvent.KEYCODE_ENTER); return true; }
+                @Override public boolean sendKeyEvent(KeyEvent e) { typed = ""; return handleKey(e); }
+                @Override public boolean performEditorAction(int action) {
+                    typed = ""; special(KeyEvent.KEYCODE_ENTER); return true;
+                }
             };
         }
         private boolean handleKey(KeyEvent event) {
