@@ -111,6 +111,17 @@ the 66dp safe circle. The foreground PNGs are scaled from the pixel art by
 whole numbers before being resampled down, which is what keeps the pixels
 square at every density.
 
+A tag push builds this APK in CI and attaches it to the GitHub release, so
+the usual way to get one is to download it rather than to build it. That
+build signs with the identity in the `TOS_ANDROID_KEYSTORE_BASE64` and
+`TOS_ANDROID_STORE_PASSWORD` repository secrets, which has to be the keystore
+earlier releases were signed with: Android refuses an update signed by a key
+it has not seen, and the uninstall that would make room for it takes the
+guest Debian disk with it. Local builds keep their own identity in
+`dist/android/development.keystore` for the same reason — the file is
+ignored by git, so a second machine building the same commit produces an APK
+that cannot update the first one's.
+
 The launcher app is **tOS** (`io.github.m96chan.tos`). Missing permissions
 produce a setup dialog. If the OS refuses these development permission
 grants, this preview cannot launch its VM on that build. It does not change

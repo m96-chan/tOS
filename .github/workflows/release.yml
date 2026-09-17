@@ -1,9 +1,17 @@
 name: release
 
 # Tag push -> build the ISO, prove it boots, publish a GitHub Release
-# with the image attached.
+# with the image attached, then build the Android APK and attach that too.
 #
 #   git tag v0.0.3 && git push origin v0.0.3
+#
+# The APK needs a signing identity that outlives the runner. Set these
+# repository secrets, from the keystore the previous releases were signed
+# with, or every release installs as a different app:
+#
+#   TOS_ANDROID_KEYSTORE_BASE64   base64 of dist/android/development.keystore
+#   TOS_ANDROID_STORE_PASSWORD    its password
+#   TOS_ANDROID_KEY_ALIAS         optional; defaults to tos-development
 
 on:
   push:
@@ -79,3 +87,67 @@ jobs:
               --generate-notes \
               dist/*.iso dist/SHA256SUMS
           fi
+
+  android:
+    name: android apk
+    # After the ISO, because this attaches to the release that job publishes.
+    # A tag whose ISO did not boot has nothing to attach an APK to.
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-linux-android
+      - name: Install the Android platform the APK is built against
+        run: >-
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          --install "platforms;android-35" > /dev/null
+      - name: Take the signing identity out of the secrets
+        env:
+          KEYSTORE: ${{ secrets.TOS_ANDROID_KEYSTORE_BASE64 }}
+          PASSWORD: ${{ secrets.TOS_ANDROID_STORE_PASSWORD }}
+        run: |
+          # An APK signed with a key nobody has seen before cannot update the
+          # tOS already on somebody's phone: Android refuses the install, and
+          # the uninstall that would make room for it takes the guest Debian
+          # disk with it. So a release without the identity stops here rather
+          # than publishing one that costs its users their data.
+          if [[ -z $KEYSTORE || -z $PASSWORD ]]; then
+            echo 'Set TOS_ANDROID_KEYSTORE_BASE64 and TOS_ANDROID_STORE_PASSWORD to the identity previous releases were signed with.' >&2
+            exit 1
+          fi
+          mkdir -p dist/android
+          printf '%s' "$KEYSTORE" | base64 -d > dist/android/release.keystore
+      - name: Build the Debian disk the APK carries
+        run: |
+          bash android/vm/build-image.sh
+          # The rootfs is assembled inside a container as root, the same way
+          # the ISO is, so dist/ comes back with root-owned files in it.
+          sudo chown -R "$(id -u):$(id -g)" dist
+      - name: Build the APK
+        env:
+          TOS_ANDROID_KEYSTORE: ${{ github.workspace }}/dist/android/release.keystore
+          TOS_ANDROID_KEY_ALIAS: ${{ secrets.TOS_ANDROID_KEY_ALIAS }}
+          TOS_ANDROID_STORE_PASSWORD: ${{ secrets.TOS_ANDROID_STORE_PASSWORD }}
+        run: bash android/build-apk.sh
+      - name: Stamp the version into the APK
+        run: |
+          cd dist/android
+          rm -f tos-android-arm64.apk.idsig tos-android-arm64.apk.sha256
+          mv tos-android-arm64.apk "tos-${GITHUB_REF_NAME}-android-arm64.apk"
+          sha256sum "tos-${GITHUB_REF_NAME}-android-arm64.apk" > SHA256SUMS-android
+          cat SHA256SUMS-android
+      - name: Attach the APK to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release upload "$GITHUB_REF_NAME" --clobber
+          "dist/android/tos-${GITHUB_REF_NAME}-android-arm64.apk"
+          dist/android/SHA256SUMS-android
+      - name: Forget the signing identity
+        if: always()
+        run: rm -f dist/android/release.keystore
