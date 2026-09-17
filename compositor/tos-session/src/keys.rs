@@ -23,6 +23,20 @@
 //! Pretending otherwise would mean giving one of them up. [`Binding::matches`]
 //! compares modifiers for equality rather than containment, so however far the
 //! two tables diverge a key in one can never fire a binding in the other.
+//!
+//! That table used to stop short of Kitty's `ctrl+shift+c` and `ctrl+shift+v`,
+//! on the argument written out below: tOS sends the Kitty keyboard protocol
+//! *into* its panes, so a program running in one can be handed ctrl+shift+c,
+//! and binding the combination here takes it away from every program in tOS
+//! at once. [#153](https://github.com/m96-chan/tOS/issues/153) decided the
+//! other way and the argument did not stop being true — the cost was paid
+//! rather than dodged. The two keys are what a person's fingers do when they
+//! want to copy in a terminal, and copy and paste being the one pair of
+//! actions that nobody looks up a binding for is worth more than the two
+//! combinations are to an application. It is the pair and nothing else: every
+//! other ctrl+shift letter tOS does not already bind goes on reaching the
+//! pane, so this is one decision taken once and not a table with a door left
+//! open in it.
 
 use std::collections::HashMap;
 
@@ -413,6 +427,15 @@ impl Keymap {
             (KeyCode::PageUp, KITTY, Action::ScrollPage(-1)),
             (KeyCode::PageDown, KITTY, Action::ScrollPage(1)),
             (KeyCode::End, KITTY, Action::ScrollToBottom),
+            // The clipboard, on the keys every terminal emulator on the
+            // machine already uses for it. These two are the ones the comment
+            // below used to be about; see #153 and the module doc for what
+            // taking them costs. `Copy` and `Paste` keep `leader y` and
+            // `leader ]` as well, because those are what a nested session has:
+            // a host terminal claims ctrl+shift+c for its own clipboard before
+            // tOS ever sees the key.
+            (KeyCode::Char('c'), KITTY, Action::Copy),
+            (KeyCode::Char('v'), KITTY, Action::Paste),
         ];
         for (code, modifiers, action) in kitty {
             keymap.bind(Binding::new(*code, *modifiers), action.clone());
@@ -422,15 +445,25 @@ impl Keymap {
             keymap.bind(Binding::new(digit, KITTY), Action::SelectWorkspace(n));
         }
 
-        // Some of Kitty's defaults are deliberately absent, and their absence
-        // is a decision rather than an oversight. ctrl+shift+c and ctrl+shift+v are
-        // Kitty's copy and paste, but Kitty can claim them because it is the
-        // terminal: tOS sends the Kitty keyboard protocol *into* its panes, so
-        // a program running in one can legitimately be sent ctrl+shift+c and
-        // `tos_input::encode` exists partly to encode exactly that. Binding
-        // them here would take the combination away from every program in tOS
-        // for good, which is too large a thing to do in passing; copy and
-        // paste stay on leader y and leader ] and their super aliases.
+        // Two of Kitty's copy and paste keys used to be absent from the table
+        // above, and the absence was a decision: Kitty can claim ctrl+shift+c
+        // because it is the terminal, while tOS sends the Kitty keyboard
+        // protocol *into* its panes, so a program running in one can
+        // legitimately be sent ctrl+shift+c and `tos_input::encode` exists
+        // partly to encode exactly that. #153 took the keys anyway, and the
+        // bill is the one that argument named: a program in a pane can no
+        // longer be sent ctrl+shift+c or ctrl+shift+v by any means, in the
+        // Kitty encoding or the legacy one, because the compositor answers
+        // first and never forwards. An editor that wanted the combination has
+        // to be given another, and under the legacy encoding it also stops
+        // seeing the ^C that shift used to be dropped from — which is the
+        // change most likely to be noticed, since ctrl+shift+c was an
+        // interrupt with a finger in the wrong place. copy and paste keep
+        // leader y and leader ] and their super aliases, so nothing was moved,
+        // only added to.
+        //
+        // The rest of Kitty's absent defaults are still absent, and for
+        // reasons of their own rather than that one.
         // ctrl+shift+q closes a tab in Kitty, and tOS has no close-workspace
         // action to give it — the nearest thing is `Quit`, which leaves the
         // whole compositor, and a key that quits everything when the user
@@ -866,12 +899,17 @@ mod tests {
         // careful: every key in it is one that a program in a pane is still
         // owed with one modifier or none. Plain enter is the only thing a
         // shell ever waits for, ctrl+w erases a word in readline and ctrl+[ is
-        // how a terminal spells escape.
+        // how a terminal spells escape. The c and the v are here since #153
+        // and are the sharpest of them: ctrl+c is how a program is
+        // interrupted, and taking the shifted combination for the clipboard
+        // must not cost the unshifted one.
         let mut keymap = Keymap::default_bindings();
         for code in [
             KeyCode::Enter,
             KeyCode::Char('t'),
             KeyCode::Char('w'),
+            KeyCode::Char('c'),
+            KeyCode::Char('v'),
             KeyCode::Char(']'),
             KeyCode::Char('['),
             KeyCode::Char('1'),
@@ -1036,29 +1074,69 @@ mod tests {
     }
 
     #[test]
-    fn copy_paste_and_close_keep_their_kitty_keys_for_the_pane() {
-        // Three of Kitty's defaults are deliberately unbound, and this is what
-        // says so: tOS sends ctrl+shift to the program in the pane, so taking
-        // c and v here would take copy and paste from every program in tOS at
-        // once, and q would quit the compositor where Kitty closes a tab.
-        // Each of the three wants a decision of its own, and until one is
-        // taken the pane keeps the key — which is a thing to break on purpose,
-        // not by somebody filling in the table.
+    fn copy_and_paste_answer_to_kittys_keys_since_153() {
+        // This test used to say the opposite, and the reasoning it recorded
+        // was sound: tOS sends ctrl+shift to the program in the pane, so
+        // taking c and v here takes copy and paste from every program in tOS
+        // at once. #153 took them anyway and paid that, because the two
+        // combinations are what a person's fingers already do and the leader
+        // aliases are not what anybody reaches for first. The cost is real and
+        // is the point of the assertion below it: nothing else on ctrl+shift
+        // moved, so this is one pair of keys spent deliberately rather than a
+        // table anybody may go on filling in.
         let mut keymap = Keymap::default_bindings();
-        for code in [KeyCode::Char('c'), KeyCode::Char('v'), KeyCode::Char('q')] {
+        let kitty = Modifiers::CTRL.union(Modifiers::SHIFT);
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('c'), kitty)),
+            Resolution::Action(Action::Copy)
+        );
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('v'), kitty)),
+            Resolution::Action(Action::Paste)
+        );
+        // An action rather than a passthrough is the whole of "consumed": the
+        // arm of `Compositor::handle_key` that encodes a key for the pane runs
+        // only on `Passthrough`, so a program in a pane cannot be sent either
+        // of these two any more. That is the bill from #153, written down.
+        //
+        // Every other letter Kitty spends on ctrl+shift and tOS does not is
+        // still the pane's. q closes a tab in Kitty and tOS has only `Quit` to
+        // offer, which leaves the whole session; the top of the scrollback has
+        // no action at all to bind. Neither is a gap for a later hand to fill
+        // in by analogy with the c and the v.
+        for code in [KeyCode::Char('q'), KeyCode::Home] {
             assert_eq!(
-                keymap.resolve(&press(code, Modifiers::CTRL.union(Modifiers::SHIFT))),
+                keymap.resolve(&press(code, kitty)),
                 Resolution::Passthrough,
                 "ctrl+shift+{code:?} is not ours to take"
             );
         }
-        // Nor is the top of the scrollback, which has no action to reach it.
+    }
+
+    #[test]
+    fn the_clipboard_keeps_its_leader_bindings_as_well() {
+        // #153 added to the clipboard's keys rather than moving them. A nested
+        // session needs that: a host terminal takes ctrl+shift+c for its own
+        // clipboard long before tOS is offered the key, so leader y is the
+        // only way to copy from inside one.
+        let mut keymap = Keymap::default_bindings();
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
         assert_eq!(
-            keymap.resolve(&press(
-                KeyCode::Home,
-                Modifiers::CTRL.union(Modifiers::SHIFT)
-            )),
-            Resolution::Passthrough
+            keymap.resolve(&press(KeyCode::Char('y'), Modifiers::NONE)),
+            Resolution::Action(Action::Copy)
+        );
+        keymap.resolve(&press(KeyCode::Char('a'), Modifiers::CTRL));
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char(']'), Modifiers::NONE)),
+            Resolution::Action(Action::Paste)
+        );
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char('y'), Modifiers::SUPER)),
+            Resolution::Action(Action::Copy)
+        );
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char(']'), Modifiers::SUPER)),
+            Resolution::Action(Action::Paste)
         );
     }
 

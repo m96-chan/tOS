@@ -956,9 +956,10 @@ the leader and super — those two go on mirroring each other, because that is
 what a nested session needs. A binding matches on the whole modifier set, so
 `ctrl+shift+l` and `super+shift+l` cannot collide, which is what lets the
 layout key and the lock key share a letter. The keys are listed under
-[Building and running](#building-and-running), including the two left unbound
-on purpose: `ctrl+shift+c` and `ctrl+shift+v` stay with the programs in the
-panes.
+[Building and running](#building-and-running). This round left `ctrl+shift+c`
+and `ctrl+shift+v` with the programs in the panes on purpose;
+[#153](https://github.com/m96-chan/tOS/issues/153) decided the other way in
+0.0.8 and the clipboard has them now.
 
 The mouse is the other half. There is a pointer on screen, the overlays answer
 a click, and the gap between two panes can be taken hold of and dragged. A
@@ -1301,13 +1302,31 @@ other protocol it speaks. These need nothing pressed first:
 | `ctrl+shift+up` / `ctrl+shift+down` | scroll a line |
 | `ctrl+shift+page_up` / `ctrl+shift+page_down` | scroll a page |
 | `ctrl+shift+end` | jump back to the live screen |
+| `ctrl+shift+c` | copy the selection |
+| `ctrl+shift+v` | paste the clipboard |
 
-Kitty's `ctrl+shift+c` and `ctrl+shift+v` are deliberately left alone. tOS
-sends the Kitty keyboard protocol *into* its panes, so a program running in one
-can legitimately be handed `ctrl+shift+c`; claiming it at the compositor would
-take the combination away from every program in tOS at once. `ctrl+shift+q`
-closes a tab in Kitty and tOS has no close-workspace action to give it — only
-`Quit`, which leaves the compositor entirely — so it is left alone too.
+The last two were deliberately left alone until
+[#153](https://github.com/m96-chan/tOS/issues/153), and the reason they were is
+the price of having them: tOS sends the Kitty keyboard protocol *into* its
+panes, so a program running in one could legitimately be handed
+`ctrl+shift+c`, and claiming the combination at the compositor takes it away
+from every program in tOS at once. Under the legacy encoding that also means
+the `^C` those fingers used to produce by accident — shift was simply dropped —
+no longer reaches the program. Copy and paste being the one pair of actions
+nobody should have to look up won the argument. Nothing else moved:
+`ctrl+shift+q` closes a tab in Kitty and tOS has no close-workspace action to
+give it — only `Quit`, which leaves the compositor entirely — so it is still
+left alone, and so is every other `ctrl+shift` letter tOS does not bind.
+
+A copy with nothing selected leaves the clipboard exactly as it was and says
+"nothing to copy" on the status bar, and a paste from an empty clipboard sends
+nothing at all, not even the bracketed-paste markers.
+
+Under a host terminal the two keys usually never arrive: a nested tOS is a
+program inside somebody else's terminal emulator, and that emulator claims
+`ctrl+shift+c` for its own clipboard first. `leader y` and `leader ]` are what
+a nested session copies and pastes with, which is the same thing they were
+before.
 
 Everything else is on a leader key, `ctrl+a`, pressed and released before the
 key it prefixes. On hardware the same table works directly with `super`, which
@@ -1322,7 +1341,8 @@ to unlock with.
 `w b e`, `0 $`, `g G` and a screenful on `ctrl+f` and `ctrl+b` — move a copy
 cursor through the pane and its history, `v` fixes one end of the selection and
 `y` copies it and leaves; the arrow, home, end and page keys do the same for
-anyone who does not think in vi. Copy and paste are `leader y` and `leader ]`.
+anyone who does not think in vi. Copy and paste are `leader y` and `leader ]`,
+or `ctrl+shift+c` and `ctrl+shift+v` where the compositor owns the keyboard.
 
 From inside a session, `leader ?` puts the binding list over the panes; both it
 and `--help` are generated from the keymap that is running, so neither can fall
