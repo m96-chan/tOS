@@ -9,3 +9,5 @@
 # committed. Agent worktrees under .claude/ are checkouts of this same repo.
 /target-*
 /.claude
+
+__pycache__/

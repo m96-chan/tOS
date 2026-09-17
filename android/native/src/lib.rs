@@ -73,11 +73,16 @@ pub unsafe extern "C" fn tos_android_create(
     let Ok(home) = CStr::from_ptr(home).to_str() else {
         return std::ptr::null_mut();
     };
+    let prefix = std::path::Path::new(home)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(home))
+        .join("usr");
     let config = Config {
         command: Some(vec!["/system/bin/sh".into(), "-c".into(),
-            "cd \"$1\" || exit; export HOME=\"$1\" TMPDIR=\"$1/tmp\" SHELL=/system/bin/sh PATH=/system/bin:/system/xbin ENV=/dev/null PS1='$ '; exec /system/bin/sh -i".into(),
-            "tos".into(), home.into()]),
+            "cd \"$1\" || exit; export HOME=\"$1\" TMPDIR=\"$1/tmp\" PREFIX=\"$2\" SHELL=\"$2/bin/bash\" PATH=\"$2/bin:/system/bin\" LD_LIBRARY_PATH=\"$2/lib\" LD_PRELOAD=\"$2/lib/libtos_paths.so\" LANG=C.UTF-8; exec \"$SHELL\" --noprofile --rcfile \"$HOME/.bashrc\" -i".into(),
+            "tos".into(), home.into(), prefix.to_string_lossy().into_owned()]),
         font_size: Some(font.clamp(6.0, 128.0)),
+        font: Some(prefix.join("share/fonts/HackGenConsoleNF-Regular.ttf")),
         status_bar: false,
         idle_lock: None,
         idle_blank: None,
@@ -85,14 +90,11 @@ pub unsafe extern "C" fn tos_android_create(
         ..Config::default()
     };
     match Compositor::new(config, (width, height), None) {
-        Ok(mut compositor) => {
-            compositor.inject(b"\x1b[38;2;145;180;135mtOS\x1b[0m / Android\r\n\r\n");
-            Box::into_raw(Box::new(Engine {
-                compositor,
-                frame: OwnedFramebuffer::new(width, height),
-                dirty: true,
-            }))
-        }
+        Ok(compositor) => Box::into_raw(Box::new(Engine {
+            compositor,
+            frame: OwnedFramebuffer::new(width, height),
+            dirty: true,
+        })),
         Err(error) => {
             eprintln!("tOS Android: {error}");
             std::ptr::null_mut()

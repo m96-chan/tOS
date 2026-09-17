@@ -24,6 +24,8 @@ if ! rustup target list --installed | grep -qx "$target"; then
     echo "Run: rustup target add $target" >&2; exit 1
 fi
 
+python3 android/userland/prepare.py
+
 CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$cc" \
     RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-Wl,-z,max-page-size=16384" \
     cargo build --locked --release --target "$target" -p tos-android
@@ -33,6 +35,12 @@ mkdir -p dist/android
 stage=$(mktemp -d "$PWD/dist/android/apk-build.XXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
 mkdir -p "$stage/classes" "$stage/dex" "$stage/lib/arm64-v8a"
+cp -a dist/android/userland/lib/arm64-v8a/. "$stage/lib/arm64-v8a/"
+cp -a dist/android/userland/assets "$stage/assets"
+"$cc" -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 \
+    android/app/jni/paths.c -ldl -o "$stage/lib/arm64-v8a/libtos_paths.so"
+"$cc" -fPIE -pie -O2 -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 \
+    android/app/jni/motd.c -o "$stage/lib/arm64-v8a/libtos_motd.so"
 "$cc" -shared -fPIC -O2 -Wall -Wextra -Werror \
     -Wl,-z,max-page-size=16384 -Wl,--exclude-libs,ALL \
     android/app/jni/bridge.c "${CARGO_TARGET_DIR:-target}/$target/release/libtos_android.a" \
@@ -49,7 +57,7 @@ mapfile -t classes < <(find "$stage/classes" -name '*.class' -type f | sort)
 cp "$stage/dex/classes.dex" "$stage/classes.dex"
 (
     cd "$stage"
-    zip -q base.apk classes.dex lib/arm64-v8a/libtos_android.so
+    zip -q -r base.apk classes.dex lib assets
 )
 "$build_tools/zipalign" -f -P 16 4 "$stage/base.apk" "$stage/aligned.apk"
 

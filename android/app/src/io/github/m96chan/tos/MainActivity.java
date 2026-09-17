@@ -125,11 +125,17 @@ public final class MainActivity extends Activity {
         final float pixels = fontPixels();
         worker.execute(() -> {
             try {
+                message("Preparing tools…");
+                Userland.prepare(this);
                 engine = NativeSession.create(home.getAbsolutePath(), pixels);
                 if (engine == 0) { message("Could not start the Android shell"); return; }
+                runOnUiThread(() -> composition.setText(""));
                 runOnUiThread(() -> terminal.bindSurface());
                 step();
-            } catch (Throwable error) { message("Could not start tOS: " + error.getMessage()); }
+            } catch (Throwable error) {
+                android.util.Log.e("tOS", "Could not start session", error);
+                message("Could not start tOS: " + error.getMessage());
+            }
         });
     }
 

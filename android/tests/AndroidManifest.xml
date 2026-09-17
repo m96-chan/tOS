@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="io.github.m96chan.tos.tests">
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
+    <application android:label="tOS device tests" />
+    <instrumentation android:name="io.github.m96chan.tos.tests.Smoke" android:targetPackage="io.github.m96chan.tos" />
+</manifest>
