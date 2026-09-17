@@ -34,7 +34,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "tos-android"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "tos-compositor",
  "tos-input",
@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "tos-compositor"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "libc",
  "tos-crypt",
@@ -61,11 +61,11 @@ dependencies = [
 
 [[package]]
 name = "tos-crypt"
-version = "0.0.7"
+version = "0.0.8"
 
 [[package]]
 name = "tos-font"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "fontdue",
  "ttf-parser",
@@ -73,11 +73,11 @@ dependencies = [
 
 [[package]]
 name = "tos-ime"
-version = "0.0.7"
+version = "0.0.8"
 
 [[package]]
 name = "tos-input"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "libc",
  "tos-term",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "tos-install"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "libc",
  "tos-compositor",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "tos-platform"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "libc",
  "tos-render",
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "tos-preview"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "libc",
  "tos-compositor",
@@ -119,14 +119,14 @@ dependencies = [
 
 [[package]]
 name = "tos-pty"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "tos-render"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "tos-font",
  "tos-term",
@@ -134,21 +134,21 @@ dependencies = [
 
 [[package]]
 name = "tos-session"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "tos-input",
 ]
 
 [[package]]
 name = "tos-system"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "tos-term"
-version = "0.0.7"
+version = "0.0.8"
 
 [[package]]
 name = "ttf-parser"

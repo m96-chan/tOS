@@ -1000,6 +1000,7 @@ banner was never erased on a bar with no message segment
 - [x] a session to log into and to log out of ([#112](https://github.com/m96-chan/tOS/issues/112)), running as whoever logged in ([#119](https://github.com/m96-chan/tOS/issues/119))
 - [x] a picture on the login screen and at the head of every pane ([#132](https://github.com/m96-chan/tOS/issues/132)), and one that scrolls away with its text ([#139](https://github.com/m96-chan/tOS/issues/139))
 - [x] a frame the panel is not still scanning out ([#102](https://github.com/m96-chan/tOS/issues/102), [#105](https://github.com/m96-chan/tOS/issues/105))
+- [x] a phone that runs tOS without giving up Android ([#168](https://github.com/m96-chan/tOS/pull/168))
 - [ ] generic arm64 image ([#21](https://github.com/m96-chan/tOS/issues/21))
 - [ ] hardware abstraction cleanup ([#22](https://github.com/m96-chan/tOS/issues/22))
 - [ ] images scanned out on DRM overlay planes ([#31](https://github.com/m96-chan/tOS/issues/31))
@@ -1042,6 +1043,20 @@ hands the display a finished frame instead of drawing into one it is still
 scanning out, and an unblank pays the buffer it lights the panel on rather
 than handing the CRTC one the shadow has already declared unknown.
 
+The round also put tOS on a phone without asking for the phone. The standalone
+APK draws the same compositor into an Android surface and owns a Debian VM
+through AVF, so a pane is a real Debian shell on a device that is still an
+Android device — no root, no custom boot image, and nothing taken away from
+the machine somebody depends on. What that costs is the layer below: Android
+hands the app a window, which is why this is the one place the compositor has
+met real hardware while DRM/KMS, evdev and VT ownership have not. The touch
+side is its own design rather than a mouse with one button — a long press
+opens the clipboard where the finger is, because a phone has no
+`Ctrl+Shift+V`, and ASCII from the soft keyboard reaches the shell as it is
+typed instead of waiting for a word to be committed, because completion and
+`^C` happen mid-word. Details, device requirements and lifecycle limits are in
+[`android/README.md`](android/README.md).
+
 What is left is the portability round. Those three are tracked here rather
 than waited for under 0.1, because a version before 0.1 lands when its idea
 has been demonstrated and there is no reason to hold a round open for the name
@@ -1064,10 +1079,15 @@ second pile of work.
 
 ### Later — Android devices
 
-- Android boot image support
-- device adaptation layer
-- touch-first terminal interaction
-- mobile power management
+- [ ] Android boot image support
+- [ ] device adaptation layer
+- [x] touch-first terminal interaction, as an app rather than a boot image
+- [ ] mobile power management
+
+The ticked one arrived early and sideways: the standalone APK is tOS on a
+phone that keeps Android, which is a different answer from the boot image the
+rest of this list is about. The unticked three are still what it would take to
+*be* the phone's system rather than a program on it.
 - vendor hardware integration where necessary
 
 ### Later — Web
@@ -1202,6 +1222,7 @@ What has been exercised, and how:
 | Installer | the whole sequence against a recorded backend, plus the real binary driven on a pseudoterminal with its output read back through tOS's own terminal emulator |
 | The ISO | built and booted in CI under QEMU on every change: the compositor announces itself on serial, the live session is checked to have reached the Debian rootfs rather than falling back to the initramfs, and the squashfs is checked to carry `dpkg` and `apt` |
 | The installed machine | installs driven by hand in a VM, headless, with the serial log read, screenshots taken and keystrokes injected — which is how the login, the privilege drop and the network were each confirmed on a machine that had actually booted |
+| The Android APK | built, signed and installed on a Pixel 10a, with its Debian guest driven through the same app-private bridge a visible pane uses: 32 device checks across eight VM restarts, and the screen itself read back with screenshots |
 
 Panes refuse to split once they are too small to divide, rather than creating
 a pane with nowhere to go, and a virtual terminal is only taken over once the
@@ -1227,8 +1248,12 @@ nothing at all while it is the tree, which is where every session starts.
 The honest gap is bare metal. The kernel-facing backends do run — the ISO is
 booted in CI under QEMU and driven by hand under VirtualBox, both of which put
 a real DRM device and a real evdev stream in front of the same code — but no
-part of this has been run on a physical machine, and a virtual GPU is not a
-panel. Audio in particular has never met a sound card: every ioctl it issues is
+part of this has been run on a physical *PC*, and a virtual GPU is not a
+panel. The one exception is a phone: the standalone APK runs the same
+compositor on a Pixel 10a, against that device's own surface, touchscreen and
+keyboard. What it does not touch is exactly the layer this paragraph is about
+— Android hands it a window, so DRM/KMS, evdev and VT ownership are still
+untried on hardware. Audio in particular has never met a sound card: every ioctl it issues is
 tested against a card built out of structures in a test.
 
 The installer is in the same position. Its logic is covered, and it has been
@@ -1242,6 +1267,11 @@ tOS/
 ├── installer/           tos-install: put tOS on a disk from the live session
 ├── preview/             tos-preview: show an image in a pane
 ├── iso/                 bootable image and its initramfs
+├── android/             the standalone APK, for a phone that keeps Android
+│   ├── app/             the Android view: Java UI, JNI bridge, resources
+│   ├── native/          tos-android: the compositor behind that view
+│   ├── vm/              the Debian VM it owns, its kernel and its disk
+│   └── userland/        the Linux tools the APK carries for the guest
 └── compositor/
     ├── tos-term/        terminal model: cells, grid, VT parser, graphics
     ├── tos-crypt/       SHA-512 and the $6$ crypt scheme, for passwords
