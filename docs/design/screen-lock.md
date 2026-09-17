@@ -836,7 +836,20 @@ rest.
 **The countdown keeps its frame.** "try again in 12s" has to become 11, and
 the blink frame that used to carry it is the frame that no longer happens. So
 the metronome is kept and only its meaning changes: while a lock is up, an
-interval means "ask for a frame if a wait is running", and nothing else.
+interval means "ask for a frame if the count is moving", and nothing else. One
+of that count's moves is off the end — the message going back to "wrong
+password" when the wait is over — so an interval that finds no wait still
+draws when the one before it had one. Without that, a box would sit telling
+somebody to wait for a second that had already passed.
+
+**And the panes behind it do not ask either.** A pane goes on running while
+the screen is locked and none of its output reaches the screen, so the frame
+that output asked for drew the box again and dropped the damage it came for
+unread — once per burst of output, for as long as a build or a `tail -f` was
+left running. Asked in both places it can be asked: where the output arrives
+in `run_once`, and in `needs_render`, because damage outlives the pass it was
+marked on and a locked screen that said yes there would draw ten times a
+second.
 
 **And the frames that do happen are partial.** `render_locked` takes
 `retained` like every other frame. It erases when it cannot know what is on the
@@ -847,5 +860,7 @@ not taste: the box **paints its own background** before it draws its border,
 so putting it down again gives the same pixels an erase would; the picture
 carries alpha, and a second pass over its own result is a different picture.
 
-An idle locked screen now asks for **no frames at all**, and the ones it does
-ask for cost the box (58,080 px at 800x480) rather than the display.
+A locked screen now asks for **no frames at all** unless something on it has
+moved — the count, a keystroke, an arrow — whatever the machine and the panes
+behind it are doing. The ones it does ask for cost the box (58,080 px at
+800x480) rather than the display.

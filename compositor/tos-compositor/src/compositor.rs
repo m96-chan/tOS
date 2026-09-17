@@ -346,6 +346,13 @@ pub struct Compositor {
     /// told, so that the keystroke which arrives at a panel that is still
     /// physically dark is recognised as one.
     blanked: bool,
+    /// Whether the lock was counting down a wait at the last tick.
+    ///
+    /// The countdown's last move is to nothing — "try again in 1s" becoming
+    /// "wrong password" once the second is over — and a screen that only drew
+    /// while a wait was running would never draw that one, leaving the box
+    /// telling somebody to wait for a second that has already passed (#164).
+    lock_was_counting: bool,
     /// Whether the lock deadline has already been acted on this idle period.
     ///
     /// A deadline fires once, not on every pass after it. Without this a
@@ -479,6 +486,7 @@ impl Compositor {
             pending_writes: false,
             last_activity: Instant::now(),
             blanked: false,
+            lock_was_counting: false,
             idle_lock_done: false,
             blank_refused: false,
             machine: Machine::at(Sysfs::new(&config.system_root)),
@@ -3273,7 +3281,14 @@ impl Compositor {
         if !self.blanked && now.saturating_duration_since(self.last_blink) >= BLINK_INTERVAL {
             self.last_blink = now;
             match self.lock.as_ref().map(|lock| lock.wait_left(now).is_some()) {
-                Some(counting_down) => lock_changed |= counting_down,
+                Some(counting_down) => {
+                    // The change is the count *moving*, and one of its moves
+                    // is off the end: the interval after the wait runs out is
+                    // the one that puts the message back to "wrong password".
+                    let was_counting =
+                        std::mem::replace(&mut self.lock_was_counting, counting_down);
+                    lock_changed |= counting_down || was_counting;
+                }
                 None => {
                     self.blink_visible = !self.blink_visible;
                     changed = true;
@@ -3384,7 +3399,12 @@ impl Compositor {
     pub fn needs_render(&self) -> bool {
         self.needs_full_redraw
             || self.pointer_moved_since_it_was_drawn()
-            || self.panes.values().any(|pane| pane.wants_frame())
+            // And a pane behind a lock is asking for a frame that would not
+            // draw it (#164). Asked here as well as where the output arrives,
+            // because damage outlives the pass it was marked on: a locked
+            // screen that answered yes here would find work outstanding on
+            // every pass of the loop and draw the box ten times a second.
+            || (self.lock.is_none() && self.panes.values().any(|pane| pane.wants_frame()))
     }
 
     /// Where the arrow belongs this frame, or `None` for no arrow at all.
@@ -4219,7 +4239,14 @@ impl Compositor {
                 }
             }
         }
-        dirty |= self.pump_panes();
+        // Output arriving is not a change to the screen while a lock is over
+        // it (#164). The frame it would ask for draws the box again and drops
+        // the pane's damage unread, and a build or a `tail -f` left running
+        // behind a locked screen is a frame per burst of output all night.
+        // The panes are pumped either way: the programs in them are not told
+        // that anybody left, and the whole screen is repainted when the lock
+        // is answered.
+        dirty |= self.pump_panes() && self.lock.is_none();
         dirty |= self.tick();
         // After the input, so that the event which arrived at a dark screen is
         // swallowed by the screen still being dark, and before the frame, so
@@ -5638,12 +5665,60 @@ mod tests {
             compositor.tick_at(start + BLINK_INTERVAL),
             "the countdown stopped counting"
         );
-        // And it stops again once the wait is over, rather than leaving a
-        // locked screen drawing forever because somebody mistyped once.
+        // The last move the count makes is off the end: the message goes back
+        // to "wrong password" when the wait is over, and that frame has to be
+        // asked for too or the box sits there naming a second that has passed.
         assert!(
-            !compositor.tick_at(start + Duration::from_secs(30)),
+            compositor.tick_at(start + Duration::from_secs(30)),
+            "the message was left telling somebody to wait for nothing"
+        );
+        // And then it stops, rather than leaving a locked screen drawing
+        // forever because somebody mistyped once.
+        assert!(
+            !compositor.tick_at(start + Duration::from_secs(60)),
             "the screen went on asking after the wait ran out"
         );
+    }
+
+    #[test]
+    fn a_pane_writing_behind_a_lock_draws_nothing() {
+        // #164 from the other side. A pane goes on running while the screen
+        // is locked and none of its output reaches the screen, so the frame
+        // that output asks for is a frame that draws the box again and throws
+        // the damage away unread — once per burst, all night, on a machine
+        // whose owner locked it and went home.
+        let mut compositor = compositor_with_password("chatty");
+        assert!(compositor.lock_session());
+        let mut panel = Panel::new();
+        // The lock itself is drawn first, and that one is owed.
+        compositor
+            .run_once(&mut panel, &[], |_| Vec::new())
+            .expect("a pass");
+        assert!(panel.frames > 0, "the lock was never drawn");
+        let drawn = panel.frames;
+
+        compositor.inject(b"echo behind-the-lock\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut arrived = false;
+        while Instant::now() < deadline && !arrived {
+            arrived = compositor.pump_panes();
+        }
+        assert!(arrived, "nothing came back from the pane to be ignored");
+
+        for _ in 0..3 {
+            compositor
+                .run_once(&mut panel, &[], |_| Vec::new())
+                .expect("a pass");
+        }
+        assert_eq!(
+            panel.frames, drawn,
+            "a pane behind the lock was drawn for anyway"
+        );
+        // And the session is not lost by it: answering the lock repaints
+        // everything, which is what `needs_full_redraw` is for.
+        answer(&mut compositor, "tos");
+        assert!(!compositor.is_locked());
+        assert!(compositor.needs_render());
     }
 
     #[test]
@@ -6224,6 +6299,8 @@ mod tests {
     struct Panel {
         framebuffer: tos_render::OwnedFramebuffer,
         told: Vec<bool>,
+        /// How many frames have been drawn into it.
+        frames: u32,
         /// A display that cannot do what it is asked, which is a thing
         /// hardware does.
         refuses: bool,
@@ -6234,6 +6311,7 @@ mod tests {
             Panel {
                 framebuffer: tos_render::OwnedFramebuffer::new(640, 360),
                 told: Vec::new(),
+                frames: 0,
                 refuses: false,
             }
         }
@@ -6252,6 +6330,7 @@ mod tests {
         }
 
         fn frame(&mut self, draw: &mut dyn FnMut(&mut Surface<'_>)) -> io::Result<()> {
+            self.frames += 1;
             draw(&mut self.framebuffer.surface());
             Ok(())
         }
