@@ -43,7 +43,13 @@ fn the_greetings_picture_reaches_the_pane() {
     // The whole greeting, not only the picture: what a shell prints is the
     // picture and then ten lines under it, and a picture that landed on top
     // of those lines would pass a test that only looked at the picture.
-    let sent = motd::greeting_from(Some(screen), std::path::Path::new(PICTURE));
+    // The size is handed over as well, so this is also what says the picture
+    // still wins on a pane wide enough to draw one in cells (#162).
+    let sent = motd::greeting_from(
+        Some(screen),
+        Some((screen.cols, screen.rows)),
+        std::path::Path::new(PICTURE),
+    );
     assert!(sent.contains("the terminal is the desktop"));
     assert!(sent.contains("ctrl+shift+enter"), "the keys are part of it");
     let bytes = dir.join("greeting.bin");
