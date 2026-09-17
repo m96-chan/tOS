@@ -265,6 +265,12 @@ Debian userspace
 
 Android devices are primarily a hardware enablement problem, not a userspace problem.
 
+To keep Android installed, the [standalone ARM64 APK](android/README.md)
+embeds the compositor in a native Android view, with adjustable text size,
+keyboard input and touch controls. It needs neither Termux nor root. This
+preview runs Android's system shell; it does not yet bundle a Linux userland.
+The earlier [Termux bring-up guide](android/TERMUX.md) remains available.
+
 The intended model is:
 
 ```text

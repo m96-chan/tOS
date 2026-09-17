@@ -635,6 +635,23 @@ impl Compositor {
         (metrics.cell_width.max(1), metrics.cell_height.max(1))
     }
 
+    /// Change text size without restarting shells or discarding their history.
+    /// The Android view calls this when the user changes its zoom level.
+    pub fn set_font_size(&mut self, pixels: f32) -> bool {
+        if !pixels.is_finite()
+            || !(6.0..=128.0).contains(&pixels)
+            || self.config.font_size == Some(pixels)
+        {
+            return false;
+        }
+        self.config.font_size = Some(pixels);
+        self.config.bitmap_scale = Some((pixels / 11.0).round().max(1.0) as u32);
+        self.fonts = build_fonts(&self.config, self.size, None);
+        self.sync_layout();
+        self.needs_full_redraw = true;
+        true
+    }
+
     /// The part of the screen panes are laid out in, in cells.
     pub fn grid_area(&self) -> Rect {
         let (cw, ch) = self.cell_size();
@@ -4369,6 +4386,35 @@ mod tests {
     /// A font stack built from `config`, at a size the tests can reason about.
     fn fonts(config: Config) -> FontStack {
         build_fonts(&config, (640, 360), None)
+    }
+
+    #[test]
+    fn changing_font_size_preserves_the_shell_and_updates_its_pty_size() {
+        let mut c = compositor_with(Config {
+            bitmap_scale: Some(2),
+            ..Config::default()
+        });
+        // compositor_with deliberately fixes a small bitmap face. Select a
+        // larger one first, then prove shrinking resizes the existing PTY.
+        assert!(c.set_font_size(22.0));
+        let before = c.pty_fds();
+        let large = c.cell_size();
+        let old_area = c.grid_area();
+        assert!(c.set_font_size(11.0));
+        assert_eq!(c.pty_fds(), before);
+        assert!(c.cell_size().0 < large.0);
+        assert!(c.grid_area().width > old_area.width);
+        let id = c.session.active().focus();
+        let pane = c.pane(id).unwrap();
+        assert_eq!(pane.area.width, c.grid_area().width);
+        let mut winsize: libc::winsize = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::ioctl(pane.pty.fd(), libc::TIOCGWINSZ, &mut winsize) },
+            0
+        );
+        assert_eq!(u32::from(winsize.ws_col), c.grid_area().width);
+        assert!(!c.set_font_size(f32::NAN));
+        assert!(!c.set_font_size(0.0));
     }
 
     /// Nothing to assert about CJK on a machine with no CJK face.

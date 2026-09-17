@@ -1,0 +1,16 @@
+[package]
+name = "tos-android"
+description = "Native compositor bridge for the standalone tOS Android app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+tos-compositor.workspace = true
+tos-input.workspace = true
+tos-render.workspace = true
+tos-session.workspace = true

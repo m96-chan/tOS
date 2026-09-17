@@ -19,6 +19,8 @@ use crate::glyph::{FontMetrics, Glyph, GlyphSource, RasterStyle};
 
 /// Places a Linux rootfs usually keeps monospace fonts, most specific first.
 const FONT_SEARCH_PATHS: &[&str] = &[
+    "/system/fonts/DroidSansMono.ttf",
+    "/system/fonts/RobotoMono-Regular.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
     "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
@@ -48,6 +50,8 @@ const FONT_SEARCH_PATHS: &[&str] = &[
 /// even though it would be a poor primary: the terminal borrows nothing from
 /// it but wide glyphs, and every wide glyph is one em regardless.
 const CJK_SEARCH_PATHS: &[&str] = &[
+    "/system/fonts/NotoSansCJK-Regular.ttc",
+    "/system/fonts/NotoSansCJKjp-VF.otf",
     // What the tOS ISO ships; see iso/mkiso.sh. It was the vlgothic line below
     // until #151 asked for this face by name, and the ISO carries one Japanese
     // face rather than two — the other paths here are for the machines tOS is
@@ -314,6 +318,18 @@ impl GlyphSource for TtfFont {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cff2_glyphs_have_visible_outlines_not_just_character_mappings() {
+        // Android's Noto CJK uses CFF2. Without variable-fonts in ttf-parser,
+        // cmap lookup succeeds while every outline silently becomes empty.
+        let mut font =
+            TtfFont::from_bytes(include_bytes!("../tests/fixtures/cff2-test.otf"), 20.0).unwrap();
+        assert!(font.covers_cjk());
+        let glyph = font.rasterize('あ', RasterStyle::default()).unwrap();
+        assert!(glyph.width > 0 && glyph.height > 0);
+        assert!(glyph.coverage.iter().any(|&alpha| alpha > 0));
+    }
 
     /// Tests need a real font; skip cleanly on machines without one.
     fn system_font() -> Option<TtfFont> {
