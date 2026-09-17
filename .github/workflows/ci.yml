@@ -75,10 +75,16 @@ jobs:
           # though only one of them is tested.
           - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-gnu
+          # Both the standalone APK and Termux bundle use Android's libc.
+          - aarch64-linux-android
           # The ISO links a fully static binary; musl is what that means, and
           # its libc definitions differ enough to break code that builds
           # everywhere else.
           - x86_64-unknown-linux-musl
+        include:
+          - target: aarch64-linux-android
+            # Android embeds the compositor, without the PC disk installer.
+            packages: -p tos-compositor -p tos-android
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -91,7 +97,7 @@ jobs:
           key: ${{ matrix.target }}
       - name: Check
         run: >-
-          cargo clippy --workspace --all-targets
+          cargo clippy ${{ matrix.packages || '--workspace' }} --all-targets
           --target ${{ matrix.target }} -- -D warnings
 
   shell:
@@ -104,10 +110,11 @@ jobs:
           # The container and initramfs scripts are POSIX shell; build.sh and
           # run.sh run on the host and are bash.
           for script in iso/mkiso.sh iso/init iso/live-session iso/profile \
-            iso/dot-profile iso/wifi-witness.sh iso/shutdown; do
+            iso/dot-profile iso/wifi-witness.sh iso/shutdown \
+            android/install-termux.sh android/termux-launcher.sh; do
             sh -n "$script" || exit 1
           done
-          for script in iso/build.sh iso/run.sh iso/check-rootfs.sh iso/bashrc; do
+          for script in iso/build.sh iso/run.sh iso/check-rootfs.sh iso/bashrc android/build.sh android/build-apk.sh android/test-device.sh android/userland/bashrc android/vm/*.sh android/vm/bashrc; do
             bash -n "$script" || exit 1
           done
       - name: Shellcheck
@@ -118,8 +125,18 @@ jobs:
           # profiles and the rc file, which are sourced and so have none.
           shellcheck --severity=warning iso/build.sh iso/run.sh iso/mkiso.sh \
             iso/init iso/live-session iso/check-rootfs.sh iso/wifi-witness.sh \
-            iso/shutdown
+            iso/shutdown android/build.sh android/build-apk.sh android/test-device.sh android/install-termux.sh android/termux-launcher.sh android/vm/*.sh
           shellcheck --shell=sh --severity=warning iso/profile iso/dot-profile
           # The rc file is bash by definition: it exists because bash reads it
           # where it reads neither /etc/profile nor $ENV.
-          shellcheck --shell=bash --severity=warning iso/bashrc
+          shellcheck --shell=bash --severity=warning iso/bashrc android/userland/bashrc android/vm/bashrc
+
+  android-packaging:
+    name: Android package boundaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test package assembly without network or SDK
+        run: python3 -m unittest discover -s android/userland -p 'test_*.py' -v
+      - name: Test VM protocol stream boundaries
+        run: bash android/vm/test-protocol.sh

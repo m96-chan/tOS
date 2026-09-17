@@ -251,6 +251,7 @@ fn sleep_if_asked(compositor: &mut Compositor) {
 /// The kernel suspends the switch until tOS answers, so every path through
 /// here has to end in an answer. Nothing may be silent: a switch left
 /// unanswered stays pending for good.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SwitchStep {
     /// Drop DRM master, so whoever is taking the console can set a mode.
@@ -283,6 +284,7 @@ enum SwitchStep {
 /// stays dark through the attempt, and an unlocked one releases exactly as it
 /// does today — `drm.rs` gives the device up as it stands and remembers the
 /// blank for the way back.
+#[cfg(any(target_os = "linux", test))]
 fn switch_away_plan(locked: bool) -> &'static [SwitchStep] {
     if locked {
         return &[SwitchStep::RefuseSwitch];

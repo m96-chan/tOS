@@ -9,7 +9,9 @@ repository.workspace = true
 
 [features]
 default = ["ttf"]
-ttf = ["dep:fontdue"]
+ttf = ["dep:fontdue", "dep:ttf-parser"]
 
 [dependencies]
 fontdue = { version = "0.9", optional = true, default-features = false, features = ["std"] }
+# fontdue disables this upstream feature; Android Noto CJK needs CFF2 outlines.
+ttf-parser = { version = "0.25", optional = true, default-features = false, features = ["variable-fonts"] }

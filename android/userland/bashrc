@@ -1,0 +1,23 @@
+# shellcheck shell=bash
+# Managed defaults; ~/.bashrc sources this file and remains user-editable.
+export EDITOR=nvim VISUAL=nvim PAGER=less
+export LESS='-R' GIT_PAGER=less
+export TERM=xterm-256color COLORTERM=truecolor TOS=1
+export SSL_CERT_FILE="$PREFIX/etc/tls/cert.pem"
+export SSL_CERT_DIR="$PREFIX/etc/tls/certs"
+export CURL_CA_BUNDLE="$SSL_CERT_FILE" GIT_SSL_CAINFO="$SSL_CERT_FILE"
+export VIMRUNTIME="$PREFIX/share/nvim/runtime"
+export TERMINFO="$PREFIX/share/terminfo" TERMINFO_DIRS="$PREFIX/share/terminfo"
+export GIT_EXEC_PATH="$PREFIX/libexec/git-core"
+export MAGIC="$PREFIX/share/misc/magic.mgc"
+export MANPATH="$PREFIX/share/man"
+export XDG_CONFIG_HOME="$HOME/.config" XDG_CACHE_HOME="$HOME/.cache"
+export XDG_DATA_HOME="$HOME/.local/share" XDG_STATE_HOME="$HOME/.local/state"
+export HISTFILE="$HOME/.bash_history" HISTSIZE=5000 HISTFILESIZE=10000
+PS1='\[\e[38;2;145;180;135m\]$\[\e[0m\] '
+shopt -s histappend checkwinsize
+alias ll='ls -lah'
+if [ -z "${TOS_MOTD_SHOWN:-}" ]; then
+    export TOS_MOTD_SHOWN=1
+    "$PREFIX/bin/tos-motd"
+fi

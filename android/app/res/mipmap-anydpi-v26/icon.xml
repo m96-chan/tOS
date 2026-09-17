@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The launcher icon is the splash art's own character, cut out of
+     compositor/tos-compositor/assets/splash.png: it lies at the bottom of the
+     mask so the crop through its arms falls outside the viewport, and the
+     face sits inside the 66dp any launcher is guaranteed to show. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/icon_background" />
+    <foreground android:drawable="@mipmap/icon_foreground" />
+</adaptive-icon>
