@@ -19,10 +19,12 @@ set -euo pipefail
 iso=${1:?usage: iso/check-rootfs.sh <iso>}
 mount_point=$(mktemp -d)
 list=$(mktemp)
+extract=$(mktemp -d)
 cleanup() {
     sudo umount "$mount_point" 2>/dev/null || true
     rmdir "$mount_point" 2>/dev/null || true
     rm -f "$list"
+    rm -rf "$extract"
 }
 trap cleanup EXIT
 
@@ -45,6 +47,12 @@ sudo umount "$mount_point"
 # rootfs that lost either would be one nothing else on the build complains
 # about. The Debian names are here for symmetry, and because a package set
 # edited in mkiso.sh should fail here rather than at somebody's login screen.
+# The four words under usr/local/sbin are how a person turns this machine off
+# from a pane (#158), and usr/sbin/shutdown is what they hand the job to — the
+# systemd-sysv symlink, which the shim also reads as "this machine has an init
+# to ask" and whose absence would send it down the initramfs's busybox path on
+# a machine that has systemd. Losing any of the five is a machine that stays
+# up when it is told to shut down, which nothing else here would notice.
 for path in usr/bin/dpkg usr/bin/apt usr/bin/bash usr/bin/mount \
     usr/bin/unsquashfs usr/sbin/sfdisk usr/sbin/mkfs.ext4 usr/sbin/grub-install \
     usr/bin/ip usr/bin/ps usr/bin/free \
@@ -55,6 +63,8 @@ for path in usr/bin/dpkg usr/bin/apt usr/bin/bash usr/bin/mount \
     root/.config/btop/btop.conf \
     usr/sbin/init usr/lib/systemd/systemd usr/sbin/tos usr/sbin/tos-install \
     usr/sbin/tos-session var/lib/dpkg/status root/.bashrc root/.profile \
+    usr/sbin/shutdown usr/local/sbin/shutdown usr/local/sbin/poweroff \
+    usr/local/sbin/reboot usr/local/sbin/halt \
     etc/hosts etc/systemd/system/tos-session.service \
     etc/systemd/system/multi-user.target.wants/tos-session.service; do
     grep -qx "squashfs-root/$path" "$list" || {
@@ -77,6 +87,57 @@ for unit in getty.target "getty@.service" "serial-getty@.service" \
         exit 1
     }
 done
+
+# And that the shutdown shim is a program, and one a pane would actually find.
+#
+# Both halves fail silently, which is why they are asserted rather than left
+# to a boot: a shim that lost its execute bit is `shutdown: Permission denied`
+# on a machine where /sbin/shutdown would have said something about a bus
+# instead, and a shim that is not first on PATH does nothing at all — the name
+# resolves to Debian's, the person gets the failure #158 is about, and every
+# other gate here is still green. The PATH is read out of the session script
+# on the medium rather than written down a second time, the way the apt suite
+# below is read out of mkiso.sh: iso/live-session is the one file that sets
+# the environment every tOS session runs in, and this is the copy that shipped.
+#
+# /usr/sbin counts as the system directory as much as /sbin does. Debian is
+# usr-merged, so they are one directory and systemd-sysv's shutdown answers to
+# both names; a PATH with /usr/sbin ahead of /usr/local/sbin would be the same
+# failure with a different spelling.
+sudo mount -o loop,ro "$iso" "$mount_point"
+unsquashfs -d "$extract/rootfs" -no-progress \
+    "$mount_point/live/filesystem.squashfs" \
+    usr/local/sbin/shutdown usr/sbin/tos-session >/dev/null
+sudo umount "$mount_point"
+
+[ -x "$extract/rootfs/usr/local/sbin/shutdown" ] || {
+    echo "the rootfs carries /usr/local/sbin/shutdown but it is not executable" >&2
+    exit 1
+}
+
+session_path=$(sed -n 's/^export PATH=//p' "$extract/rootfs/usr/sbin/tos-session")
+if [ -z "$session_path" ]; then
+    echo "the session script on the medium exports no PATH at all" >&2
+    exit 1
+fi
+first=
+IFS=: read -r -a path_entries <<<"$session_path"
+for entry in "${path_entries[@]}"; do
+    case "$entry" in
+    /usr/local/sbin)
+        first=shim
+        break
+        ;;
+    /sbin | /usr/sbin)
+        first=$entry
+        break
+        ;;
+    esac
+done
+[ "$first" = shim ] || {
+    echo "the session's PATH does not reach /usr/local/sbin first: $session_path" >&2
+    exit 1
+}
 
 # The Japanese face, which nothing else here would miss: the compositor falls
 # back to its built-in bitmap and every kana turns into a hollow box, with the

@@ -144,6 +144,20 @@ cp iso/live-session "$ROOT/sbin/tos-session"
 chmod 755 "$ROOT/init" "$ROOT/sbin/tos" "$ROOT/sbin/tos-install" \
     "$ROOT/sbin/tos-preview" "$ROOT/sbin/tos-session"
 
+# And the four words a person turns a computer off with, for the same reason
+# and by the same rule: one file in the tree, on both sides of the pivot. Here
+# it answers the rescue session, where busybox has halt, poweroff and reboot
+# applets and no `shutdown` at all — so the one word everybody types is the one
+# word that was missing — and where the applets it does have signal a PID 1
+# that is a shell and returns 0 having done nothing. iso/shutdown says the
+# whole of it; #158 is the issue.
+mkdir -p "$ROOT/usr/local/sbin"
+cp iso/shutdown "$ROOT/usr/local/sbin/shutdown"
+chmod 755 "$ROOT/usr/local/sbin/shutdown"
+for verb in poweroff reboot halt; do
+    ln -sf shutdown "$ROOT/usr/local/sbin/$verb"
+done
+
 # The message of the day, which is where a person is told that this is a live
 # session and how to put it on a disk, and the pictures beside it. Both are
 # compiled into tos as well, so the screens have one whatever happens to /etc;
@@ -871,6 +885,43 @@ cp "$PREVIEW_BIN" "$ROOTFS/sbin/tos-preview"
 cp iso/live-session "$ROOTFS/sbin/tos-session"
 chmod 755 "$ROOTFS/sbin/tos" "$ROOTFS/sbin/tos-install" \
     "$ROOTFS/sbin/tos-preview" "$ROOTFS/sbin/tos-session"
+
+# `shutdown` and the three words beside it, in /usr/local/sbin where they are
+# found before Debian's (#158).
+#
+# On an installed machine /sbin/shutdown is systemd-sysv's symlink to
+# systemctl, and a pane runs as the person rather than as root (#119). There
+# is no way for that person to reach PID 1 on this image: no D-Bus, so no
+# logind to ask and no polkit to ask it — the note beside the masked
+# wpa_supplicant.service below is the same fact from the other end — and
+# /run/systemd/private is `srwx------ root root`. So the command everybody
+# turns a computer off with exited 1 saying `Failed to connect to bus`, and
+# the machine stayed up. The live image was unaffected only because its
+# session is root.
+#
+# /usr/local/sbin rather than replacing /sbin/shutdown: that symlink is
+# dpkg's, and a file tOS writes over it is one the next `apt upgrade` of
+# systemd-sysv takes back without telling anybody. /usr/local is the
+# directory the FHS keeps for exactly this, and it is first on the PATH
+# iso/live-session exports.
+#
+# It is half the answer; the other half is the installer's sudoers drop-in,
+# which names this very file — not /sbin/shutdown, because sudo matches a
+# command by inode as well as by name and those four /sbin names are one
+# systemctl, so granting them would be granting `sudo systemctl <anything>`.
+# The shim re-runs itself under `sudo -n` and the root pass hands over to
+# /sbin, which keeps the passwordless part bounded by what this file will do.
+# `POWER_PROGRAM` in installer/src/install.rs is the whole of it. Neither is
+# D-Bus and polkit,
+# which is what the rest of the world does and what #158 turned down for now:
+# that needs a logind session this compositor does not create, and the seat
+# is #22's question as well.
+mkdir -p "$ROOTFS/usr/local/sbin"
+cp iso/shutdown "$ROOTFS/usr/local/sbin/shutdown"
+chmod 755 "$ROOTFS/usr/local/sbin/shutdown"
+for verb in poweroff reboot halt; do
+    ln -sf shutdown "$ROOTFS/usr/local/sbin/$verb"
+done
 
 # And the wireless witness, which is a test rather than a part of the system —
 # on the image because the machine it has to run on is one that was booted
