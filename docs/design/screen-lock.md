@@ -640,11 +640,19 @@ repaints only the cells a pane marked as damaged, so a box painted on top of a
 session leaves the whole of the rest of that session where it was, status bar
 and pane titles included.
 
-The clear runs on **every** locked frame and not only on the first. A DRM
-display has two buffers and hands out the one it is not scanning out, so a
-clear that ran once cleared one of them and the next flip would put the session
-back on the screen. `tests/lock.rs` renders into two framebuffers in turn to
-say so.
+The clear runs on every locked frame that cannot know what is already on the
+surface it was handed. It used to run on **every** locked frame full stop, and
+the reason was a display with two buffers handing out the one it is not
+scanning out: a clear that ran once cleared one of them, and the next flip put
+the session back on the screen. That display stopped existing at
+[#105](https://github.com/m96-chan/tOS/issues/105) — the DRM backend
+composites into one shadow and copies out what changed, and the second dumb
+buffer is squared by `Shadow::owed` — and a clear on every frame became a
+whole display repainted twice a second for a caret that does not blink. See
+*A locked screen stands still* at the end of this document (#164). The
+two-framebuffer case is still what a backend that does not retain its contents
+looks like, and `tests/lock.rs` still renders into two of them in turn to say
+that such a display gets the session erased out of both.
 
 A screen too small to draw the box in is still locked; it simply has nowhere to
 say so. That is the one direction the drawing is allowed to fail in, and it is
@@ -772,3 +780,87 @@ that is written down rather than fixed. It is worth saying plainly that this is
 the weakest joint in the chain — everything else here holds against somebody at
 the keyboard, and this one does not hold against somebody who can make the
 compositor die.
+
+## A locked screen stands still
+
+**Issue #164.** Reported as a flicker: on the lock screen and on the login
+screen, the screen blinks and what was there before shows through. Neither
+screen has anything moving on it.
+
+### What was happening
+
+Two rules met badly.
+
+`Compositor::tick` flipped the caret phase every 530 ms and called it a change
+— and **the lock's caret does not blink**. `LockScreen::draw_field` has never
+been handed the phase; the block in the password field is drawn solid. So the
+flip was a change to nothing.
+
+`Compositor::render_locked` erased the display and drew the box again for
+every frame it was asked for, because the frontispiece composites with alpha
+and cannot be painted over its own last result. So the change to nothing cost
+the whole screen.
+
+Measured at 800x480, three frames with nothing touched between them:
+
+| | first | second | third |
+|---|---|---|---|
+| a login screen | 384,000 px | 384,000 | 384,000 |
+| a session | 384,000 px | 17,864 | 17,864 |
+
+Twice a second, for as long as a machine sat at a login screen or a locked
+one. On the panel that is a whole-screen `Shadow::copy_out` and a
+`Scanout::present` — and `present` is a page flip only where the driver
+reports its flips. Where it does not, `reports_flips` is false and every
+present is a mode set, which is a panel that blinks twice a second. A session
+does not show it because a session's frames are the caret cell and nothing
+else, which is exactly why the two screens in the report are the lock and the
+login.
+
+### What it is now
+
+**The blink stands still behind a lock**, the way it already stood still
+behind a blank — "a cursor nobody can see does not need to be somewhere in
+particular" — and for the same reason arriving from the other side: a caret
+drawn solid has no phase to be in.
+
+**And so does everything else `tick` finds.** A reading that moved, a minute
+turning over, a lease landing, an animated image advancing: none of them is on
+a screen the lock covers, because no bar is drawn, the notification queue
+already stands still, and the panes are behind the box. All of it still
+*happens* — a locked machine is still a machine, and #124's whole point is a
+link brought up with nobody there — but none of it is a reason to paint.
+`tick_at` keeps what the lock itself needs in `lock_changed` and drops the
+rest.
+
+**The countdown keeps its frame.** "try again in 12s" has to become 11, and
+the blink frame that used to carry it is the frame that no longer happens. So
+the metronome is kept and only its meaning changes: while a lock is up, an
+interval means "ask for a frame if the count is moving", and nothing else. One
+of that count's moves is off the end — the message going back to "wrong
+password" when the wait is over — so an interval that finds no wait still
+draws when the one before it had one. Without that, a box would sit telling
+somebody to wait for a second that had already passed.
+
+**And the panes behind it do not ask either.** A pane goes on running while
+the screen is locked and none of its output reaches the screen, so the frame
+that output asked for drew the box again and dropped the damage it came for
+unread — once per burst of output, for as long as a build or a `tail -f` was
+left running. Asked in both places it can be asked: where the output arrives
+in `run_once`, and in `needs_render`, because damage outlives the pass it was
+marked on and a locked screen that said yes there would draw ten times a
+second.
+
+**And the frames that do happen are partial.** `render_locked` takes
+`retained` like every other frame. It erases when it cannot know what is on the
+surface — `needs_full_redraw`, a backend that does not retain, or an arrow
+that has moved, since what an arrow uncovers can be the picture — and
+otherwise repaints the box alone, which is `Repaint::TheBox`. That split is
+not taste: the box **paints its own background** before it draws its border,
+so putting it down again gives the same pixels an erase would; the picture
+carries alpha, and a second pass over its own result is a different picture.
+
+A locked screen now asks for **no frames at all** unless something on it has
+moved — the count, a keystroke, an arrow — whatever the machine and the panes
+behind it are doing. The ones it does ask for cost the box (58,080 px at
+800x480) rather than the display.
