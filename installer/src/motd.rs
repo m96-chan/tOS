@@ -27,6 +27,19 @@
 //! [`place`] is deliberately the sequence its `transmit::sequence` builds —
 //! room scrolled up first, because `a=T` clips at the bottom of the screen
 //! rather than scrolling, and the cursor walked back down afterwards.
+//!
+//! ## And the picture drawn in cells
+//!
+//! A terminal at the far end of an `ssh` cannot be sent the picture — that is
+//! what [`Screen::probe`] refuses — but it can draw one, in the half blocks
+//! `chafa` produces and [`art_runs`] has always parsed. So there is a third
+//! rung between the two (#162): [`ASCII`], the same splash rendered into
+//! cells once and checked in, printed by any terminal the whole greeting fits
+//! on. The ladder is the picture, then this, then the drawn banner: each rung
+//! is what the one above gives way to, and the bottom one is unconditional,
+//! because a greeting has to arrive. ([`ART_SMALL`] is not on it — that is
+//! the floor of the installer's own welcome screen, which has a box to fit
+//! the banner inside and can end up with no room at all.)
 
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
@@ -47,6 +60,20 @@ pub const ART_SMALL: &str = "tOS — the terminal is the desktop";
 
 /// Where the live image keeps the art, so it can be changed without a rebuild.
 pub const ART_PATH: &str = "/etc/tos/motd_art";
+
+/// The picture drawn in cells, for a terminal that cannot be sent the file.
+///
+/// Half blocks with a true colour foreground and background: two rows of
+/// picture in every row of cells, which is what `chafa` produces and what
+/// [`art_runs`] was written to read. It is checked in rather than rendered
+/// during the build because rendering it wants `chafa`, and a banner is not
+/// worth a build dependency — `docs/design/splash.md` says the command that
+/// makes it again when the picture changes.
+pub const ASCII: &str = include_str!("../../.motd_ascii");
+
+/// Where the live image keeps that render, so it too can be changed without a
+/// rebuild. The same door [`ART_PATH`] opens, for the same reason.
+pub const ASCII_PATH: &str = "/etc/tos/motd_ascii";
 
 /// The picture a pane is shown instead of the drawn banner.
 ///
@@ -94,6 +121,11 @@ pub fn is_installed() -> bool {
 /// Load the banner, preferring the copy on this machine.
 pub fn art() -> String {
     std::fs::read_to_string(ART_PATH).unwrap_or_else(|_| ART.to_string())
+}
+
+/// Load the picture drawn in cells, preferring the copy on this machine.
+pub fn ascii() -> String {
+    std::fs::read_to_string(ASCII_PATH).unwrap_or_else(|_| ASCII.to_string())
 }
 
 /// A run of characters in the banner that share one style.
@@ -306,11 +338,13 @@ pub fn message() -> String {
 
 /// The greeting for whichever machine this is, on whichever terminal this is.
 ///
-/// A pane gets the picture; everything else — a serial console, a kernel VT,
-/// somebody logged in from another machine — gets the banner drawn in cells,
-/// because it is the one of the two that is certain to arrive.
-pub fn greeting(screen: Option<Screen>) -> String {
-    greeting_from(screen, Path::new(PICTURE_PATH))
+/// A pane gets the picture. A terminal that cannot be sent one but has room to
+/// draw it — an `ssh` from anywhere, most often — gets the same picture in
+/// cells. Everything left over gets the banner, which fits anything and is
+/// certain to arrive: `size` is `None` for a terminal that could not even be
+/// asked how big it is.
+pub fn greeting(screen: Option<Screen>, size: Option<(u32, u32)>) -> String {
+    greeting_from(screen, size, Path::new(PICTURE_PATH))
 }
 
 /// The same, with the picture named rather than assumed.
@@ -320,11 +354,63 @@ pub fn greeting(screen: Option<Screen>) -> String {
 /// running it. Not a setting — the greeting and the login screen draw the same
 /// file on purpose, and a second way to name it would be a way for them to
 /// disagree.
-pub fn greeting_from(screen: Option<Screen>, path: &Path) -> String {
-    match screen.and_then(|screen| picture(screen, path)) {
-        Some(banner) => greeting_under(banner),
-        None => message(),
+pub fn greeting_from(screen: Option<Screen>, size: Option<(u32, u32)>, path: &Path) -> String {
+    if let Some(sent) = screen.and_then(|screen| picture(screen, path)) {
+        return greeting_under(sent);
     }
+    if let Some((cols, rows)) = size {
+        let drawn = greeting_under(ascii_banner());
+        if fits(&drawn, cols, rows) {
+            return drawn;
+        }
+    }
+    message()
+}
+
+/// The picture drawn in cells, with the line it does not say underneath it.
+fn ascii_banner() -> String {
+    let mut art = ascii();
+    if !art.ends_with('\n') {
+        art.push('\n');
+    }
+    let width = art_width(&art) as u32;
+    art.push_str(&tagline(width));
+    art
+}
+
+/// Whether a greeting reaches a terminal this size as it was drawn.
+///
+/// Width is the question that matters. One cell too wide and every line wraps,
+/// and a picture whose every other row starts a column further along is not a
+/// picture — where the banner that fits is at least what it was meant to be.
+///
+/// Height is asked too, and not because text cannot scroll. The rows above the
+/// prompt are all anybody sees without reaching for the scrollback, and a
+/// greeting with three rows of somebody's hair at the top of it says less than
+/// the small banner it gave way to. Both are the same rule the picture already
+/// follows for the same reason (`fit`): the banner is the part that gives way,
+/// because the ten lines under it are the part being read.
+fn fits(greeting: &str, cols: u32, rows: u32) -> bool {
+    // Counted as it is printed. `art_lines` is the wrong ruler here: it drops
+    // the blank line the greeting ends on, and a blank line is a row the
+    // terminal spends like any other.
+    art_width(greeting) as u32 <= cols && greeting.lines().count() as u32 <= rows
+}
+
+/// How big the terminal on `fd` is, in cells, whatever terminal it is.
+///
+/// [`Screen::probe`] answers for the one terminal a picture can be sent to and
+/// says nothing about any other, because that is all a picture needs to know.
+/// This is the question every terminal answers: an `ssh`, a serial line and a
+/// kernel VT all fill in `ws_col` and `ws_row` where they leave the pixel
+/// fields zero. `None` is something that is not a terminal at all — a pipe
+/// into `less`, or a shell started with no tty — which gets the banner.
+pub fn cells(fd: RawFd) -> Option<(u32, u32)> {
+    let size = tty::terminal_size(fd).ok()?;
+    if size.cols == 0 || size.rows == 0 {
+        return None;
+    }
+    Some((size.cols as u32, size.rows as u32))
 }
 
 fn greeting_under(banner: String) -> String {
@@ -397,11 +483,14 @@ pub fn picture(screen: Screen, path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     let size = tos_term::png::dimensions(&bytes).ok()?;
     let cells = fit(screen, size)?;
-    let indent = " ".repeat(((cells.0.saturating_sub(TAGLINE.len() as u32)) / 2) as usize);
-    Some(format!(
-        "{}{indent}{TAGLINE_COLOUR}{TAGLINE}\x1b[0m\n",
-        place(path, cells)
-    ))
+    Some(format!("{}{}", place(path, cells), tagline(cells.0)))
+}
+
+/// What the banner says in words, centred under something that says it in
+/// pixels: the picture, and the picture drawn in cells.
+fn tagline(width: u32) -> String {
+    let indent = " ".repeat(((width.saturating_sub(TAGLINE.len() as u32)) / 2) as usize);
+    format!("{indent}{TAGLINE_COLOUR}{TAGLINE}\x1b[0m\n")
 }
 
 /// How many cells to give the picture.
@@ -691,7 +780,7 @@ mod tests {
         // Nothing is on file descriptor -1, and a greeting has to come out
         // anyway.
         assert_eq!(Screen::probe(-1), None);
-        assert_eq!(greeting(None), message());
+        assert_eq!(greeting(None, None), message());
     }
 
     #[test]
@@ -705,6 +794,120 @@ mod tests {
         assert!(
             !greeting.contains('\u{2588}'),
             "the drawn banner was printed under the picture as well"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- the picture drawn in cells (#162) -------------------------------
+
+    /// The smallest terminal the render is chosen on, worked out from the
+    /// greeting itself: the tests below are then the rule rather than a copy
+    /// of whatever the file in the tree happens to measure today.
+    fn smallest() -> (u32, u32) {
+        let greeting = greeting_under(ascii_banner());
+        (art_width(&greeting) as u32, greeting.lines().count() as u32)
+    }
+
+    #[test]
+    fn the_render_is_compiled_in() {
+        assert!(!ASCII.trim().is_empty());
+        assert!(
+            ASCII.contains('\u{2584}'),
+            "the render should be drawn in half blocks"
+        );
+        assert!(
+            ASCII.contains("\x1b[38;2;"),
+            "the render should carry true colour"
+        );
+    }
+
+    #[test]
+    fn the_render_is_a_rectangle() {
+        // A ragged line is a line that was measured wrong, and the fit is
+        // decided on the widest one.
+        let widths: Vec<usize> = art_lines(ASCII)
+            .iter()
+            .map(|line| tos_term::str_width(line))
+            .collect();
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "the render is ragged: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn a_terminal_with_room_for_it_is_shown_the_picture_in_cells() {
+        let (cols, rows) = smallest();
+        let greeting = greeting(None, Some((cols, rows)));
+        assert!(
+            greeting.contains('\u{2584}'),
+            "a terminal with room got no render"
+        );
+        assert!(
+            greeting.contains(TAGLINE),
+            "the render has no words of its own, so the greeting says them"
+        );
+        assert!(
+            greeting.contains("ctrl+shift+enter"),
+            "the keys are part of the greeting whatever is above them"
+        );
+        assert!(
+            !greeting.contains('\u{2588}'),
+            "the drawn banner was printed as well"
+        );
+    }
+
+    #[test]
+    fn the_greeting_chosen_for_a_terminal_is_printed_inside_it() {
+        // Measured with a different ruler than `fits` uses: the rows a
+        // terminal spends are the newlines that reach it, and the columns are
+        // the widest line after the escapes come out. A greeting chosen for a
+        // terminal has to be within both, or the rule is measuring something
+        // other than what arrives.
+        let (cols, rows) = smallest();
+        let greeting = greeting(None, Some((cols, rows)));
+        assert!(
+            greeting.contains('\u{2584}'),
+            "this is the terminal the render is chosen on"
+        );
+        assert!(greeting.matches('\n').count() as u32 <= rows, "too tall");
+        assert!(art_width(&greeting) as u32 <= cols, "too wide");
+    }
+
+    #[test]
+    fn one_cell_too_narrow_or_too_short_is_the_drawn_banner() {
+        // Wrapping is what this is avoiding, and a picture mostly above the
+        // screen says less than a small one wholly on it.
+        let (cols, rows) = smallest();
+        assert_eq!(greeting(None, Some((cols - 1, rows))), message());
+        assert_eq!(greeting(None, Some((cols, rows - 1))), message());
+    }
+
+    #[test]
+    fn a_terminal_that_cannot_be_asked_its_size_gets_the_drawn_banner() {
+        // Nothing is on file descriptor -1, and a greeting has to come out.
+        assert_eq!(cells(-1), None);
+        assert_eq!(greeting(None, None), message());
+    }
+
+    #[test]
+    fn an_eighty_column_console_gets_the_banner_it_always_got() {
+        // The floor for any terminal, and under the render's width: a serial
+        // line and a kernel VT are exactly where the small banner has to win.
+        assert_eq!(greeting(None, Some((80, 24))), message());
+    }
+
+    #[test]
+    fn a_pane_is_still_sent_the_picture_rather_than_the_render() {
+        // Both rungs are available on a pane this size. The picture is real
+        // pixels and wins.
+        let path = picture_file("cells", 512, 170);
+        let (cols, rows) = smallest();
+        let sent = greeting_from(Some(pane(cols, rows)), Some((cols, rows)), &path);
+        assert!(sent.contains("t=f"), "the pane lost its picture");
+        assert!(
+            !sent.contains('\u{2584}'),
+            "the render was sent to the pane as well"
         );
         let _ = std::fs::remove_file(&path);
     }

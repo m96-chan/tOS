@@ -309,12 +309,20 @@ In a pane the banner is not what a shell prints at all. `/etc/tos/splash.png`
 is on the image beside it — the picture the login screen draws — and a shell
 that finds itself in a tOS pane sends the terminal that file's *path* over the
 graphics protocol, so the real picture arrives for the price of a hundred byte
-escape. The drawn banner is what everything else gets: a serial console, the
-kernel VT the rescue session lands on, and anybody logged in from another
-machine. What decides is whether `TOS` is in the environment and whether the
+escape. What decides is whether `TOS` is in the environment and whether the
 terminal filled in the pixel fields of its `winsize`, which tOS does for every
 pane and the kernel's VT does not. Replacing `splash.png` changes the login
 screen and the greeting together, which is why there is one file.
+
+A terminal that cannot be sent the picture is shown it drawn in cells instead,
+where there is room: `/etc/tos/motd_ascii`, the same picture rendered once into
+half blocks, printed whenever the whole greeting fits the terminal — 120 cells
+by 29 on an installed machine, and by 32 in a live session, where there are
+three more lines to say about installing. That is a maximized window at the
+far end of an `ssh`, and not an 80-column console. Below it the drawn banner,
+as it has always been:
+the serial console, the kernel VT the rescue session lands on, and anybody
+logged in from another machine on a smaller screen.
 
 `/etc/tos/lock.png` is beside it and is the other picture: the one in the
 bottom right corner of a locked screen. It is a second file rather than a

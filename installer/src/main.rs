@@ -48,10 +48,12 @@ fn main() -> ExitCode {
     }
     if has("--motd") {
         // Used by the live image's shell profile. The terminal is asked what
-        // it is before anything is written to it: a pane gets the picture and
-        // everything else gets the banner drawn in cells (#132).
-        let screen = motd::Screen::probe(std::io::stdout().as_raw_fd());
-        print!("{}", motd::greeting(screen));
+        // it is before anything is written to it: a pane gets the picture
+        // (#132), a terminal with room for it gets that picture drawn in
+        // cells, and anything else gets the banner (#162).
+        let fd = std::io::stdout().as_raw_fd();
+        let screen = motd::Screen::probe(fd);
+        print!("{}", motd::greeting(screen, motd::cells(fd)));
         return ExitCode::SUCCESS;
     }
 

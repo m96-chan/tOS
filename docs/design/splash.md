@@ -161,6 +161,10 @@ answers:
 | a tOS pane | `/etc/tos/splash.png`, over the graphics protocol |
 | anything else | the banner drawn in cells, as before |
 
+*Since #162 there is a third answer between them — the same picture drawn in
+cells, for a terminal that cannot be sent it and has room to draw it. See "And
+the picture, drawn in cells" below.*
+
 **A path, not a payload.** The picture goes as `t=f` — the compositor is told
 the file's name and opens it — so the escape is a hundred bytes whether the
 picture is a hundred kilobytes or ten megabytes, and nothing travels through
@@ -210,6 +214,80 @@ its compiled-in copy. `iso/mkiso.sh` puts it there beside `motd_art`, and the
 installer carries it onto the disk with the rest of `/etc`. A machine that
 replaces it has replaced both screens at once, which is the point of there
 being one file rather than two.
+
+## And the picture, drawn in cells
+
+**Issue #162.** Decided: one more rung on the ladder, `.motd_ascii`, between
+the picture and the banner.
+
+The two answers above were the right two while "anything else" meant a serial
+console and a rescue VT. It stopped being: an installed machine runs an init
+that starts `openssh-server` for itself (#110) and gets an address without
+anybody sitting down at it (#124), so the ordinary way into a tOS machine is
+now the one path that was written for the terminals tOS has no say over. What
+such a terminal saw of tOS was a 46-column rectangle.
+
+It cannot be sent the picture — that is exactly what the `TOS` question above
+refuses, and refuses correctly. It can draw one. Half blocks carrying a true
+colour foreground and a true colour background are two rows of picture per row
+of cells, which is what `chafa` produces, what every emulator anybody `ssh`s
+from has drawn for years, and what `motd::art_runs` was already written to
+read — its test fixture has been chafa output since the installer learned to
+put a banner on its welcome screen.
+
+**A file, not a build step.** `.motd_ascii` is checked in beside `.motd_art`,
+compiled into the installer with `include_str!`, copied to
+`/etc/tos/motd_ascii` by `iso/mkiso.sh`, and read from there in preference to
+the compiled copy — the same door `/etc/tos/motd_art` and `/etc/tos/splash.png`
+open, for the same reason. It is made from `splash.png` the way this makes
+one:
+
+```sh
+chafa --format symbols --symbols vhalf --size 120x20 --colors full \
+    compositor/tos-compositor/assets/splash.png > .motd_ascii
+```
+
+The file is the artefact and the command is only how it was got: a different
+`chafa` renders the same picture differently, so a build step would make the
+greeting depend on which one the builder happened to have. Rendering it is
+also the one thing here that wants a tool nobody needs otherwise, and a banner
+is not worth a build dependency. **The cost is that it is a copy**: change
+`splash.png` and this does not follow. That is the same bargain as the tagline
+being a copy of the last line of `.motd_art`, and it is written down here
+because nothing enforces it.
+
+**What decides.** The whole greeting has to fit the terminal, in cells, as it
+was drawn — `motd::fits`, against `TIOCGWINSZ`. Width is the half that
+matters: one cell too wide and every line wraps, and a picture whose every
+other row begins a column further along is not a picture, where the small
+banner at least arrives as what it was meant to be. Height is asked for a
+softer reason — text scrolls, and nothing is lost — but the rows above the
+prompt are all anybody sees without reaching for the scrollback, and a
+greeting that opens on three rows of somebody's hair says less than the banner
+that fits whole. It is the rule `fit` already follows for the picture: the
+banner is the part that gives way, because the lines under it are the part
+being read.
+
+For the file in the tree that comes to **120 by 32** in a live session and
+**120 by 29** on an installed machine — the greeting is three lines shorter
+once there is no disk left to offer, and the installed machine is the one
+being `ssh`'d into. Either number is a maximized terminal window and neither
+is an 80-column console, which goes on getting what it always got. A second,
+narrower render would reach it, at the price of a second copy to keep in step
+with `splash.png` by hand, and one copy is enough to be going on with.
+
+**Asking every terminal, not only tOS's own.** `Screen::probe` returns nothing
+without `TOS` in the environment, so before this the greeting knew nothing at
+all about a terminal it had not started. `motd::cells` is the question every
+terminal answers — an `ssh`, a serial line and a kernel VT all fill in
+`ws_col` and `ws_row` where they leave the pixel fields at zero — and it is
+asked separately, so that "can be sent a picture" stays the one thing
+`Screen` means. Nothing is a terminal for a pipe into `less`, and that gets
+the banner.
+
+**The words this picture does not have either.** The tagline goes under it,
+centred, by the same function that puts it under the picture. The render has
+the tOS in the artwork and no sentence anywhere.
 
 ## The colours the session is drawn in
 
