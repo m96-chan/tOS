@@ -291,6 +291,21 @@ pub struct Compositor {
     /// explicit copy writes, and 'p' is primary, which the mouse writes.
     clipboard: HashMap<char, Vec<u8>>,
     blink_visible: bool,
+    /// The phase the caret was last *painted* in.
+    ///
+    /// `draw_cursor` puts the block down on every frame a pane is drawn, and
+    /// nothing takes it away: the block is erased only by the cell under it
+    /// being repainted, and `render` skips a row that is not dirty. So a
+    /// phase that flipped with nothing else happening repainted nothing and
+    /// left the caret exactly where it was — the caret did not blink, it
+    /// stayed lit until something else dirtied its row (#169).
+    ///
+    /// Held beside the phase rather than folded into it because they are two
+    /// different questions — what the caret should be, and what it is — and
+    /// the answer to the second one is only known here. It is the arrow's
+    /// trick: [`Compositor::pointer_moved_since_it_was_drawn`] compares wanted
+    /// against painted and retires itself after the frame that squares them.
+    blink_painted: bool,
     last_blink: Instant,
     /// Everything the compositor and its panes have had to say, queued for the
     /// status bar and kept for the history list.
@@ -471,6 +486,7 @@ impl Compositor {
             size,
             clipboard: HashMap::new(),
             blink_visible: true,
+            blink_painted: true,
             last_blink: Instant::now(),
             notifications: Notifications::new(),
             overlay: None,
@@ -915,7 +931,15 @@ impl Compositor {
                 // It comes back on the next motion, so getting it back costs
                 // the same gesture as wanting it.
                 let put_away = self.pointer.hide();
-                self.handle_key(key) || put_away
+                // And brings the caret back lit. The phase belongs to a caret
+                // nobody is touching; somebody typing is looking straight at
+                // it, and every terminal emulator holds it solid for them
+                // (#169). It also makes the frame that draws the character
+                // the frame that draws the caret with it, rather than one
+                // that happens to catch the phase in its off half.
+                let relit = !std::mem::replace(&mut self.blink_visible, true);
+                self.last_blink = Instant::now();
+                self.handle_key(key) || put_away || relit
             }
             // A host terminal reports cells; a device reports pixels. The two
             // are separate types so the conversion can never be skipped, and
@@ -3469,6 +3493,22 @@ impl Compositor {
         let area = self.grid_area();
         let focus = self.session.focus();
         let geometry = self.session.active().geometry(area);
+
+        // The caret is the same trick with a different owner. `draw_cursor`
+        // paints the block on every frame and nothing erases it, so a phase
+        // that flipped with nothing else happening repainted no row and left
+        // the old caret standing: the caret did not blink, it stayed lit
+        // until something else dirtied its row — usually the next keystroke,
+        // which is what made it look as though typing was what moved it
+        // (#169). Only the focused pane, because an unfocused one draws a
+        // hollow caret that does not blink at all.
+        if self.blink_painted != self.blink_visible {
+            self.blink_painted = self.blink_visible;
+            if let Some(pane) = self.panes.get_mut(&focus) {
+                let row = pane.terminal.cursor().y;
+                pane.terminal.damage_mut().mark_row(row);
+            }
+        }
 
         // The preedit is in nobody's grid, so nothing marks the rows it
         // covered as needing another look: `render()` skips a row that is not
