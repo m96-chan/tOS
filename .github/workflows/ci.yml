@@ -26,7 +26,7 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Tests run on whatever stable is, so a compiler that genuinely breaks
       # tOS is caught rather than pinned away from.
       - uses: dtolnay/rust-toolchain@stable
@@ -43,7 +43,7 @@ jobs:
     name: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.LINT_TOOLCHAIN }}
@@ -86,7 +86,7 @@ jobs:
             # Android embeds the compositor, without the PC disk installer.
             packages: -p tos-compositor -p tos-android
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.LINT_TOOLCHAIN }}
@@ -104,7 +104,7 @@ jobs:
     name: shell scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Syntax
         run: |
           # The container and initramfs scripts are POSIX shell; build.sh and
@@ -135,7 +135,7 @@ jobs:
     name: Android package boundaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Test package assembly without network or SDK
         run: python3 -m unittest discover -s android/userland -p 'test_*.py' -v
       - name: Test the gate on the guest binaries the initramfs carries
