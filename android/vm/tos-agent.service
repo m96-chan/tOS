@@ -1,0 +1,14 @@
+[Unit]
+Description=tOS app session bridge
+After=local-fs.target
+
+[Service]
+ExecStart=/usr/lib/tos/agent
+Restart=on-failure
+RestartSec=1
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -114,7 +114,7 @@ jobs:
             android/install-termux.sh android/termux-launcher.sh; do
             sh -n "$script" || exit 1
           done
-          for script in iso/build.sh iso/run.sh iso/check-rootfs.sh iso/bashrc android/build.sh android/build-apk.sh android/test-device.sh android/userland/bashrc; do
+          for script in iso/build.sh iso/run.sh iso/check-rootfs.sh iso/bashrc android/build.sh android/build-apk.sh android/test-device.sh android/userland/bashrc android/vm/*.sh android/vm/bashrc; do
             bash -n "$script" || exit 1
           done
       - name: Shellcheck
@@ -125,11 +125,11 @@ jobs:
           # profiles and the rc file, which are sourced and so have none.
           shellcheck --severity=warning iso/build.sh iso/run.sh iso/mkiso.sh \
             iso/init iso/live-session iso/check-rootfs.sh iso/wifi-witness.sh \
-            iso/shutdown android/build.sh android/build-apk.sh android/test-device.sh android/install-termux.sh android/termux-launcher.sh
+            iso/shutdown android/build.sh android/build-apk.sh android/test-device.sh android/install-termux.sh android/termux-launcher.sh android/vm/*.sh
           shellcheck --shell=sh --severity=warning iso/profile iso/dot-profile
           # The rc file is bash by definition: it exists because bash reads it
           # where it reads neither /etc/profile nor $ENV.
-          shellcheck --shell=bash --severity=warning iso/bashrc android/userland/bashrc
+          shellcheck --shell=bash --severity=warning iso/bashrc android/userland/bashrc android/vm/bashrc
 
   android-packaging:
     name: Android package boundaries
@@ -138,3 +138,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test package assembly without network or SDK
         run: python3 -m unittest discover -s android/userland -p 'test_*.py' -v
+      - name: Test VM protocol stream boundaries
+        run: bash android/vm/test-protocol.sh

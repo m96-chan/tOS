@@ -21,7 +21,7 @@ PREFIX = 'data/data/com.termux/files/usr/'
 SEEDS = ['bash', 'git', 'curl', 'less', 'neovim', 'ripgrep', 'fzf', 'openssh',
          'rsync', 'unzip', 'file', 'mandoc', 'yazi', 'htop', 'coreutils',
          'findutils', 'grep', 'sed', 'gawk', 'tar', 'gzip', 'bzip2', 'xz-utils',
-         'ca-certificates', 'procps', 'util-linux', 'diffutils']
+         'ca-certificates', 'procps', 'util-linux', 'diffutils', 'libslirp']
 # This package sets up the Termux app and package manager, not a library.
 # tOS supplies its own installation, shell setup and executable locations.
 REPLACED = {'termux-tools'}
@@ -173,6 +173,8 @@ def assemble(lock, archives, font_archive, output):
             if name in ('bin/nvim', 'share/man/mandoc.db'):
                 continue  # Replaced with a relocatable LuaJIT launcher below.
             if data.startswith(b'\x7fELF'):
+                if len(data) >= 18 and int.from_bytes(data[16:18], 'little') == 1:
+                    continue  # Build-time relocatable objects are not runtime programs.
                 validate_elf(data, name)
                 filename = 'libtos_pkg_' + hashlib.sha256(name.encode()).hexdigest()[:24] + '.so'
                 (native / filename).write_bytes(data)
@@ -196,6 +198,7 @@ def assemble(lock, archives, font_archive, output):
         # These programs are built by build-apk.sh and signed alongside the packages.
         links['bin/tos-motd'] = ('N', 'libtos_motd.so')
         links['lib/libtos_paths.so'] = ('N', 'libtos_paths.so')
+        links['bin/tos-vmclient'] = ('N', 'libtos_vmclient.so')
         if 'bin/sh' not in links and 'bin/sh' not in files:
             links['bin/sh'] = ('S', 'bash')
         write('share/tos/links.tsv', ''.join(

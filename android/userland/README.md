@@ -1,4 +1,10 @@
-# Bundled Android tools
+# Bundled Android host runtime
+
+The current APK runs user shells/tools in an app-owned Debian VM. This
+directory retains the previous Android-native bundle and now supplies
+libslirp, its host dependencies and HackGen to that VM frontend. The native
+shell/package limitations below describe the legacy host bundle, not Debian;
+Debian supports apt. See [../README.md](../README.md).
 
 `packages.lock.json` pins the ARM64 packages from the official
 [Termux package repository](https://packages.termux.dev/apt/termux-main/)

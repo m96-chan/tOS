@@ -77,6 +77,16 @@ class PackagingTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 self.assemble([(name, b'data')])
 
+    def test_build_time_elf_objects_are_not_installed_as_executables(self):
+        relocatable = bytearray(elf())
+        struct.pack_into('<H', relocatable, 16, 1)  # ET_REL has no load segments.
+        struct.pack_into('<HH', relocatable, 54, 0, 0)
+        result = self.assemble([('lib/build.o', bytes(relocatable)), ('lib/runtime.so', elf())])
+        self.assertEqual(len(list((result / 'lib/arm64-v8a').glob('*.so'))), 1)
+        with zipfile.ZipFile(result / 'assets/userland.zip') as archive:
+            self.assertNotIn('lib/build.o', archive.namelist())
+            self.assertNotIn('build.o', archive.read('share/tos/links.tsv').decode())
+
     def test_rejects_links_outside_prefix(self):
         for target in ('../../escape', '/etc/passwd', '/' + prepare.PREFIX + '../escape', 'tool\nN'):
             with self.subTest(target=target), self.assertRaises(ValueError):

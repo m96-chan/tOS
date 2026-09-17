@@ -1,0 +1,12 @@
+# shellcheck shell=bash
+export TERM=xterm-256color COLORTERM=truecolor EDITOR=nvim VISUAL=nvim PAGER=less
+export LESS=-R TOS=1
+PS1='\[\e[38;2;145;180;135m\]$\[\e[0m\] '
+shopt -s histappend checkwinsize
+alias ll='ls -lah'
+if [ -z "${TOS_MOTD_SHOWN:-}" ]; then
+    export TOS_MOTD_SHOWN=1
+    printf '\033_Ga=T,f=100,t=d,q=2;'
+    base64 -w0 /usr/share/tos/splash.png
+    printf '\033\\\n\033[38;2;145;180;135mtOS\033[0m — Debian VM\n\n'
+fi

@@ -29,7 +29,8 @@
     "ca-certificates",
     "procps",
     "util-linux",
-    "diffutils"
+    "diffutils",
+    "libslirp"
   ],
   "replaced": [
     "termux-tools"
@@ -157,6 +158,17 @@
       "Description": "Programming language designed for text processing"
     },
     {
+      "Package": "gdbm",
+      "Version": "1.26-1",
+      "Architecture": "aarch64",
+      "Filename": "pool/main/g/gdbm/gdbm_1.26-1_aarch64.deb",
+      "SHA256": "c378de833aae3cf41f3028491ea11836479d9833ab653edc27d0c0e0e691d5c5",
+      "Size": "150284",
+      "Homepage": "https://www.gnu.org.ua/software/gdbm/",
+      "Depends": "readline",
+      "Description": "Library of database functions that use extensible hashing"
+    },
+    {
       "Package": "git",
       "Version": "2.55.0",
       "Architecture": "aarch64",
@@ -166,6 +178,17 @@
       "Homepage": "https://git-scm.com/",
       "Depends": "libcurl, libexpat, libiconv, less, openssl, pcre2, zlib",
       "Description": "Fast, scalable, distributed revision control system"
+    },
+    {
+      "Package": "glib",
+      "Version": "2.90.0",
+      "Architecture": "aarch64",
+      "Filename": "pool/main/g/glib/glib_2.90.0_aarch64.deb",
+      "SHA256": "fee438e69505cda78f29e6662afb04613947f56db3e8d1557f25a0a5c3ea7c9c",
+      "Size": "2572036",
+      "Homepage": "https://developer.gnome.org/glib/",
+      "Depends": "libandroid-support, libffi, libiconv, pcre2, resolv-conf, zlib, python",
+      "Description": "Library providing core building blocks for libraries and applications written in C"
     },
     {
       "Package": "grep",
@@ -322,6 +345,17 @@
       "Description": "Library making programming with POSIX capabilities easier than traditional libcap"
     },
     {
+      "Package": "libcrypt",
+      "Version": "0.2-6",
+      "Architecture": "aarch64",
+      "Filename": "pool/main/libc/libcrypt/libcrypt_0.2-6_aarch64.deb",
+      "SHA256": "6c283eed576b98cc3568f99638156f8588f77d979579d03bef8683d6eb8601e1",
+      "Size": "8880",
+      "Homepage": "http://michael.dipperstein.com/crypt/",
+      "Depends": "openssl",
+      "Description": "A crypt(3) implementation"
+    },
+    {
       "Package": "libcurl",
       "Version": "8.22.0",
       "Architecture": "aarch64",
@@ -364,6 +398,17 @@
       "Homepage": "https://libexpat.github.io/",
       "Depends": "",
       "Description": "XML parsing C library"
+    },
+    {
+      "Package": "libffi",
+      "Version": "3.8.0",
+      "Architecture": "aarch64",
+      "Filename": "pool/main/libf/libffi/libffi_3.8.0_aarch64.deb",
+      "SHA256": "4f255badf74cd31f6a2801c17fa1444199c84c834b517b7c843e2fe9ebe91d77",
+      "Size": "37592",
+      "Homepage": "https://sourceware.org/libffi/",
+      "Depends": "",
+      "Description": "Library providing a portable, high level programming interface to various calling conventions"
     },
     {
       "Package": "libgmp",
@@ -498,6 +543,17 @@
       "Description": "A wrapper for DNS name resolving or DNS faking"
     },
     {
+      "Package": "libslirp",
+      "Version": "4.8.0-2",
+      "Architecture": "aarch64",
+      "Filename": "pool/main/libs/libslirp/libslirp_4.8.0-2_aarch64.deb",
+      "SHA256": "6bdd5dc34d9c1b121b1ede5f9d3d8a253ea9ed8637bd16abf91538b8256ce5a4",
+      "Size": "56044",
+      "Homepage": "https://gitlab.freedesktop.org/slirp/libslirp",
+      "Depends": "glib",
+      "Description": "A general purpose TCP-IP emulator"
+    },
+    {
       "Package": "libsmartcols",
       "Version": "2.42.1-4",
       "Architecture": "aarch64",
@@ -507,6 +563,17 @@
       "Homepage": "https://en.wikipedia.org/wiki/Util-linux",
       "Depends": "libandroid-posix-semaphore",
       "Description": "Library for smart adaptive formatting of tabular data"
+    },
+    {
+      "Package": "libsqlite",
+      "Version": "3.53.4",
+      "Architecture": "aarch64",
+      "Filename": "pool/main/libs/libsqlite/libsqlite_3.53.4_aarch64.deb",
+      "SHA256": "0e909ce0d50fe123305446cd22e0c5edf535d40344b9b065fbdcdee52f53198d",
+      "Size": "759764",
+      "Homepage": "https://www.sqlite.org",
+      "Depends": "zlib",
+      "Description": "Library implementing a self-contained and transactional SQL database engine"
     },
     {
       "Package": "libssh2",
@@ -619,6 +686,17 @@
       "Description": "Library for text-based user interfaces in a terminal-independent manner"
     },
     {
+      "Package": "ncurses-ui-libs",
+      "Version": "6.6.20260307+really6.5.20250830",
+      "Architecture": "aarch64",
+      "Filename": "pool/main/n/ncurses-ui-libs/ncurses-ui-libs_6.6.20260307+really6.5.20250830_aarch64.deb",
+      "SHA256": "7393f369009be189b3d4ec1f9b16ebd57621d6a1b22949ae07685573950d1f37",
+      "Size": "32940",
+      "Homepage": "https://invisible-island.net/ncurses/",
+      "Depends": "ncurses (= 6.6.20260307+really6.5.20250830)",
+      "Description": "Libraries for terminal user interfaces based on ncurses"
+    },
+    {
       "Package": "ncurses-utils",
       "Version": "6.6.20260307+really6.5.20250830",
       "Architecture": "aarch64",
@@ -705,6 +783,17 @@
       "Homepage": "https://gitlab.com/procps-ng/procps",
       "Depends": "libandroid-glob, libandroid-support, ncurses",
       "Description": "Utilities that give information about processes using the /proc filesystem"
+    },
+    {
+      "Package": "python",
+      "Version": "3.14.6-1",
+      "Architecture": "aarch64",
+      "Filename": "pool/main/p/python/python_3.14.6-1_aarch64.deb",
+      "SHA256": "3166e56c2b6c03fff41191fbb9d736302978e7c484702814d9f6dc99dd6006bd",
+      "Size": "4816756",
+      "Homepage": "https://python.org/",
+      "Depends": "gdbm, libandroid-posix-semaphore, libandroid-support, libbz2, libcrypt, libexpat, libffi, liblzma, libsqlite, ncurses, ncurses-ui-libs, openssl, readline, zlib, zstd",
+      "Description": "Python 3 programming language intended to enable clear programs"
     },
     {
       "Package": "readline",

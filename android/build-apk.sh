@@ -26,6 +26,12 @@ fi
 
 python3 android/userland/prepare.py
 
+[[ -f dist/android/vm/debian.img.gz ]] || { echo 'Build the Debian disk with bash android/vm/build-image.sh first.' >&2; exit 1; }
+bash android/vm/prepare-kernel.sh
+"$cc" -static -O2 -Wall -Wextra -Werror android/vm/init.c -o dist/android/vm/init
+"$cc" -static -O2 -Wall -Wextra -Werror android/vm/agent.c -o dist/android/vm/agent
+python3 android/vm/prepare.py
+
 CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$cc" \
     RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-Wl,-z,max-page-size=16384" \
     cargo build --locked --release --target "$target" -p tos-android
@@ -37,6 +43,13 @@ trap 'rm -rf -- "$stage"' EXIT
 mkdir -p "$stage/classes" "$stage/dex" "$stage/lib/arm64-v8a"
 cp -a dist/android/userland/lib/arm64-v8a/. "$stage/lib/arm64-v8a/"
 cp -a dist/android/userland/assets "$stage/assets"
+cp -a dist/android/vm/assets/. "$stage/assets/"
+cp dist/android/vm/debian.img.gz "$stage/assets/vm/"
+"$cc" -fPIE -pie -O2 -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 \
+    android/vm/client.c -o "$stage/lib/arm64-v8a/libtos_vmclient.so"
+"$cc" -fPIE -pie -O2 -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -Wl,--allow-shlib-undefined \
+    -I dist/android/vm/include android/vm/net.c "$(cat dist/android/vm/slirp-library)" \
+    -o "$stage/lib/arm64-v8a/libtos_vmnet.so"
 "$cc" -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 \
     android/app/jni/paths.c -ldl -o "$stage/lib/arm64-v8a/libtos_paths.so"
 "$cc" -fPIE -pie -O2 -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 \

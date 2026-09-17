@@ -78,9 +78,13 @@ pub unsafe extern "C" fn tos_android_create(
         .unwrap_or_else(|| std::path::Path::new(home))
         .join("usr");
     let config = Config {
-        command: Some(vec!["/system/bin/sh".into(), "-c".into(),
-            "cd \"$1\" || exit; export HOME=\"$1\" TMPDIR=\"$1/tmp\" PREFIX=\"$2\" SHELL=\"$2/bin/bash\" PATH=\"$2/bin:/system/bin\" LD_LIBRARY_PATH=\"$2/lib\" LD_PRELOAD=\"$2/lib/libtos_paths.so\" LANG=C.UTF-8; exec \"$SHELL\" --noprofile --rcfile \"$HOME/.bashrc\" -i".into(),
-            "tos".into(), home.into(), prefix.to_string_lossy().into_owned()]),
+        command: Some(vec![
+            prefix
+                .join("bin/tos-vmclient")
+                .to_string_lossy()
+                .into_owned(),
+            "io.github.m96chan.tos.vm".into(),
+        ]),
         font_size: Some(font.clamp(6.0, 128.0)),
         font: Some(prefix.join("share/fonts/HackGenConsoleNF-Regular.ttf")),
         status_bar: false,

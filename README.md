@@ -267,10 +267,11 @@ Android devices are primarily a hardware enablement problem, not a userspace pro
 
 To keep Android installed, the [standalone ARM64 APK](android/README.md)
 embeds the compositor in a native Android view, with adjustable text size,
-keyboard input and touch controls. It needs neither Termux nor root. The APK
-bundles Bash, Git, Neovim, Yazi and the other core terminal tools, along with
-the desktop character greeting and HackGen font. See the guide for Android
-substitutions and the current package-installation limits.
+keyboard input and touch controls, and owns a Debian VM through AVF. It needs
+neither Termux nor root, but this preview requires an AVF-capable Android 15+
+device and two initial ADB permission grants. The APK bundles the core Linux
+tools, character greeting and HackGen font; additional guest packages can be
+installed with apt. See the guide for device requirements and lifecycle limits.
 The earlier [Termux bring-up guide](android/TERMUX.md) remains available.
 
 The intended model is:

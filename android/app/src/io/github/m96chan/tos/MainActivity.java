@@ -120,6 +120,13 @@ public final class MainActivity extends Activity {
         updateSizeLabel();
         terminal.requestFocus();
 
+        String vmIssue = VmService.unavailable(this);
+        if (vmIssue != null) {
+            new android.app.AlertDialog.Builder(this).setTitle("Debian setup").setMessage(vmIssue)
+                .setPositiveButton("Close", (dialog, which) -> finish()).show();
+            return;
+        }
+
         File home = new File(getFilesDir(), "home");
         new File(home, "tmp").mkdirs();
         final float pixels = fontPixels();
@@ -127,8 +134,9 @@ public final class MainActivity extends Activity {
             try {
                 message("Preparing tools…");
                 Userland.prepare(this);
+                VmService.start(this);
                 engine = NativeSession.create(home.getAbsolutePath(), pixels);
-                if (engine == 0) { message("Could not start the Android shell"); return; }
+                if (engine == 0) { message("Could not start the Debian session"); return; }
                 runOnUiThread(() -> composition.setText(""));
                 runOnUiThread(() -> terminal.bindSurface());
                 step();
@@ -149,7 +157,7 @@ public final class MainActivity extends Activity {
                 runOnUiThread(() -> title.setText("tOS  " + (grid >>> 32) + "×" + (grid & 0xffffffffL)));
             }
             if (result < 0) {
-                message("Session ended — reopen tOS to start again");
+                message(VmService.lastFailure != null ? "Debian: " + VmService.lastFailure : "Session ended — reopen tOS to start again");
                 return;
             }
         }
@@ -223,9 +231,12 @@ public final class MainActivity extends Activity {
         String[] labels = {"Split left / right", "Split top / bottom", "Close pane", "Zoom pane", "Select text", "Copy selection", "New workspace", "Next workspace"};
         for (int i = 0; i < labels.length; i++) menu.getMenu().add(0, i, i, labels[i]);
         menu.getMenu().add(0, 8, 8, "Paste");
+        menu.getMenu().add(0, 9, 9, "Shut down Debian");
         menu.setOnMenuItemClickListener(item -> {
             int action = item.getItemId();
-            if (action == 8) {
+            if (action == 9) {
+                VmService.shutdown(this);
+            } else if (action == 8) {
                 ClipboardManager clipboard = (ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
                 ClipData data = clipboard.getPrimaryClip();
                 if (data != null && data.getItemCount() > 0) {
