@@ -102,10 +102,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: aarch64-linux-android
-      - name: Install the Android platform the APK is built against
-        run: >-
-          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          --install "platforms;android-35" > /dev/null
+      - name: Install the Android platform and NDK the APK is built against
+        # The NDK is pinned for the same reason the kernel and the Debian base
+        # are: the guest's init and agent are statically linked against its
+        # libc, and r27's gives them an 8-byte-aligned TLS segment that Bionic
+        # refuses to exec. v0.0.8 shipped that way — the VM panicked on PID 1
+        # and no phone that installed it ever reached Debian. The runner
+        # exports its own ANDROID_NDK_HOME, so pointing the build at this one
+        # means overriding that rather than installing beside it.
+        env:
+          NDK: "29.0.14206865"
+        run: |
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            --install "platforms;android-35" "ndk;$NDK" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/$NDK" >> "$GITHUB_ENV"
       - name: Take the signing identity out of the secrets
         env:
           KEYSTORE: ${{ secrets.TOS_ANDROID_KEYSTORE_BASE64 }}
