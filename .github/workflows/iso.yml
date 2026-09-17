@@ -81,7 +81,7 @@ jobs:
         run: |
           sudo apt-get install -y --no-install-recommends squashfs-tools
           iso/check-rootfs.sh dist/tos-x86_64.iso
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tos-iso-x86_64
           path: dist/*.iso
