@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>tOS browser PoC test page</title>
+<!--
+  The page the proof of concept renders. It is not a pretty demo: every part of
+  it is here to make one kind of failure visible in a PNG, so that "a frame came
+  back" can be told apart from "the right frame came back".
+
+    - CJK text          fonts-noto-cjk is missing -> tofu boxes, not glyphs
+    - a CSS gradient    the raster path is real, not a solid-colour fallback
+    - a table           layout ran, and borders land on pixel boundaries
+    - JavaScript        the frame was captured after script, not before it
+    - a moving bar      successive screencast frames differ, so a static
+                        capture cannot be mistaken for a live stream
+-->
+<style>
+  body { margin: 0; font-family: "Noto Sans CJK JP", sans-serif; color: #101418; }
+  header { padding: 10px 14px; background: linear-gradient(90deg,#0b3d91,#8a1f6b 45%,#d1620a); color: #fff; }
+  h1 { margin: 0; font-size: 20px; }
+  .sub { font-size: 12px; opacity: .85; }
+  main { padding: 10px 14px; font-size: 13px; }
+  table { border-collapse: collapse; margin-top: 8px; font-size: 12px; }
+  th, td { border: 1px solid #99a; padding: 3px 8px; }
+  th { background: #e7ebf2; }
+  #bar { height: 12px; background: #0b3d91; width: 0; transition: none; }
+  #js { font-weight: bold; color: #0a6b2f; }
+</style>
+<header>
+  <h1>tOS ブラウザ実証 — 日本語表示テスト</h1>
+  <div class="sub">gradient / table / JavaScript / CJK glyph coverage</div>
+</header>
+<main>
+  <p>漢字・ひらがな・カタカナ、and Latin text on the same line.</p>
+  <table>
+    <tr><th>項目</th><th>値</th></tr>
+    <tr><td>描画</td><td id="w">-</td></tr>
+    <tr><td>実行</td><td id="js">pending</td></tr>
+  </table>
+  <div id="bar"></div>
+</main>
+<script>
+  // Fills #js and #w only once script has run, so a capture taken too early
+  // shows "pending" instead of quietly looking correct.
+  document.getElementById('js').textContent = 'JS OK ' + (2 ** 10);
+  document.getElementById('w').textContent = innerWidth + 'x' + innerHeight;
+  // Repaints a full-width bar every frame. The screencast benchmark wants the
+  // worst case -- something changing constantly -- not an idle page that the
+  // compositor can skip encoding.
+  let t = 0;
+  (function tick() {
+    t = (t + 7) % 100;
+    document.getElementById('bar').style.width = t + '%';
+    requestAnimationFrame(tick);
+  })();
+</script>
