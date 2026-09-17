@@ -3508,6 +3508,28 @@ impl Compositor {
                 let row = pane.terminal.cursor().y;
                 pane.terminal.damage_mut().mark_row(row);
             }
+            // And the same for text the phase hides: `render` leaves a cell
+            // with `BLINK` blank while the phase is down, so those rows have
+            // to be repainted for the same reason the caret's does — in every
+            // pane, not only the focused one, because that text blinks
+            // wherever it is. There is nowhere else to ask: nothing counts
+            // blinking cells, so this is a walk of what is on screen, and it
+            // happens only on the two frames a second where the phase moves.
+            for pane in self.panes.values_mut() {
+                let rows = pane.terminal.grid().rows();
+                for y in 0..rows {
+                    let blinking = pane
+                        .terminal
+                        .grid()
+                        .display_row(y)
+                        .cells()
+                        .iter()
+                        .any(|cell| cell.attrs.flags.contains(tos_term::Flags::BLINK));
+                    if blinking {
+                        pane.terminal.damage_mut().mark_row(y);
+                    }
+                }
+            }
         }
 
         // The preedit is in nobody's grid, so nothing marks the rows it
