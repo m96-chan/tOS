@@ -13,13 +13,16 @@ import android.text.Editable;
 import android.text.InputType;
 import android.text.SpannableStringBuilder;
 import android.view.GestureDetector;
+import android.view.HapticFeedbackConstants;
 import android.view.KeyEvent;
+import android.view.MenuItem;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.view.inputmethod.BaseInputConnection;
@@ -27,6 +30,7 @@ import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
+import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.PopupMenu;
@@ -45,6 +49,8 @@ public final class MainActivity extends Activity {
     private static final int BAR = Color.rgb(25, 23, 30);
     private static final int FG = Color.rgb(221, 214, 225);
     private static final int GREEN = Color.rgb(145, 180, 135);
+    // Menu ids: 0..7 are the native actions, and the rest are this side's own.
+    private static final int COPY = 5, PASTE = 8, SHUTDOWN = 9, MORE = 10;
     private final ScheduledThreadPoolExecutor worker = new ScheduledThreadPoolExecutor(1);
     // Only the worker owns the native handle and calls JNI.
     private long engine;
@@ -52,6 +58,9 @@ public final class MainActivity extends Activity {
     private volatile boolean closing;
     private volatile boolean visible;
     private TerminalView terminal;
+    // A one pixel view moved under the finger, so a menu opens where it was
+    // asked for rather than in a corner of the screen.
+    private View touchAnchor;
     private TextView title, sizeLabel, composition;
     private Button ctrlButton, altButton;
     private boolean ctrl, alt, keyboardVisible;
@@ -83,8 +92,12 @@ public final class MainActivity extends Activity {
         top.addView(menu);
         root.addView(top);
 
+        FrameLayout stage = new FrameLayout(this);
         terminal = new TerminalView();
-        root.addView(terminal, new LinearLayout.LayoutParams(-1, 0, 1));
+        stage.addView(terminal, new FrameLayout.LayoutParams(-1, -1));
+        touchAnchor = new View(this);
+        stage.addView(touchAnchor, new FrameLayout.LayoutParams(1, 1));
+        root.addView(stage, new LinearLayout.LayoutParams(-1, 0, 1));
         composition = label("", 14);
         composition.setPadding(dp(10), 0, dp(10), 0);
         composition.setTextColor(GREEN);
@@ -230,34 +243,63 @@ public final class MainActivity extends Activity {
         PopupMenu menu = new PopupMenu(this, anchor);
         String[] labels = {"Split left / right", "Split top / bottom", "Close pane", "Zoom pane", "Select text", "Copy selection", "New workspace", "Next workspace"};
         for (int i = 0; i < labels.length; i++) menu.getMenu().add(0, i, i, labels[i]);
-        menu.getMenu().add(0, 8, 8, "Paste");
-        menu.getMenu().add(0, 9, 9, "Shut down Debian");
-        menu.setOnMenuItemClickListener(item -> {
-            int action = item.getItemId();
-            if (action == 9) {
-                VmService.shutdown(this);
-            } else if (action == 8) {
-                ClipboardManager clipboard = (ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
-                ClipData data = clipboard.getPrimaryClip();
-                if (data != null && data.getItemCount() > 0) {
-                    String text = data.getItemAt(0).coerceToText(this).toString();
-                    session(h -> NativeSession.text(h, text, 0, true));
-                }
-            } else {
-                session(h -> {
-                    NativeSession.action(h, action);
-                    if (action == 5) {
-                        byte[] bytes = NativeSession.clipboard(h);
-                        if (bytes != null && bytes.length > 0) {
-                            String text = new String(bytes, StandardCharsets.UTF_8);
-                            runOnUiThread(() -> ((ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("tOS", text)));
-                        }
-                    }
-                });
-            }
-            terminal.requestFocus(); return true;
-        });
+        menu.getMenu().add(0, PASTE, PASTE, "Paste");
+        menu.getMenu().add(0, SHUTDOWN, SHUTDOWN, "Shut down Debian");
+        menu.setOnMenuItemClickListener(this::onMenuItem);
         menu.show();
+    }
+    /**
+     * What a long press opens: the clipboard, at the finger.
+     *
+     * Panes and workspaces are a thing somebody arranges once and leaves
+     * alone, and they have the top bar's ⋮ for it. Copy and paste are the
+     * opposite — a phone has no ctrl+shift+v, and a PATH typed by hand on a
+     * soft keyboard is a typo waiting to happen — so the gesture that is
+     * already under the text goes to the clipboard, and the rest is behind
+     * "More…".
+     */
+    private void showClipboardMenu(float x, float y) {
+        touchAnchor.setX(Math.max(0, Math.min(terminal.getWidth() - 1, x)));
+        touchAnchor.setY(Math.max(0, Math.min(terminal.getHeight() - 1, y)));
+        PopupMenu menu = new PopupMenu(this, touchAnchor);
+        String pending = clipboardText();
+        menu.getMenu().add(0, PASTE, 0, pending == null ? "Paste (clipboard empty)" : "Paste").setEnabled(pending != null);
+        menu.getMenu().add(0, COPY, 1, "Copy selection");
+        menu.getMenu().add(0, MORE, 2, "More…");
+        menu.setOnMenuItemClickListener(this::onMenuItem);
+        menu.show();
+    }
+    private boolean onMenuItem(MenuItem item) {
+        int action = item.getItemId();
+        if (action == MORE) { showMenu(touchAnchor); return true; }
+        if (action == SHUTDOWN) VmService.shutdown(this);
+        else if (action == PASTE) paste();
+        else if (action == COPY) copySelection();
+        else session(h -> NativeSession.action(h, action));
+        terminal.requestFocus();
+        return true;
+    }
+    /** Yank whatever the pane has selected, and hand it to Android. */
+    private void copySelection() {
+        session(h -> {
+            NativeSession.action(h, COPY);
+            byte[] bytes = NativeSession.clipboard(h);
+            if (bytes == null || bytes.length == 0) { message("Nothing to copy — long press and drag over text"); return; }
+            String text = new String(bytes, StandardCharsets.UTF_8);
+            runOnUiThread(() -> ((ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("tOS", text)));
+        });
+    }
+    private void paste() {
+        String text = clipboardText();
+        if (text == null) { message("The Android clipboard is empty"); return; }
+        session(h -> NativeSession.text(h, text, 0, true));
+    }
+    /** The Android clipboard as text, or null when there is nothing in it. */
+    private String clipboardText() {
+        ClipData data = ((ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).getPrimaryClip();
+        if (data == null || data.getItemCount() == 0) return null;
+        CharSequence text = data.getItemAt(0).coerceToText(this);
+        return text == null || text.length() == 0 ? null : text.toString();
     }
 
     @Override protected void onStart() { super.onStart(); visible = true; }
@@ -276,11 +318,18 @@ public final class MainActivity extends Activity {
     private final class TerminalView extends SurfaceView implements SurfaceHolder.Callback {
         private final GestureDetector gestures;
         private final ScaleGestureDetector scale;
+        private final int slop;
         private float pinchFont, pinchScale;
         private float scrollPixels;
+        // A long press owns the gesture from the moment it fires; the press
+        // itself waits for the first real movement, so a hold that never
+        // drags leaves no one-cell highlight behind the menu.
+        private boolean selecting, dragging;
+        private float pressX, pressY;
 
         TerminalView() {
             super(MainActivity.this);
+            slop = ViewConfiguration.get(MainActivity.this).getScaledTouchSlop();
             setFocusable(true); setFocusableInTouchMode(true);
             setContentDescription("tOS terminal");
             getHolder().addCallback(this);
@@ -295,7 +344,7 @@ public final class MainActivity extends Activity {
                     requestFocus(); float x = e.getX(), y = e.getY();
                     session(h -> NativeSession.pointer(h, x, y, 0)); return true;
                 }
-                @Override public void onLongPress(MotionEvent e) { showMenu(terminal); }
+                @Override public void onLongPress(MotionEvent e) { beginSelection(e); }
                 @Override public boolean onScroll(MotionEvent first, MotionEvent last, float dx, float dy) {
                     scrollPixels += dy;
                     float threshold = Math.max(8, fontPixels());
@@ -329,9 +378,57 @@ public final class MainActivity extends Activity {
             catch (Exception ignored) { /* A queued detach still owns the native reference until it runs. */ }
         }
         @Override public boolean onTouchEvent(MotionEvent event) {
+            if (selecting) {
+                if (event.getActionMasked() != MotionEvent.ACTION_DOWN) return dragSelection(event);
+                // A fresh gesture while a selection is open means its end was
+                // lost somewhere; drop it rather than holding the finger.
+                endSelection(event.getX(), event.getY(), false);
+            }
             scale.onTouchEvent(event);
             if (!scale.isInProgress() && event.getPointerCount() == 1) gestures.onTouchEvent(event);
             return true;
+        }
+        /** Take the gesture away from scrolling: it belongs to the clipboard now. */
+        private void beginSelection(MotionEvent down) {
+            requestFocus();
+            selecting = true; dragging = false;
+            pressX = down.getX(); pressY = down.getY();
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            composition.setText("Drag to select · lift for the clipboard menu");
+            MotionEvent cancel = MotionEvent.obtain(down);
+            cancel.setAction(MotionEvent.ACTION_CANCEL);
+            gestures.onTouchEvent(cancel);
+            cancel.recycle();
+        }
+        private boolean dragSelection(MotionEvent event) {
+            float x = event.getX(), y = event.getY();
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_MOVE) {
+                if (!dragging) {
+                    if (Math.hypot(x - pressX, y - pressY) < slop) return true;
+                    dragging = true;
+                    final float fromX = pressX, fromY = pressY;
+                    session(h -> NativeSession.select(h, fromX, fromY, 0));
+                }
+                session(h -> NativeSession.select(h, x, y, 1));
+            } else if (action == MotionEvent.ACTION_UP) {
+                endSelection(x, y, true);
+            } else if (action == MotionEvent.ACTION_CANCEL || action == MotionEvent.ACTION_POINTER_DOWN) {
+                endSelection(x, y, false);
+            }
+            return true;
+        }
+        /** A drag that ends on the text copies it; a hold that never moved asks. */
+        private void endSelection(float x, float y, boolean lifted) {
+            selecting = false;
+            composition.setText("");
+            if (dragging) {
+                session(h -> NativeSession.select(h, x, y, 2));
+                if (lifted) copySelection();
+            } else if (lifted) {
+                showClipboardMenu(x, y);
+            }
+            dragging = false;
         }
         @Override public boolean onCheckIsTextEditor() { return true; }
         @Override public InputConnection onCreateInputConnection(EditorInfo info) {

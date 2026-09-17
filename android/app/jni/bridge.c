@@ -12,6 +12,7 @@ extern void tos_android_resize(Engine *, uint32_t, uint32_t, float);
 extern void tos_android_text(Engine *, const uint16_t *, size_t, uint8_t, bool);
 extern void tos_android_key(Engine *, uint32_t, uint32_t, uint8_t, bool);
 extern void tos_android_pointer(Engine *, double, double, int32_t);
+extern void tos_android_select(Engine *, double, double, uint32_t);
 extern void tos_android_action(Engine *, uint32_t);
 extern const uint8_t *tos_android_clipboard(Engine *, size_t *);
 extern uint64_t tos_android_grid(Engine *);
@@ -77,6 +78,12 @@ JNIEXPORT void JNICALL JNI_METHOD(key)(JNIEnv *env, jclass cls, jlong handle, ji
 JNIEXPORT void JNICALL JNI_METHOD(pointer)(JNIEnv *env, jclass cls, jlong handle, jfloat x, jfloat y, jint wheel) {
     (void)env; (void)cls;
     tos_android_pointer(CLIENT->engine, x, y, wheel);
+}
+
+JNIEXPORT void JNICALL JNI_METHOD(select)(JNIEnv *env, jclass cls, jlong handle, jfloat x, jfloat y, jint phase) {
+    (void)env; (void)cls;
+    if (phase < 0) return;
+    tos_android_select(CLIENT->engine, x, y, (uint32_t)phase);
 }
 
 JNIEXPORT void JNICALL JNI_METHOD(action)(JNIEnv *env, jclass cls, jlong handle, jint action) {

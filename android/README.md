@@ -118,12 +118,20 @@ SELinux, hidden-API settings, the bootloader or the stock Terminal's data.
 | Tap a pane | Focus it |
 | Swipe vertically | Terminal wheel events |
 | **Esc / Ctrl / Alt / Tab / arrows** | Terminal keys; modifiers apply to the next input |
-| **⋮**, or long press | Panes, workspaces, selection, clipboard, Debian shutdown |
+| Long press and drag | Select text; lifting copies it to the Android clipboard |
+| Long press and lift | Clipboard menu: paste, copy the selection, or **More…** |
+| **⋮** | Panes, workspaces, selection, clipboard, Debian shutdown |
 
 Text defaults to 10.5 sp and is adjustable from 8 to 24 sp. The top bar shows
 columns and rows. Rendering uses the surface's pixels, without half-block
 scaling. IME composing text appears above the extra keys and enters Debian
 when committed. Hardware-keyboard `Ctrl+A` prefix shortcuts also work.
+
+Long press is the clipboard rather than the session menu: a phone has no
+`Ctrl+Shift+V`, and a `PATH` typed by hand on a soft keyboard is a typo
+waiting to happen. Holding and dragging selects text and copies it on
+release; holding without dragging opens paste, copy and **More…** at the
+finger. Pasted text arrives bracketed, so a shell sees it as one line.
 
 A foreground service owns the VM while tOS is in the background. Use
 **⋮ → Shut down Debian** for a clean shutdown. The service also defines a

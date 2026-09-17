@@ -53,6 +53,21 @@ fn key(code: u32, unicode: u32) -> Option<KeyCode> {
     })
 }
 
+/// The phase of a long press that is dragging a selection out of a pane.
+///
+/// A tap is a press and a release in one call because nothing happens
+/// between them; a selection is the opposite — it is made of what happens
+/// between them — so the phases arrive one at a time and the finger, not the
+/// engine, decides how long the middle lasts.
+fn touch(phase: u32) -> Option<MouseAction> {
+    Some(match phase {
+        0 => MouseAction::Press,
+        1 => MouseAction::Drag,
+        2 => MouseAction::Release,
+        _ => return None,
+    })
+}
+
 // All exported functions are private to the APK's JNI bridge. Its worker owns
 // each Engine pointer, passes only live handles, and destroys each exactly once.
 // The C bridge checks bitmap/window dimensions and passes valid slices. These
@@ -250,6 +265,22 @@ pub unsafe extern "C" fn tos_android_pointer(engine: *mut Engine, x: f64, y: f64
 /// # Safety
 /// `engine` must be a live, exclusively owned handle.
 #[no_mangle]
+pub unsafe extern "C" fn tos_android_select(engine: *mut Engine, x: f64, y: f64, phase: u32) {
+    let Some(action) = touch(phase) else { return };
+    let e = &mut *engine;
+    e.compositor.handle_input(InputEvent::Pointer(PointerEvent {
+        x,
+        y,
+        button: Some(MouseButton::Left),
+        action,
+        modifiers: Modifiers::NONE,
+    }));
+    e.dirty = true;
+}
+
+/// # Safety
+/// `engine` must be a live, exclusively owned handle.
+#[no_mangle]
 pub unsafe extern "C" fn tos_android_action(engine: *mut Engine, action: u32) {
     let action = match action {
         0 => Action::Split(Axis::Columns),
@@ -307,6 +338,13 @@ mod tests {
         assert_eq!(key(0, 'A' as u32), Some(KeyCode::Char('a')));
         assert_eq!(key(0, 0), None);
         assert_eq!(key(0, 0xd800), None);
+    }
+    #[test]
+    fn a_long_press_drag_is_one_press_many_drags_and_one_release() {
+        assert_eq!(touch(0), Some(MouseAction::Press));
+        assert_eq!(touch(1), Some(MouseAction::Drag));
+        assert_eq!(touch(2), Some(MouseAction::Release));
+        assert_eq!(touch(3), None);
     }
     #[test]
     fn reject_unbounded_surface_allocations() {

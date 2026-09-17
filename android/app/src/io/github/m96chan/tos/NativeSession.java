@@ -12,6 +12,8 @@ final class NativeSession {
     static native void text(long handle, String text, int modifiers, boolean paste);
     static native void key(long handle, int code, int unicode, int modifiers, boolean release);
     static native void pointer(long handle, float x, float y, int wheel);
+    /** Phases of a long press dragging a selection: 0 press, 1 drag, 2 release. */
+    static native void select(long handle, float x, float y, int phase);
     static native void action(long handle, int action);
     static native byte[] clipboard(long handle);
     static native long grid(long handle);
