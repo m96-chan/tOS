@@ -138,5 +138,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test package assembly without network or SDK
         run: python3 -m unittest discover -s android/userland -p 'test_*.py' -v
+      - name: Test the gate on the guest binaries the initramfs carries
+        run: python3 -m unittest discover -s android/vm -p 'test_*.py' -v
       - name: Test VM protocol stream boundaries
         run: bash android/vm/test-protocol.sh

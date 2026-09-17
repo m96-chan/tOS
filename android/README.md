@@ -54,6 +54,14 @@ On Linux x86_64, install Docker, Rust, JDK 17, Python 3.9+, curl, binutils,
 zip, Android SDK platform 35, SDK build-tools and the Android NDK. Tested with
 NDK 29.0.14206865 and build-tools 36.1.0. No Gradle setup is needed.
 
+Which NDK is not a detail here. The guest's `init` and `agent` are statically
+linked against its libc, and r27's gives them a TLS segment aligned to 8 bytes
+where Bionic wants 64: the binaries build and sign cleanly, then the guest
+kernel panics on PID 1 and the VM reboots instead of initialising, which is
+how v0.0.8 shipped. `android/vm/prepare.py` now refuses to put such a binary
+in the initramfs, so a machine whose default NDK is too old fails the build
+rather than the phone.
+
 ```sh
 rustup target add aarch64-linux-android
 bash android/vm/build-image.sh
