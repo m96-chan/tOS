@@ -22,6 +22,13 @@
 //! REQUEST → ACK is exercised by this crate's tests against [`FakeServer`],
 //! on a machine with no DHCP server, no privileges and no network at all.
 //!
+//! So is everything *below* the wire, which there is some of since #156:
+//! sends go out of a raw socket, because a UDP socket on a link with no
+//! address of its own puts another link's address in the IP header.
+//! [`broadcast_frame`] is the Ethernet, IPv4 and UDP headers as one more
+//! function over bytes, and the only thing the socket does with it is hand it
+//! to `sendto`.
+//!
 //! # What is here and what is not
 //!
 //! Acquisition is complete: a client that has never had an address gets one,
@@ -85,15 +92,14 @@ const MIN_LEN: usize = FIXED_LEN + 4;
 
 /// `flags`: ask the server to broadcast its reply rather than unicast it.
 ///
-/// This bit is the whole reason an ordinary UDP socket is enough here. A
-/// client in SELECTING has no address, so a server that unicasts the OFFER to
-/// the address it is about to hand out is talking to a machine that does not
-/// have it yet: the reply then has to be caught below the IP stack, with a
-/// raw `AF_PACKET` socket and Ethernet, IP and UDP headers built and
-/// checksummed by hand. RFC 2131 §4.1 put this flag in the protocol for
-/// exactly that case, and a server that honours it broadcasts to
-/// 255.255.255.255:68, which lands in a socket bound to `0.0.0.0:68` like any
-/// other datagram.
+/// This bit is the whole reason an ordinary UDP socket is enough to *hear*
+/// on. A client in SELECTING has no address, so a server that unicasts the
+/// OFFER to the address it is about to hand out is talking to a machine that
+/// does not have it yet: the reply would then have to be caught below the IP
+/// stack, on the raw socket that [`broadcast_frame`] already sends from.
+/// RFC 2131 §4.1 put this flag in the protocol for exactly that case, and a
+/// server that honours it broadcasts to 255.255.255.255:68, which lands in a
+/// socket bound to `0.0.0.0:68` like any other datagram.
 ///
 /// What goes wrong without it, or against a server that ignores it: the offer
 /// goes somewhere this client cannot hear, nothing arrives, and [`acquire`]
@@ -989,6 +995,233 @@ pub fn hardware_address(text: &str) -> Option<[u8; 6]> {
     Some(mac)
 }
 
+/// The Ethernet address a DISCOVER is sent to: everybody on the link.
+const BROADCAST_MAC: [u8; 6] = [0xff; 6];
+
+/// `ETH_P_IP`, the ethertype of a frame carrying IPv4.
+///
+/// Written out rather than taken from `libc` because everything from here to
+/// [`broadcast_frame`] is bytes rather than Linux, and is tested on any
+/// machine that can run `cargo test`.
+const ETHERTYPE_IPV4: u16 = 0x0800;
+
+/// IPv4's protocol number for UDP.
+const PROTOCOL_UDP: u8 = 17;
+
+/// The TTL on the way out.
+///
+/// A limited broadcast never leaves the link — no router forwards
+/// 255.255.255.255 — so any value at all would arrive, and this could be 1.
+/// It is 64 because that is what the Linux stack puts on an ordinary datagram
+/// and what `udhcpc` puts on this one, and a packet that looks like every
+/// other packet is a packet nothing on the way has a special opinion about.
+const IPV4_TTL: u8 = 64;
+
+/// Destination, source, ethertype.
+const ETHERNET_HEADER: usize = 14;
+/// An IPv4 header with no options on it.
+const IPV4_HEADER: usize = 20;
+/// Two ports, a length and a checksum.
+const UDP_HEADER: usize = 8;
+
+/// One DHCP message wrapped in the Ethernet, IPv4 and UDP headers that a
+/// client with no address has to write for itself.
+///
+/// This is the header construction `docs/design/network.md` decided not to
+/// write, under "A UDP socket, not a raw one", and what changed is that the
+/// machine has two links now and had one then. `SO_BINDTODEVICE` fixes which
+/// interface a broadcast leaves by; it does not fix the address the kernel
+/// puts in the IP header. For a limited broadcast out of a link that has no
+/// address the kernel goes looking — `inet_select_addr` falls back to the
+/// first suitable address on *any* device — so a laptop with a cable in it
+/// sends the radio's DISCOVER from the cable's address. RFC 2131 §4.1 says a
+/// client in SELECTING sends from `0.0.0.0`; so does every other client; and
+/// `0.0.0.0:68 -> 255.255.255.255:67` is how the rule that admits DHCP
+/// through a firewall is usually written. There is no socket option that
+/// makes a UDP socket send from an address the host does not have, so the
+/// header is written here instead.
+///
+/// Only the sending side is built. Replies still arrive on the UDP socket,
+/// because [`FLAG_BROADCAST`] asks the server to broadcast them and a
+/// broadcast to 255.255.255.255:68 lands in a socket bound to `0.0.0.0:68`
+/// like any other datagram. Receiving is the half with no source address to
+/// get wrong, and leaving it alone keeps everything the kernel's UDP stack
+/// does for free: the checksum verified rather than computed, the port
+/// demultiplexed, anything that arrived in pieces put back together.
+///
+/// The payload goes in untouched. These are forty-two bytes in front of what
+/// [`Message::encode`] already built, which is what
+/// `a_frame_is_the_payload_with_forty_two_bytes_in_front_of_it` says on the
+/// bytes rather than in prose.
+pub fn broadcast_frame(mac: [u8; 6], payload: &[u8]) -> Vec<u8> {
+    let datagram = udp_datagram(
+        Ipv4Addr::UNSPECIFIED,
+        Ipv4Addr::BROADCAST,
+        CLIENT_PORT,
+        SERVER_PORT,
+        payload,
+    );
+    let header = ipv4_header(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, datagram.len());
+
+    let mut frame = Vec::with_capacity(ETHERNET_HEADER + header.len() + datagram.len());
+    frame.extend_from_slice(&BROADCAST_MAC);
+    frame.extend_from_slice(&mac);
+    frame.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+    frame.extend_from_slice(&header);
+    frame.extend_from_slice(&datagram);
+    frame
+}
+
+/// The IPv4 header over a UDP datagram of `length` bytes.
+///
+/// The fields left zero, and why, because a header that is mostly zeroes is
+/// the part that looks unfinished:
+///
+/// - **DSCP and ECN.** Nothing on this link is doing differentiated services,
+///   and a DISCOVER asking for low delay is asking a switch that has one
+///   queue.
+/// - **Identification.** It exists so that fragments of one datagram can be
+///   told from fragments of another, and this datagram is 328 bytes: under
+///   every MTU there has ever been, including the 576 bytes RFC 791 makes
+///   everything accept.
+/// - **Flags and fragment offset.** Zero, which is "may fragment, and this is
+///   the first fragment". Setting `DF` would be truer to the line above and
+///   would also ask any hop that could not forward it to send an ICMP back to
+///   `0.0.0.0`, which is not an address anything can answer.
+///
+/// The header checksum covers this header alone, which is why it can be
+/// finished here without ever seeing the payload.
+fn ipv4_header(source: Ipv4Addr, destination: Ipv4Addr, length: usize) -> [u8; IPV4_HEADER] {
+    let mut header = [0u8; IPV4_HEADER];
+    // Version 4 in the high nibble; in the low one the header's own length in
+    // 32 bit words, which is five because there are no options on it.
+    header[0] = 0x45;
+    // The clamp is unreachable from this module — the caller's datagram is
+    // 328 bytes — and is here because a total length that has wrapped round
+    // does not describe a shorter packet, it describes a different one.
+    let total = u16::try_from(IPV4_HEADER + length).unwrap_or(u16::MAX);
+    header[2..4].copy_from_slice(&total.to_be_bytes());
+    header[8] = IPV4_TTL;
+    header[9] = PROTOCOL_UDP;
+    // 10..12 is the checksum itself, which is computed over a header carrying
+    // zero in it and written in afterwards.
+    header[12..16].copy_from_slice(&source.octets());
+    header[16..20].copy_from_slice(&destination.octets());
+    let sum = checksum(&[&header]);
+    header[10..12].copy_from_slice(&sum.to_be_bytes());
+    header
+}
+
+/// A UDP datagram with its checksum computed.
+///
+/// IPv4 allows that checksum to be zero, meaning "not computed", and it is
+/// tempting to leave it there: the payload is about to be checked by
+/// [`Message::parse`] anyway, and the frame is not going further than the
+/// wire it is put on. It is computed because the machines this whole change
+/// is for are the ones that look — the firewall that inspects DHCP before it
+/// forwards it, the server that logs what it dropped — and a datagram with no
+/// checksum is one some of them have already decided not to trust.
+///
+/// A checksum that comes out zero goes on the wire as `0xffff`. The two are
+/// the same number in ones complement arithmetic, and only one of them means
+/// "there is no checksum here".
+fn udp_datagram(
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    from: u16,
+    to: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    // Same clamp, same unreachability, same reason as in `ipv4_header`.
+    let length = u16::try_from(UDP_HEADER + payload.len()).unwrap_or(u16::MAX);
+    let mut datagram = Vec::with_capacity(UDP_HEADER + payload.len());
+    datagram.extend_from_slice(&from.to_be_bytes());
+    datagram.extend_from_slice(&to.to_be_bytes());
+    datagram.extend_from_slice(&length.to_be_bytes());
+    // The checksum's own two bytes, zero while it is being computed over
+    // them.
+    datagram.extend_from_slice(&[0, 0]);
+    datagram.extend_from_slice(payload);
+
+    let pseudo = pseudo_header(source, destination, length);
+    let sum = match checksum(&[&pseudo, &datagram]) {
+        0 => 0xffff,
+        sum => sum,
+    };
+    datagram[6..8].copy_from_slice(&sum.to_be_bytes());
+    datagram
+}
+
+/// The twelve bytes RFC 768 checksums and nobody sends.
+///
+/// The addresses out of the IP header, the protocol, and the UDP length
+/// again. It is there so that a datagram delivered to the wrong host, or
+/// handed to the wrong protocol, fails its checksum instead of arriving —
+/// which is worth more here than usual, because the two addresses it covers
+/// are `0.0.0.0` and `255.255.255.255` and they are the entire claim this
+/// change makes about the packet.
+fn pseudo_header(source: Ipv4Addr, destination: Ipv4Addr, length: u16) -> [u8; 12] {
+    let mut pseudo = [0u8; 12];
+    pseudo[0..4].copy_from_slice(&source.octets());
+    pseudo[4..8].copy_from_slice(&destination.octets());
+    // pseudo[8] is a zero byte that exists to line the protocol up.
+    pseudo[9] = PROTOCOL_UDP;
+    pseudo[10..12].copy_from_slice(&length.to_be_bytes());
+    pseudo
+}
+
+/// RFC 1071's internet checksum, over as many runs of bytes as it is handed.
+///
+/// One function for the IPv4 header's checksum and for the UDP one, because
+/// they are the same arithmetic over different bytes: add the big-endian 16
+/// bit words up, fold the carries back in until none is left, complement.
+/// Taking a list of runs is what lets the UDP checksum cover a pseudo-header
+/// that is never sent followed by a datagram that is, without joining 340
+/// bytes together first.
+///
+/// A run of odd length does not pad itself. The byte left over is carried
+/// into the next run and pairs with its first byte, because the checksum is
+/// defined over the concatenation and not over the pieces; only a byte left
+/// over at the very end is the high half of a word whose low half is zero.
+/// Splitting the same bytes differently therefore cannot change the answer,
+/// which is what `the_checksum_does_not_care_where_the_runs_are_split` is
+/// for.
+fn checksum(runs: &[&[u8]]) -> u16 {
+    let mut total: u32 = 0;
+    // The high half of a word whose low half is in the next run.
+    let mut half: Option<u8> = None;
+
+    for run in runs {
+        let mut bytes = *run;
+        if let Some(high) = half.take() {
+            let Some((low, rest)) = bytes.split_first() else {
+                // An empty run in the middle: the byte is still waiting.
+                half = Some(high);
+                continue;
+            };
+            total += u32::from(u16::from_be_bytes([high, *low]));
+            bytes = rest;
+        }
+        let mut words = bytes.chunks_exact(2);
+        for word in &mut words {
+            total += u32::from(u16::from_be_bytes([word[0], word[1]]));
+        }
+        if let [tail] = words.remainder() {
+            half = Some(*tail);
+        }
+    }
+    if let Some(high) = half {
+        total += u32::from(u16::from_be_bytes([high, 0]));
+    }
+
+    // Twice is enough — the first fold cannot carry more than once — but the
+    // loop says what it is doing without asking anyone to prove that.
+    while total > 0xffff {
+        total = (total & 0xffff) + (total >> 16);
+    }
+    !(total as u16)
+}
+
 /// A DHCP server that is not on a network.
 ///
 /// Answers out of a small table: one address, one netmask, and whatever else
@@ -1171,9 +1404,18 @@ impl Transport for FakeServer {
     }
 }
 
-/// The real socket: UDP on port 68, pinned to one interface.
+/// The real transport: a raw socket to send on, a UDP socket to hear on,
+/// both pinned to one interface.
 ///
-/// Three socket options, none of which this can do without:
+/// Two sockets rather than one because the two directions have different
+/// problems. A send out of a link with no address has to say `0.0.0.0` and no
+/// UDP socket can be made to — see [`broadcast_frame`], which is where the
+/// headers for it are built — so sends go out of an `AF_PACKET` socket below
+/// the IP stack. Replies are broadcast to 255.255.255.255:68 by a server
+/// honouring [`FLAG_BROADCAST`], which is an ordinary datagram arriving at an
+/// ordinary socket, so receives stay where they were.
+///
+/// Three socket options on the UDP half, none of which it can do without:
 ///
 /// - `SO_REUSEADDR`, because 68 is a fixed well known port and a second
 ///   attempt while a previous socket is still being torn down would otherwise
@@ -1182,29 +1424,51 @@ impl Transport for FakeServer {
 ///   afterwards rather than the other way round.
 /// - `SO_BROADCAST`, without which the kernel refuses to send to
 ///   255.255.255.255 at all. It refuses with `EACCES`, which reads like a
-///   privilege problem and is not one.
+///   privilege problem and is not one. Nothing is sent from this socket any
+///   more, but a socket that cannot send to the broadcast address cannot be
+///   asked to later, and the option costs one syscall.
 /// - `SO_BINDTODEVICE`, which is why this is per interface. A machine asking
 ///   for its first address has no route to anywhere, so nothing in the
-///   routing table can tell the kernel which interface a broadcast should
-///   leave by; naming the device is the only way to say "ask on this cable".
-///   It is also what stops a machine with two links from configuring the
-///   wrong one.
+///   routing table can tell the kernel which interface a datagram should
+///   leave by or arrive on; naming the device is the only way to say "ask on
+///   this cable". On the receiving side it is also what stops the answer to
+///   the radio's DISCOVER being read as the cable's.
 #[cfg(target_os = "linux")]
 pub struct BroadcastSocket {
     socket: std::net::UdpSocket,
+    raw: PacketSocket,
     interface: String,
 }
 
 #[cfg(target_os = "linux")]
 impl BroadcastSocket {
-    /// Open the socket for one interface.
+    /// Open both sockets for one interface.
     ///
-    /// Fails with a permission error for anybody without `CAP_NET_RAW`, which
-    /// `SO_BINDTODEVICE` wants, or `CAP_NET_BIND_SERVICE`, which binding port
-    /// 68 wants. That is an ordinary user's situation, and the error goes
-    /// straight up so that the status bar can say so rather than the menu
-    /// appearing to do nothing.
-    pub fn bind(interface: &str) -> io::Result<BroadcastSocket> {
+    /// Takes the MAC because the Ethernet header built for every send needs
+    /// it, and the caller — [`acquire_on`] — has already had to read it out
+    /// of sysfs to put in `chaddr`. Reading it again here, out of the kernel
+    /// this time, would be a second answer to a question that already has
+    /// one, and the two disagreeing is how a server ends up keying a lease on
+    /// a client identifier that belongs to nobody.
+    ///
+    /// # When it fails
+    ///
+    /// Everything here wants privilege, and it all wants the same privilege:
+    /// `SO_BINDTODEVICE` wants `CAP_NET_RAW`, an `AF_PACKET` socket wants
+    /// `CAP_NET_RAW`, and binding port 68 wants `CAP_NET_BIND_SERVICE`. The
+    /// compositor is root today and has all of them. If it is ever not, this
+    /// fails at the first of the three and says so, exactly as it did before
+    /// the raw socket was added — the new socket cannot be the thing that
+    /// takes DHCP away from an unprivileged process, because that process
+    /// could not have bound port 68 either.
+    ///
+    /// There is no fall back to sending on the UDP socket when the raw one
+    /// cannot be opened, and that is deliberate: sending on the UDP socket
+    /// *is* the bug. A fallback would put the wrong source address back on
+    /// the wire on exactly the machines nobody was watching, which is how it
+    /// got onto the wire in the first place. The error goes straight up
+    /// instead, through [`acquire_on`], to the status bar that asked.
+    pub fn bind(interface: &str, mac: [u8; 6]) -> io::Result<BroadcastSocket> {
         use std::os::fd::FromRawFd;
 
         if interface.is_empty() || interface.len() >= libc::IF_NAMESIZE {
@@ -1236,8 +1500,15 @@ impl BroadcastSocket {
         bind_to_device(fd, interface)?;
         bind_to_client_port(fd)?;
 
+        // Last, so that the ordinary failures above — a name that is not an
+        // interface, port 68 already held — are still the ones reported
+        // first, and so that a machine without `AF_PACKET` in its kernel
+        // fails with a message about `AF_PACKET` and not about DHCP.
+        let raw = PacketSocket::open(interface, mac)?;
+
         Ok(BroadcastSocket {
             socket,
+            raw,
             interface: interface.to_string(),
         })
     }
@@ -1245,6 +1516,166 @@ impl BroadcastSocket {
     pub fn interface(&self) -> &str {
         &self.interface
     }
+}
+
+/// The send half: `AF_PACKET`/`SOCK_RAW`, which takes a whole Ethernet frame
+/// and puts it on the wire as it is.
+///
+/// `SOCK_RAW` rather than `SOCK_DGRAM`: the datagram flavour would have the
+/// kernel write the Ethernet header, which is the one header out of the three
+/// that has nothing wrong with it, and would leave the IP one — the whole
+/// point — still unwritten.
+#[cfg(target_os = "linux")]
+struct PacketSocket {
+    fd: libc::c_int,
+    /// The interface, by the index `sockaddr_ll` names it with. A packet
+    /// socket has no `SO_BINDTODEVICE`; this field is how it is per
+    /// interface.
+    index: libc::c_int,
+    /// The source address of every frame this sends: the link's own.
+    mac: [u8; 6],
+}
+
+#[cfg(target_os = "linux")]
+impl PacketSocket {
+    fn open(interface: &str, mac: [u8; 6]) -> io::Result<PacketSocket> {
+        let index = interface_index(interface)?;
+
+        // The protocol is in network order because it is an ethertype on the
+        // wire and not a number to the kernel. SAFETY: a plain socket call.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_PACKET,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::c_int::from(ETHERTYPE_IPV4.to_be()),
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let socket = PacketSocket { fd, index, mac };
+
+        // Bound with a protocol of zero, which `packet(7)` defines as "and
+        // receive nothing". The socket is created with the ethertype it
+        // sends, because that is what a reader of `socket(2)` expects to see,
+        // and then narrowed here: nothing ever reads this descriptor — the
+        // replies come up the UDP socket — and a socket left listening for
+        // `ETH_P_IP` is a copy of every IP frame on a busy link going into a
+        // buffer behind nobody, for the fifteen seconds an acquisition lasts.
+        let address = link_address(index, 0, None);
+        // SAFETY: address is a correctly shaped sockaddr_ll and outlives the
+        // call; the length handed over is its own. The descriptor is owned by
+        // `socket`, which closes it if this returns early.
+        let bound = unsafe {
+            libc::bind(
+                socket.fd,
+                std::ptr::addr_of!(address).cast(),
+                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+            )
+        };
+        if bound < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(socket)
+    }
+
+    /// Put one DHCP payload on the wire, wrapped.
+    fn send(&self, payload: &[u8]) -> io::Result<()> {
+        let frame = broadcast_frame(self.mac, payload);
+        let address = link_address(self.index, ETHERTYPE_IPV4.to_be(), Some(BROADCAST_MAC));
+
+        // SAFETY: the frame and the address both outlive the call and both
+        // lengths handed over are their own.
+        let sent = unsafe {
+            libc::sendto(
+                self.fd,
+                frame.as_ptr().cast(),
+                frame.len(),
+                // No MSG_DONTWAIT: a packet socket blocks only for as long as
+                // the driver's queue is full, which is microseconds, and a
+                // DISCOVER dropped for EAGAIN would be indistinguishable from
+                // a network with no server on it.
+                0,
+                std::ptr::addr_of!(address).cast(),
+                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+            )
+        };
+        if sent < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // A packet socket writes a frame whole or not at all, so a short
+        // count is not something to retry from — it is something that should
+        // not have happened, and half a DISCOVER on the wire is worth saying
+        // out loud rather than waiting fifteen seconds for.
+        if sent as usize != frame.len() {
+            return Err(io::Error::other(format!(
+                "{} of {} bytes went out",
+                sent,
+                frame.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PacketSocket {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor is ours and is not used again.
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+/// The `sockaddr_ll` that names an interface, and optionally a hardware
+/// address on it.
+///
+/// One function for both uses because the struct is the same either way: the
+/// bind wants the index and nothing else, and the `sendto` wants the index,
+/// the ethertype and the destination MAC. Every other field is for the
+/// receiving side and is ignored on a send.
+#[cfg(target_os = "linux")]
+fn link_address(
+    index: libc::c_int,
+    protocol: u16,
+    destination: Option<[u8; 6]>,
+) -> libc::sockaddr_ll {
+    // SAFETY: sockaddr_ll is plain data with no invalid bit patterns, and all
+    // zeroes is the value the fields not set below are meant to have.
+    let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+    address.sll_family = libc::AF_PACKET as libc::sa_family_t;
+    address.sll_protocol = protocol;
+    address.sll_ifindex = index;
+    if let Some(mac) = destination {
+        address.sll_halen = mac.len() as libc::c_uchar;
+        address.sll_addr[..mac.len()].copy_from_slice(&mac);
+    }
+    address
+}
+
+/// An interface's index, which is what `sockaddr_ll` names it by.
+///
+/// `if_nametoindex` answers zero for a name that is not an interface and does
+/// not always set `errno` doing it, so the zero is turned into an error here
+/// rather than handed to `bind` as index zero — which means "every
+/// interface", and is the one answer that would put a DISCOVER out of the
+/// wrong link silently.
+#[cfg(target_os = "linux")]
+fn interface_index(interface: &str) -> io::Result<libc::c_int> {
+    let name = std::ffi::CString::new(interface).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface name has a NUL in it",
+        )
+    })?;
+    // SAFETY: the string is NUL terminated by CString and outlives the call.
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    if index == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{interface} is not an interface the kernel knows"),
+        ));
+    }
+    Ok(index as libc::c_int)
 }
 
 /// `setsockopt` for the options that are one boolean.
@@ -1320,9 +1751,9 @@ fn bind_to_client_port(fd: libc::c_int) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 impl Transport for BroadcastSocket {
     fn send(&mut self, datagram: &[u8]) -> io::Result<()> {
-        self.socket
-            .send_to(datagram, (Ipv4Addr::BROADCAST, SERVER_PORT))?;
-        Ok(())
+        // Down the raw socket, not `self.socket.send_to`: the UDP send is the
+        // one that would put another link's address in the IP header.
+        self.raw.send(datagram)
     }
 
     fn receive(&mut self, timeout: Duration) -> io::Result<Option<Vec<u8>>> {
@@ -1355,7 +1786,7 @@ impl Transport for BroadcastSocket {
 /// under test.
 #[cfg(target_os = "linux")]
 pub fn acquire_on(interface: &str, mac: [u8; 6]) -> io::Result<Lease> {
-    let mut socket = BroadcastSocket::bind(interface)?;
+    let mut socket = BroadcastSocket::bind(interface, mac)?;
     acquire(&mut socket, mac, transaction_id(mac))
 }
 
@@ -1789,6 +2220,195 @@ mod tests {
         // What an interface with no address of its own reads as, which no
         // server could answer a DISCOVER from.
         assert_eq!(hardware_address("00:00:00:00:00:00"), None);
+    }
+
+    #[test]
+    fn the_checksum_is_the_worked_example_in_rfc_1071() {
+        // §3, "Numerical Examples". The bytes and the answer are both the
+        // RFC's, so this is the arithmetic being checked against something
+        // other than itself.
+        let example: &[u8] = &[0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7];
+        assert_eq!(checksum(&[example]), 0x220d);
+    }
+
+    #[test]
+    fn the_last_byte_of_an_odd_run_is_the_high_half_of_a_word() {
+        let odd: &[u8] = &[0x00, 0x01, 0xf2];
+        // Padded on the right, which is what RFC 1071 says.
+        assert_eq!(checksum(&[odd]), checksum(&[&[0x00, 0x01, 0xf2, 0x00]]));
+        // Not on the left, which is the way to get this wrong that still
+        // produces a plausible looking number.
+        assert_ne!(checksum(&[odd]), checksum(&[&[0x00, 0x01, 0x00, 0xf2]]));
+        // And not dropped: change the byte with no partner and the checksum
+        // changes with it.
+        assert_ne!(checksum(&[odd]), checksum(&[&[0x00, 0x01, 0xff]]));
+    }
+
+    #[test]
+    fn the_checksum_does_not_care_where_the_runs_are_split() {
+        // The UDP checksum covers a pseudo-header and a datagram handed over
+        // separately, so a split that changed the answer would be a checksum
+        // no receiver could reproduce.
+        let whole: &[u8] = &[0x45, 0x00, 0x01, 0x48, 0x11, 0xff, 0x2a];
+        let expected = checksum(&[whole]);
+        for at in 0..=whole.len() {
+            assert_eq!(checksum(&[&whole[..at], &whole[at..]]), expected, "at {at}");
+        }
+        // Including across a run with nothing in it, which is what an empty
+        // DHCP payload would make the second half.
+        assert_eq!(
+            checksum(&[&whole[..3], &whole[3..3], &whole[3..]]),
+            expected
+        );
+    }
+
+    #[test]
+    fn an_ipv4_header_is_the_twenty_bytes_a_capture_would_show() {
+        let header = ipv4_header(
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            UDP_HEADER + MIN_PAYLOAD,
+        );
+        assert_eq!(
+            header,
+            [
+                0x45, 0x00, // IPv4, five words of header, no DSCP
+                0x01, 0x48, // 328 bytes: 20 + 8 + 300
+                0x00, 0x00, // no identification, because nothing fragments
+                0x00, 0x00, // no flags, no fragment offset
+                0x40, // TTL 64
+                0x11, // UDP
+                0x79, 0xa6, // the checksum over the rest of this
+                0x00, 0x00, 0x00, 0x00, // from 0.0.0.0, which is the point
+                0xff, 0xff, 0xff, 0xff, // to everybody
+            ]
+        );
+    }
+
+    #[test]
+    fn a_receiver_checksumming_the_header_gets_zero() {
+        // What the checksum is for: the same sum run over a header that has
+        // a correct one in it cancels out. A receiver that gets anything
+        // else drops the packet.
+        for length in [UDP_HEADER, UDP_HEADER + MIN_PAYLOAD, 1500] {
+            let header = ipv4_header(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, length);
+            assert_eq!(checksum(&[&header]), 0, "at {length}");
+        }
+    }
+
+    #[test]
+    fn a_receiver_checksumming_the_datagram_gets_zero_however_odd_the_payload() {
+        for length in [0, 1, 3, 299, MIN_PAYLOAD] {
+            let payload = vec![0xa5u8; length];
+            let datagram = udp_datagram(
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::BROADCAST,
+                CLIENT_PORT,
+                SERVER_PORT,
+                &payload,
+            );
+            assert_eq!(datagram.len(), UDP_HEADER + length);
+            assert_eq!(
+                u16::from_be_bytes([datagram[4], datagram[5]]) as usize,
+                datagram.len(),
+                "the length field at {length}"
+            );
+            let pseudo = pseudo_header(
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::BROADCAST,
+                datagram.len() as u16,
+            );
+            assert_eq!(checksum(&[&pseudo, &datagram]), 0, "at {length}");
+        }
+    }
+
+    #[test]
+    fn a_checksum_that_comes_out_zero_is_sent_the_other_way_round() {
+        // The one payload in this shape whose checksum is zero, found by
+        // trying all 65536 of them. Zero on the wire means "there is no
+        // checksum here", so it has to go as 0xffff, which is the same
+        // number in ones complement and not that sentence.
+        let datagram = udp_datagram(
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            CLIENT_PORT,
+            SERVER_PORT,
+            &[0xff, 0x53],
+        );
+        assert_eq!(&datagram[6..8], &[0xff, 0xff]);
+    }
+
+    #[test]
+    fn a_frame_is_the_bytes_a_capture_would_show() {
+        // Three bytes of payload rather than a real DHCP message, so that
+        // the whole frame fits in one assertion. The shorter payload is what
+        // makes the two lengths and both checksums different from every
+        // other test here.
+        assert_eq!(
+            broadcast_frame(MAC, &[0x00, 0x01, 0x02]),
+            vec![
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // to everybody
+                0x52, 0x54, 0x00, 0x12, 0x34, 0x56, // from this link
+                0x08, 0x00, // IPv4
+                0x45, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x40, 0x11, 0x7a, 0xcf, 0x00, 0x00,
+                0x00, 0x00, 0xff, 0xff, 0xff, 0xff, // 31 bytes, 0.0.0.0 to broadcast
+                0x00, 0x44, 0x00, 0x43, 0x00, 0x0b, 0xfd, 0x50, // 68 to 67, 11 bytes
+                0x00, 0x01, 0x02, // the payload, untouched
+            ]
+        );
+    }
+
+    #[test]
+    fn a_frame_is_the_payload_with_forty_two_bytes_in_front_of_it() {
+        let mut client = Client::new(MAC, XID);
+        let datagram = client.discover(0);
+        let frame = broadcast_frame(MAC, &datagram);
+
+        let headers = ETHERNET_HEADER + IPV4_HEADER + UDP_HEADER;
+        assert_eq!(headers, 42);
+        assert_eq!(
+            &frame[headers..],
+            &datagram[..],
+            "the payload is not touched"
+        );
+        // The number in the capture in #156, which is the same DHCP message
+        // this wraps: 14 + 20 + 8 + 300.
+        assert_eq!(frame.len(), 342);
+        // And a server reading the frame finds the message that went in.
+        let message = Message::parse(&frame[headers..]).expect("a message");
+        assert_eq!(message.message_type(), Some(MessageType::Discover));
+        assert_eq!(message.mac, MAC);
+        assert_eq!(message.xid, XID);
+    }
+
+    #[test]
+    fn both_of_the_packets_a_client_sends_go_out_from_nothing_to_everybody() {
+        let mut server = FakeServer::new();
+        acquire(&mut server, MAC, XID).expect("a lease");
+        assert_eq!(server.transcript(), vec!["DISCOVER", "REQUEST"]);
+
+        for datagram in &server.sent {
+            let frame = broadcast_frame(MAC, datagram);
+            assert_eq!(&frame[0..6], &BROADCAST_MAC, "destination MAC");
+            assert_eq!(&frame[6..12], &MAC, "source MAC");
+            assert_eq!(&frame[12..14], &ETHERTYPE_IPV4.to_be_bytes());
+            // The whole of #156 in one assertion: not the other link's
+            // address, which is what SO_BINDTODEVICE left the kernel free to
+            // put here.
+            assert_eq!(&frame[26..30], &[0, 0, 0, 0], "source address");
+            assert_eq!(&frame[30..34], &[255, 255, 255, 255], "destination");
+            assert_eq!(&frame[34..36], &CLIENT_PORT.to_be_bytes(), "from port 68");
+            assert_eq!(&frame[36..38], &SERVER_PORT.to_be_bytes(), "to port 67");
+            assert_ne!(
+                &frame[40..42],
+                &[0, 0],
+                "a checksum, not the absence of one"
+            );
+            assert_eq!(
+                &frame[ETHERNET_HEADER + IPV4_HEADER + UDP_HEADER..],
+                &datagram[..]
+            );
+        }
     }
 
     #[test]

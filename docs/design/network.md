@@ -64,43 +64,115 @@ same call for the same reason: the thing being avoided is larger than the
 thing being written, and what is written is testable in a way that a
 subprocess is not.
 
-### A UDP socket, not a raw one
+### A raw send, a UDP receive — [#156](https://github.com/m96-chan/tOS/issues/156)
 
 This is the one decision in the DHCP client that could reasonably have gone
-the other way.
+the other way, and half of it has since gone the other way.
 
-A client in SELECTING has no address. A server is therefore entitled to
-unicast its OFFER to the address it is about to hand out, which is an address
-this machine does not have and whose ARP the kernel will not answer. `dhcpcd`,
-`udhcpc` and `dhclient` all solve this with a raw `AF_PACKET` socket: they
-build the Ethernet, IP and UDP headers by hand, compute the UDP checksum by
-hand, and read frames below the IP stack.
+**What it was.** A client in SELECTING has no address. A server is therefore
+entitled to unicast its OFFER to the address it is about to hand out, which is
+an address this machine does not have and whose ARP the kernel will not
+answer. `dhcpcd`, `udhcpc` and `dhclient` all solve that with a raw
+`AF_PACKET` socket: they build the Ethernet, IP and UDP headers by hand and
+read frames below the IP stack. RFC 2131 §4.1 has a bit for exactly this
+situation — setting `BROADCAST` in the `flags` field asks the server to
+broadcast its reply to 255.255.255.255:68, which arrives in an ordinary
+`SOCK_DGRAM` socket bound to `0.0.0.0:68` — so `dhcp.rs` set the bit, used one
+UDP socket for both directions, and did not write the headers.
 
-RFC 2131 §4.1 has a bit for exactly this situation. Setting `BROADCAST` in the
-`flags` field asks the server to broadcast its reply to 255.255.255.255:68,
-which arrives in an ordinary `SOCK_DGRAM` socket bound to `0.0.0.0:68`. That
-is what `dhcp.rs` does.
+**What changed.** Nothing about receiving. The flag still works: two NAT
+implementations and `udhcpd` on the wireless witness have all honoured it.
+What changed is that the machine grew a second link.
 
-The cost is honest and bounded: against a server that ignores the flag, the
-offer goes somewhere this client cannot hear, nothing arrives, and acquisition
-ends in a timeout after fifteen seconds. The failure mode is *no address*,
-never *a wrong address*. What the raw socket would buy is compatibility with a
-class of server that is rare and out of spec; what it would cost is about two
-hundred lines of header construction and checksum arithmetic whose only test
-would be one that constructs the same bytes the code does.
+`SO_BINDTODEVICE` fixes which *interface* a broadcast leaves by. It does not
+fix the *source address*, and there is no socket option that does. For a
+limited broadcast the kernel picks one with
+`inet_select_addr(dev, 0, RT_SCOPE_LINK)`, which falls back to the first
+suitable address on *any* device when the bound device has none. So a laptop
+with a cable in it and a radio associating sent the radio's DISCOVER from the
+cable's address:
 
-Three socket options are not optional, and one of them is why this is a
-per-interface operation at all:
+```text
+02:00:00:00:00:00 > ff:ff:ff:ff:ff:ff, ethertype IPv4, length 342:
+    10.0.2.15.68 > 255.255.255.255.67: BOOTP/DHCP, Request from 02:00:00:00:00:00
+```
+
+A machine with one link can never show this, because there is no other address
+to pick, and a machine with one link is what there was when the original call
+was made.
+
+**What it is now.** Sends go out of an `AF_PACKET`/`SOCK_RAW` socket bound to
+the interface index, carrying headers `dhcp.rs` writes itself: destination MAC
+`ff:ff:ff:ff:ff:ff` and source the link's own, IPv4 from `0.0.0.0` to
+`255.255.255.255` with a computed header checksum, UDP 68 → 67 with a checksum
+computed over the pseudo-header. Receives are unchanged — the same UDP socket
+on `0.0.0.0:68`, because the `BROADCAST` flag still makes the replies land
+there, and because receiving is the direction with no source address to get
+wrong. Leaving it alone keeps the checksum verified rather than computed, the
+port demultiplexed, and anything fragmented reassembled, all by the kernel.
+
+The UDP checksum is computed rather than left zero, which IPv4 permits. The
+machines this whole change is for are the ones that look: a firewall whose
+rule is written `0.0.0.0:68 -> 255.255.255.255:67`, a server that logs what it
+dropped. A datagram with no checksum on it is one some of them have already
+decided not to trust.
+
+What it cost was about two hundred lines of header construction and checksum
+arithmetic, which is exactly what the original entry said it would cost. What
+the original entry got wrong was the claim that those lines' "only test would
+be one that constructs the same bytes the code does". They are pure functions
+over bytes, so the tests are a known-good frame asserted byte for byte, RFC
+1071's own worked example for the checksum, the odd-length payload that
+exercises the one-byte tail, a receiver's check that a correct header and a
+correct datagram both checksum back to zero, and the round trip saying the
+DHCP payload is unchanged by being wrapped.
+
+The tests are bytes, so the send itself was witnessed separately, off the
+image: two network namespaces joined by a veth, `dnsmasq` 2.93 serving DHCP in
+one, and the client asking in the other on a link with no address while a
+second link in the same namespace had 192.168.50.9. The old path and the new
+one were captured on the same wire:
+
+```text
+before  fa:fd:a2:c2:e1:b9 > ff:ff:ff:ff:ff:ff  10.0.2.15.68 > 255.255.255.255.67
+after   fa:fd:a2:c2:e1:b9 > ff:ff:ff:ff:ff:ff     0.0.0.0.68 > 255.255.255.255.67
+```
+
+Both 342 bytes; the second's IP and UDP checksums both verify at a receiver
+and the first's UDP checksum does not, because the kernel left it to the
+hardware. `dnsmasq` read the hand-built DISCOVER — MAC, transaction and
+requested options 1, 3, 6 and 15 — and the whole handshake completed:
+`DHCPDISCOVER`, `DHCPOFFER`, `DHCPREQUEST`, `DHCPACK`, and a lease of
+10.0.2.108/24 via 10.0.2.15 on the client. That is a real server answering
+headers this repository wrote, and the reply arriving on the UDP socket, which
+is the claim in one run.
+
+**When the raw socket cannot be opened, acquisition fails and says so.** There
+is no fallback to the UDP send, because the UDP send is the bug: a fallback
+would put the wrong source address back on the wire on exactly the machines
+nobody is watching. This takes nothing away from an unprivileged process
+either, and the reason is that all three of these want the same privilege —
+`SO_BINDTODEVICE` wants `CAP_NET_RAW`, an `AF_PACKET` socket wants
+`CAP_NET_RAW`, and binding port 68 wants `CAP_NET_BIND_SERVICE`. Anybody who
+could open the old socket can open the new one; anybody who cannot never got
+past the first line of `BroadcastSocket::bind`. The compositor is root today.
+
+The socket options on the UDP half are still not optional, and one of them is
+still why this is a per-interface operation at all:
 
 - `SO_REUSEADDR`, set before the bind, which is why the descriptor is built
   with `libc::socket` and wrapped in `std::net::UdpSocket` afterwards.
 - `SO_BROADCAST`, without which sending to 255.255.255.255 fails with
   `EACCES` — an error that reads like a permission problem and is not one.
+  Nothing is sent from this socket any more; it is one syscall to keep a
+  socket that can be.
 - `SO_BINDTODEVICE`. A machine asking for its first address has no route to
   anywhere, so nothing in the routing table can tell the kernel which
-  interface a broadcast should leave by. Naming the device is the only way to
-  say "ask on this cable", and it is also what stops a laptop with a cable and
-  a radio from configuring the wrong one.
+  interface a datagram should leave by or arrive on. Naming the device is the
+  only way to say "ask on this cable", and on the receiving side it is what
+  stops a laptop with a cable and a radio from reading the answer meant for
+  the other one. The packet socket has no `SO_BINDTODEVICE`; it is bound by
+  interface index in its `sockaddr_ll` instead.
 
 ### The seam, and what is actually tested
 
@@ -109,9 +181,12 @@ Everything above the wire is a function over bytes:
 ```text
 Message::parse / Message::encode      no socket
 Client::receive -> Step               no socket, no clock
+broadcast_frame                       no socket: Ethernet, IPv4 and UDP
+                                      headers as bytes in, bytes out
 Transport (2 methods)                 the socket
 FakeServer: Transport                 a server that is not on a network
-BroadcastSocket: Transport            the real one, Linux only
+BroadcastSocket: Transport            the real one, Linux only: an AF_PACKET
+                                      socket to send on, UDP to hear on
 ```
 
 So the whole of DISCOVER → OFFER → REQUEST → ACK is exercised in `cargo test`
@@ -620,7 +695,10 @@ DHCP 67->68  ACK       yiaddr=10.0.2.15
 That is the handshake at the top of this document, on a wire, against a server
 nobody in this repository wrote, captured rather than asserted. Two different
 NAT implementations — VirtualBox's and QEMU's slirp — both answer the
-`BROADCAST` flag, which is the bet "A UDP socket, not a raw one" made.
+`BROADCAST` flag, which is the bet "A raw send, a UDP receive" makes on the
+receiving half. (This capture predates #156: the source address on those two
+sends was the kernel's choice, not `0.0.0.0`. It was the right address here
+because the machine had one link.)
 
 ### What did not work
 
