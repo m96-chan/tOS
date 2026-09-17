@@ -226,8 +226,15 @@ not.
 So the consequence is not "add three variants". It is that **the IME toggle
 must be a binding, configurable, with a default that is not a JIS key**,
 because on the hardware that most needs the toggle the toggle is
-indistinguishable from an ordinary character. The three keys should still get
-names eventually, because a named key that is dropped is the bug #41 fixed —
+indistinguishable from an ordinary character. The defaults are `ctrl+space`
+and `super+i`. `ctrl+space` was held back at first on the grounds that a
+terminal owes it to the program inside it — `encode_key` makes it a NUL, which
+is emacs's set-mark — and it is bound anyway, because until #62 settles what
+半角/全角 sends it is the only combination a Japanese user's fingers already
+reach for. That cost is paid for this one combination rather than opened up as
+a rule, and `super+i` and the かな key stay bound beside it so a session that
+wants its NUL back still has a toggle. The three keys should still get names
+eventually, because a named key that is dropped is the bug #41 fixed —
 but what `KEY_KATAKANA` ought to *do* is a question about how many modes tOS
 has, and a variant named for a mode that does not exist is a guess inside an
 enum built specifically to carry meaning. It is a task below, with the

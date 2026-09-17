@@ -356,9 +356,9 @@ impl Keymap {
             (KeyCode::Char('n'), Modifiers::SHIFT, Action::ShowNetworks),
             // i for input method. It is the letter the thing is named after
             // in every language it has a name in, and it is one of the few
-            // still free — the obvious alternative, ctrl+space, is NUL to a
-            // terminal and set-mark to emacs, so binding it would take a key
-            // away from the program the IME exists to type into.
+            // still free. ctrl+space is bound to the same action further down
+            // — see the note there for why this one is still the name the
+            // cheat sheet teaches.
             (KeyCode::Char('i'), Modifiers::NONE, Action::ImeToggle),
         ];
         for (code, modifiers, action) in bindings {
@@ -544,6 +544,22 @@ impl Keymap {
             Binding::new(KeyCode::Ime(ImeKey::KanaMode), Modifiers::NONE),
             Action::ImeToggle,
         );
+        // ctrl+space, which is what a person who has used a Linux desktop
+        // presses to turn an input method on — it is ibus's and fcitx's
+        // default, and fingers that have learned it do not learn super+i
+        // first. The cost is real and was the reason this binding did not
+        // exist: `encode_key` sends ctrl+space to the pane as NUL, which is
+        // emacs's set-mark, so binding it here takes that key away from every
+        // program in tOS at once, including the ones the IME exists to type
+        // into. It is the same trade #153 took for ctrl+shift+c — a key that
+        // nobody looks up is worth more than the byte — and it is taken the
+        // same way: this combination and no other. super+i and the かな key
+        // stay bound, so a person who wants their NUL back can unbind this one
+        // and still have a toggle.
+        keymap.bind(
+            Binding::new(KeyCode::Char(' '), Modifiers::CTRL),
+            Action::ImeToggle,
+        );
         keymap
     }
 
@@ -696,6 +712,21 @@ mod tests {
             keymap.resolve(&press(KeyCode::Ime(ImeKey::KanaMode), Modifiers::NONE)),
             Resolution::Action(Action::ImeToggle)
         );
+        // And ctrl+space, the combination a Linux desktop has taught. It costs
+        // the pane its NUL, which is why it is written down in the table and
+        // here rather than left to be noticed.
+        assert_eq!(
+            keymap.resolve(&press(KeyCode::Char(' '), Modifiers::CTRL)),
+            Resolution::Action(Action::ImeToggle)
+        );
+        // Space with nothing held down is still a space, and the other
+        // modifiers on it are still the pane's.
+        for modifiers in [Modifiers::NONE, Modifiers::SHIFT, Modifiers::ALT] {
+            assert_eq!(
+                keymap.resolve(&press(KeyCode::Char(' '), modifiers)),
+                Resolution::Passthrough
+            );
+        }
         // The other two conversion keys belong to the preedit rather than to
         // the keymap, so they go on through to the compositor's IME arm.
         for code in [ImeKey::Convert, ImeKey::NonConvert] {

@@ -947,8 +947,12 @@ marking the rows it used rather than by redrawing the screen. The candidate
 window is deliberately not an overlay, for reasons that accumulated as it was
 written — among them that typing during a conversion extends the preedit,
 which is the opposite of what typing into an overlay does. Turning the IME on
-is `super+i` and not 半角/全角: what that key sends through the kernel's event
-stream has not been established yet, which is the one item above still open.
+is `ctrl+space` or `super+i`, and not 半角/全角: what that key sends through
+the kernel's event stream has not been established yet, which is the one item
+above still open. `ctrl+space` is what ibus and fcitx are set to on a Linux
+desktop, so it is the combination most fingers already know; the price is that
+the pane no longer receives it as NUL, and a session that wants that byte back
+can unbind it and keep `super+i`.
 `[ime] dictionary` under [Configuration](#configuration) says where the
 dictionary is looked for.
 
@@ -1451,8 +1455,9 @@ blank-after = 600
 # Japanese input. The dictionary it converts through; kana still type without
 # one and conversion simply finds nothing. Left out, it is searched for at
 # $XDG_DATA_HOME/tos/SKK-JISYO and then /usr/share/tos/SKK-JISYO.L. Turning it
-# on is a binding, super+i, and not the 半角/全角 key: on a JIS keyboard that
-# key arrives as KEY_GRAVE and is indistinguishable from a backtick.
+# on is a binding, ctrl+space or super+i, and not the 半角/全角 key: on a JIS
+# keyboard that key arrives as KEY_GRAVE and is indistinguishable from a
+# backtick. ctrl+space is the desktop default and costs the pane its NUL.
 [ime]
 dictionary = /usr/share/skk/SKK-JISYO.L
 
