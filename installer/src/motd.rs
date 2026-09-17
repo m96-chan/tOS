@@ -35,9 +35,11 @@
 //! `chafa` produces and [`art_runs`] has always parsed. So there is a third
 //! rung between the two (#162): [`ASCII`], the same splash rendered into
 //! cells once and checked in, printed by any terminal the whole greeting fits
-//! on. The ladder is the picture, then this, then the drawn banner, then
-//! [`ART_SMALL`]: each rung is what the one above gives way to, and the
-//! bottom one always arrives.
+//! on. The ladder is the picture, then this, then the drawn banner: each rung
+//! is what the one above gives way to, and the bottom one is unconditional,
+//! because a greeting has to arrive. ([`ART_SMALL`] is not on it — that is
+//! the floor of the installer's own welcome screen, which has a box to fit
+//! the banner inside and can end up with no room at all.)
 
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
@@ -389,7 +391,10 @@ fn ascii_banner() -> String {
 /// follows for the same reason (`fit`): the banner is the part that gives way,
 /// because the ten lines under it are the part being read.
 fn fits(greeting: &str, cols: u32, rows: u32) -> bool {
-    art_width(greeting) as u32 <= cols && art_lines(greeting).len() as u32 <= rows
+    // Counted as it is printed. `art_lines` is the wrong ruler here: it drops
+    // the blank line the greeting ends on, and a blank line is a row the
+    // terminal spends like any other.
+    art_width(greeting) as u32 <= cols && greeting.lines().count() as u32 <= rows
 }
 
 /// How big the terminal on `fd` is, in cells, whatever terminal it is.
@@ -800,10 +805,7 @@ mod tests {
     /// of whatever the file in the tree happens to measure today.
     fn smallest() -> (u32, u32) {
         let greeting = greeting_under(ascii_banner());
-        (
-            art_width(&greeting) as u32,
-            art_lines(&greeting).len() as u32,
-        )
+        (art_width(&greeting) as u32, greeting.lines().count() as u32)
     }
 
     #[test]
@@ -853,6 +855,23 @@ mod tests {
             !greeting.contains('\u{2588}'),
             "the drawn banner was printed as well"
         );
+    }
+
+    #[test]
+    fn the_greeting_chosen_for_a_terminal_is_printed_inside_it() {
+        // Measured with a different ruler than `fits` uses: the rows a
+        // terminal spends are the newlines that reach it, and the columns are
+        // the widest line after the escapes come out. A greeting chosen for a
+        // terminal has to be within both, or the rule is measuring something
+        // other than what arrives.
+        let (cols, rows) = smallest();
+        let greeting = greeting(None, Some((cols, rows)));
+        assert!(
+            greeting.contains('\u{2584}'),
+            "this is the terminal the render is chosen on"
+        );
+        assert!(greeting.matches('\n').count() as u32 <= rows, "too tall");
+        assert!(art_width(&greeting) as u32 <= cols, "too wide");
     }
 
     #[test]

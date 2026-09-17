@@ -317,8 +317,10 @@ screen and the greeting together, which is why there is one file.
 A terminal that cannot be sent the picture is shown it drawn in cells instead,
 where there is room: `/etc/tos/motd_ascii`, the same picture rendered once into
 half blocks, printed whenever the whole greeting fits the terminal — 120 cells
-by 31, which is a maximized window at the far end of an `ssh` and not an
-80-column console. Below that it is the drawn banner, as it has always been:
+by 29 on an installed machine, and by 32 in a live session, where there are
+three more lines to say about installing. That is a maximized window at the
+far end of an `ssh`, and not an 80-column console. Below it the drawn banner,
+as it has always been:
 the serial console, the kernel VT the rescue session lands on, and anybody
 logged in from another machine on a smaller screen.
 

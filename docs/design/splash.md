@@ -268,11 +268,13 @@ that fits whole. It is the rule `fit` already follows for the picture: the
 banner is the part that gives way, because the lines under it are the part
 being read.
 
-For the file in the tree that comes to **120 by 31**: a maximized terminal
-window, and not an 80-column console. An 80-column console gets what it always
-got. A second, narrower render would reach it, at the price of a second copy
-to keep in step with `splash.png` by hand, and one copy is enough to be going
-on with.
+For the file in the tree that comes to **120 by 32** in a live session and
+**120 by 29** on an installed machine — the greeting is three lines shorter
+once there is no disk left to offer, and the installed machine is the one
+being `ssh`'d into. Either number is a maximized terminal window and neither
+is an 80-column console, which goes on getting what it always got. A second,
+narrower render would reach it, at the price of a second copy to keep in step
+with `splash.png` by hand, and one copy is enough to be going on with.
 
 **Asking every terminal, not only tOS's own.** `Screen::probe` returns nothing
 without `TOS` in the environment, so before this the greeting knew nothing at
