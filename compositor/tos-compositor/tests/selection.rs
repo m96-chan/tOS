@@ -88,8 +88,15 @@ fn screen(c: &Compositor) -> String {
     c.pane(focus).unwrap().terminal.grid().to_text()
 }
 
-/// Wait for `text` to appear in the focused pane more times than it already
-/// does, which is how a paste echoed by the line discipline shows up.
+/// Wait until `text` is on the focused pane's screen at least `times` over.
+///
+/// `times` is the whole count on the screen and not the number of new ones, so
+/// a caller naming a count the screen already holds has written no wait at all
+/// — and, worse, one that returns before the thing it was waiting for. It is
+/// also the *first* write to reach that count that ends the wait, which is not
+/// always the last write the round trip makes: see #166 and the comment in
+/// `japanese_and_more_than_one_line_survive_the_round_trip`, where the echo
+/// arrives one write before `cat`'s copy does.
 fn wait_for_echo(c: &mut Compositor, text: &str, times: usize) -> bool {
     wait_for(c, Duration::from_secs(5), |c| {
         screen(c).matches(text).count() >= times
@@ -425,14 +432,40 @@ fn japanese_and_more_than_one_line_survive_the_round_trip() {
     assert_eq!(clipboard(&c), "日本語のテキスト\nと二行目");
 
     assert!(ctrl_shift(&mut c, 'v'));
-    // The newline in the middle arrives as a carriage return, which is what
-    // `encode_paste` makes of it, so the second line lands under the first.
+    // What the screen settles at, and why each copy is there. `inject` is not
+    // the pty — it advances the terminal — so the text starts on the screen
+    // once. The paste then goes the whole way round: the line discipline
+    // echoes it, and `cat` writes the first line back, because `encode_paste`
+    // turns the newline into a carriage return and the tty turns that into the
+    // newline that completes a line. The second line is never terminated, so
+    // cat is still holding it and it stays at two.
+    //
+    // | | injected | echoed | written by cat |
+    // |---|---|---|---|
+    // | 日本語のテキスト | 1 | 1 | 1 |
+    // | と二行目 | 1 | 1 | — |
+    //
+    // The wait is on cat's copy, which is the **last** of the three to land.
+    // It used to be on the echo of the second line, which is the first — so it
+    // returned with the screen one write short of settled and the count below
+    // raced the scheduler for it, losing about one run in five (#166).
     assert!(
-        wait_for_echo(&mut c, "と二行目", 2),
+        wait_for_echo(&mut c, "日本語のテキスト", 3),
         "the paste never came back: {:?}",
         screen(&c)
     );
-    assert_eq!(screen(&c).matches("日本語のテキスト").count(), 2);
+    assert_eq!(
+        screen(&c).matches("日本語のテキスト").count(),
+        3,
+        "something wrote the first line a fourth time: {:?}",
+        screen(&c)
+    );
+    assert_eq!(
+        screen(&c).matches("と二行目").count(),
+        2,
+        "the second line is not terminated, so cat cannot have written it: {:?}",
+        screen(&c)
+    );
 }
 
 #[test]
