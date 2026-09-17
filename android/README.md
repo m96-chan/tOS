@@ -103,6 +103,14 @@ adb -s DEVICE_SERIAL shell pm grant io.github.m96chan.tos android.permission.USE
 adb -s DEVICE_SERIAL shell am start -n io.github.m96chan.tos/.MainActivity
 ```
 
+Its launcher icon is an adaptive icon whose foreground is the splash art's
+own character, cut out of `compositor/tos-compositor/assets/splash.png`: the
+character rests against the bottom of the mask, so the crop through its arms
+falls outside the viewport every launcher shows, and its face stays inside
+the 66dp safe circle. The foreground PNGs are scaled from the pixel art by
+whole numbers before being resampled down, which is what keeps the pixels
+square at every density.
+
 The launcher app is **tOS** (`io.github.m96chan.tos`). Missing permissions
 produce a setup dialog. If the OS refuses these development permission
 grants, this preview cannot launch its VM on that build. It does not change

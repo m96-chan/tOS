@@ -5,7 +5,7 @@
     <uses-permission android:name="android.permission.USE_CUSTOM_VIRTUAL_MACHINE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-    <application android:label="tOS" android:theme="@style/AppTheme" android:icon="@drawable/icon"
+    <application android:label="tOS" android:theme="@style/AppTheme" android:icon="@mipmap/icon"
         android:allowBackup="false" android:extractNativeLibs="true" android:supportsRtl="true">
         <service android:name=".VmService" android:exported="false" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Run the user's Debian virtual machine and terminal sessions" />
