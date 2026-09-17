@@ -262,6 +262,41 @@ fn the_toggle_is_a_binding_and_not_a_key_a_japanese_keyboard_sends_as_a_backtick
     assert!(c.pane(focus).unwrap().ime.is_enabled());
     press(&mut c, KeyCode::Ime(ImeKey::KanaMode));
     assert!(!c.pane(focus).unwrap().ime.is_enabled());
+    // And ctrl+space, which is the toggle on every other Linux desktop. It
+    // resolves in the keymap, so it toggles rather than reaching the pane as
+    // the NUL `encode_key` would otherwise make of it.
+    c.handle_input(InputEvent::Key(KeyEvent::new(
+        KeyCode::Char(' '),
+        Modifiers::CTRL,
+    )));
+    assert!(c.pane(focus).unwrap().ime.is_enabled());
+    c.handle_input(InputEvent::Key(KeyEvent::new(
+        KeyCode::Char(' '),
+        Modifiers::CTRL,
+    )));
+    assert!(!c.pane(focus).unwrap().ime.is_enabled());
+}
+
+#[test]
+fn ctrl_space_toggles_rather_than_sending_the_pane_a_nul() {
+    let mut c = compositor();
+    settle(&mut c);
+    // The tty echoes ^@ for a NUL that reaches it, so the pane is the witness
+    // for the cost this binding pays: with the binding in place nothing
+    // arrives at all.
+    c.handle_input(InputEvent::Key(KeyEvent::new(
+        KeyCode::Char(' '),
+        Modifiers::CTRL,
+    )));
+    let bytes = bytes_that_reached_the_pty(&mut c);
+    assert!(!bytes.contains(&0), "ctrl+space reached the pty: {bytes:?}");
+    // A space with nothing held down is still a space.
+    press(&mut c, KeyCode::Char(' '));
+    let bytes = bytes_that_reached_the_pty(&mut c);
+    assert!(
+        bytes.contains(&b' '),
+        "the space key stopped typing a space"
+    );
 }
 
 #[test]
