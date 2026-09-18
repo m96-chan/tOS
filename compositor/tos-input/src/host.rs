@@ -442,6 +442,9 @@ fn decode_sgr_mouse(body: &[u8], final_byte: u8) -> Option<MouseEvent> {
         action,
         col: col.saturating_sub(1) as usize,
         row: row.saturating_sub(1) as usize,
+        // A host terminal reports cells. There is no pixel here to pass on and
+        // none to be invented from a cell number.
+        pixel: None,
         modifiers,
     })
 }

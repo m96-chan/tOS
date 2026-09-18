@@ -1244,6 +1244,20 @@ impl Terminal {
                 };
                 reporting_changed = true;
             }
+            // 1016 is 1006 with the position in pixels. The encodings share
+            // one field, so setting either one replaces the other and the
+            // last one set wins — `?1006h` then `?1016h` leaves pixels, as it
+            // does in xterm, where all of these write the same `extend_coords`.
+            // Resetting goes back to X10 rather than to whatever was set
+            // before, again as the neighbours do.
+            1016 => {
+                self.mouse.encoding = if enable {
+                    MouseEncoding::SgrPixels
+                } else {
+                    MouseEncoding::X10
+                };
+                reporting_changed = true;
+            }
             1047 => self.swap_alt_screen(enable),
             1048 => {
                 if enable {
@@ -1294,7 +1308,16 @@ impl Terminal {
             1002 => set(self.mouse.tracking == MouseTracking::ButtonEvent),
             1003 => set(self.mouse.tracking == MouseTracking::AnyEvent),
             1004 => set(self.modes.focus_events),
+            // Cells and pixels are two encodings and not a flag on one, so
+            // 1006 is reset while 1016 is what is set. A program that asked
+            // for pixels and is told 1006 is still on would have to guess
+            // which of the two it is being sent.
             1006 => set(self.mouse.encoding == MouseEncoding::Sgr),
+            // The reply to this query is how a program finds out whether
+            // pixel reporting exists at all: it sets 1016 and asks, and an
+            // emulator that never heard of it answers 0. Programs depend on
+            // it, so the shape of the answer is fixed.
+            1016 => set(self.mouse.encoding == MouseEncoding::SgrPixels),
             1049 => set(self.modes.alt_screen),
             2004 => set(self.modes.bracketed_paste),
             2026 => set(self.modes.synchronized_output),

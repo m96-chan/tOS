@@ -777,6 +777,7 @@ fn a_host_terminal_mouse_click_lands_where_a_device_pointer_at_the_same_spot_doe
             action: MouseAction::Press,
             col: x as usize,
             row: (y / 2) as usize,
+            pixel: None,
             modifiers: Modifiers::NONE,
         }));
         assert_eq!(

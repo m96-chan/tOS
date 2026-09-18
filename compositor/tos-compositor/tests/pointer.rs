@@ -496,6 +496,7 @@ fn a_host_terminals_mouse_report_puts_no_arrow_on_the_panel() {
             action: MouseAction::Motion,
             col: 10,
             row: 5,
+            pixel: None,
             modifiers: Modifiers::NONE,
         })),
         "a host terminal's motion asked for a frame with nothing to put in it"

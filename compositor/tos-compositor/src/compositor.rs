@@ -986,7 +986,14 @@ impl Compositor {
                 let (pw, ph) = tos_platform::nested::HOST_CELL_PIXELS;
                 let x = (mouse.col as u32).saturating_mul(pw);
                 let y = (mouse.row as u32).saturating_mul(ph);
-                self.route_mouse(x / cw, y / ch, mouse.button, mouse.action, mouse.modifiers)
+                self.route_mouse(
+                    x / cw,
+                    y / ch,
+                    (x, y),
+                    mouse.button,
+                    mouse.action,
+                    mouse.modifiers,
+                )
             }
             InputEvent::Pointer(pointer) => {
                 let (cw, ch) = self.cell_size();
@@ -1001,6 +1008,7 @@ impl Compositor {
                 let routed = self.route_mouse(
                     x / cw,
                     y / ch,
+                    (x, y),
                     pointer.button,
                     pointer.action,
                     pointer.modifiers,
@@ -1234,10 +1242,18 @@ impl Compositor {
     }
 
     /// Route a mouse event that is already in display cell coordinates.
+    ///
+    /// `pixel` is the same position in display pixels, which is where the
+    /// cells were divided out of and which the pixel mouse encoding (1016)
+    /// reports instead of them. It is carried beside the cells rather than
+    /// recovered from them: a cell multiplied back up names its top left
+    /// corner, and the whole point of reporting pixels is where in the cell
+    /// the pointer is.
     fn route_mouse(
         &mut self,
         cell_x: u32,
         cell_y: u32,
+        pixel: (u32, u32),
         button: Option<MouseButton>,
         action: MouseAction,
         modifiers: tos_input::Modifiers,
@@ -1353,11 +1369,22 @@ impl Compositor {
         // Clamp into the pane so a drag past its edge still selects sensibly.
         let local_col = cell_x.clamp(rect.x, rect.right() - 1) - rect.x;
         let local_row = cell_y.clamp(rect.y, rect.bottom() - 1) - rect.y;
+        // And the same clamp in pixels, against the pane's own edges in
+        // pixels. A drag that has left the pane has to name the last pixel
+        // inside it for the same reason it names the last cell: the two are
+        // the same report, and a program that got a clamped cell and an
+        // unclamped pixel would be told the pointer is in two places.
+        let (cw, ch) = self.cell_size();
+        let local_pixel = (
+            pixel.0.clamp(rect.x * cw, rect.right() * cw - 1) - rect.x * cw,
+            pixel.1.clamp(rect.y * ch, rect.bottom() * ch - 1) - rect.y * ch,
+        );
         let local = MouseEvent {
             button,
             action,
             col: local_col as usize,
             row: local_row as usize,
+            pixel: Some(local_pixel),
             modifiers,
         };
 
@@ -5564,6 +5591,7 @@ mod tests {
             action: MouseAction::Press,
             col: 2,
             row: 0,
+            pixel: None,
             modifiers: tos_input::Modifiers::NONE,
         }));
         assert!(
@@ -5631,6 +5659,7 @@ mod tests {
             action: MouseAction::Motion,
             col: 20,
             row: 6,
+            pixel: None,
             modifiers: tos_input::Modifiers::NONE,
         }));
 
@@ -6250,6 +6279,7 @@ mod tests {
             action: MouseAction::Press,
             col: 2,
             row: 2,
+            pixel: None,
             modifiers: tos_input::Modifiers::NONE,
         }));
         // A pointer press and drag, which is how the mouse selects and copies

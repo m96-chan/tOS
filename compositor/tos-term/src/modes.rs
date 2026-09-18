@@ -100,6 +100,22 @@ pub enum MouseEncoding {
     Sgr,
     /// 1015: urxvt decimal.
     Urxvt,
+    /// 1016: SGR again, with the position in pixels rather than cells. A cell
+    /// is as much as a TUI can aim at; a program drawing its own picture in
+    /// the pane — a browser with a link, a scrollbar or a caret in it — needs
+    /// to know where in the cell the pointer landed.
+    SgrPixels,
+}
+
+impl MouseEncoding {
+    /// Whether a release report names the button that was let go of.
+    ///
+    /// The legacy encodings have one release code for every button and lose
+    /// it; both SGR encodings say which button it was and end the report with
+    /// `m` instead of `M`, which is the ambiguity they were invented to fix.
+    pub fn reports_the_released_button(self) -> bool {
+        matches!(self, MouseEncoding::Sgr | MouseEncoding::SgrPixels)
+    }
 }
 
 /// Mouse reporting state.

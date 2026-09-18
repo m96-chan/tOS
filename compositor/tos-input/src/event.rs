@@ -364,6 +364,28 @@ pub struct MouseEvent {
     /// Zero based cell coordinates within the pane.
     pub col: usize,
     pub row: usize,
+    /// Zero based pixel coordinates within the same pane, for the encodings
+    /// that report pixels rather than cells (1016, SGR-Pixels).
+    ///
+    /// Pixels on the cell side of the conversion look at first like the seam
+    /// [`PointerEvent`] exists to keep, and they are not. That seam is between
+    /// a device, which knows pixels and nothing about panes, and an encoder,
+    /// which needs the position inside one pane; this is on the far side of
+    /// it. What 1016 reports is the same event as 1006, in the same report,
+    /// picked by the program in the pane and not by the hardware — so it is
+    /// pane relative like the cells beside it, clamped to the pane like them,
+    /// and it arrives here only because the compositor worked it out on the
+    /// way, in the same place it divided the cells out. Nothing is converted
+    /// implicitly and no input path can forget to: a [`PointerEvent`] still
+    /// has to be turned into one of these by hand.
+    ///
+    /// `None` when nobody on the way here could say where the pointer was in
+    /// pixels — a host terminal reports its own cells and nothing finer, so
+    /// the nested backend has no pixel to offer. A pixel encoding then reports
+    /// nothing rather than putting cell numbers where a program is expecting
+    /// pixels, which would silently place every click a hundred pixels from
+    /// where the hand was.
+    pub pixel: Option<(u32, u32)>,
     pub modifiers: Modifiers,
 }
 
