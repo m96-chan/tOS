@@ -48,7 +48,15 @@ pub const CANDIDATES: [&str; 4] = [
 /// The environment variable that overrides the search.
 pub const ENGINE_ENV: &str = "TOS_BROWSER_ENGINE";
 
-/// How many lines of the engine's stderr are kept to explain a death.
+/// How many lines of the engine's stderr are kept to explain a death: the
+/// first `HEAD` and the last `TAIL`, with whatever came between dropped.
+///
+/// Both ends, because Chromium says why it is dying at the top — one
+/// `FATAL:` line, or "No usable sandbox!" — and then prints a stack trace and
+/// a register dump some twenty lines long. A tail alone keeps the registers
+/// and loses the sentence, which is exactly what happened the first time this
+/// ran on a machine whose Chromium could not start.
+const HEAD: usize = 8;
 const TAIL: usize = 12;
 
 /// The engine's pid, for the paths that cannot run a destructor.
@@ -175,8 +183,9 @@ impl Engine {
                 }
                 if let Ok(mut tail) = keep.lock() {
                     tail.push(line);
-                    if tail.len() > TAIL {
-                        tail.remove(0);
+                    if tail.len() > HEAD + TAIL {
+                        // The first lines stay; the ring is the rest.
+                        tail.remove(HEAD);
                     }
                 }
             }
