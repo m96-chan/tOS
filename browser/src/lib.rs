@@ -34,8 +34,9 @@
 //!
 //! **No place on the ISO.** `docs/design/applications.md` lists what every tOS
 //! image carries and says why: thirteen Debian packages, one upstream binary,
-//! and the rule that everything else is the person's. A Chromium is 150 MB of
-//! squashfs and a policy about which browser somebody uses. This crate builds
+//! and the rule that everything else is the person's. A Chromium is 482 MB
+//! installed — twice the ISO, measured in `docs/design/browser.md` — and a
+//! policy about which browser somebody uses. This crate builds
 //! into the tree, and the engine it drives is installed by the person who
 //! wants one — `$TOS_BROWSER_ENGINE`, or whichever of `chromium-shell`,
 //! `chromium`, `chromium-browser` or `google-chrome` is on the path.
