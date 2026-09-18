@@ -8,9 +8,17 @@
 //! compared with a booted tOS is the renderer and the PTY, neither of which
 //! can say anything about whether the protocol is right.
 //!
-//! Every test here skips when there is no Chromium, because CI has none. They
-//! are not skipped quietly: the reason is printed, so that a run which proved
-//! nothing does not read like a run which proved something.
+//! Every test here runs only when `TOS_BROWSER_ENGINE` names the engine to
+//! use, and skips otherwise — not when a Chromium happens to be on `PATH`.
+//! The program itself searches `PATH`, because a person who installed a
+//! browser wants it found; a test is different. A machine that builds tOS is
+//! not a machine that agreed to run whatever browser its image carries for
+//! some other job, and the first run on GitHub's runner found one, started
+//! it, and watched it abort — a Chromium of somebody else's, with sandbox
+//! rules of somebody else's, proving nothing about this crate either way.
+//! Naming the engine is the consent. The skips are not quiet: the reason is
+//! printed, so that a run which proved nothing does not read like a run which
+//! proved something.
 
 use std::time::{Duration, Instant};
 
@@ -54,6 +62,13 @@ const CELL: (u32, u32) = (8, 16);
 
 /// Connect to a fresh engine, or say why the test is not running.
 fn connect() -> Option<(Engine, Client)> {
+    if std::env::var_os(engine::ENGINE_ENV).is_none() {
+        eprintln!(
+            "skipped: {} is not set; name a Chromium to run this against",
+            engine::ENGINE_ENV
+        );
+        return None;
+    }
     match engine::locate() {
         Ok(path) => eprintln!("engine: {}", path.display()),
         Err(why) => {
