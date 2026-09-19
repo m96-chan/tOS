@@ -341,6 +341,45 @@ fn mouse_tracking_modes_are_tracked() {
 }
 
 #[test]
+fn pixel_mouse_reporting_is_an_encoding_of_its_own() {
+    let mut t = term(10, 2);
+    t.advance(b"\x1b[?1016h");
+    assert_eq!(t.mouse().encoding, tos_term::MouseEncoding::SgrPixels);
+    // The query a program uses to find out whether pixels are available at
+    // all. An emulator that never heard of 1016 answers 0 here.
+    t.advance(b"\x1b[?1016$p");
+    assert_eq!(t.take_output(), b"\x1b[?1016;1$y".to_vec());
+    // And 1006 is reset while 1016 is what is on, because the two are one
+    // field: a program told both were set could not tell which it is getting.
+    t.advance(b"\x1b[?1006$p");
+    assert_eq!(t.take_output(), b"\x1b[?1006;2$y".to_vec());
+
+    t.advance(b"\x1b[?1016l");
+    assert_eq!(t.mouse().encoding, tos_term::MouseEncoding::X10);
+    t.advance(b"\x1b[?1016$p");
+    assert_eq!(t.take_output(), b"\x1b[?1016;2$y".to_vec());
+}
+
+#[test]
+fn the_last_mouse_encoding_asked_for_is_the_one_in_force() {
+    let mut t = term(10, 2);
+    // As in xterm, where every one of these writes the same field: a program
+    // that asks for cells and then for pixels gets pixels.
+    t.advance(b"\x1b[?1006h\x1b[?1016h");
+    assert_eq!(t.mouse().encoding, tos_term::MouseEncoding::SgrPixels);
+    t.advance(b"\x1b[?1006$p");
+    assert_eq!(t.take_output(), b"\x1b[?1006;2$y".to_vec());
+
+    // And the other way round, which is what a program does to fall back.
+    t.advance(b"\x1b[?1016h\x1b[?1006h");
+    assert_eq!(t.mouse().encoding, tos_term::MouseEncoding::Sgr);
+    t.advance(b"\x1b[?1016$p");
+    assert_eq!(t.take_output(), b"\x1b[?1016;2$y".to_vec());
+    t.advance(b"\x1b[?1006$p");
+    assert_eq!(t.take_output(), b"\x1b[?1006;1$y".to_vec());
+}
+
+#[test]
 fn cursor_style_is_settable() {
     let mut t = term(10, 2);
     t.advance(b"\x1b[4 q");
