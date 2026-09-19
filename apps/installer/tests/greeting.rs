@@ -24,7 +24,7 @@ const SIZE: (u32, u32) = (800, 480);
 /// [`motd::PICTURE_PATH`] — the same file the login screen draws.
 const PICTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../compositor/tos-compositor/assets/splash.png"
+    "/../../compositor/tos-compositor/assets/splash.png"
 );
 
 #[test]

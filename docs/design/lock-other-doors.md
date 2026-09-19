@@ -457,7 +457,7 @@ Changed:
 | --- | --- |
 | `iso/mkiso.sh` | live command line gains `sysctl.kernel.sysrq=438` and `tos.rescue` — the same behaviour it has today, said out loud |
 | `iso/init` | the emergency shell needs `tos.rescue` on the command line; without it the compositor restarts |
-| `installer/src/install.rs` | installed command line gains `sysctl.kernel.sysrq=434`; `console=tty0` with no serial console is now a named constant with a test |
+| `apps/installer/src/install.rs` | installed command line gains `sysctl.kernel.sysrq=434`; `console=tty0` with no serial console is now a named constant with a test |
 
 Written down and deliberately not done:
 

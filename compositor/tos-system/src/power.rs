@@ -6,7 +6,7 @@
 //! directory a test can build. Sysfs lies by omission constantly, so absence
 //! is answered with `None` rather than a guess, and never with a panic.
 //!
-//! Acting goes through [`PowerBackend`], the same seam `installer/src/exec.rs`
+//! Acting goes through [`PowerBackend`], the same seam `apps/installer/src/exec.rs`
 //! uses, for a blunter reason: a test that really called `reboot(2)` would
 //! take the developer's machine down mid-run.
 

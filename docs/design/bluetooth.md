@@ -65,7 +65,7 @@ above the build is the whole shape of the thing — *"Fully static binaries: the
 run as PID 1's children with no libc on disk."* There is no libc on the image
 for `bluetoothd` to link against, no `/usr/lib`, no `ld.so`.
 
-The installed system (`installer/src/install.rs`) is busybox init with a
+The installed system (`apps/installer/src/install.rs`) is busybox init with a
 three-line `/etc/inittab`:
 
 ```text

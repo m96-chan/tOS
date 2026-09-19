@@ -594,7 +594,7 @@ Five things that are easy to get wrong and belong in tests:
 
 All of it is testable under the headless backend, on a machine with no
 keyboard, no font and no dictionary, provided the dictionary is opened through
-a path the test supplies — the seam `tos-system` and `installer/src/exec.rs`
+a path the test supplies — the seam `tos-system` and `apps/installer/src/exec.rs`
 already use for the same reason.
 
 ---

@@ -4,7 +4,7 @@
 //! cargo run -p tos-preview --example preview_in_pane -- picture.png /tmp/tos-preview.ppm
 //! ```
 //!
-//! The same thing `preview/tests/pane.rs` does, without the assertions and
+//! The same thing `apps/preview/tests/pane.rs` does, without the assertions and
 //! with a file of your choosing, for when the question is what a particular
 //! picture looks like in a pane rather than whether one arrived at all.
 

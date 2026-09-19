@@ -414,7 +414,7 @@ impl From<io::Error> for Error {
 /// Everything that is not a file read.
 ///
 /// Every ioctl, socket and device write in this module goes through here, for
-/// the same reason `installer/src/exec.rs` has its `Backend`: the logic above
+/// the same reason `apps/installer/src/exec.rs` has its `Backend`: the logic above
 /// it is then testable on a machine with no adapter, no `AF_BLUETOOTH` and no
 /// `/dev/rfkill`, which is every machine this is written on.
 pub trait Control {

@@ -11,7 +11,7 @@ README listed candidates. This is the list.
 
 ## The shell is bash, and Homebrew does not get a vote
 
-Bash, and it already was: `installer/src/install.rs` writes the account's line
+Bash, and it already was: `apps/installer/src/install.rs` writes the account's line
 with `/bin/bash` when the rootfs has one and `/bin/sh` when the fallback
 busybox world is on the disk, and `iso/live-session` asks the same question on
 the live side. Nothing changes here; it is written down because #151 asked for

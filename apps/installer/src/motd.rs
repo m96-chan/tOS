@@ -52,7 +52,7 @@ use tos_term::Palette;
 use crate::ui::{Color, Style};
 
 /// The banner, as it ships.
-pub const ART: &str = include_str!("../../.motd_art");
+pub const ART: &str = include_str!("../../../.motd_art");
 
 /// The banner for a screen too small for a picture: one line that still says
 /// what this machine is.
@@ -69,7 +69,7 @@ pub const ART_PATH: &str = "/etc/tos/motd_art";
 /// during the build because rendering it wants `chafa`, and a banner is not
 /// worth a build dependency — `docs/design/splash.md` says the command that
 /// makes it again when the picture changes.
-pub const ASCII: &str = include_str!("../../.motd_ascii");
+pub const ASCII: &str = include_str!("../../../.motd_ascii");
 
 /// Where the live image keeps that render, so it too can be changed without a
 /// rebuild. The same door [`ART_PATH`] opens, for the same reason.

@@ -357,7 +357,7 @@ One rule, three configurations:
 | Installed, password declined | none | same as live |
 
 And it is testable everywhere. The credential path goes behind a seam the way
-`tos-system` and `installer/src/exec.rs` already do theirs, so a test points
+`tos-system` and `apps/installer/src/exec.rs` already do theirs, so a test points
 the compositor at a file it wrote itself and drives the whole state machine —
 lock, wrong password, right password, refusal with no credential — under the
 headless backend on a machine with no VT and no DRM. The one configuration CI

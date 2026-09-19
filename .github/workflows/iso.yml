@@ -5,7 +5,8 @@ on:
     branches: [main]
     paths:
       - "compositor/**"
-      - "installer/**"
+      - "apps/installer/**"
+      - "apps/preview/**"
       - "iso/**"
       - ".motd_art"
       - ".motd_ascii"
@@ -15,7 +16,8 @@ on:
   pull_request:
     paths:
       - "compositor/**"
-      - "installer/**"
+      - "apps/installer/**"
+      - "apps/preview/**"
       - "iso/**"
       - ".motd_art"
       - ".motd_ascii"
@@ -75,7 +77,7 @@ jobs:
         # #83: a tOS machine had no package manager at all, and nothing could
         # ever be added to one. The installer's CopySystem step is an
         # `unsquashfs` of this exact file onto the new root — the test in
-        # installer/src/install.rs is what pins that — so what is inside it is
+        # apps/installer/src/install.rs is what pins that — so what is inside it is
         # what an installed machine has. The script is shared with the release
         # workflow, which used to make none of these assertions.
         run: |
