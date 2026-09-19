@@ -14,6 +14,7 @@ pub struct Engine {
     compositor: Compositor,
     frame: OwnedFramebuffer,
     dirty: bool,
+    focused: Option<bool>,
 }
 
 fn rgba(pixel: u32) -> u32 {
@@ -113,6 +114,7 @@ pub unsafe extern "C" fn tos_android_create(
             compositor,
             frame: OwnedFramebuffer::new(width, height),
             dirty: true,
+            focused: None,
         })),
         Err(error) => {
             eprintln!("tOS Android: {error}");
@@ -241,24 +243,61 @@ pub unsafe extern "C" fn tos_android_key(
 /// # Safety
 /// `engine` must be a live, exclusively owned handle.
 #[no_mangle]
-pub unsafe extern "C" fn tos_android_pointer(engine: *mut Engine, x: f64, y: f64, wheel: i32) {
+pub unsafe extern "C" fn tos_android_focus(engine: *mut Engine, gained: bool) {
     let e = &mut *engine;
-    let button = if wheel > 0 {
-        MouseButton::WheelUp
-    } else if wheel < 0 {
-        MouseButton::WheelDown
-    } else {
-        MouseButton::Left
-    };
-    for action in [MouseAction::Press, MouseAction::Release] {
-        e.compositor.handle_input(InputEvent::Pointer(PointerEvent {
-            x,
-            y,
-            button: Some(button),
-            action,
-            modifiers: Modifiers::NONE,
-        }));
+    if e.focused == Some(gained) {
+        return;
     }
+    e.focused = Some(gained);
+    e.compositor.handle_input(if gained {
+        InputEvent::FocusGained
+    } else {
+        InputEvent::FocusLost
+    });
+    e.dirty = true;
+}
+
+fn pointer_event(x: f64, y: f64, button: i32, action: i32, modifiers: u8) -> Option<PointerEvent> {
+    let button = if button == -1 {
+        None
+    } else {
+        Some(MouseButton::from_report_code(u32::try_from(button).ok()?)?)
+    };
+    let action = match action {
+        0 => MouseAction::Press,
+        1 => MouseAction::Release,
+        2 => MouseAction::Drag,
+        3 => MouseAction::Motion,
+        _ => return None,
+    };
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    Some(PointerEvent {
+        x,
+        y,
+        button,
+        action,
+        modifiers: Modifiers(modifiers & 0x0f),
+    })
+}
+
+/// # Safety
+/// `engine` must be a live, exclusively owned handle.
+#[no_mangle]
+pub unsafe extern "C" fn tos_android_pointer(
+    engine: *mut Engine,
+    x: f64,
+    y: f64,
+    button: i32,
+    action: i32,
+    modifiers: u8,
+) {
+    let Some(event) = pointer_event(x, y, button, action, modifiers) else {
+        return;
+    };
+    let e = &mut *engine;
+    e.compositor.handle_input(InputEvent::Pointer(event));
     e.dirty = true;
 }
 
@@ -345,6 +384,28 @@ mod tests {
         assert_eq!(touch(1), Some(MouseAction::Drag));
         assert_eq!(touch(2), Some(MouseAction::Release));
         assert_eq!(touch(3), None);
+    }
+    #[test]
+    fn desktop_pointer_keeps_button_action_and_modifiers() {
+        let right = pointer_event(12.0, 24.0, 2, 0, 0b0110).unwrap();
+        assert_eq!(right.button, Some(MouseButton::Right));
+        assert_eq!(right.action, MouseAction::Press);
+        assert_eq!(right.modifiers, Modifiers(0b0110));
+        let drag = pointer_event(13.0, 25.0, 0, 2, 0).unwrap();
+        assert_eq!(drag.action, MouseAction::Drag);
+        let hover = pointer_event(14.0, 26.0, -1, 3, 0).unwrap();
+        assert_eq!(hover.button, None);
+        assert_eq!(hover.action, MouseAction::Motion);
+        assert_eq!(
+            pointer_event(1.0, 1.0, 67, 0, 0).unwrap().button,
+            Some(MouseButton::WheelRight)
+        );
+    }
+    #[test]
+    fn desktop_pointer_rejects_invalid_input() {
+        assert!(pointer_event(f64::NAN, 0.0, 0, 0, 0).is_none());
+        assert!(pointer_event(0.0, 0.0, 3, 0, 0).is_none());
+        assert!(pointer_event(0.0, 0.0, 0, 99, 0).is_none());
     }
     #[test]
     fn reject_unbounded_surface_allocations() {

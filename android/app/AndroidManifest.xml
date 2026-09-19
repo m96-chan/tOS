@@ -10,8 +10,8 @@
         <service android:name=".VmService" android:exported="false" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Run the user's Debian virtual machine and terminal sessions" />
         </service>
-        <activity android:name=".MainActivity" android:exported="true"
-            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode|density"
+        <activity android:name=".MainActivity" android:exported="true" android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|touchscreen|navigation|uiMode|density|fontScale"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
