@@ -319,6 +319,25 @@ pub fn page_target(address: &str, timeout: Duration) -> Result<String, String> {
     }
 }
 
+/// The WebSocket url of any page target, from the browser's own url.
+///
+/// A second tab has no entry in `/json/list` until the engine has got round to
+/// listing it, and asking over HTTP for something the browser connection just
+/// told us about would be a round trip and a race. Every endpoint the engine
+/// serves is `/devtools/<kind>/<id>` on the one port, so the page endpoint is
+/// the browser endpoint with the last two path elements replaced — which is
+/// exactly what [`page_target`] finds by asking, and this finds by knowing.
+pub fn target_url(browser_url: &str, target: &str) -> Result<String, String> {
+    let (host, port, _) = crate::ws::split_url(browser_url)?;
+    Ok(format!("ws://{host}:{port}/devtools/page/{target}"))
+}
+
+/// The target id at the end of a target's WebSocket url.
+pub fn target_of(url: &str) -> Option<&str> {
+    let id = url.rsplit('/').next()?;
+    (!id.is_empty()).then_some(id)
+}
+
 /// The first page target's WebSocket url in a `/json/list` answer.
 pub fn first_page(body: &str) -> Result<String, String> {
     let value = Json::parse(body).map_err(|e| format!("the target list is not JSON: {e}"))?;
@@ -389,6 +408,22 @@ mod tests {
         assert!(first_page("[]").is_err());
         assert!(first_page(r#"[{"type":"browser"}]"#).is_err());
         assert!(first_page("not json").is_err());
+    }
+
+    #[test]
+    fn a_second_tab_is_reached_on_the_port_the_browser_answered_on() {
+        let browser = "ws://127.0.0.1:37021/devtools/browser/8f-4a";
+        assert_eq!(
+            target_url(browser, "AB12"),
+            Ok("ws://127.0.0.1:37021/devtools/page/AB12".into())
+        );
+        // And the id comes back out of a url the list gave us.
+        assert_eq!(
+            target_of("ws://127.0.0.1:1/devtools/page/AB12"),
+            Some("AB12")
+        );
+        assert_eq!(target_of("ws://127.0.0.1:1/devtools/page/"), None);
+        assert!(target_url("not a url", "AB12").is_err());
     }
 
     #[test]
