@@ -1,0 +1,25 @@
+[package]
+name = "tos-browser"
+description = "Browse the web in a tOS pane, over the compositor's graphics and input protocols"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tos-browser"
+path = "src/main.rs"
+
+[lib]
+name = "tos_browser"
+path = "src/lib.rs"
+
+[dependencies]
+tos-platform = { workspace = true }
+tos-preview = { workspace = true }
+tos-term = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tos-compositor = { workspace = true }
