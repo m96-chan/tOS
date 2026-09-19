@@ -211,6 +211,7 @@ fn a_click_reported_in_host_terminal_cells_lands_on_the_pane_under_the_hand() {
             action: MouseAction::Press,
             col: x as usize,
             row: (y / 2) as usize,
+            pixel: None,
             modifiers: Modifiers::NONE,
         }));
     };

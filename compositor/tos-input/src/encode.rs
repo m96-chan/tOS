@@ -528,7 +528,7 @@ pub fn encode_mouse(event: &MouseEvent, mouse: MouseState) -> Option<Vec<u8>> {
     // from a real device carry an out of range button number.
     const NO_BUTTON: u32 = 3;
     let mut code = match event.action {
-        MouseAction::Release if mouse.encoding != MouseEncoding::Sgr => NO_BUTTON,
+        MouseAction::Release if !mouse.encoding.reports_the_released_button() => NO_BUTTON,
         _ => match event.button {
             Some(button) => button.report_code(),
             None => NO_BUTTON,
@@ -560,6 +560,42 @@ pub fn encode_mouse(event: &MouseEvent, mouse: MouseState) -> Option<Vec<u8>> {
                 'M'
             };
             format!("\x1b[<{code};{col};{row}{final_byte}").into_bytes()
+        }
+        // 1016 is 1006 with the position in pixels, and nothing else about it
+        // differs: the same `CSI <`, the same Cb with the same +4/+8/+16 for
+        // the modifiers and +32 for motion, `M` for a press and `m` for a
+        // release, and the released button kept rather than turned into 3.
+        // Checked against xterm's ctlseqs — "Use the same mouse response
+        // format as the 1006 control, but report position in pixels rather
+        // than character cells" — and against its button.c, which subtracts
+        // the text area's origin to get the pixel offset and then hands it to
+        // the same `EmitMousePosition` that prints `value + 1` for every
+        // extended encoding, 1016 among them. So the top left pixel of the
+        // pane is `1;1`, exactly as the top left cell is.
+        //
+        // Kitty numbers the same pixels from zero (kitty/mouse.c overwrites
+        // the already incremented cell coordinates with the raw offset), so
+        // the two disagree by one. xterm defines the mode and the increment is
+        // what makes 1016 "the same format as 1006", so xterm is what tOS
+        // follows; a program that cares about the difference is going to be
+        // wrong by a single pixel on one of the two terminals whatever tOS
+        // does.
+        //
+        // Wheel notches are a press and never a release in either terminal:
+        // the button code is 64..67 and the final byte is `M`.
+        MouseEncoding::SgrPixels => {
+            // Nobody could say where the pointer was in pixels — a host
+            // terminal reports its own cells and there is nothing finer
+            // underneath them. Cell numbers are not pixels and sending them
+            // here would put every click a cell's worth of pixels from the
+            // top left corner of the screen, silently and plausibly.
+            let (x, y) = event.pixel?;
+            let final_byte = if event.action == MouseAction::Release {
+                'm'
+            } else {
+                'M'
+            };
+            format!("\x1b[<{code};{};{}{final_byte}", x + 1, y + 1).into_bytes()
         }
         MouseEncoding::Urxvt => format!("\x1b[{};{col};{row}M", code + 32).into_bytes(),
         MouseEncoding::Utf8 => {
@@ -907,6 +943,9 @@ mod tests {
             action,
             col: 4,
             row: 9,
+            // A pixel inside that cell but not at its corner, so a pixel
+            // report that quietly multiplied the cell back up would not match.
+            pixel: Some((36, 150)),
             modifiers: Modifiers::NONE,
         }
     }
@@ -989,6 +1028,74 @@ mod tests {
         )
         .unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), "\x1b[<64;5;10M");
+    }
+
+    // ---- 1016: SGR with the position in pixels ----
+
+    #[test]
+    fn sgr_pixels_reports_the_pixel_and_not_the_cell() {
+        // The helper's event is in cell (4, 9) at pixel (36, 150), which is
+        // inside that cell and at neither of its corners: neither number can
+        // be mistaken for the other, and neither can be worked out from it.
+        let pixels = mouse_state(MouseTracking::Normal, MouseEncoding::SgrPixels);
+        let event = mouse(MouseAction::Press, Some(MouseButton::Left));
+        let bytes = encode_mouse(&event, pixels).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "\x1b[<0;37;151M");
+
+        // And the cell encoding is untouched by any of this: the same event
+        // under 1006 is byte for byte what it always was.
+        let cells = mouse_state(MouseTracking::Normal, MouseEncoding::Sgr);
+        let bytes = encode_mouse(&event, cells).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "\x1b[<0;5;10M");
+    }
+
+    #[test]
+    fn sgr_pixels_drags_and_releases_the_way_sgr_does() {
+        let state = mouse_state(MouseTracking::ButtonEvent, MouseEncoding::SgrPixels);
+        let drag = mouse(MouseAction::Drag, Some(MouseButton::Left));
+        let bytes = encode_mouse(&drag, state).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "\x1b[<32;37;151M");
+
+        // A release names the button that was let go of and ends in `m`,
+        // which is the ambiguity the SGR encodings were invented to fix.
+        let release = mouse(MouseAction::Release, Some(MouseButton::Right));
+        let bytes = encode_mouse(&release, state).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "\x1b[<2;37;151m");
+    }
+
+    #[test]
+    fn sgr_pixels_wheel_notches_are_presses() {
+        let state = mouse_state(MouseTracking::Normal, MouseEncoding::SgrPixels);
+        let up = mouse(MouseAction::Press, Some(MouseButton::WheelUp));
+        let bytes = encode_mouse(&up, state).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "\x1b[<64;37;151M");
+    }
+
+    #[test]
+    fn sgr_pixels_encodes_modifiers_where_they_always_were() {
+        let state = mouse_state(MouseTracking::Normal, MouseEncoding::SgrPixels);
+        let mut event = mouse(MouseAction::Press, Some(MouseButton::Left));
+        event.modifiers = Modifiers::CTRL;
+        let bytes = encode_mouse(&event, state).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "\x1b[<16;37;151M");
+    }
+
+    #[test]
+    fn sgr_pixels_says_nothing_when_there_is_no_pixel_to_say() {
+        // A host terminal reports cells and nothing finer, so an event that
+        // arrived through the nested backend has no pixel on it. Sending its
+        // cell numbers instead would tell a program the pointer is a few
+        // pixels from the corner of the pane, which is a lie with nothing
+        // about it to catch.
+        let mut event = mouse(MouseAction::Press, Some(MouseButton::Left));
+        event.pixel = None;
+        let pixels = mouse_state(MouseTracking::Normal, MouseEncoding::SgrPixels);
+        assert!(encode_mouse(&event, pixels).is_none());
+
+        // The same event still reports in cells, which is what it has.
+        let cells = mouse_state(MouseTracking::Normal, MouseEncoding::Sgr);
+        let bytes = encode_mouse(&event, cells).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "\x1b[<0;5;10M");
     }
 
     #[test]
@@ -1126,6 +1233,7 @@ mod review_regressions {
             action: MouseAction::Motion,
             col: 4,
             row: 9,
+            pixel: Some((36, 150)),
             modifiers: Modifiers::NONE,
         };
         assert_eq!(text(encode_mouse(&event, state).unwrap()), "\x1b[<35;5;10M");
@@ -1139,6 +1247,7 @@ mod review_regressions {
             action: MouseAction::Drag,
             col: 0,
             row: 0,
+            pixel: Some((0, 0)),
             modifiers: Modifiers::NONE,
         };
         assert_eq!(text(encode_mouse(&event, state).unwrap()), "\x1b[<35;1;1M");
@@ -1152,6 +1261,7 @@ mod review_regressions {
             action: MouseAction::Press,
             col: 0,
             row: 0,
+            pixel: Some((0, 0)),
             modifiers: Modifiers::NONE,
         };
         assert_eq!(text(encode_mouse(&event, state).unwrap()), "\x1b[<128;1;1M");

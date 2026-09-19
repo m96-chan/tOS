@@ -369,29 +369,46 @@ to that one over its control socket rather than linking it.
 
 ## Browser
 
-A modern browser is one of the most important missing pieces in a terminal-native desktop.
-
-Traditional text browsers intentionally simplify the web.
-
-tOS eventually wants something different:
+A modern browser is one of the most important missing pieces in a
+terminal-native desktop, and traditional text browsers intentionally simplify
+the web. tOS wants something different:
 
 ```text
 HTML / CSS / JavaScript
         ↓
-      WebKit
+Blink — chromium-shell, headless, no X11 and no Wayland
         ↓
  Layout / Paint
         ↓
-tOS Presentation Backend
-   ├── terminal cells
-   ├── glyph runs
-   ├── image surfaces
-   └── input events
+tOS Presentation Backend — the terminal protocols, not a private API
+   ├── image surfaces   Kitty graphics, f=100 PNG over t=s shared memory
+   ├── terminal cells   the URL line and the browser's own chrome
+   ├── input events     SGR mouse 1006, or 1016 in pixels, and the
+   │                    Kitty keyboard protocol
+   └── glyph runs       not attempted; an engine paints pixels, not text
 ```
 
-The long-term experiment is whether a real browser engine can treat the tOS compositor as a native presentation target.
+The experiment was #147 and it has an answer:
+[`docs/design/browser.md`](docs/design/browser.md).
 
-A browser should be able to mix semantic terminal UI with graphical surfaces instead of flattening every webpage into plain text.
+The presentation backend turned out to exist already. It is not something the
+compositor exposes to a browser — it is what the compositor speaks into every
+pane, so a browser is an ordinary program in a pane and the frame path needs
+no compositor change at all. The engine is Chromium's headless shell driven
+over the DevTools protocol, which was proven to render a page with no display
+server present; WPE WebKit is smaller and would hand over raw buffers with
+damage rectangles, and is the open question rather than the choice. The one
+compositor change is on the input side: mouse mode 1016, because a click
+reported in 8×16 cells cannot hit a link.
+
+The engine is **not on the image** — at 482 MB it is twice the ISO, which is
+the clearest case of the rule in
+[`docs/design/applications.md`](docs/design/applications.md) that everything
+past the base set is the person's. The `tos-browser` client ships; the engine
+is found on `$PATH` or at `$TOS_BROWSER_ENGINE`.
+
+Page text as terminal cells is deliberately not part of this. It is a research
+item with its own conditions, written down at the end of the design note.
 
 ---
 
@@ -1270,7 +1287,7 @@ minds losing.
 tOS/
 ├── installer/           tos-install: put tOS on a disk from the live session
 ├── preview/             tos-preview: show an image in a pane
-├── browser/             the browser proof of concept: headless Chromium in a pane
+├── browser/             tos-browser client and Chromium PoC tools
 ├── iso/                 bootable image and its initramfs
 ├── android/             the standalone APK, for a phone that keeps Android
 │   ├── app/             the Android view: Java UI, JNI bridge, resources

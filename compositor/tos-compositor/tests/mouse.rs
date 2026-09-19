@@ -2,6 +2,8 @@
 //! dividers that can be dragged. Real panes, real pointer events, and no
 //! display anywhere.
 
+use std::time::{Duration, Instant};
+
 use tos_compositor::chrome::pane_label;
 use tos_compositor::status::{Piece, Settings};
 use tos_compositor::{
@@ -625,5 +627,132 @@ fn clicking_a_hidden_pane_on_the_bar_resizes_the_zoom_it_drops() {
         child_size(&c, zoomed),
         (rect.width, rect.height),
         "and the program inside it was never told it had shrunk"
+    );
+}
+
+// ---- 1016: the mouse in pixels ------------------------------------------
+
+/// Everything the child's line discipline has echoed back, which is the only
+/// evidence from outside the compositor of what actually reached the PTY.
+///
+/// Read off the master directly rather than through the pane's terminal,
+/// because the question is about bytes and not about what a terminal made of
+/// them. The escape comes back from the tty as `^[`, which is why the
+/// assertions below are on everything after it — unambiguous on its own.
+fn bytes_that_reached_the_pty(c: &mut Compositor) -> Vec<u8> {
+    let focus = c.session().focus();
+    let pane = c.pane_mut(focus).expect("the focused pane");
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    // Four empty polls in a row is the line discipline having nothing more to
+    // say. A single deadline would either be flaky or slow; this is neither.
+    let mut idle = 0;
+    while idle < 4 {
+        if pane.pty.poll_readable(50).unwrap_or(false) {
+            if let Ok(n) = pane.pty.read(&mut buf) {
+                if n > 0 {
+                    out.extend_from_slice(&buf[..n]);
+                    idle = 0;
+                    continue;
+                }
+            }
+        }
+        idle += 1;
+    }
+    out
+}
+
+/// Wait for the child to be far enough along that the tty is echoing, and
+/// throw away whatever it said on the way.
+fn settle(c: &mut Compositor) {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        c.pump_panes();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = bytes_that_reached_the_pty(c);
+}
+
+/// A pointer at a display pixel rather than at a cell, which is the only way
+/// to put one anywhere but a cell's top left corner.
+fn pointer_at(
+    c: &mut Compositor,
+    at: (u32, u32),
+    button: Option<MouseButton>,
+    action: MouseAction,
+) {
+    c.handle_input(InputEvent::Pointer(PointerEvent {
+        button,
+        action,
+        x: at.0 as f64,
+        y: at.1 as f64,
+        modifiers: Modifiers::NONE,
+    }));
+}
+
+#[test]
+fn a_pane_that_asked_for_pixels_is_sent_pixels() {
+    let mut c = quiet();
+    settle(&mut c);
+    let focus = c.session().focus();
+    let rect = rect_of(&c, focus);
+    let (cw, ch) = c.cell_size();
+
+    // Button tracking and the position in pixels, which is the pair a program
+    // that draws its own picture inside the pane sets.
+    c.inject(b"\x1b[?1002h\x1b[?1016h");
+
+    // The middle of the cell three across and two down inside the pane. The
+    // middle rather than the corner, because the corner is what multiplying a
+    // cell back up would give and the difference is what this is about.
+    let (col, row) = (3, 2);
+    let at = ((rect.x + col) * cw + cw / 2, (rect.y + row) * ch + ch / 2);
+    pointer_at(&mut c, at, Some(MouseButton::Left), MouseAction::Press);
+
+    let echoed = bytes_that_reached_the_pty(&mut c);
+    let echoed = String::from_utf8_lossy(&echoed).into_owned();
+    // One based, and relative to the pane rather than to the screen.
+    let pixels = format!("[<0;{};{}M", col * cw + cw / 2 + 1, row * ch + ch / 2 + 1);
+    assert!(
+        echoed.contains(&pixels),
+        "the pane was sent {echoed:?}, which does not carry {pixels:?}"
+    );
+    let cells = format!("[<0;{};{}M", col + 1, row + 1);
+    assert!(
+        !echoed.contains(&cells),
+        "the pane asked for pixels and was sent cells: {echoed:?}"
+    );
+}
+
+#[test]
+fn the_pixels_a_pane_is_sent_are_measured_from_its_own_corner() {
+    // The cells a pane is sent have always been its own; the pixels have to
+    // be too, and a pane at the left edge of the screen cannot tell the two
+    // apart. This one starts a few hundred pixels in.
+    let mut c = quiet();
+    c.perform(Action::Split(Axis::Columns));
+    settle(&mut c);
+    let focus = c.session().focus();
+    let rect = rect_of(&c, focus);
+    let (cw, ch) = c.cell_size();
+    assert!(rect.x > 0, "the split put the focus at the left edge");
+    c.inject(b"\x1b[?1002h\x1b[?1016h");
+
+    // Three pixels past the middle of the pane's second cell, which is a
+    // number no cell arithmetic on either side would land on by accident.
+    let at = (rect.x * cw + cw + cw / 2 + 3, rect.y * ch + ch / 2);
+    pointer_at(&mut c, at, Some(MouseButton::Left), MouseAction::Press);
+
+    let echoed = bytes_that_reached_the_pty(&mut c);
+    let echoed = String::from_utf8_lossy(&echoed).into_owned();
+    let local = format!("[<0;{};{}M", at.0 - rect.x * cw + 1, at.1 - rect.y * ch + 1);
+    assert!(
+        echoed.contains(&local),
+        "the pane was sent {echoed:?}, which does not carry {local:?}"
+    );
+    let screen = format!("[<0;{};{}M", at.0 + 1, at.1 + 1);
+    assert!(
+        !echoed.contains(&screen),
+        "the pane was sent the pointer's place on the screen: {echoed:?}"
     );
 }

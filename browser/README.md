@@ -1,4 +1,7 @@
-# Browser proof of concept
+# Browser proof-of-concept tools
+
+The Rust `tos-browser` client lives in `src/`; this page covers the earlier
+Python experiments and benchmark tools kept alongside it for reproduction.
 
 A page rendered by a headless Chromium, arriving in a tOS pane as kitty
 graphics. The reasoning, the measurements and the decisions are in
