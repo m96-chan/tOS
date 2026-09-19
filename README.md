@@ -1288,7 +1288,8 @@ tOS/
 ├── apps/                programs that run in a pane; none of them is the compositor
 │   ├── installer/       tos-install: put tOS on a disk from the live session
 │   ├── preview/         tos-preview: show an image in a pane
-│   └── browser/         tos-browser: a web page in a pane, on an engine the person installs
+│   └── browser/         tos-browser: a web page in a pane, on an engine the person
+│                        installs; and the PoC tools that decided its design
 ├── iso/                 bootable image and its initramfs
 ├── android/             the standalone APK, for a phone that keeps Android
 │   ├── app/             the Android view: Java UI, JNI bridge, resources

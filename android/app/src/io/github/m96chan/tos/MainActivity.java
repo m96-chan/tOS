@@ -14,6 +14,7 @@ import android.text.InputType;
 import android.text.SpannableStringBuilder;
 import android.view.GestureDetector;
 import android.view.HapticFeedbackConstants;
+import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MenuItem;
 import android.view.MotionEvent;
@@ -59,11 +60,13 @@ public final class MainActivity extends Activity {
     private volatile boolean closing;
     private volatile boolean visible;
     private TerminalView terminal;
+    private LinearLayout root, toolbarControls, keys;
+    private HorizontalScrollView toolbarScroll, keysScroll;
     // A one pixel view moved under the finger, so a menu opens where it was
     // asked for rather than in a corner of the screen.
     private View touchAnchor;
     private TextView title, sizeLabel, composition;
-    private Button ctrlButton, altButton;
+    private Button ctrlButton, altButton, menuButton;
     private boolean ctrl, alt, keyboardVisible;
     private float fontSp;
 
@@ -75,22 +78,27 @@ public final class MainActivity extends Activity {
         if (!Float.isFinite(fontSp)) fontSp = 10.5f;
         fontSp = Math.max(8f, Math.min(24f, fontSp));
 
-        LinearLayout root = new LinearLayout(this);
+        root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(BG);
         LinearLayout top = row();
+        toolbarControls = row();
         title = label("tOS", 16);
         title.setTextColor(GREEN);
         title.setPadding(dp(12), 0, 0, 0);
-        top.addView(title, new LinearLayout.LayoutParams(0, dp(48), 1));
-        top.addView(button("A−", "Smaller text", () -> changeFont(fontSp - .5f)));
+        toolbarControls.addView(title, new LinearLayout.LayoutParams(dp(110), dp(48)));
+        toolbarControls.addView(button("A−", "Smaller text", () -> changeFont(fontSp - .5f)));
         sizeLabel = label("", 12);
-        top.addView(sizeLabel, new LinearLayout.LayoutParams(dp(40), dp(48)));
-        top.addView(button("A+", "Larger text", () -> changeFont(fontSp + .5f)));
-        top.addView(button("⌨", "Show or hide keyboard", this::toggleKeyboard));
-        Button menu = button("⋮", "Session menu", () -> {});
-        menu.setOnClickListener(v -> showMenu(menu));
-        top.addView(menu);
+        toolbarControls.addView(sizeLabel, new LinearLayout.LayoutParams(dp(40), dp(48)));
+        toolbarControls.addView(button("A+", "Larger text", () -> changeFont(fontSp + .5f)));
+        toolbarControls.addView(button("⌨", "Show or hide keyboard", this::toggleKeyboard));
+        toolbarScroll = new HorizontalScrollView(this);
+        toolbarScroll.setHorizontalScrollBarEnabled(false);
+        toolbarScroll.addView(toolbarControls);
+        top.addView(toolbarScroll, new LinearLayout.LayoutParams(0, dp(48), 1));
+        menuButton = button("⋮", "Session menu", () -> {});
+        menuButton.setOnClickListener(v -> showMenu(menuButton));
+        top.addView(menuButton);
         root.addView(top);
 
         FrameLayout stage = new FrameLayout(this);
@@ -105,9 +113,9 @@ public final class MainActivity extends Activity {
         composition.setBackgroundColor(BAR);
         root.addView(composition, new LinearLayout.LayoutParams(-1, dp(22)));
 
-        HorizontalScrollView scroll = new HorizontalScrollView(this);
-        scroll.setHorizontalScrollBarEnabled(false);
-        LinearLayout keys = row();
+        keysScroll = new HorizontalScrollView(this);
+        keysScroll.setHorizontalScrollBarEnabled(false);
+        keys = row();
         keys.addView(button("Esc", "Escape", () -> special(KeyEvent.KEYCODE_ESCAPE)));
         ctrlButton = button("Ctrl", "Control modifier", () -> { ctrl = !ctrl; modifiersChanged(); });
         keys.addView(ctrlButton);
@@ -118,12 +126,12 @@ public final class MainActivity extends Activity {
         keys.addView(button("↓", "Down", () -> special(KeyEvent.KEYCODE_DPAD_DOWN)));
         keys.addView(button("↑", "Up", () -> special(KeyEvent.KEYCODE_DPAD_UP)));
         keys.addView(button("→", "Right", () -> special(KeyEvent.KEYCODE_DPAD_RIGHT)));
-        scroll.addView(keys);
-        root.addView(scroll, new LinearLayout.LayoutParams(-1, dp(48)));
+        keysScroll.addView(keys);
+        root.addView(keysScroll, new LinearLayout.LayoutParams(-1, dp(48)));
         if (Build.VERSION.SDK_INT >= 30) {
             getWindow().setDecorFitsSystemWindows(false);
             root.setOnApplyWindowInsetsListener((view, insets) -> {
-                Insets system = insets.getInsets(WindowInsets.Type.systemBars());
+                Insets system = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.captionBar());
                 Insets ime = insets.getInsets(WindowInsets.Type.ime());
                 keyboardVisible = insets.isVisible(WindowInsets.Type.ime());
                 view.setPadding(system.left, system.top, system.right, Math.max(system.bottom, ime.bottom));
@@ -151,6 +159,10 @@ public final class MainActivity extends Activity {
                 VmService.start(this);
                 engine = NativeSession.create(home.getAbsolutePath(), pixels);
                 if (engine == 0) { message("Could not start the Debian session"); return; }
+                runOnUiThread(() -> {
+                    boolean focused = hasWindowFocus();
+                    session(h -> NativeSession.focus(h, focused));
+                });
                 runOnUiThread(() -> composition.setText(""));
                 runOnUiThread(() -> terminal.bindSurface());
                 step();
@@ -336,10 +348,49 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onStart() { super.onStart(); visible = true; }
-    @Override protected void onStop() { visible = false; super.onStop(); }
+    @Override protected void onStop() {
+        visible = false;
+        session(h -> NativeSession.focus(h, false));
+        super.onStop();
+    }
+    @Override public void onWindowFocusChanged(boolean gained) {
+        super.onWindowFocusChanged(gained);
+        session(h -> NativeSession.focus(h, gained));
+    }
     @Override public void onConfigurationChanged(Configuration config) {
         super.onConfigurationChanged(config);
-        terminal.resize();
+        // A window moved to another display can change density without an
+        // Activity restart. LayoutParams contain pixels, not dp, so rebuild
+        // chrome dimensions before sizing the terminal's new Surface.
+        title.setTextSize(16);
+        title.setPadding(dp(12), 0, 0, 0);
+        title.setLayoutParams(new LinearLayout.LayoutParams(dp(110), dp(48)));
+        sizeLabel.setTextSize(12);
+        sizeLabel.setLayoutParams(new LinearLayout.LayoutParams(dp(40), dp(48)));
+        for (int i = 0; i < toolbarControls.getChildCount(); i++) {
+            View child = toolbarControls.getChildAt(i);
+            if (child instanceof Button) {
+                ((Button)child).setTextSize(13);
+                child.setLayoutParams(new LinearLayout.LayoutParams(dp(48), dp(48)));
+            }
+        }
+        for (int i = 0; i < keys.getChildCount(); i++) {
+            Button key = (Button)keys.getChildAt(i);
+            key.setTextSize(13);
+            key.setLayoutParams(new LinearLayout.LayoutParams(dp(48), dp(48)));
+        }
+        menuButton.setTextSize(13);
+        menuButton.setLayoutParams(new LinearLayout.LayoutParams(dp(48), dp(48)));
+        toolbarScroll.getLayoutParams().height = dp(48);
+        toolbarScroll.requestLayout();
+        keysScroll.getLayoutParams().height = dp(48);
+        keysScroll.requestLayout();
+        composition.setTextSize(14);
+        composition.setPadding(dp(10), 0, dp(10), 0);
+        composition.getLayoutParams().height = dp(22);
+        composition.requestLayout();
+        root.requestApplyInsets();
+        terminal.post(terminal::resize);
     }
     @Override protected void onDestroy() {
         closing = true;
@@ -359,6 +410,9 @@ public final class MainActivity extends Activity {
         // drags leaves no one-cell highlight behind the menu.
         private boolean selecting, dragging;
         private float pressX, pressY;
+        private int mouseButton = NativeSession.BUTTON_NONE;
+        private boolean hostContextClick;
+        private float wheelX, wheelY;
 
         TerminalView() {
             super(MainActivity.this);
@@ -375,7 +429,11 @@ public final class MainActivity extends Activity {
                 @Override public boolean onDown(MotionEvent e) { scrollPixels = 0; return true; }
                 @Override public boolean onSingleTapUp(MotionEvent e) {
                     requestFocus(); float x = e.getX(), y = e.getY();
-                    session(h -> NativeSession.pointer(h, x, y, 0)); return true;
+                    session(h -> {
+                        NativeSession.pointer(h, x, y, NativeSession.BUTTON_LEFT, NativeSession.POINTER_PRESS, 0);
+                        NativeSession.pointer(h, x, y, NativeSession.BUTTON_LEFT, NativeSession.POINTER_RELEASE, 0);
+                    });
+                    return true;
                 }
                 @Override public void onLongPress(MotionEvent e) { beginSelection(e); }
                 @Override public boolean onScroll(MotionEvent first, MotionEvent last, float dx, float dy) {
@@ -386,7 +444,8 @@ public final class MainActivity extends Activity {
                         int wheel = scrollPixels > 0 ? -1 : 1;
                         scrollPixels %= threshold;
                         float x = last.getX(), y = last.getY();
-                        session(h -> { for (int i = 0; i < steps; i++) NativeSession.pointer(h, x, y, wheel); });
+                        int button = wheel > 0 ? NativeSession.WHEEL_UP : NativeSession.WHEEL_DOWN;
+                        session(h -> { for (int i = 0; i < steps; i++) NativeSession.pointer(h, x, y, button, NativeSession.POINTER_PRESS, 0); });
                     }
                     return true;
                 }
@@ -411,6 +470,7 @@ public final class MainActivity extends Activity {
             catch (Exception ignored) { /* A queued detach still owns the native reference until it runs. */ }
         }
         @Override public boolean onTouchEvent(MotionEvent event) {
+            if (event.isFromSource(InputDevice.SOURCE_MOUSE)) return onMouseTouch(event);
             if (selecting) {
                 if (event.getActionMasked() != MotionEvent.ACTION_DOWN) return dragSelection(event);
                 // A fresh gesture while a selection is open means its end was
@@ -420,6 +480,114 @@ public final class MainActivity extends Activity {
             scale.onTouchEvent(event);
             if (!scale.isInProgress() && event.getPointerCount() == 1) gestures.onTouchEvent(event);
             return true;
+        }
+        private int pointerModifiers(MotionEvent event) {
+            int state = event.getMetaState();
+            return ((state & KeyEvent.META_SHIFT_ON) != 0 ? 1 : 0)
+                | ((state & KeyEvent.META_ALT_ON) != 0 ? 2 : 0)
+                | ((state & KeyEvent.META_CTRL_ON) != 0 ? 4 : 0)
+                | ((state & KeyEvent.META_META_ON) != 0 ? 8 : 0);
+        }
+        private void mouseEvent(MotionEvent event, int button, int action) {
+            float x = event.getX(), y = event.getY();
+            int modifiers = pointerModifiers(event);
+            session(h -> NativeSession.pointer(h, x, y, button, action, modifiers));
+        }
+        private int mouseButton(int androidButton) {
+            if (androidButton == MotionEvent.BUTTON_PRIMARY) return NativeSession.BUTTON_LEFT;
+            if (androidButton == MotionEvent.BUTTON_SECONDARY) return NativeSession.BUTTON_RIGHT;
+            if (androidButton == MotionEvent.BUTTON_TERTIARY) return NativeSession.BUTTON_MIDDLE;
+            return NativeSession.BUTTON_NONE;
+        }
+        private boolean onMouseTouch(MotionEvent event) {
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    requestFocus();
+                    // Secondary/middle buttons also generate generic button events.
+                    // Do not send their following ACTION_DOWN a second time.
+                    if (mouseButton == NativeSession.BUTTON_NONE &&
+                        (event.getButtonState() & MotionEvent.BUTTON_PRIMARY) != 0) {
+                        mouseButton = NativeSession.BUTTON_LEFT;
+                        mouseEvent(event, mouseButton, NativeSession.POINTER_PRESS);
+                    }
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    mouseEvent(event, mouseButton, mouseButton == NativeSession.BUTTON_NONE
+                        ? NativeSession.POINTER_MOTION : NativeSession.POINTER_DRAG);
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    if (mouseButton == NativeSession.BUTTON_LEFT ||
+                        mouseButton != NativeSession.BUTTON_NONE &&
+                        (event.getActionMasked() == MotionEvent.ACTION_CANCEL || event.getButtonState() == 0)) {
+                        mouseEvent(event, mouseButton, NativeSession.POINTER_RELEASE);
+                        mouseButton = NativeSession.BUTTON_NONE;
+                    }
+                    return true;
+                default:
+                    return true;
+            }
+        }
+        private void wheel(MotionEvent event, float amount, boolean horizontal) {
+            if (!Float.isFinite(amount)) return;
+            if (horizontal) wheelX += amount; else wheelY += amount;
+            float pending = horizontal ? wheelX : wheelY;
+            int steps = Math.min(8, (int)Math.abs(pending));
+            if (steps == 0) return;
+            if (horizontal) wheelX -= Math.copySign(steps, pending);
+            else wheelY -= Math.copySign(steps, pending);
+            int button = horizontal
+                ? (pending > 0 ? NativeSession.WHEEL_RIGHT : NativeSession.WHEEL_LEFT)
+                : (pending > 0 ? NativeSession.WHEEL_UP : NativeSession.WHEEL_DOWN);
+            float x = event.getX(), y = event.getY();
+            int modifiers = pointerModifiers(event);
+            session(h -> {
+                for (int i = 0; i < steps; i++)
+                    NativeSession.pointer(h, x, y, button, NativeSession.POINTER_PRESS, modifiers);
+            });
+        }
+        @Override public boolean onGenericMotionEvent(MotionEvent event) {
+            if (!event.isFromSource(InputDevice.SOURCE_CLASS_POINTER)) return super.onGenericMotionEvent(event);
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_SCROLL:
+                    wheel(event, event.getAxisValue(MotionEvent.AXIS_VSCROLL), false);
+                    wheel(event, event.getAxisValue(MotionEvent.AXIS_HSCROLL), true);
+                    return true;
+                case MotionEvent.ACTION_HOVER_ENTER:
+                case MotionEvent.ACTION_HOVER_MOVE:
+                    mouseEvent(event, NativeSession.BUTTON_NONE, NativeSession.POINTER_MOTION);
+                    return true;
+                case MotionEvent.ACTION_BUTTON_PRESS:
+                case MotionEvent.ACTION_BUTTON_RELEASE:
+                    int button = mouseButton(event.getActionButton());
+                    if (button == NativeSession.BUTTON_NONE || button == NativeSession.BUTTON_LEFT) return true;
+                    if (event.getActionMasked() == MotionEvent.ACTION_BUTTON_PRESS) {
+                        requestFocus();
+                        // Shift+right-click is the host clipboard/menu escape
+                        // hatch; an unmodified right-click reaches the guest.
+                        if (button == NativeSession.BUTTON_RIGHT &&
+                            (event.getMetaState() & KeyEvent.META_SHIFT_ON) != 0) {
+                            hostContextClick = true;
+                            showClipboardMenu(event.getX(), event.getY());
+                            return true;
+                        }
+                        if (mouseButton != NativeSession.BUTTON_NONE && mouseButton != button) return true;
+                        if (mouseButton == NativeSession.BUTTON_NONE) mouseButton = button;
+                        mouseEvent(event, button, NativeSession.POINTER_PRESS);
+                    } else {
+                        if (button == NativeSession.BUTTON_RIGHT && hostContextClick) {
+                            hostContextClick = false;
+                            return true;
+                        }
+                        if (mouseButton == button) {
+                            mouseEvent(event, button, NativeSession.POINTER_RELEASE);
+                            mouseButton = NativeSession.BUTTON_NONE;
+                        }
+                    }
+                    return true;
+                default:
+                    return super.onGenericMotionEvent(event);
+            }
         }
         /** Take the gesture away from scrolling: it belongs to the clipboard now. */
         private void beginSelection(MotionEvent down) {
@@ -540,6 +708,14 @@ public final class MainActivity extends Activity {
         }
         private boolean handleKey(KeyEvent event) {
             int code = event.getKeyCode();
+            if (event.isCtrlPressed() && event.isShiftPressed()) {
+                if (code == KeyEvent.KEYCODE_C || code == KeyEvent.KEYCODE_V) {
+                    if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                        if (code == KeyEvent.KEYCODE_C) copySelection(); else paste();
+                    }
+                    return true;
+                }
+            }
             if (code == KeyEvent.KEYCODE_BACK || code == KeyEvent.KEYCODE_VOLUME_UP || code == KeyEvent.KEYCODE_VOLUME_DOWN) return false;
             if (KeyEvent.isModifierKey(code)) return true;
             boolean release = event.getAction() == KeyEvent.ACTION_UP;

@@ -38,7 +38,9 @@ final class Userland {
         Os.symlink(target, temp.getPath());
         Os.rename(temp.getPath(), path.getPath());
     }
-    static File prepare(Context context) throws Exception {
+    // Desktop windowing can start a second Activity while the first is still
+    // preparing the same shared runtime. Never expose a half-extracted bundle.
+    static synchronized File prepare(Context context) throws Exception {
         String id = read(context.getAssets().open("userland.id")).trim();
         if (!id.matches("[a-f0-9]{64}")) throw new java.io.IOException("Invalid bundle version");
         File root = new File(context.getFilesDir(), "runtime/" + id);

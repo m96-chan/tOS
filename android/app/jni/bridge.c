@@ -11,7 +11,8 @@ extern bool tos_android_render(Engine *, uint32_t *, uint32_t, uint32_t, uint32_
 extern void tos_android_resize(Engine *, uint32_t, uint32_t, float);
 extern void tos_android_text(Engine *, const uint16_t *, size_t, uint8_t, bool);
 extern void tos_android_key(Engine *, uint32_t, uint32_t, uint8_t, bool);
-extern void tos_android_pointer(Engine *, double, double, int32_t);
+extern void tos_android_focus(Engine *, bool);
+extern void tos_android_pointer(Engine *, double, double, int32_t, int32_t, uint8_t);
 extern void tos_android_select(Engine *, double, double, uint32_t);
 extern void tos_android_action(Engine *, uint32_t);
 extern const uint8_t *tos_android_clipboard(Engine *, size_t *);
@@ -75,9 +76,14 @@ JNIEXPORT void JNICALL JNI_METHOD(key)(JNIEnv *env, jclass cls, jlong handle, ji
     tos_android_key(CLIENT->engine, code, unicode, modifiers, release);
 }
 
-JNIEXPORT void JNICALL JNI_METHOD(pointer)(JNIEnv *env, jclass cls, jlong handle, jfloat x, jfloat y, jint wheel) {
+JNIEXPORT void JNICALL JNI_METHOD(focus)(JNIEnv *env, jclass cls, jlong handle, jboolean gained) {
     (void)env; (void)cls;
-    tos_android_pointer(CLIENT->engine, x, y, wheel);
+    tos_android_focus(CLIENT->engine, gained == JNI_TRUE);
+}
+
+JNIEXPORT void JNICALL JNI_METHOD(pointer)(JNIEnv *env, jclass cls, jlong handle, jfloat x, jfloat y, jint button, jint action, jint modifiers) {
+    (void)env; (void)cls;
+    tos_android_pointer(CLIENT->engine, x, y, button, action, (uint8_t)modifiers);
 }
 
 JNIEXPORT void JNICALL JNI_METHOD(select)(JNIEnv *env, jclass cls, jlong handle, jfloat x, jfloat y, jint phase) {
