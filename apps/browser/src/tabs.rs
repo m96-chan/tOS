@@ -352,6 +352,19 @@ pub fn change(event: &Event) -> Option<Change> {
             // has none, and neither has the `about:blank` the engine started
             // with — both are already tabs by the time the event arrives, and
             // acting on it again would open the same page twice.
+            //
+            // All five ways a page can ask for a window were checked against
+            // `chromium-shell` before this rule was trusted, because one of
+            // them not carrying an opener would be a click that does nothing:
+            // a `target=_blank` link, the same link with `rel=noopener`, a
+            // `window.open` from a click handler, the same with `noopener`, and
+            // a `window.open` from a script with no user gesture at all. Every
+            // one of them arrives with `openerId` set. What differs between
+            // them is `canAccessOpener`, which is about what the *page* may
+            // reach and is none of this program's business. The url, on the
+            // other hand, is empty in this event for all five: the target is
+            // announced before it has an address, and the address comes along
+            // afterwards as `Target.targetInfoChanged`.
             let opener = info.get("openerId").and_then(Json::as_str)?;
             if opener.is_empty() {
                 return None;
