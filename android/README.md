@@ -154,6 +154,31 @@ Text defaults to 10.5 sp and is adjustable from 8 to 24 sp. The top bar shows
 columns and rows. Rendering uses the surface's pixels, without half-block
 scaling. Hardware-keyboard `Ctrl+A` prefix shortcuts also work.
 
+### Android desktop windowing (experimental)
+
+The APK does not disable Android's resizable-window behavior. Its terminal
+surface is wired to follow window size and display-density changes; the top
+toolbar can scroll horizontally in a narrow window while **⋮** stays visible.
+A physical keyboard sends terminal keys. `Ctrl+Shift+C` / `Ctrl+Shift+V` copy
+the selection to / paste from Android's clipboard. Mouse and trackpad input
+includes click-and-drag selection, middle/right buttons, hover and vertical or
+horizontal wheel events. `Shift+right-click` opens tOS's Android clipboard
+menu; an unmodified right-click is passed to the terminal application.
+
+This is not yet validated on an external monitor or in freeform desktop
+windowing. The current APK has no Android document import/export, and no
+multi-instance window contract: use one tOS window until those paths have
+device tests. Android still owns the desktop, display and input devices; the
+two initial AVF ADB permission grants above are unchanged. Track the remaining
+work in [issue #181](https://github.com/m96-chan/tOS/issues/181).
+
+Before claiming desktop support, check on an AVF-capable device with an
+external display, keyboard and mouse/trackpad: resize and maximize repeatedly,
+move the window between displays of different densities, unplug and reconnect
+the display, switch focus with another app, and verify `stty size`, pointer
+selection, copy/paste and the guest disk after each transition. Record the
+device and Android build because desktop-window and AVF behavior vary by OS.
+
 ASCII from the soft keyboard reaches the pane as it is typed rather than
 waiting for the keyboard to commit a word: a shell answers a character at a
 time, and completion, history search and `^C` all happen before a word is
