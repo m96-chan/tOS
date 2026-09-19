@@ -19,6 +19,28 @@
 //! wherever the terminal will read them — see [`graphics`] for the id and the
 //! transport, both of which are decisions rather than defaults.
 //!
+//! # Tabs, and why they are not panes
+//!
+//! A tab here is one CDP page target: a page with its own history, its own
+//! renderer and its own WebSocket, listed on the one row this program already
+//! owns. Tabs exist because the first thing anybody meets on a real site is a
+//! link with `target=_blank` — the engine makes a target for it whatever this
+//! program does, and a target nothing attaches to is a click that did nothing
+//! at all.
+//!
+//! The tOS-shaped answer would be a pane each: the compositor has workspaces
+//! and panes and a tree to arrange them in, and a page per pane would put a
+//! browser's tabs under the same keys as everything else on the machine. It is
+//! not what this does, for two reasons. A pane program has no way to ask for
+//! another pane — there is no compositor API, no socket, and `apps/browser`
+//! having one would be this crate's second dependency after `libc` and the
+//! first that is on tOS itself. And the engine's own model *is* tabs: targets
+//! are opened, closed and raised by a browser-level connection that knows
+//! nothing about panes, so a pane per page would be a second list to keep in
+//! step with the engine's. So the tabs live in the browser, on the row that
+//! was already there, and the pane stays one pane. See [`tabs`] for what that
+//! costs per tab, which is one socket and no frames.
+//!
 //! # What it deliberately does not do
 //!
 //! **No JPEG.** The screencast can produce it and [`tos_term::png`] cannot
@@ -58,6 +80,7 @@ pub mod json;
 pub mod keys;
 pub mod screen;
 pub mod sha1;
+pub mod tabs;
 pub mod ws;
 
 pub use app::Options;

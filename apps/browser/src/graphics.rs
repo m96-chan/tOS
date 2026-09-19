@@ -226,6 +226,23 @@ pub fn shared_memory_command(name: &str, cells: Cells) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Take the picture off the screen and the frame out of the store.
+///
+/// For switching tabs, which is the one moment the picture on screen belongs
+/// to a page that is no longer being shown. The alternative — leaving it until
+/// the new tab's first frame lands — would show the old page under the new
+/// tab's title for as long as the new page takes to paint, which on a tab that
+/// was opened a second ago and has not loaded is as long as the network takes.
+/// An empty pane is honest about there being nothing to show yet.
+///
+/// `d=I` rather than `d=i`: the uppercase form frees the image data as well as
+/// the placement, and the data is the pane in RGBA — nearly a megabyte at
+/// 640x368. The next frame transmits a new image under the same id anyway, so
+/// there is nothing to keep.
+pub fn clear_command() -> Vec<u8> {
+    format!("\x1b_Ga=d,d=I,i={IMAGE_ID},p={PLACEMENT_ID},q=2\x1b\\").into_bytes()
+}
+
 /// `t=d`: the image itself, base64, in as many escape sequences as it takes.
 pub fn inline_command(png: &[u8], cells: Cells) -> Vec<u8> {
     let control = control(cells);
@@ -317,6 +334,26 @@ mod tests {
             joined.extend_from_slice(&tos_term::graphics::decode_base64(&body[semicolon + 1..]));
         }
         assert_eq!(joined, png);
+    }
+
+    #[test]
+    fn switching_tabs_takes_the_old_page_off_the_screen() {
+        let mut terminal = tos_term::Terminal::new(40, 12, tos_term::TerminalConfig::default());
+        let mut painter = Painter::at(Path::new("/nonexistent-for-a-test"));
+        terminal.advance(&painter.frame(&tiny_png(), cells(4, 2), 2, 1));
+        assert_eq!(terminal.graphics().placements().count(), 1);
+        assert!(terminal.graphics().image(IMAGE_ID).is_some());
+
+        terminal.advance(&clear_command());
+        assert_eq!(
+            terminal.graphics().placements().count(),
+            0,
+            "the picture is gone"
+        );
+        assert!(
+            terminal.graphics().image(IMAGE_ID).is_none(),
+            "and so are its pixels"
+        );
     }
 
     #[test]

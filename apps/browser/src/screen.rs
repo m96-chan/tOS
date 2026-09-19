@@ -208,6 +208,146 @@ pub fn status_line(cols: u32, text: &str, editing: Option<&str>) -> Vec<u8> {
     out
 }
 
+/// One tab, as the strip needs it: a name and whether it is the one in front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabLabel<'a> {
+    pub title: &'a str,
+    pub active: bool,
+}
+
+/// How much room a url has to be worth putting after the strip.
+///
+/// Less than this and what is shown is a scheme and an ellipsis, which says
+/// nothing and takes the space the titles wanted.
+const URL_MINIMUM: usize = 12;
+
+/// The top row when there is more than one tab: `1 title  2 title  3 title`,
+/// and the active tab's url after them if anything is left over.
+///
+/// The whole row is reverse video, as [`status_line`] draws it, so the active
+/// tab cannot be marked by reversing it again — it is *un*-reversed instead
+/// (`\x1b[27m`), which against a reversed row is the same emphasis the other
+/// way round and needs no colour. Colour would have to be chosen against a
+/// theme this program cannot see.
+pub fn tab_line(cols: u32, tabs: &[TabLabel], url: &str) -> Vec<u8> {
+    let cols = cols.max(1) as usize;
+    let mut out = b"\x1b[1;1H\x1b[K\x1b[7m".to_vec();
+    let mut used = 0;
+    for (text, active) in strip(cols, tabs, url) {
+        used += width(&text);
+        if active {
+            out.extend_from_slice(b"\x1b[27m");
+            out.extend_from_slice(text.as_bytes());
+            out.extend_from_slice(b"\x1b[7m");
+        } else {
+            out.extend_from_slice(text.as_bytes());
+        }
+    }
+    out.extend(std::iter::repeat(b' ').take(cols.saturating_sub(used)));
+    out.extend_from_slice(b"\x1b[0m\x1b[?25l");
+    out
+}
+
+/// The strip as the runs it is drawn in: the text, and whether it is the
+/// active tab and so emphasised.
+///
+/// Separate from the escapes so that what fits can be tested as what fits.
+fn strip(cols: usize, tabs: &[TabLabel], url: &str) -> Vec<(String, bool)> {
+    // What every tab costs before its title: its number, a space, and the two
+    // spaces that separate it from the one before.
+    let fixed: usize = tabs
+        .iter()
+        .enumerate()
+        .map(|(index, _)| number_width(index + 1) + 1 + if index == 0 { 0 } else { 2 })
+        .sum();
+    let budget = cols.saturating_sub(fixed);
+    let wanted: Vec<usize> = tabs.iter().map(|tab| width(tab.title)).collect();
+    let given = shares(budget, &wanted);
+
+    let mut runs: Vec<(String, bool)> = Vec::new();
+    let mut used = 0;
+    for (index, tab) in tabs.iter().enumerate() {
+        if index > 0 {
+            runs.push(("  ".to_string(), false));
+            used += 2;
+        }
+        let text = format!("{} {}", index + 1, clip_to(tab.title, given[index]));
+        used += width(&text);
+        runs.push((text, tab.active));
+    }
+
+    // The url gets whatever the titles did not want, and only if that is
+    // enough to read: the strip is what this row is for now.
+    let left = cols.saturating_sub(used);
+    if !url.is_empty() && left >= URL_MINIMUM + 2 {
+        runs.push((format!("  {}", clip_to(url, left - 2)), false));
+    }
+
+    // Titles can be clipped to nothing but numbers cannot, so a pane narrower
+    // than `1  2  3 …` still has more strip than row. The row wins: what is
+    // past the edge is cut, and the numbers that are left still say which tab
+    // is which, because the order never changes.
+    let mut fitted = Vec::with_capacity(runs.len());
+    let mut used = 0;
+    for (text, active) in runs {
+        let room = cols - used;
+        if width(&text) <= room {
+            used += width(&text);
+            fitted.push((text, active));
+            continue;
+        }
+        if room > 0 {
+            fitted.push((clip_to(&text, room), active));
+        }
+        break;
+    }
+    fitted
+}
+
+/// Share `budget` cells between titles that want `wanted`.
+///
+/// Equally, except that a title which wants less than its share gives the rest
+/// back to the ones that want more — so two short titles and one long one show
+/// the long one rather than three equal stumps. What nobody gets is a share of
+/// zero while somebody else has room to spare.
+fn shares(mut budget: usize, wanted: &[usize]) -> Vec<usize> {
+    let mut given = vec![0usize; wanted.len()];
+    let mut open: Vec<usize> = (0..wanted.len()).collect();
+    while !open.is_empty() {
+        let each = budget / open.len();
+        if each == 0 {
+            break;
+        }
+        let modest: Vec<usize> = open
+            .iter()
+            .copied()
+            .filter(|&i| wanted[i] <= each)
+            .collect();
+        if modest.is_empty() {
+            let spare = budget - each * open.len();
+            for (rank, &i) in open.iter().enumerate() {
+                given[i] = each + usize::from(rank < spare);
+            }
+            break;
+        }
+        for i in modest {
+            given[i] = wanted[i];
+            budget -= wanted[i];
+            open.retain(|&open| open != i);
+        }
+    }
+    given
+}
+
+/// How many cells a tab's number takes.
+fn number_width(n: usize) -> usize {
+    if n < 10 {
+        1
+    } else {
+        n.to_string().len()
+    }
+}
+
 /// How wide a string is in cells.
 ///
 /// The ranges are the East Asian wide and fullwidth blocks, which is what a
@@ -364,6 +504,120 @@ mod tests {
         assert!(line.contains("long/path"), "{line:?}");
         assert!(line.ends_with("\x1b[?25h"), "the cursor is shown: {line:?}");
         assert!(line.contains("\x1b[1;21H"), "at the end of what was typed");
+    }
+
+    fn labels<'a>(titles: &[&'a str], active: usize) -> Vec<TabLabel<'a>> {
+        titles
+            .iter()
+            .enumerate()
+            .map(|(index, title)| TabLabel {
+                title,
+                active: index == active,
+            })
+            .collect()
+    }
+
+    /// What the strip reads as, with the emphasis written as brackets.
+    fn strip_text(cols: usize, tabs: &[TabLabel], url: &str) -> String {
+        strip(cols, tabs, url)
+            .into_iter()
+            .map(
+                |(text, active)| {
+                    if active {
+                        format!("[{text}]")
+                    } else {
+                        text
+                    }
+                },
+            )
+            .collect()
+    }
+
+    #[test]
+    fn the_strip_numbers_the_tabs_and_marks_the_one_in_front() {
+        let tabs = labels(&["One", "Two", "Three"], 1);
+        assert_eq!(strip_text(80, &tabs, ""), "1 One  [2 Two]  3 Three");
+        // The number is part of what is emphasised: it is how the tab is
+        // selected, and a number outside the mark would read as a separator.
+        let line = String::from_utf8(tab_line(80, &tabs, "")).expect("ascii");
+        assert!(line.contains("\x1b[27m2 Two\x1b[7m"), "{line:?}");
+        assert!(line.contains("1 One"), "{line:?}");
+    }
+
+    #[test]
+    fn the_strip_fills_the_width_and_no_more() {
+        for cols in [8u32, 13, 20, 40, 80] {
+            for count in 2..=9usize {
+                let titles: Vec<String> =
+                    (1..=count).map(|n| format!("Title number {n}")).collect();
+                let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+                let tabs = labels(&refs, count - 1);
+                let line = String::from_utf8(tab_line(cols, &tabs, "https://example.com/page"))
+                    .expect("ascii");
+                let body = line
+                    .trim_start_matches("\x1b[1;1H\x1b[K\x1b[7m")
+                    .trim_end_matches("\x1b[0m\x1b[?25l")
+                    .replace("\x1b[27m", "")
+                    .replace("\x1b[7m", "");
+                assert_eq!(
+                    width(&body),
+                    cols as usize,
+                    "{cols} cols, {count} tabs: {body:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_title_is_clipped_and_a_short_one_gives_its_room_away() {
+        // Three tabs, forty cells: the numbers and separators cost 10, so 30
+        // is shared. "ok" wants two and gives back the rest.
+        let tabs = labels(
+            &["ok", "a title that will not fit in ten cells", "also ok"],
+            0,
+        );
+        let text = strip_text(40, &tabs, "");
+        assert_eq!(
+            width(&text) - 2,
+            40,
+            "the brackets are the test's, not the row's"
+        );
+        assert!(text.starts_with("[1 ok]  2 a title that"), "{text:?}");
+        assert!(text.contains('…'), "the long one says it was cut: {text:?}");
+        assert!(text.ends_with("3 also ok"), "{text:?}");
+    }
+
+    #[test]
+    fn the_url_comes_after_the_strip_when_there_is_room_for_it() {
+        let tabs = labels(&["A", "B"], 0);
+        let wide = strip_text(60, &tabs, "https://example.com/a");
+        assert!(wide.ends_with("  https://example.com/a"), "{wide:?}");
+        // And not when there is not: half a url is not worth a title.
+        let narrow = strip_text(12, &tabs, "https://example.com/a");
+        assert_eq!(narrow, "[1 A]  2 B");
+    }
+
+    #[test]
+    fn more_tabs_than_the_pane_is_wide_is_still_one_row() {
+        let titles: Vec<String> = (1..=9).map(|n| format!("Tab {n}")).collect();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let tabs = labels(&refs, 0);
+        let text = strip_text(10, &tabs, "https://example.com");
+        assert!(width(&text) <= 10 + 2, "{text:?}");
+        assert!(text.starts_with("[1"), "{text:?}");
+    }
+
+    #[test]
+    fn the_shares_go_to_the_titles_that_want_them() {
+        // Nobody wants more than a third: everybody gets what they asked for.
+        assert_eq!(shares(30, &[5, 5, 5]), vec![5, 5, 5]);
+        // One wants everything: it gets what the other two left.
+        assert_eq!(shares(30, &[2, 100, 3]), vec![2, 25, 3]);
+        // Everybody wants more than there is: it is split, and the odd cell
+        // goes to the left.
+        assert_eq!(shares(10, &[100, 100, 100]), vec![4, 3, 3]);
+        // Nothing to share.
+        assert_eq!(shares(1, &[10, 10, 10]), vec![0, 0, 0]);
     }
 
     #[test]
