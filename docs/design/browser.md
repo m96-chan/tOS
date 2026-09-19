@@ -45,7 +45,7 @@ keyboard      the Kitty keyboard protocol, including key releases, event
 
 Every one of those already has a program on the far end of it that is not
 tOS. `tos-preview` sends `f=100` because that is the path a file manager uses
-(`preview/src/lib.rs`), and yazi — which was never told what tOS is — asks the
+(`apps/preview/src/lib.rs`), and yazi — which was never told what tOS is — asks the
 terminal whether it can show a picture, is told yes, and previews a photograph
 (`docs/design/applications.md`). The graphics file media were argued and built
 for #68, and `a=f` taking compressed frames was #69.
@@ -167,7 +167,7 @@ this experiment and something else will be.
 
 **The frames go through as PNG, unchanged.** JPEG is 4× smaller per frame and
 it is not used, because `tos-term` cannot decode it and writing a decoder to
-get this is the trade `preview/src/lib.rs` already refused for previews: a
+get this is the trade `apps/preview/src/lib.rs` already refused for previews: a
 baseline JPEG decoder is 600–900 lines before progressive JPEG is considered,
 in a repository whose one dependency is `libc`, and nothing else in the tree
 wants it. PNG is what the graphics protocol names as its own payload format
@@ -423,6 +423,60 @@ about what arrives on the screen.
    pane is fine for one pane. It is a different conversation at four.
 
 ---
+
+## Where the crate lives, and what would move it out
+
+**Decided: `apps/browser`, in this tree, beside `apps/preview` and
+`apps/installer`.** Not its own repository yet — and the conditions under
+which it becomes one are written here so that the question is answered by
+events rather than reopened by mood.
+
+The case for a separate repository is real and mostly correct. A browser is a
+program in a pane and not the compositor, which is the same line
+`applications.md` drew for what goes on the image. What it tracks is
+Chromium's DevTools protocol, on Chromium's calendar and not tOS's. Its
+engine tests cannot run in this repository's CI, which has no Chromium and
+must not borrow the runner's; a repository of its own could install
+`chromium-shell` and run them on every push. And 1,739 lines of it — the
+WebSocket client, the JSON reader, the HTTP GET, base64, SHA-1 — exist for no
+reason except that this workspace depends on `libc` and nothing else. In a
+repository with its own policy they are two lines of `Cargo.toml`.
+
+What keeps it here for now is what it is coupled to, measured rather than
+assumed. At runtime the crate uses two things from the tree:
+`tos_platform::tty` for raw mode and non-blocking reads, and
+`tos_preview::fit` for `TIOCGWINSZ` and the cell arithmetic — perhaps a
+hundred and fifty lines between them, and copyable. The coupling that matters
+is in the tests. `graphics.rs` feeds the escape sequences it emits to a real
+`tos_term::Terminal` and asserts what the store holds; the integration test
+installs the compositor's own `ImageFiles` so that `t=s` is read and unlinked
+by the code that does it in a session; the 1016 test asks the real
+`report_private_mode`. Those are the tests that fail when the browser and the
+compositor disagree about the protocol between them, and they can exist only
+because both ends are in one tree behind one gate — mode 1016 landed with its
+first consumer in the same afternoon for that reason. Outside the tree they
+would pin a commit of tOS and test the past. None of `tos-term`, `tos-input`,
+`tos-platform` or `tos-preview` is published, so a separate repository today
+would depend on this one by git revision, which is that pinning made
+permanent. And before 0.1 the protocols change weekly; a two-repository dance
+for each change is a cost with nothing yet on the other side of the ledger.
+
+It moves out when the first of these happens:
+
+- **The pane-program crates are published.** Any program written for tOS by
+  somebody else needs what `tos_preview::fit` and the graphics encoder know,
+  and the moment that is on crates.io the browser can depend on it the way a
+  third party would. This is the real prerequisite, and it is a question about
+  a tOS SDK rather than about the browser.
+- **0.1 ships and the browser's releases stop lining up with the image's.** A
+  crate that is not on the ISO has no reason to be versioned with it.
+- **The browser wants a real dependency** — a JPEG decoder, a WebSocket
+  library, `serde` — and the workspace's one-dependency rule is the only thing
+  in the way. That is the workspace's policy to change or the browser's tree
+  to leave, and either is a decision for the person, not a drift.
+
+Until then `apps/` is the separation: three programs that are not the
+compositor, in one place, under one gate.
 
 ## Follow-ups
 

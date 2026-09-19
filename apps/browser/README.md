@@ -5,7 +5,7 @@ Python experiments and benchmark tools kept alongside it for reproduction.
 
 A page rendered by a headless Chromium, arriving in a tOS pane as kitty
 graphics. The reasoning, the measurements and the decisions are in
-[`docs/design/browser.md`](../docs/design/browser.md); this file is how to run
+[`docs/design/browser.md`](../../docs/design/browser.md); this file is how to run
 it.
 
 Nothing here requires a change to the compositor. The converter is an ordinary

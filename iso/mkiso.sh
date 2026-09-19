@@ -246,7 +246,7 @@ maybe_tool blkid
 # initramfs and has no rootfs to reach: it can still partition a disk and copy
 # a system onto it, and what it left behind would have nothing to start it. So
 # tos-install looks for a grub-install before it offers to erase anything —
-# see Bootloader::detect and Plan::refusal in installer/src/plan.rs — and a
+# see Bootloader::detect and Plan::refusal in apps/installer/src/plan.rs — and a
 # rescue session now refuses rather than producing that disk.
 
 # Every shared library those binaries need, resolved transitively by ldd.
@@ -915,7 +915,7 @@ chmod 755 "$ROOTFS/sbin/tos" "$ROOTFS/sbin/tos-install" \
 # systemctl, so granting them would be granting `sudo systemctl <anything>`.
 # The shim re-runs itself under `sudo -n` and the root pass hands over to
 # /sbin, which keeps the passwordless part bounded by what this file will do.
-# `POWER_PROGRAM` in installer/src/install.rs is the whole of it. Neither is
+# `POWER_PROGRAM` in apps/installer/src/install.rs is the whole of it. Neither is
 # D-Bus and polkit,
 # which is what the rest of the world does and what #158 turned down for now:
 # that needs a logind session this compositor does not create, and the seat

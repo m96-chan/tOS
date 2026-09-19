@@ -525,7 +525,7 @@ cell metrics the kernel is already holding in the pane's `winsize`, and hands
 the file to the terminal as `f=100` rather than decoding it first — the same
 route a file manager takes, so what is exercised is the integration and not
 only the decoder. It has been run in a pane and the resulting frame counted
-pixel by pixel against the picture that went in (`preview/tests/pane.rs`), and
+pixel by pixel against the picture that went in (`apps/preview/tests/pane.rs`), and
 it has been run on the booted ISO under QEMU with the picture read off a
 second disc. The live image carries its own picture now — `/etc/tos/splash.png`
 is what the login screen and the head of every pane draw
@@ -1285,9 +1285,11 @@ minds losing.
 
 ```text
 tOS/
-├── installer/           tos-install: put tOS on a disk from the live session
-├── preview/             tos-preview: show an image in a pane
-├── browser/             tos-browser client and Chromium PoC tools
+├── apps/                programs that run in a pane; none of them is the compositor
+│   ├── installer/       tos-install: put tOS on a disk from the live session
+│   ├── preview/         tos-preview: show an image in a pane
+│   └── browser/         tos-browser: a web page in a pane, on an engine the person
+│                        installs; and the PoC tools that decided its design
 ├── iso/                 bootable image and its initramfs
 ├── android/             the standalone APK, for a phone that keeps Android
 │   ├── app/             the Android view: Java UI, JNI bridge, resources

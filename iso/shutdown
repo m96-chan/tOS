@@ -32,7 +32,7 @@
 #                     `sudo -n` and the root pass below hands over to the real
 #                     program. The installer's /etc/sudoers.d drop-in grants
 #                     this file without a password; see `add_sudo` in
-#                     installer/src/install.rs for why that costs nothing and
+#                     apps/installer/src/install.rs for why that costs nothing and
 #                     why the rule names this file rather than /sbin.
 #   rescue session    out of the initramfs, where busybox has halt, poweroff
 #                     and reboot applets and no shutdown one at all, and
@@ -56,7 +56,7 @@ esac
 # the name the other three verbs are symlinks to. Written out rather than
 # taken from $0, because it is what one particular line in one particular
 # file says, and the two have to agree: see `POWER_PROGRAM` in
-# installer/src/install.rs.
+# apps/installer/src/install.rs.
 SHIM_DIR=/usr/local/sbin
 
 # Not root, which is an installed machine's session and nothing else. Ask
@@ -190,7 +190,7 @@ fi
 # and a shell that installed no handler is a PID 1 the kernel discards the
 # signal for — so the applet returns 0 and the machine stays up, silently.
 # That is not a guess: it is the bug the installer's own reboot had, written
-# down at `Backend::reboot` in installer/src/exec.rs — the key that restarts
+# down at `Backend::reboot` in apps/installer/src/exec.rs — the key that restarts
 # a finished install had never worked on any machine, and the discarded exit
 # status was 0 every time. -f is the applet calling reboot(2) itself, which
 # is the only thing that can work where there is no init, and it is why the

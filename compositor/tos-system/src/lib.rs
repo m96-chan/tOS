@@ -6,7 +6,7 @@
 //!
 //! Everything that touches the machine goes through a seam, so the logic above
 //! it can be tested on a machine that has none of this: [`Sysfs`] for reading,
-//! and each module's own trait for acting. `installer/src/exec.rs` uses the
+//! and each module's own trait for acting. `apps/installer/src/exec.rs` uses the
 //! same shape for the same reason.
 
 pub mod audio;

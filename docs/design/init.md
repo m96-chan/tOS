@@ -152,7 +152,7 @@ The unit is the image's and this line is the machine's. A unit rewritten by the
 installer would be a unit that stops improving the day a new image is installed
 over it.
 
-That also ends a duplication `installer/src/install.rs` had carried since the
+That also ends a duplication `apps/installer/src/install.rs` had carried since the
 rootfs arrived: the session environment was written out a second time there,
 because busybox init could not run `iso/live-session`, and the two copies
 drifted by a `TERM` and a `PATH` before a test was written to compare them.

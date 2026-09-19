@@ -12,9 +12,9 @@ members = [
     "compositor/tos-system",
     "compositor/tos-ime",
     "compositor/tos-compositor",
-    "installer",
-    "preview",
-    "browser",
+    "apps/installer",
+    "apps/preview",
+    "apps/browser",
     "android/native",
 ]
 
@@ -37,9 +37,9 @@ tos-platform = { path = "compositor/tos-platform" }
 tos-system = { path = "compositor/tos-system" }
 tos-ime = { path = "compositor/tos-ime" }
 tos-compositor = { path = "compositor/tos-compositor" }
-tos-install = { path = "installer" }
-tos-preview = { path = "preview" }
-tos-browser = { path = "browser" }
+tos-install = { path = "apps/installer" }
+tos-preview = { path = "apps/preview" }
+tos-browser = { path = "apps/browser" }
 libc = "0.2"
 
 [profile.release]

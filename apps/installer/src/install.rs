@@ -980,14 +980,14 @@ const ACCOUNT_ID: &str = "1000";
 /// `include_str!` rather than a second copy: `iso/mkiso.sh` installs this same
 /// file as `/root/.bashrc` and `/etc/skel/.bashrc` inside the image, and a
 /// machine installed from an image is meant to be that image.
-const BASHRC: &str = include_str!("../../iso/bashrc");
+const BASHRC: &str = include_str!("../../../iso/bashrc");
 
 /// The `~/.profile` that goes with it, for the login shells that do not read
 /// `~/.bashrc` at all.
 ///
 /// Same reason for `include_str!`: `iso/mkiso.sh` installs this file as
 /// `/root/.profile` and `/etc/skel/.profile`.
-const PROFILE: &str = include_str!("../../iso/dot-profile");
+const PROFILE: &str = include_str!("../../../iso/dot-profile");
 
 /// Where a drop-in for `tos-session.service` goes: systemd reads every `.conf`
 /// in this directory on top of the unit itself.
@@ -1824,7 +1824,7 @@ mod tests {
         // still sets up a session: ENV, which is how a pane running dash
         // reads /etc/profile and prints the message of the day, and the rest
         // of what a compositor started by an init system is handed nothing of.
-        let session = include_str!("../../iso/live-session");
+        let session = include_str!("../../../iso/live-session");
         for variable in [
             "export HOME=/root",
             "export TOS_USER",
