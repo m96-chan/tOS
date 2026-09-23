@@ -102,6 +102,62 @@ a degraded mode worth hiding — link-clicking on a cell grid is usable for a
 page of prose and unusable for a dense one, and the browser should say which
 it is in.
 
+### The other gap: a wheel notch is a gesture, not an event
+
+Scrolling read as choppy on the installed machine, and it was not the frame
+rate. `Input.dispatchMouseEvent` with `type: mouseWheel` and `deltaY: 120` —
+what the crate sent until now — moves the page 120 pixels in **one screencast
+frame**, measured against `chromium-shell` 153 at 1280×768 in docker on two
+cores. Not a fast animation: no animation. `--enable-smooth-scrolling` on the
+engine changes nothing, because the engine's smooth scrolling belongs to the
+wheel input pipeline that a synthetic event skips, and splitting one notch into
+six twenty-pixel events over a hundred milliseconds gives three frames and
+still reads as a jump. No amount of frame-rate work can fix a page that
+teleports.
+
+`Input.synthesizeScrollGesture` is the one the engine animates itself. At
+`app::SCROLL_SPEED`, 700 CSS pixels a second, one 120-pixel notch is **13
+screencast frames over 232 ms** (six runs, 231 to 242 ms), and it ends exactly
+120 pixels down. The cost is distance ÷ speed plus a flat 60 to 65 ms of the
+engine's own, so 240 pixels is 366 ms and 600 pixels is 800 ms. 700 rather than
+the protocol's default of 800 because of what happens when a hand is faster
+than the engine: a gesture is in flight for as long as it animates, and two in
+flight at once are neither refused nor dropped but **serialised** — issued
+together, or 50 or 120 ms apart, the replies come at 181 and 365 ms and the
+page ends 240 pixels down either way. So one gesture per notch would put the
+page further and further behind the hand. Instead the first notch after idle
+goes out at once, notches that arrive while one animates are added up, and the
+sum goes out when the reply comes. Five notches 100 ms apart — the fast end of
+what a wheel produces — is then three gestures of 120, 240 and 240 pixels at
+speed 700, reproducibly across eight runs, and flips between three and four at
+speed 800. One gesture for a sum is also cheaper than the notches it stands
+for, because that 65 ms is per gesture: two notches are 366 ms together and
+464 ms apart.
+
+The gesture is issued asynchronously, for the reason the lossless still is: the
+reply arrives when the animation *ends*, and a loop sitting in a `call` for a
+quarter of a second is a loop that is not reading the terminal. Both ends of it
+count as input in [`motion`](../../apps/browser/src/motion.rs)'s sense — at
+issue and at reply — so no still is asked for in the middle of an animation.
+
+Two things it is worth knowing are not identical to a wheel in a window. One
+notch reaches the page as **twelve `wheel` events** carrying a slice each
+rather than one of 120 pixels, so a site that counts them — a full-screen
+carousel that advances per event — will advance twelve times; what such a site
+does with `preventDefault` still works, and a gesture over an inner scroller
+scrolls that scroller and not the page, both checked. And because the speed is
+fixed, a sustained hand faster than 700 ÷ 120 ≈ 5.8 notches a second asks for
+more scrolling than the engine will deliver, so the page keeps moving after the
+wheel stops — 830 ms after five notches. A speed that grew with the coalesced
+distance would fix that and is the obvious follow-up; it was not measured here.
+
+A page with nothing left to scroll is not a failure and needs no handling of
+its own: at the bottom of a long page, and on `about:blank`, the engine
+animates the gesture anyway and answers with an ordinary empty result after
+215 and 231 ms. An error reply would throw the pending distance away rather
+than re-send it, so a page that refuses one gesture cannot wedge the wheel for
+the pages after it.
+
 ---
 
 ## The engine

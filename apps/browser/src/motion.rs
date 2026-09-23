@@ -133,6 +133,13 @@ pub const REST_AFTER: Duration = Duration::from_millis(250);
 /// wheel has been quiet for longer than the longest gap a hand leaves —
 /// 400 ms is 300 with room — and a scroll then costs one still at the end of
 /// it rather than one per notch.
+///
+/// A notch is now an `Input.synthesizeScrollGesture` rather than a dispatched
+/// wheel event, so the animation is 232 ms rather than about 100 and it
+/// outlives the notch that asked for it. [`Motion::input`] is called at both
+/// ends of one — when it is issued and when its reply says it has finished —
+/// so this interval is counted from the end of the *animation* rather than
+/// from the end of the hand. See `docs/design/browser.md`.
 pub const INPUT_QUIET: Duration = Duration::from_millis(400);
 
 /// How many screencast frames a still produces just by being taken.

@@ -1277,25 +1277,101 @@ fn raw_pixels_cost_the_terminal_a_fraction_of_what_a_png_frame_did() {
 // When the lossless still is taken, and what it costs the loop
 // ---------------------------------------------------------------------------
 
-/// One wheel notch over the middle of the page, exactly as `app::send_mouse`
-/// sends one: a notification, because the reply says nothing and a round trip
-/// between two notches would be a round trip a person can feel.
-fn notch(client: &mut Client) {
+/// A scroll down the middle of the page, exactly as `app::issue_scroll` sends
+/// one: asynchronously, at the crate's own speed, with the protocol's sign.
+///
+/// The reply arrives when the animation *ends*, so the `Pending` is the thing
+/// that says the page is still moving.
+fn send_gesture(client: &mut Client, distance: f64) -> Pending {
     client
-        .notify(
-            "Input.dispatchMouseEvent",
+        .send(
+            "Input.synthesizeScrollGesture",
             Json::object(vec![
-                ("type", Json::string("mouseWheel")),
                 ("x", Json::number(WIDE / 2)),
                 ("y", Json::number(TALL / 2)),
-                ("modifiers", Json::number(0)),
-                ("button", Json::string("none")),
-                ("buttons", Json::number(0)),
-                ("deltaX", Json::number(0)),
-                ("deltaY", Json::number(120)),
+                ("xDistance", Json::number(0)),
+                ("yDistance", Json::number(-distance)),
+                ("speed", Json::number(tos_browser::app::SCROLL_SPEED)),
+                ("gestureSourceType", Json::string("mouse")),
             ]),
         )
-        .expect("the notch goes out");
+        .expect("the gesture goes out")
+}
+
+/// How far down the page is, asked of the page.
+fn scroll_y(client: &mut Client) -> f64 {
+    client
+        .call_within(
+            "Runtime.evaluate",
+            Json::object(vec![
+                ("expression", Json::string("window.scrollY")),
+                ("returnByValue", Json::Bool(true)),
+            ]),
+            Duration::from_secs(5),
+        )
+        .ok()
+        .and_then(|value| value.path(&["result", "value"]).and_then(Json::as_f64))
+        .expect("the page says where it is")
+}
+
+/// The loop's coalescing, as much of it as a test needs.
+///
+/// One gesture at a time, the notches that arrive behind it added up, and the
+/// still's clock marked at both ends of the animation — which is what
+/// `apps/browser/src/app.rs` does with `Wheel`, `issue_scroll` and
+/// `collect_scroll`. The rule itself is unit-tested there, without an engine;
+/// this is here so that an engine can be driven with it.
+#[derive(Default)]
+struct Hand {
+    flight: Option<Pending>,
+    queued: f64,
+    /// Every gesture that went out, as the distance it carried.
+    issued: Vec<f64>,
+}
+
+impl Hand {
+    /// A notch. Goes out at once if nothing is animating, and waits if
+    /// something is.
+    fn notch(&mut self, client: &mut Client, rest: &mut Motion) {
+        rest.input(Instant::now());
+        if self.flight.is_some() {
+            self.queued += tos_browser::app::WHEEL_PIXELS;
+            return;
+        }
+        self.issue(client, rest, tos_browser::app::WHEEL_PIXELS);
+    }
+
+    fn issue(&mut self, client: &mut Client, rest: &mut Motion, distance: f64) {
+        self.issued.push(distance);
+        self.flight = Some(send_gesture(client, distance));
+        rest.input(Instant::now());
+    }
+
+    /// Take the reply if it has come, and send what piled up behind it.
+    /// Returns whether a gesture finished on this pass.
+    fn collect(&mut self, client: &mut Client, rest: &mut Motion) -> bool {
+        let Some(pending) = self.flight.take() else {
+            return false;
+        };
+        let Some(answer) = client.take_reply(&pending) else {
+            self.flight = Some(pending);
+            return false;
+        };
+        assert!(
+            answer.is_ok(),
+            "the engine refused a scroll gesture: {answer:?}"
+        );
+        rest.input(Instant::now());
+        let queued = std::mem::take(&mut self.queued);
+        if queued != 0.0 {
+            self.issue(client, rest, queued);
+        }
+        true
+    }
+
+    fn scrolling(&self) -> bool {
+        self.flight.is_some()
+    }
 }
 
 /// Ask for the lossless still without waiting for it, as the loop does.
@@ -1424,6 +1500,12 @@ fn a_still_photographs_itself_into_the_screencast_exactly_once() {
 /// several times a second and a page with colour in it flashed. What is
 /// asserted is that no still is even *asked for* while the notches are going,
 /// and that exactly one is painted once they stop.
+///
+/// The notches are scroll gestures rather than dispatched wheel events, which
+/// is what the crate sends — so "while the notches are going" now means while
+/// the engine is animating one as well, and the last gesture's reply comes
+/// after the last notch. Both are asserted against, because a still taken in
+/// the middle of an animation is exactly the one this policy exists to stop.
 #[test]
 fn a_hand_on_the_wheel_gets_no_still_until_it_stops() {
     let Some((mut engine, mut client)) = connect() else {
@@ -1437,10 +1519,12 @@ fn a_hand_on_the_wheel_gets_no_still_until_it_stops() {
     cast(&mut client, "jpeg", Some(motion::QUALITY), WIDE, TALL);
 
     let mut rest = Motion::new(Instant::now());
+    let mut hand = Hand::default();
     let mut in_flight: Option<(Pending, Instant)> = None;
     let mut sent = 0u32;
     let mut next = Instant::now();
     let mut last_notch = Instant::now();
+    let mut last_gesture: Option<Instant> = None;
     let mut requested: Vec<Instant> = Vec::new();
     let mut painted: Vec<Instant> = Vec::new();
     let mut discarded = 0usize;
@@ -1451,8 +1535,7 @@ fn a_hand_on_the_wheel_gets_no_still_until_it_stops() {
     while Instant::now() < give_up {
         let now = Instant::now();
         if sent < NOTCHES && now >= next {
-            notch(&mut client);
-            rest.input(now);
+            hand.notch(&mut client, &mut rest);
             last_notch = now;
             sent += 1;
             next = now + EVERY;
@@ -1463,6 +1546,11 @@ fn a_hand_on_the_wheel_gets_no_still_until_it_stops() {
         for (_, stamp) in take_frames(&mut client) {
             frames += 1;
             rest.motion_frame(stamp, Instant::now());
+        }
+        // And the scroll before the still, for the same reason the loop puts
+        // it there: the animation ending is the page's last movement.
+        if hand.collect(&mut client, &mut rest) {
+            last_gesture = Some(Instant::now());
         }
         match in_flight.take() {
             Some((pending, at)) => match client.take_reply(&pending) {
@@ -1505,9 +1593,11 @@ fn a_hand_on_the_wheel_gets_no_still_until_it_stops() {
     }
 
     let _ = client.call("Page.stopScreencast", Json::empty());
+    let last_gesture = last_gesture.expect("a gesture finished");
     eprintln!(
-        "{NOTCHES} notches every {EVERY:?}: {frames} frames, {} stills asked for, \
-         {} painted, {discarded} thrown away because the page moved",
+        "{NOTCHES} notches every {EVERY:?}: {} gestures, {frames} frames, \
+         {} stills asked for, {} painted, {discarded} thrown away because the page moved",
+        hand.issued.len(),
         requested.len(),
         painted.len(),
     );
@@ -1517,6 +1607,10 @@ fn a_hand_on_the_wheel_gets_no_still_until_it_stops() {
         "a still was asked for while the wheel was still turning"
     );
     assert!(
+        requested.iter().all(|at| *at > last_gesture),
+        "a still was asked for while the engine was still animating a scroll"
+    );
+    assert!(
         painted.iter().all(|at| *at > last_notch),
         "a still was painted while the wheel was still turning"
     );
@@ -1524,6 +1618,183 @@ fn a_hand_on_the_wheel_gets_no_still_until_it_stops() {
         painted.len(),
         1,
         "the scroll should cost one lossless still, at the end of it"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// One notch is an animation the engine drives, not a page that teleports.
+///
+/// This is the difference a person sees as "scrolling is choppy", and it is
+/// not a frame rate: `Input.dispatchMouseEvent` with `deltaY: 120` — what this
+/// crate sent until `app::scroll` — moves the page 120 pixels in **one**
+/// screencast frame, whatever the screencast is capable of. The numbers here
+/// are the floor of what was measured for `Input.synthesizeScrollGesture` at
+/// `app::SCROLL_SPEED`: 13 frames over 232 ms against `chromium-shell` 153 on
+/// two cores. Eight frames and 120 ms is that with room, and it is far more
+/// than a dispatched wheel event can produce however slow the machine is.
+#[test]
+fn one_notch_is_an_animation_and_not_a_jump() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    article(&mut client, WIDE, TALL);
+    // A page that has loaded is not necessarily a page that has painted.
+    let _ = screenshot(&mut client, "png", None);
+    cast(&mut client, "jpeg", Some(motion::QUALITY), WIDE, TALL);
+    // And the first frames of the screencast are the page arriving rather than
+    // the page scrolling.
+    std::thread::sleep(Duration::from_millis(400));
+    let _ = take_frames(&mut client);
+    assert_eq!(scroll_y(&mut client), 0.0, "the page starts at the top");
+
+    let at = Instant::now();
+    let pending = send_gesture(&mut client, tos_browser::app::WHEEL_PIXELS);
+    let mut frames: Vec<Instant> = Vec::new();
+    let mut replied = None;
+    while at.elapsed() < Duration::from_secs(5) {
+        for _ in take_frames(&mut client) {
+            frames.push(Instant::now());
+        }
+        if replied.is_none() {
+            if let Some(answer) = client.take_reply(&pending) {
+                assert!(answer.is_ok(), "the engine refused the gesture: {answer:?}");
+                replied = Some(at.elapsed());
+            }
+        }
+        // A moment past the reply, in case a frame trails it.
+        if let Some(replied) = replied {
+            if at.elapsed() > replied + Duration::from_millis(100) {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    let replied = replied.expect("the gesture is answered when it has finished animating");
+    let span = match (frames.first(), frames.last()) {
+        (Some(first), Some(last)) => last.duration_since(*first),
+        _ => Duration::ZERO,
+    };
+    eprintln!(
+        "one notch at speed {}: {} frames spanning {span:?}, answered at {replied:?}",
+        tos_browser::app::SCROLL_SPEED,
+        frames.len(),
+    );
+    assert!(
+        frames.len() >= 8,
+        "only {} frames for one notch: the page jumped",
+        frames.len()
+    );
+    assert!(
+        span >= Duration::from_millis(120),
+        "the frames spanned only {span:?}: the page jumped"
+    );
+    assert_eq!(
+        scroll_y(&mut client),
+        tos_browser::app::WHEEL_PIXELS,
+        "an animated notch still ends exactly one notch down"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// A hand faster than the engine costs gestures, not a queue.
+///
+/// Five notches 100 ms apart is the fast end of what a wheel produces, and a
+/// gesture is in flight for 232 ms — so four of the five arrive while one is
+/// animating. Issuing each of them would not lose one: two gestures in flight
+/// are serialised by the engine, and the second answers after the first has
+/// finished and then run its own course. It would put the page behind the
+/// hand, and the scroll would go on visibly after the wheel had stopped. So
+/// they are added up, and the sum goes out when the reply comes: three
+/// gestures of 120, 240 and 240 pixels, reproducibly, for the same 600 pixels.
+///
+/// And no still is asked for in the middle of any of it, which is the half of
+/// the rule that only shows up when the animation outlives the notch.
+#[test]
+fn notches_faster_than_the_engine_are_coalesced() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    article(&mut client, WIDE, TALL);
+    let _ = screenshot(&mut client, "png", None);
+    cast(&mut client, "jpeg", Some(motion::QUALITY), WIDE, TALL);
+    std::thread::sleep(Duration::from_millis(400));
+    let _ = take_frames(&mut client);
+    assert_eq!(scroll_y(&mut client), 0.0, "the page starts at the top");
+
+    const FAST: u32 = 5;
+    const APART: Duration = Duration::from_millis(100);
+
+    let mut rest = Motion::new(Instant::now());
+    let mut hand = Hand::default();
+    let mut sent = 0u32;
+    let mut next = Instant::now();
+    let mut last_gesture = Instant::now();
+    let mut requested: Vec<Instant> = Vec::new();
+    let mut frames = 0usize;
+
+    let give_up = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < give_up {
+        let now = Instant::now();
+        if sent < FAST && now >= next {
+            hand.notch(&mut client, &mut rest);
+            sent += 1;
+            next = now + APART;
+        }
+        for (_, stamp) in take_frames(&mut client) {
+            frames += 1;
+            rest.motion_frame(stamp, Instant::now());
+        }
+        if hand.collect(&mut client, &mut rest) {
+            last_gesture = Instant::now();
+        }
+        // Nothing is ever sent for it; what is recorded is that the policy
+        // would have, which is what `rest_shot` asks on every pass.
+        if rest.wants_still(Instant::now()) {
+            requested.push(Instant::now());
+            rest.still_requested();
+            rest.still_failed();
+        }
+        if sent == FAST && !hand.scrolling() && last_gesture.elapsed() > Duration::from_millis(600)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    eprintln!(
+        "{FAST} notches every {APART:?}: gestures {:?}, {frames} frames, \
+         {} stills wanted",
+        hand.issued,
+        requested.len(),
+    );
+    assert_eq!(sent, FAST, "the notches never all went out");
+    assert_eq!(
+        scroll_y(&mut client),
+        FAST as f64 * tos_browser::app::WHEEL_PIXELS,
+        "coalescing lost a notch, or invented one"
+    );
+    assert!(
+        hand.issued.len() <= 3,
+        "{} gestures for {FAST} notches: they were not coalesced",
+        hand.issued.len()
+    );
+    assert_eq!(
+        hand.issued.iter().sum::<f64>(),
+        FAST as f64 * tos_browser::app::WHEEL_PIXELS,
+        "the gestures do not add up to the notches"
+    );
+    assert!(
+        requested.iter().all(|at| *at > last_gesture),
+        "a still was wanted before the last gesture had finished animating"
     );
 
     client.close();

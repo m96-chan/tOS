@@ -47,7 +47,44 @@ const TARGET_TIMEOUT: Duration = Duration::from_secs(15);
 /// A terminal mouse reports notches and nothing else — no acceleration, no
 /// fractional scroll — so the number is a constant, and this is the one that
 /// makes a page move by about the same amount it would in a window.
-const WHEEL_PIXELS: f64 = 120.0;
+pub const WHEEL_PIXELS: f64 = 120.0;
+
+/// How fast a scroll gesture travels, in CSS pixels a second.
+///
+/// A notch is not dispatched as a wheel event. `Input.dispatchMouseEvent` with
+/// `type: mouseWheel` and `deltaY: 120` moves the page 120 pixels in **one
+/// screencast frame** — measured against `chromium-shell` 153 at 1280x768, and
+/// `--enable-smooth-scrolling` on the engine changes nothing, because the
+/// engine's smooth scrolling is a property of the wheel input pipeline that a
+/// synthetic event skips. Splitting the notch into six twenty-pixel events over
+/// a hundred milliseconds gives three frames and still reads as a jump. That is
+/// what "scrolling is choppy" on the installed machine was: not a frame rate,
+/// an instantaneous page.
+///
+/// `Input.synthesizeScrollGesture` is the one the engine animates itself, and
+/// what it costs is this constant. 120 pixels at 700 px/s is **13 screencast
+/// frames over 232 ms** (measured six times, 231 to 242 ms; the engine's own
+/// overhead is a flat 60 to 65 ms on top of distance ÷ speed, so 240 px is
+/// 366 ms and 600 px is 800 ms).
+///
+/// Why 700 rather than the protocol's default of 800, which would be 232 ms of
+/// its own: a gesture is in flight for as long as it animates, and notches that
+/// arrive meanwhile are coalesced into the next one — see [`Wheel`]. A hand at
+/// the fast end of what a wheel produces, a notch every 100 ms, lands on
+/// exactly three gestures at 700 and flips between three and four at 800,
+/// because at 800 the first reply beats the third notch about half the time.
+/// Fewer gestures is fewer round trips and fewer of the engine's flat
+/// overheads, so the slower speed finishes the same 600 pixels sooner.
+pub const SCROLL_SPEED: u32 = 700;
+
+/// How long a scroll gesture may be out before it is given up on.
+///
+/// A gesture answers when its animation ends, so the deadline is a multiple of
+/// the longest one a hand can ask for rather than a round trip: five seconds is
+/// 3500 pixels at [`SCROLL_SPEED`], and no coalesced notch comes near it. It
+/// exists so that an engine which stops answering costs one scroll rather than
+/// a pane where the wheel has stopped working.
+const SCROLL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How close in time and space two presses have to be to be a double click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
@@ -135,6 +172,8 @@ struct Chrome {
     motion: Motion,
     /// The lossless still that has been asked for and not yet answered.
     still: Option<Still>,
+    /// The scroll gesture the engine is animating, and what is owed behind it.
+    wheel: Wheel<Pending>,
     /// `Some` while the url is being typed.
     editing: Option<String>,
     /// Whether that url is still the one the page had, untouched.
@@ -158,6 +197,119 @@ struct Still {
     pending: Pending,
     /// When it went out, against [`STILL_TIMEOUT`].
     sent: Instant,
+}
+
+/// An `Input.synthesizeScrollGesture` that is out with the engine.
+///
+/// The target travels with the command for the reason [`Still`]'s does, and
+/// one more: a reply's id belongs to the connection it was sent on, ids start
+/// at one on every connection, and a tab that is closed takes its connection
+/// with it. Asking another tab's client for this id could hand back another
+/// tab's reply, so the id is only ever asked of the tab it was sent to.
+struct Flight<P> {
+    target: String,
+    pending: P,
+    /// When it went out, against [`SCROLL_TIMEOUT`].
+    sent: Instant,
+}
+
+/// One tab's scrolling: the gesture that is animating and the notches that
+/// arrived behind it.
+///
+/// A gesture is in flight for as long as the engine animates it — 232 ms for
+/// one notch at [`SCROLL_SPEED`] — and a hand on a wheel produces notches 100
+/// to 300 ms apart, so the two overlap constantly. Two gestures in flight at
+/// once are not refused and not dropped: the engine **serialises** them, and
+/// the second answers after the first has finished animating and then run its
+/// own course (measured: two notches issued together, or 50 or 120 ms apart,
+/// reply at 181 ms and 365 ms in every case, and the page ends 240 px down).
+/// So issuing one per notch would not lose a notch — it would put the page
+/// further and further behind the hand, and the scroll would go on visibly
+/// after the wheel had stopped.
+///
+/// What this does instead: the first notch after idle goes out immediately,
+/// notches that arrive while a gesture animates are added up, and when the
+/// reply comes the sum goes out as one gesture. One gesture for a sum is also
+/// cheaper than the notches it stands for, because the engine's per-gesture
+/// overhead is flat — two notches are 366 ms as one gesture and 464 ms as two.
+///
+/// It is generic in what a command in flight is called so that the rule can be
+/// tested without an engine, a socket or a page; the loop uses
+/// [`crate::cdp::Pending`].
+struct Wheel<P> {
+    /// The gesture the engine is animating, if there is one.
+    flight: Option<Flight<P>>,
+    /// What has piled up behind it, in CSS pixels: x then y.
+    queued: (f64, f64),
+    /// Where the pointer was for the most recent notch.
+    ///
+    /// The pile is scrolled where the wheel was last turned rather than where
+    /// it was first turned, because a pointer that has moved onto a different
+    /// scroller is a person who means the one they are pointing at now.
+    at: (i32, i32),
+}
+
+impl<P> Default for Wheel<P> {
+    fn default() -> Wheel<P> {
+        Wheel {
+            flight: None,
+            queued: (0.0, 0.0),
+            at: (0, 0),
+        }
+    }
+}
+
+impl<P> Wheel<P> {
+    /// A notch, as a distance in CSS pixels. `Some` is the gesture to issue
+    /// now; `None` means it went on the pile behind one that is animating.
+    fn notch(&mut self, at: (i32, i32), distance: (f64, f64)) -> Option<((i32, i32), (f64, f64))> {
+        self.at = at;
+        if self.flight.is_some() {
+            self.queued.0 += distance.0;
+            self.queued.1 += distance.1;
+            return None;
+        }
+        Some((at, distance))
+    }
+
+    /// A gesture went out, so the next notch has something to queue behind.
+    fn issued(&mut self, target: String, pending: P, sent: Instant) {
+        self.flight = Some(Flight {
+            target,
+            pending,
+            sent,
+        });
+    }
+
+    /// The gesture came back. `Some` is the gesture to issue for what piled up
+    /// behind it.
+    ///
+    /// `ok` is whether the engine answered with a result rather than a
+    /// refusal. A refusal throws the pile away rather than sending it again:
+    /// whatever the page did to earn one, it would earn a second, and a
+    /// distance that is re-sent for ever is a wheel that has stopped working
+    /// on every page after it. A page with nothing to scroll is not that case
+    /// — the engine answers such a gesture with an ordinary empty result,
+    /// after animating it, which is measured in `docs/design/browser.md`.
+    fn replied(&mut self, ok: bool) -> Option<((i32, i32), (f64, f64))> {
+        self.flight = None;
+        let queued = std::mem::replace(&mut self.queued, (0.0, 0.0));
+        if !ok || queued == (0.0, 0.0) {
+            return None;
+        }
+        Some((self.at, queued))
+    }
+
+    /// Nothing is animating and nothing is owed: the tab in front changed, the
+    /// gesture could not be sent, or it was never answered.
+    fn forget(&mut self) {
+        self.flight = None;
+        self.queued = (0.0, 0.0);
+    }
+
+    fn flight(&self) -> Option<&Flight<P>> {
+        self.flight.as_ref()
+    }
 }
 
 /// Run until the person quits or something goes wrong.
@@ -239,6 +391,7 @@ fn drive(
         metrics,
         motion: Motion::new(Instant::now()),
         still: None,
+        wheel: Wheel::default(),
         editing: None,
         editing_whole: false,
     };
@@ -280,8 +433,11 @@ fn drive(
             }
             // The screen was cleared and the page is a different size, so
             // nothing that was captured before this is worth painting and the
-            // still that reflows the page is worth asking for.
+            // still that reflows the page is worth asking for. A scroll that
+            // was owed goes with it: the point it would be sent at was a point
+            // in a viewport that no longer exists.
             chrome.motion.reset(Instant::now());
+            chrome.wheel.forget();
             redraw_row(pane, tabs, &chrome)?;
         }
 
@@ -342,6 +498,10 @@ fn drive(
         // and never from one that has just been left behind.
         handle_target_events(pane, tabs, browser, &mut chrome, browser_url)?;
         handle_page_events(pane, tabs, &mut chrome)?;
+        // Before the still and after the frames: a scroll gesture that has
+        // just finished is the page's last moment of movement, and the still
+        // must not be asked for until it has been counted as one.
+        collect_scroll(tabs, &mut chrome);
         // And last, because it is the thing to do when nothing else happened:
         // a page that has stopped moving gets its lossless picture.
         rest_shot(pane, tabs, &mut chrome)?;
@@ -500,6 +660,11 @@ fn switched(
     if now == was {
         return Ok(());
     }
+    // What the last tab was owed is not owed to this one. The gesture that was
+    // animating, if there was one, is left to finish in a page nobody is
+    // looking at; its reply goes to a mailbox that is about to be dropped with
+    // the tab, or sits unread in one that is not.
+    chrome.wheel.forget();
     if let Some(was) = &was {
         deactivate(tabs, was);
     }
@@ -977,6 +1142,117 @@ fn request_still(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
     }
 }
 
+/// One wheel notch, as the engine's own scroll animation.
+///
+/// The sign is the one the protocol asks for and the opposite of the wheel's:
+/// `yDistance` is the distance to move the *content*, so a notch down, which
+/// this crate reports as `+1`, is a negative distance. Checked against the
+/// engine rather than read off the documentation — `yDistance: -120` over a
+/// long page leaves `window.scrollY` at 120, and `xDistance: -120` leaves
+/// `scrollX` at 120, while the positives move nothing at the top left.
+fn scroll(tabs: &mut Tabs<Client>, chrome: &mut Chrome, report: &MouseInput) {
+    let pixels = chrome.parser.pixel_coordinates();
+    let (x, y) = crate::input::page_point(report, pixels, chrome.metrics.cell, 1);
+    if y < 0 {
+        // The status row is this program's, and turning the wheel over it is
+        // not the page's business.
+        return;
+    }
+    let distance = (
+        -(report.wheel.0 as f64) * WHEEL_PIXELS,
+        -(report.wheel.1 as f64) * WHEEL_PIXELS,
+    );
+    if let Some((at, distance)) = chrome.wheel.notch((x, y), distance) {
+        issue_scroll(tabs, chrome, at, distance);
+    }
+}
+
+/// Send one gesture and remember it, without waiting for it.
+///
+/// Asynchronously for the reason the still is: the reply arrives when the
+/// animation *ends*, a quarter of a second later, and a loop sitting in a
+/// `call` for it is a loop that is not reading the terminal — so every key
+/// pressed during a scroll would arrive late.
+///
+/// Issuing one is also input, in [`crate::motion`]'s sense, and so is its
+/// reply: between the two the page is animating, and a lossless still taken in
+/// the middle of that is a still of a page that has already moved on.
+fn issue_scroll(
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+    at: (i32, i32),
+    distance: (f64, f64),
+) {
+    let Some(target) = tabs.active_target().map(str::to_string) else {
+        chrome.wheel.forget();
+        return;
+    };
+    let Some(tab) = tabs.active_mut() else {
+        chrome.wheel.forget();
+        return;
+    };
+    let sent = tab.connection.send(
+        "Input.synthesizeScrollGesture",
+        Json::object(vec![
+            ("x", Json::number(at.0)),
+            ("y", Json::number(at.1)),
+            ("xDistance", Json::number(distance.0)),
+            ("yDistance", Json::number(distance.1)),
+            ("speed", Json::number(SCROLL_SPEED)),
+            // So that the page is sent wheel events rather than touch ones: a
+            // site that listens for `wheel`, or calls `preventDefault` on it,
+            // behaves as it would in a window.
+            ("gestureSourceType", Json::string("mouse")),
+        ]),
+    );
+    match sent {
+        Ok(pending) => {
+            chrome.motion.input(Instant::now());
+            chrome.wheel.issued(target, pending, Instant::now());
+        }
+        // The socket is gone, which everything that cares hears on the next
+        // pass. What must not happen is a distance owed to a gesture that was
+        // never sent, because nothing would ever arrive to pay it.
+        Err(_) => chrome.wheel.forget(),
+    }
+}
+
+/// Take the reply to the gesture, if it has come back, and send what is owed.
+fn collect_scroll(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    let stale = match chrome.wheel.flight() {
+        None => return,
+        Some(flight) => tabs.active_target() != Some(flight.target.as_str()),
+    };
+    if stale {
+        // The tab was switched away from or closed while the engine scrolled.
+        // `switched` has already forgotten this one; so has a tab that was
+        // reaped. This is the case neither of them covers, and it is here
+        // because an id asked of the wrong connection is the one mistake that
+        // would be silent.
+        chrome.wheel.forget();
+        return;
+    }
+    let Some(flight) = chrome.wheel.flight() else {
+        return;
+    };
+    let timed_out = flight.sent.elapsed() >= SCROLL_TIMEOUT;
+    let Some(tab) = tabs.active_mut() else {
+        return;
+    };
+    let Some(answer) = tab.connection.take_reply(&flight.pending) else {
+        if timed_out {
+            chrome.wheel.forget();
+        }
+        return;
+    };
+    // The animation has just stopped, so the page is at its last moment of
+    // movement rather than at rest: see [`issue_scroll`].
+    chrome.motion.input(Instant::now());
+    if let Some((at, distance)) = chrome.wheel.replied(answer.is_ok()) {
+        issue_scroll(tabs, chrome, at, distance);
+    }
+}
+
 /// Handle one thing the terminal said. `false` means quit.
 fn handle_input(
     pane: &mut Pane,
@@ -1069,6 +1345,11 @@ fn handle_input(
             // never got its lossless picture at all.
             if report.kind == MouseKind::Wheel {
                 chrome.motion.input(Instant::now());
+                // Not an event but a gesture the engine animates, which is a
+                // command with a reply and a tab to belong to — so it goes
+                // through the loop's own state rather than straight out.
+                scroll(tabs, chrome, &report);
+                return Ok(true);
             }
             let metrics = chrome.metrics;
             let pixels = chrome.parser.pixel_coordinates();
@@ -1368,13 +1649,10 @@ fn send_mouse(
             ("mouseReleased", vec![("clickCount", Json::number(1))])
         }
         MouseKind::Move => ("mouseMoved", Vec::new()),
-        MouseKind::Wheel => (
-            "mouseWheel",
-            vec![
-                ("deltaX", Json::number(report.wheel.0 as f64 * WHEEL_PIXELS)),
-                ("deltaY", Json::number(report.wheel.1 as f64 * WHEEL_PIXELS)),
-            ],
-        ),
+        // A wheel notch never reaches here: it is an
+        // `Input.synthesizeScrollGesture`, because a dispatched `mouseWheel`
+        // moves the page in one frame. See [`scroll`] and [`SCROLL_SPEED`].
+        MouseKind::Wheel => return,
     };
 
     let mut fields = vec![
@@ -1526,6 +1804,129 @@ mod tests {
             page_cells(metrics).rows * metrics.cell.1,
             page_pixels(metrics).1
         );
+    }
+
+    /// A wheel with no engine behind it: the command in flight is a number.
+    fn a_wheel() -> Wheel<u32> {
+        Wheel::default()
+    }
+
+    /// What the loop does with a gesture the wheel asked it to send.
+    fn goes_out(wheel: &mut Wheel<u32>, id: u32, what: Option<((i32, i32), (f64, f64))>) {
+        assert!(what.is_some(), "there was no gesture to send");
+        wheel.issued(format!("tab-{id}"), id, Instant::now());
+    }
+
+    /// The first notch after idle goes out on its own, and what arrives while
+    /// it is animating waits for it.
+    #[test]
+    fn the_first_notch_goes_out_and_the_rest_pile_up_behind_it() {
+        let mut wheel = a_wheel();
+        let first = wheel.notch((100, 200), (0.0, -120.0));
+        assert_eq!(first, Some(((100, 200), (0.0, -120.0))));
+        goes_out(&mut wheel, 1, first);
+
+        // Three more while it animates, and not one of them is sent.
+        assert_eq!(wheel.notch((100, 200), (0.0, -120.0)), None);
+        assert_eq!(wheel.notch((100, 210), (0.0, -120.0)), None);
+        assert_eq!(wheel.notch((100, 220), (0.0, -120.0)), None);
+
+        // The reply pays all three at once, where the wheel was last turned.
+        assert_eq!(
+            wheel.replied(true),
+            Some(((100, 220), (0.0, -360.0))),
+            "three notches behind one gesture are one gesture of three notches"
+        );
+    }
+
+    /// A gesture that nothing queued behind leaves the wheel idle, so the next
+    /// notch is sent the moment it arrives rather than waiting for anything.
+    #[test]
+    fn a_reply_with_nothing_owed_leaves_the_wheel_idle() {
+        let mut wheel = a_wheel();
+        let first = wheel.notch((10, 10), (0.0, -120.0));
+        goes_out(&mut wheel, 1, first);
+        assert_eq!(wheel.replied(true), None);
+
+        let next = wheel.notch((10, 10), (0.0, -120.0));
+        assert_eq!(next, Some(((10, 10), (0.0, -120.0))));
+    }
+
+    /// And the sum is cleared by the reply that pays it, so the gesture after
+    /// that one owes nothing.
+    #[test]
+    fn the_sum_is_owed_once() {
+        let mut wheel = a_wheel();
+        let first = wheel.notch((10, 10), (0.0, -120.0));
+        goes_out(&mut wheel, 1, first);
+        assert_eq!(wheel.notch((10, 10), (0.0, -120.0)), None);
+
+        let second = wheel.replied(true);
+        assert_eq!(second, Some(((10, 10), (0.0, -120.0))));
+        goes_out(&mut wheel, 2, second);
+        assert_eq!(wheel.replied(true), None, "the pile was paid already");
+    }
+
+    /// Horizontal notches pile up on their own axis, and a hand that turns
+    /// both wheels in one gesture's window gets both.
+    #[test]
+    fn the_two_axes_are_added_up_separately() {
+        let mut wheel = a_wheel();
+        let first = wheel.notch((5, 5), (0.0, -120.0));
+        goes_out(&mut wheel, 1, first);
+        assert_eq!(wheel.notch((5, 5), (-120.0, 0.0)), None);
+        assert_eq!(wheel.notch((5, 5), (120.0, 0.0)), None);
+        assert_eq!(wheel.notch((5, 5), (-120.0, -120.0)), None);
+        assert_eq!(wheel.replied(true), Some(((5, 5), (-120.0, -120.0))));
+    }
+
+    /// A refusal is not re-sent. A page that would not take one gesture would
+    /// not take the next, and a distance that is owed for ever is a wheel that
+    /// has stopped working.
+    #[test]
+    fn a_refused_gesture_throws_away_what_was_owed() {
+        let mut wheel = a_wheel();
+        let first = wheel.notch((5, 5), (0.0, -120.0));
+        goes_out(&mut wheel, 1, first);
+        assert_eq!(wheel.notch((5, 5), (0.0, -120.0)), None);
+
+        assert_eq!(wheel.replied(false), None, "a refusal sends nothing");
+        // And the wheel is idle rather than stuck: the next notch goes out.
+        assert_eq!(
+            wheel.notch((5, 5), (0.0, -120.0)),
+            Some(((5, 5), (0.0, -120.0)))
+        );
+    }
+
+    /// A tab switch or a close takes the pile with it: what was owed was owed
+    /// by a page nobody is looking at.
+    #[test]
+    fn the_pile_does_not_follow_a_tab_switch() {
+        let mut wheel = a_wheel();
+        let first = wheel.notch((5, 5), (0.0, -120.0));
+        goes_out(&mut wheel, 1, first);
+        assert_eq!(wheel.notch((5, 5), (0.0, -120.0)), None);
+        assert!(wheel.flight().is_some());
+
+        wheel.forget();
+        assert!(wheel.flight().is_none());
+        assert_eq!(
+            wheel.notch((5, 5), (0.0, -120.0)),
+            Some(((5, 5), (0.0, -120.0))),
+            "the new tab's first notch is a first notch"
+        );
+    }
+
+    /// The target travels with the command so that a reply is only ever asked
+    /// of the connection it was sent on.
+    #[test]
+    fn a_gesture_knows_which_tab_it_belongs_to() {
+        let mut wheel = a_wheel();
+        let first = wheel.notch((5, 5), (0.0, -120.0));
+        goes_out(&mut wheel, 7, first);
+        let flight = wheel.flight().expect("a gesture is out");
+        assert_eq!(flight.target, "tab-7");
+        assert_eq!(flight.pending, 7);
     }
 
     #[test]
