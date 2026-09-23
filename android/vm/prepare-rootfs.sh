@@ -35,7 +35,7 @@ curl -fL --retry 3 -o /out/yazi.deb https://github.com/sxyazi/yazi/releases/down
 echo '39ae427eb0f0275c4302429b7a8fd48d1b862a2ee40d68d37b23f336be025164  /out/yazi.deb' | sha256sum -c -
 dpkg-deb -x /out/yazi.deb /rootfs
 rm -f /out/debian.img
-truncate -s 3G /out/debian.img
+truncate -s 20G /out/debian.img
 mkfs.ext4 -q -F -L tos-debian -d /rootfs /out/debian.img
 gzip -n -1 -c /out/debian.img > /out/debian.img.gz
 sha256sum /out/debian.img > /out/debian.img.sha256

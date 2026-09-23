@@ -31,6 +31,9 @@ public final class VmService extends Service {
     private static final String CHANNEL = "debian";
     private static final String STOP = "io.github.m96chan.tos.STOP_VM";
     private static final int MAX_FRAME = 65536;
+    private static final long GIB = 1024L * 1024 * 1024;
+    private static final long DISK_SIZE_BYTES = 20L * GIB;
+    private static final long DISK_HEADROOM_BYTES = 64L * 1024 * 1024;
     private final ExecutorService workers = Executors.newCachedThreadPool();
     private final ConcurrentHashMap<Integer, Client> clients = new ConcurrentHashMap<>();
     private final AtomicInteger nextId = new AtomicInteger(1);
@@ -116,8 +119,8 @@ public final class VmService extends Service {
         File directory = new File(getFilesDir(), "debian"); directory.mkdirs();
         File disk = new File(directory, "rootfs.img");
         if (!disk.exists()) {
-            if (directory.getUsableSpace() < 3L * 1024 * 1024 * 1024 + 64L * 1024 * 1024)
-                throw new IOException("At least 3.1 GiB of free storage is required for Debian");
+            if (directory.getUsableSpace() < DISK_SIZE_BYTES + DISK_HEADROOM_BYTES)
+                throw new IOException("At least 20.1 GiB of free storage is required for Debian");
             update("Preparing Debian disk…");
             File temporary = new File(directory, "rootfs.img.new");
             MessageDigest digest = MessageDigest.getInstance("SHA-256"); long total = 0;
@@ -125,7 +128,7 @@ public final class VmService extends Service {
                  FileOutputStream out = new FileOutputStream(temporary)) {
                 byte[] b = new byte[262144]; int n;
                 while ((n = in.read(b)) != -1) {
-                    total += n; if (total > 3L * 1024 * 1024 * 1024) throw new IOException("Debian image exceeds limit");
+                    total += n; if (total > DISK_SIZE_BYTES) throw new IOException("Debian image exceeds limit");
                     digest.update(b, 0, n); out.write(b, 0, n);
                 }
                 out.getFD().sync();
@@ -133,7 +136,7 @@ public final class VmService extends Service {
             StringBuilder hash = new StringBuilder(); for (byte b : digest.digest()) hash.append(String.format("%02x", b & 255));
             String expected;
             try (BufferedReader r = new BufferedReader(new InputStreamReader(getAssets().open("vm/debian.sha256"), StandardCharsets.UTF_8))) { expected = r.readLine(); }
-            if (!hash.toString().equals(expected) || total != 3L * 1024 * 1024 * 1024) { temporary.delete(); throw new IOException("Debian image checksum mismatch"); }
+            if (!hash.toString().equals(expected) || total != DISK_SIZE_BYTES) { temporary.delete(); throw new IOException("Debian image checksum mismatch"); }
             android.system.Os.rename(temporary.getPath(), disk.getPath());
         }
         copyAsset("vm/initrd.cpio", new File(directory, "initrd.cpio"));
