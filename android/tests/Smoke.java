@@ -92,6 +92,7 @@ public final class Smoke extends Instrumentation {
             }
             open();
             if (!check("Debian boot", "cat /etc/os-release; getconf GNU_LIBC_VERSION; uname -r; test -f /var/lib/tos-ready")) throw new IOException("Debian did not become ready");
+            check("20 GiB disk", "bytes=$(df -B1 --output=size / | tail -n1 | tr -d ' '); test \"$bytes\" -ge 21000000000 && df -h /");
             check("fixture", "cd \"$(mktemp -d /tmp/tos-smoke.XXXXXX)\" && printf 'hello\\n' > example");
             check("Git", "git init -q && git add example && git -c user.name=tOS -c user.email=test@example.invalid commit -qm test && git --no-pager log -1 --format=%s");
             check("Neovim", "nvim --headless -u NONE -i NONE +'lua print(\"TOS_NVIM_OK\")' +qa");

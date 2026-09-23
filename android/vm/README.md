@@ -58,7 +58,7 @@ message must not be interpreted as binary frames.
 The build uses an ordinary x86 Debian container for filesystem assembly and
 APT's ARM64 package resolution. It never runs ARM64 maintainer scripts on the
 host. Docker's exclusions of manuals and unsafe dpkg write setting are
-removed from the interactive guest. The initial disk is a 3 GiB ext4 image;
+removed from the interactive guest. The initial disk is a 20 GiB ext4 image;
 its SHA-256 is checked while it is expanded on the phone. It is installed
 atomically and is never overwritten on an ordinary APK update.
 

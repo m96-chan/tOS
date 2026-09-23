@@ -24,8 +24,8 @@ Linux dependencies. The package list is [vm/packages.txt](vm/packages.txt).
 The desktop hardware/DRM session and Wi-Fi controls are supplied by Android
 instead of the PC ISO's boot services.
 
-First launch expands a 3 GiB disk and configures the bundled packages offline.
-Allow at least 3.1 GiB free space **after** installing the APK. Subsequent
+First launch expands a 20 GiB disk and configures the bundled packages offline.
+Allow at least 20.1 GiB free space **after** installing the APK. Subsequent
 starts reuse this disk. The guest has 1 GiB RAM and one virtual CPU. Shells
 start as guest root; this does not grant root access to Android.
 
@@ -231,7 +231,7 @@ The test APK uses the same signing key and is removed afterward. Tests restart
 the app, create temporary guest fixtures and install jq. Reopen tOS afterward.
 For an explicit first-boot test, add `--fresh`: it renames the previous disk to
 `rootfs.img.backup-TIMESTAMP` before expanding a new disk. This needs another
-3.1 GiB of free space; backups are retained, not automatically deleted.
+20.1 GiB of free space; backups are retained, not automatically deleted.
 
 Host checks:
 
