@@ -15,6 +15,23 @@
 //! has a deadline, and why the flags are written here as a constant rather
 //! than assembled from options.
 //!
+//! # The group, and why not the pid
+//!
+//! What is started here is usually not a browser. On Debian — which is what a
+//! tOS rootfs is — `/usr/bin/chromium-shell` and `/usr/bin/chromium` are shell
+//! scripts that run the real binary under `/usr/lib/chromium/` as a child and
+//! wait for it, and `/usr/bin/google-chrome` is a wrapper too. So the pid this
+//! program gets back from `spawn` is `/bin/sh`, and a `kill(2)` on it takes
+//! the shell and leaves the browser: reparented to init, still holding its
+//! debugging port, still painting the page it had. Seven sessions of that on
+//! an installed machine left seven engines nobody was looking at, between them
+//! keeping two processors busy.
+//!
+//! So the engine is started in a process group of its own and every kill here
+//! signals the *group*: the wrapper, the browser it ran, and the zygote, gpu
+//! and renderer processes the browser forked, all of which inherit the group
+//! and none of which this program otherwise knows the pid of.
+//!
 //! `--remote-debugging-port=0` asks the kernel for a free port and Chromium
 //! prints the one it got; taking a port from the child is the only way to run
 //! two of these at once without them colliding.
@@ -26,6 +43,7 @@
 //! would be turning off a protection that was working.
 
 use std::io::{BufRead, BufReader};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -59,25 +77,105 @@ pub const ENGINE_ENV: &str = "TOS_BROWSER_ENGINE";
 const HEAD: usize = 8;
 const TAIL: usize = 12;
 
-/// The engine's pid, for the paths that cannot run a destructor.
+/// What to kill to stop the engine, for the paths that cannot run a
+/// destructor.
 ///
 /// A panic in a release build aborts — the workspace sets `panic = "abort"` —
 /// so `Drop` is not a way to be sure the child dies. This is read by the panic
 /// hook and by the signal path, both of which have to kill a process without
 /// owning anything.
-static PID: AtomicI32 = AtomicI32::new(0);
+///
+/// It is written the way `kill(2)` wants it: the engine's process group,
+/// negated, or the wrapper's bare pid if a group of its own could not be made.
+/// Zero when there is nothing to kill.
+static TARGET: AtomicI32 = AtomicI32::new(0);
 
-/// Kill the engine, from anywhere, without a `&mut` to it.
+/// Kill the engine and everything it started, from anywhere, without a `&mut`
+/// to it.
 ///
 /// Signal-safe enough for what it is used for: one `kill(2)` on an integer
-/// read out of an atomic.
+/// read out of an atomic. The panic hook and the signal path do not go through
+/// [`Engine::kill`] and have no connection to ask the browser to close on, so
+/// they take the group with `SIGKILL` and leave the lock file behind.
 pub fn kill_engine() {
-    let pid = PID.swap(0, Ordering::SeqCst);
-    if pid > 0 {
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
+    signal_all(TARGET.swap(0, Ordering::SeqCst), libc::SIGKILL);
+}
+
+/// Signal the engine: the whole group where there is one.
+///
+/// `target` is already in `kill(2)`'s own notation — negative for a group —
+/// so this is one `kill(2)` and a check, which is all a signal handler may do.
+fn signal_all(target: i32, signal: libc::c_int) {
+    // 0 is "this program's own group" and -1 is "every process we are allowed
+    // to signal". Either would be this program killing itself, so a target
+    // that was never recorded kills nothing.
+    if target == 0 || target == -1 {
+        return;
     }
+    unsafe {
+        libc::kill(target, signal);
+    }
+}
+
+/// Start `command` as the leader of a new process group, and say what to kill.
+///
+/// The group is asked for twice on purpose: in the child before `exec`, and
+/// again in the parent. Either call alone is a race — the parent can reach the
+/// kill before the child has reached `setpgid`, and the child can `exec`
+/// before the parent has got round to it — and `setpgid(2)` on a process that
+/// already leads its own group changes nothing, so doing both closes the
+/// window. The parent's call failing means the child's has already run.
+fn spawn_in_own_group(command: &mut Command) -> std::io::Result<(Child, i32)> {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn()?;
+    let pid = child.id() as i32;
+    unsafe {
+        libc::setpgid(pid, pid);
+    }
+    Ok((child, group_target(pid)))
+}
+
+/// `kill(2)`'s argument for everything `pid` leads: `-pid` once `pid` is a
+/// group of its own, and `pid` alone if it somehow is not.
+///
+/// The second case should not happen and is not an error: a program that is
+/// running is better stopped by its pid than not at all. It is checked rather
+/// than assumed because the number is about to be handed to `kill(2)` with a
+/// minus in front of it, and the group this program is in is one of the things
+/// that could be on the other end of that.
+fn group_target(pid: i32) -> i32 {
+    let group = unsafe { libc::getpgid(pid) };
+    let ours = unsafe { libc::getpgrp() };
+    if group == pid && group != ours {
+        -pid
+    } else {
+        pid
+    }
+}
+
+/// Whether anything is left of the engine's group.
+///
+/// Signal 0 asks `kill(2)` whether it could send rather than sending, and
+/// `ESRCH` is the answer that the group is empty. A process nobody has waited
+/// for is still a member of it, which is why the wrapper is reaped before this
+/// is believed.
+fn group_alive(target: i32) -> bool {
+    if target >= 0 {
+        // No group of its own; the child's own exit status is the whole
+        // answer, and the caller has it.
+        return false;
+    }
+    if unsafe { libc::kill(target, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// Where the engine is, or a sentence about why there is none.
@@ -150,6 +248,8 @@ pub fn devtools_url(line: &str) -> Option<String> {
 /// A running engine, killed when this is dropped and when the program dies.
 pub struct Engine {
     child: Child,
+    /// What to kill, in `kill(2)`'s notation; see [`TARGET`].
+    target: i32,
     browser_url: String,
     tail: Arc<Mutex<Vec<String>>>,
 }
@@ -160,14 +260,15 @@ impl Engine {
     pub fn launch(timeout: Duration) -> Result<Engine, String> {
         let path = locate()?;
         let as_root = unsafe { libc::geteuid() } == 0;
-        let mut child = Command::new(&path)
+        let mut command = Command::new(&path);
+        command
             .args(flags(as_root))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped());
+        let (mut child, target) = spawn_in_own_group(&mut command)
             .map_err(|e| format!("cannot start {}: {e}", path.display()))?;
-        PID.store(child.id() as i32, Ordering::SeqCst);
+        TARGET.store(target, Ordering::SeqCst);
 
         let stderr = child.stderr.take().ok_or("the engine has no stderr")?;
         let tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -197,6 +298,7 @@ impl Engine {
                 let why = describe_tail(&tail);
                 let mut engine = Engine {
                     child,
+                    target,
                     browser_url: String::new(),
                     tail,
                 };
@@ -211,9 +313,18 @@ impl Engine {
 
         Ok(Engine {
             child,
+            target,
             browser_url,
             tail,
         })
+    }
+
+    /// The engine's process group, once it has one of its own.
+    ///
+    /// `None` means the group could not be made and the wrapper's pid is all
+    /// there is to kill, which is the case this module exists to avoid.
+    pub fn group(&self) -> Option<i32> {
+        (self.target < 0).then_some(-self.target)
     }
 
     /// The browser-level WebSocket url the engine printed.
@@ -245,29 +356,33 @@ impl Engine {
         }
     }
 
-    /// Stop it, politely and then not.
+    /// Stop it, politely and then not — and the group, not the pid.
     pub fn kill(&mut self) {
-        PID.store(0, Ordering::SeqCst);
-        let pid = self.child.id() as i32;
-        unsafe {
-            libc::kill(pid, libc::SIGTERM);
-        }
-        // A tenth of a second to close its files, then the signal that is not
-        // a request. Chromium leaves a lock file behind if it is only ever
-        // SIGKILLed, and waits forever if it is only ever asked.
+        TARGET.store(0, Ordering::SeqCst);
+        let target = self.target;
+        signal_all(target, libc::SIGTERM);
+        // Half a second to close its files, then the signal that is not a
+        // request. Chromium flushes its profile and takes its SingletonLock
+        // with it when it is asked to stop, leaves the lock behind if it is
+        // only ever SIGKILLed, and waits forever if it is only ever asked.
         let deadline = Instant::now() + Duration::from_millis(500);
         loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                _ => break,
+            // The wrapper first — a process nobody has waited for is still a
+            // member of its own group — and then the group it led, which is
+            // where the browser and its renderers are.
+            let waited = !matches!(self.child.try_wait(), Ok(None));
+            if waited && !group_alive(target) {
+                return;
             }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
+        signal_all(target, libc::SIGKILL);
+        // The wrapper is this program's child and has to be waited for. The
+        // rest of the group are init's children by the time the signal lands,
+        // and die on it with nothing here left to reap.
         let _ = self.child.wait();
     }
 }
@@ -424,6 +539,51 @@ mod tests {
         );
         assert_eq!(target_of("ws://127.0.0.1:1/devtools/page/"), None);
         assert!(target_url("not a url", "AB12").is_err());
+    }
+
+    #[test]
+    fn a_child_leads_a_group_that_is_not_the_one_this_program_is_in() {
+        // The shape of the Debian wrapper: a shell that runs something else
+        // and waits for it, rather than exec-ing it. The trailing `:` is what
+        // stops the shell optimising the wait away and becoming the sleep.
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sleep 30; :")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let (mut child, target) = spawn_in_own_group(&mut command).expect("a shell starts");
+        let pid = child.id() as i32;
+        let ours = unsafe { libc::getpgrp() };
+
+        assert_eq!(
+            target, -pid,
+            "the target is the child's group, kill(2)'s way"
+        );
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid, "and the child leads it");
+        assert_ne!(-target, ours, "a group of its own, not the one we are in");
+        assert!(
+            group_alive(target),
+            "the group has the shell in it at least"
+        );
+
+        signal_all(target, libc::SIGKILL);
+        let status = child.wait().expect("the shell is reaped");
+        assert!(!status.success(), "it was killed, not asked: {status}");
+    }
+
+    #[test]
+    fn a_target_that_was_never_recorded_kills_nothing() {
+        // 0 is this program's own group and -1 is every process it may signal,
+        // so either of those reaching `kill(2)` would end this test process
+        // and every other test with it. Getting to the end is the assertion.
+        signal_all(0, libc::SIGKILL);
+        signal_all(-1, libc::SIGKILL);
+        assert!(
+            !group_alive(0),
+            "a pid with no group of its own is not a group"
+        );
     }
 
     #[test]
