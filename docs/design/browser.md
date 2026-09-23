@@ -225,11 +225,9 @@ event — will advance nine times; what such a site does with `preventDefault`
 still works, and a notch over an inner scroller scrolls that scroller. And the
 events are dispatched with `Client::notify` rather than `Client::send`: a
 `mouseWheel` has nothing to say back, and nine round trips a notch would be
-nine replies to collect. Chromium answers a notification all the same and
-`cdp::Client` files every reply under its id whether anybody asked for one, so
-those replies sit in the mailbox unread — a leak older than this code, fed
-sixty times a second by the screencast acknowledgements, and one for `cdp.rs`
-to fix.
+nine replies to collect. Chromium answers a notification all the same, and
+that answer is thrown away as it is read — see [what the mailbox
+keeps](#what-the-mailbox-keeps).
 
 Every tick that goes out counts as input in
 [`motion`](../../apps/browser/src/motion.rs)'s sense, as does every notch, so
@@ -470,6 +468,36 @@ SIGWINCH, reads the new pixel fields out of `TIOCGWINSZ`, and sends
 bounded to the new size. The engine then lays the page out at the pane's real
 pixel dimensions rather than being scaled into them, which is what makes a
 resize a reflow rather than a blur.
+
+### What the mailbox keeps
+
+`cdp::Client`'s reader thread sorts what arrives into replies, kept under the
+`id` of the command they answer, and events, queued for the loop to drain. The
+event queue has always been bounded — 512, oldest dropped, because the newest
+frame is the one worth having. The reply map was not, and that was a leak with
+a rate: almost everything this program says to the engine it says with
+`Client::notify`, which sends and never comes back, and Chromium answers every
+one of those. A screencast acknowledgement per frame is sixty replies a
+second; nine `mouseWheel` events a notch and a key event per keystroke are the
+rest. An hour of reading was a map of hundreds of thousands of answers to
+questions nobody had asked.
+
+So the mailbox keeps a reply only while somebody has a claim on it. `call` and
+`send` register their `id` before the command goes out — before, so that a
+reply cannot beat the registration — and the reader keeps a reply only if it
+finds its id in that set, which is one hash lookup on the path every frame
+takes. `notify` registers nothing. A claim ends when the reply is taken, when
+a `call` gives up at its deadline, or when the `Pending` from a `send` is
+dropped: `Pending::drop` unregisters the id *and* removes a reply that arrived
+in the meantime, which is what makes "the tab was switched away from while the
+engine was drawing a screenshot" cost nothing rather than a megabyte. That is
+also why a `Pending` is neither `Clone` nor `Eq` — two of them for one id
+would be two claims on one reply, and the first drop would cancel the second.
+
+`Client::replies_held` and `Client::replies_wanted` report the two numbers, so
+that the claim can be asserted rather than believed: the engine test rolls a
+three-second screencast with acknowledgements and a burst of wheel notches
+past it and expects both to be zero at the end.
 
 ---
 

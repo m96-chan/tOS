@@ -1944,3 +1944,93 @@ fn a_key_is_handled_while_the_still_is_in_flight() {
     client.close();
     engine.kill();
 }
+
+/// What a few seconds of an ordinary page leaves behind in the mailbox.
+///
+/// The two commands this program sends by the thousand go out with
+/// `Client::notify` — a `Page.screencastFrameAck` per frame, sixty times a
+/// second, and nine `Input.dispatchMouseEvent` per wheel notch — and Chromium
+/// answers every one of them. Filing those answers under their ids was a leak
+/// with a rate: an hour of reading was hundreds of thousands of entries. The
+/// claim now is that nothing is kept for a command nobody will come back for,
+/// and the only place to prove it is against an engine that really does reply.
+///
+/// A still asked for and given up on is the other half: the reply is a
+/// megabyte of PNG, and dropping its `Pending` has to be enough to be rid of
+/// it however late it arrives.
+#[test]
+fn nothing_is_kept_for_the_acknowledgements_and_the_wheel() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    a_page_to_scroll(&mut client);
+    assert_eq!(
+        (client.replies_held(), client.replies_wanted()),
+        (0, 0),
+        "the page was loaded with calls, and a call collects its own reply"
+    );
+
+    let at = (WIDE as i32 / 2, TALL as i32 / 2);
+    let mut animator = Animator::default();
+    let mut notches = 0u32;
+    let mut next_notch = Instant::now() + Duration::from_millis(400);
+    let mut frames = 0usize;
+    let mut events = 0usize;
+
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until {
+        let now = Instant::now();
+        if notches < NOTCHES && now >= next_notch {
+            animator.notch(at, (0.0, tos_browser::app::WHEEL_PIXELS), now);
+            notches += 1;
+            next_notch = now + EVERY;
+        }
+        while let Some(step) = animator.tick(Instant::now()) {
+            wheel_step(&mut client, step);
+            events += 1;
+        }
+        frames += take_offsets(&mut client).len();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Whatever the engine was still saying about the last of them.
+    std::thread::sleep(Duration::from_millis(500));
+    frames += take_offsets(&mut client).len();
+
+    assert_eq!(notches, NOTCHES, "the notches never all went out");
+    assert!(
+        frames > 20,
+        "only {frames} frames in three seconds; the page was not casting, so \
+         this proves nothing about the acknowledgements"
+    );
+    eprintln!(
+        "{frames} frames acknowledged and {events} wheel events sent; the \
+         mailbox holds {} replies and wants {}",
+        client.replies_held(),
+        client.replies_wanted()
+    );
+    assert_eq!(
+        (client.replies_held(), client.replies_wanted()),
+        (0, 0),
+        "{} replies to commands nobody asked about",
+        client.replies_held()
+    );
+
+    // And the still that is given up on.
+    let pending = ask_for_a_still(&mut client);
+    assert_eq!(
+        client.replies_wanted(),
+        1,
+        "the still is the one thing outstanding"
+    );
+    drop(pending);
+    std::thread::sleep(Duration::from_millis(1000));
+    let _ = take_offsets(&mut client);
+    assert_eq!(
+        (client.replies_held(), client.replies_wanted()),
+        (0, 0),
+        "a still nobody is waiting for was kept anyway"
+    );
+
+    client.close();
+    engine.kill();
+}

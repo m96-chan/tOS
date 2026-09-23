@@ -948,7 +948,8 @@ fn collect_still(
     if tabs.active_target() != Some(still.target.as_str()) {
         // The tab was switched away from or closed while the engine drew. The
         // motion state was reset with the switch, so there is nothing to tell
-        // it; the reply, if it ever comes, is left in a mailbox nobody reads.
+        // it; dropping the still drops its `Pending`, which is what tells the
+        // mailbox not to keep a megabyte of picture nobody will collect.
         chrome.still = None;
         return Ok(());
     }
@@ -1054,11 +1055,9 @@ fn scroll(chrome: &mut Chrome, report: &MouseInput) {
 /// The event goes out with [`Client::notify`], which is what an acknowledged
 /// screencast frame uses: a `mouseWheel` has nothing to say back, and eighteen
 /// round trips per notch would be eighteen replies to collect and a `Pending`
-/// to carry for each of them. (Chromium answers a notification all the same,
-/// and [`Client`] files every reply under its id whether anybody asked for
-/// one, so these replies sit in the mailbox unread. That leak is older than
-/// this code — the screencast acknowledgements feed it sixty times a second —
-/// and it belongs to `cdp.rs`; it is named here because this adds to it.)
+/// to carry for each of them. Chromium answers a notification all the same,
+/// and those answers cost nothing: a notification's id is never registered
+/// with the mailbox, so the reader thread drops its reply where it reads it.
 ///
 /// Every step that goes out is input in [`crate::motion`]'s sense, so the
 /// quiet interval that earns a lossless still runs from the last tick of the
