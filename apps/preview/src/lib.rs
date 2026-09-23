@@ -32,18 +32,39 @@
 //!
 //! # JPEG
 //!
-//! Not here, and deliberately. A baseline JPEG decoder is Huffman decoding,
-//! dequantisation, an inverse DCT, upsampling for subsampled chroma and a
-//! YCbCr conversion — somewhere around 600 to 900 lines before progressive
-//! JPEG, which most cameras and every web image pipeline emit, is considered
-//! at all. That is larger than [`tos_term::png`] and [`tos_term::inflate`]
-//! put together, for a second format, in a repository whose one dependency is
-//! `libc`. "Cheap" was the condition in the issue and JPEG does not meet it.
-//! PNG first is the right call because it is what the graphics protocol
-//! already names as its own payload format, so the decoder earns its keep
-//! twice: once for this program and once for every file manager that sends
-//! `f=100`. JPEG deserves its own issue, its own test corpus and its own
-//! decision about progressive.
+//! It exists now, in [`tos_term::jpeg`], and this paragraph used to say it
+//! never would.
+//!
+//! What it said was that a baseline decoder is Huffman decoding,
+//! dequantisation, an inverse DCT, chroma upsampling and a YCbCr conversion —
+//! six hundred to nine hundred lines before progressive JPEG is considered at
+//! all — for a second format, in a repository whose one dependency is `libc`,
+//! and that nothing in the tree wanted it badly enough to pay for that.
+//! Every clause of that is still true, and the estimate was accurate: the
+//! decoder is a little over nine hundred lines of code, and it refuses
+//! progressive files by name rather than growing a second entropy decoder
+//! for them.
+//!
+//! What changed is the other side of the ledger, and it changed because
+//! somebody measured it rather than argued about it. `docs/design/browser.md`
+//! has the numbers: Chromium's screencast is bounded by its own encode of
+//! each frame, and a 1280x770 pane goes from 33.8 frames a second as PNG to
+//! 57.8 as JPEG at quality 85 — which is the difference between a page that
+//! scrolls and a page that stutters, and it is not buyable anywhere else in
+//! the path. A format nothing wanted turned out to be the only thing standing
+//! between a browser and sixty frames a second, which is a better reason than
+//! "an image viewer should probably read JPEGs".
+//!
+//! **`tos-preview` still does not show them, and that is a follow-up rather
+//! than an oversight.** Everything above about `f=100` and about this program
+//! existing to exercise the path a file manager takes is unaffected: the
+//! graphics protocol names PNG as its payload format and names no other, so a
+//! JPEG shown here would have to be decoded here and transmitted as `f=24`,
+//! which is the `--rgba` path with a second decoder in front of it. That is a
+//! small change and a real one — `fit` needs the size, `transmit` needs a
+//! third payload shape, and somebody has to decide what happens to a
+//! progressive file the person double-clicked. It belongs in its own commit
+//! with its own tests.
 
 pub mod fit;
 pub mod transmit;

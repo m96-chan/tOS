@@ -899,3 +899,116 @@ fn wait_for_frame(client: &mut Client, timeout: Duration) -> Option<Vec<u8>> {
     }
     None
 }
+
+// ---------------------------------------------------------------------------
+// The format the frames go in
+// ---------------------------------------------------------------------------
+
+/// The same screenful as [`PAGE`] with nothing moving in it.
+///
+/// Comparing a JPEG against the PNG of the same frame needs the frame to be
+/// the same frame, and [`PAGE`] repaints a moving block sixty times a second
+/// by design. The coloured text is the point of the comparison rather than
+/// decoration: Chromium's JPEG encoder is 4:2:0 at every quality, so a blue
+/// word on white is the worst thing in a page and the thing quality 85 was
+/// chosen to keep legible.
+const STILL_PAGE: &str = "data:text/html,\
+<body style='margin:0;height:100vh;font:12px monospace;overflow:hidden;background:%23fff'>\
+<div id=t></div><div style='position:absolute;left:400px;top:40px;width:160px;height:120px;\
+background:linear-gradient(135deg,%23c33,%233c3,%2333c)'></div><script>\
+var rows=[];for(var i=0;i<28;i++){rows.push(i+' the quick brown fox jumps over the lazy dog \
+0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ')}\
+var t=document.getElementById('t');\
+t.innerHTML=rows.map(function(r,i){return i%253==0?\
+'<span style=color:%230645ad>'+r+'</span>':r}).join('<br>');\
+document.title='still';\
+</script></body>";
+
+/// One `Page.captureScreenshot`, in whichever format.
+fn screenshot(client: &mut Client, format: &str, quality: Option<u32>) -> Vec<u8> {
+    let mut fields = vec![("format", Json::string(format))];
+    if let Some(quality) = quality {
+        fields.push(("quality", Json::number(quality)));
+    }
+    let answer = client
+        .call("Page.captureScreenshot", Json::object(fields))
+        .expect("a screenshot");
+    let data = answer
+        .get("data")
+        .and_then(Json::as_str)
+        .expect("a screenshot carries its picture");
+    tos_browser::base64::decode(data.as_bytes()).expect("valid base64")
+}
+
+/// What quality 85 costs, against the lossless picture of the same frame.
+///
+/// This is the number `docs/design/browser.md`'s JPEG section rests on: the
+/// frames are only allowed to be lossy while the page is moving, and how
+/// lossy is a thing to measure rather than to trust. 35 dB is the floor — the
+/// measured figure on this page is comfortably above it, and anything near
+/// the floor means either the encoder's defaults moved or `tos_term::jpeg`
+/// has a bug the fixtures did not catch.
+#[test]
+fn a_jpeg_frame_at_quality_85_is_the_png_of_the_same_frame() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(STILL_PAGE))]),
+        )
+        .expect("the still page loads");
+    assert_eq!(
+        wait_for_title(&mut client, "still", Duration::from_secs(10)),
+        "still"
+    );
+    // A frame after the load event is not necessarily a frame that has been
+    // painted; one screenshot forces one.
+    let _ = screenshot(&mut client, "png", None);
+
+    let png = screenshot(&mut client, "png", None);
+    let jpeg = screenshot(&mut client, "jpeg", Some(85));
+    assert_eq!(&png[..4], b"\x89PNG");
+    assert_eq!(&jpeg[..2], b"\xff\xd8");
+
+    let lossless = tos_term::png::decode(&png, 64 * 1024 * 1024).expect("the PNG decodes");
+    let at = Instant::now();
+    let lossy = tos_term::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("the JPEG decodes");
+    let decoding = at.elapsed();
+    assert_eq!(
+        (lossy.width, lossy.height),
+        (lossless.width, lossless.height)
+    );
+
+    // Mean squared error over every channel of every pixel, and the
+    // peak-signal-to-noise ratio that is the usual way of saying it.
+    let mut squares = 0f64;
+    let mut samples = 0usize;
+    for (rgba, rgb) in lossless.rgba.chunks_exact(4).zip(lossy.rgb.chunks_exact(3)) {
+        for channel in 0..3 {
+            let error = rgba[channel] as f64 - rgb[channel] as f64;
+            squares += error * error;
+            samples += 1;
+        }
+    }
+    let mse = squares / samples as f64;
+    let psnr = if mse == 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (255.0f64 * 255.0 / mse).log10()
+    };
+    eprintln!(
+        "quality 85 at {}x{}: {psnr:.1} dB, {} kB of JPEG against {} kB of PNG, \
+         decoded in {decoding:?}",
+        lossy.width,
+        lossy.height,
+        jpeg.len() / 1024,
+        png.len() / 1024,
+    );
+    assert!(psnr >= 35.0, "quality 85 came out at {psnr:.1} dB");
+
+    client.close();
+    engine.kill();
+}
