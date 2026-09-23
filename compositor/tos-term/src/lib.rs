@@ -11,6 +11,7 @@ pub mod color;
 pub mod graphics;
 pub mod grid;
 pub mod inflate;
+pub mod jpeg;
 pub mod medium;
 pub mod modes;
 pub mod parser;
