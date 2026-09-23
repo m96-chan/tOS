@@ -77,13 +77,42 @@ pub const WHEEL_PIXELS: f64 = 120.0;
 /// overheads, so the slower speed finishes the same 600 pixels sooner.
 pub const SCROLL_SPEED: u32 = 700;
 
+/// How long a gesture should take whatever distance it carries, and the rule
+/// that turns [`SCROLL_SPEED`] from a speed into a floor.
+///
+/// At a fixed speed a coalesced gesture takes longer the more it carries, and
+/// on the installed machine that was felt at once: a hand that rolls faster
+/// than 700 ÷ 120 ≈ 5.8 notches a second piles up distance, and the page went
+/// on scrolling for a second and more after the wheel had stopped, waiting
+/// for the engine to animate every pixel the hand had asked for at the speed
+/// of the first notch. The person's word for it was "つらい".
+///
+/// So a gesture is sized to take about one notch's time no matter how far it
+/// goes: the speed is the distance over [`SCROLL_SECONDS`], with
+/// [`SCROLL_SPEED`] as the floor so that a single notch keeps the animation
+/// the engine gives it. A hand that outruns the engine now gets the same
+/// ~230 ms per gesture and a page that jumps further per gesture, which is
+/// what a browser in a window does with a flick.
+pub const SCROLL_SECONDS: f64 = 120.0 / 700.0;
+
+/// The speed to ask for a gesture over `distance` (px per axis).
+pub fn scroll_speed(distance: (f64, f64)) -> u32 {
+    let length = (distance.0 * distance.0 + distance.1 * distance.1).sqrt();
+    let wanted = (length / SCROLL_SECONDS).round();
+    if wanted.is_finite() && wanted > f64::from(SCROLL_SPEED) {
+        wanted.min(f64::from(u32::MAX / 2)) as u32
+    } else {
+        SCROLL_SPEED
+    }
+}
+
 /// How long a scroll gesture may be out before it is given up on.
 ///
-/// A gesture answers when its animation ends, so the deadline is a multiple of
-/// the longest one a hand can ask for rather than a round trip: five seconds is
-/// 3500 pixels at [`SCROLL_SPEED`], and no coalesced notch comes near it. It
-/// exists so that an engine which stops answering costs one scroll rather than
-/// a pane where the wheel has stopped working.
+/// A gesture answers when its animation ends, and since [`scroll_speed`] sizes
+/// every gesture to about a notch's time, five seconds is twenty of them: an
+/// engine that has not answered by then has stopped. It exists so that such an
+/// engine costs one scroll rather than a pane where the wheel has stopped
+/// working.
 const SCROLL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How close in time and space two presses have to be to be a double click.
@@ -1198,7 +1227,7 @@ fn issue_scroll(
             ("y", Json::number(at.1)),
             ("xDistance", Json::number(distance.0)),
             ("yDistance", Json::number(distance.1)),
-            ("speed", Json::number(SCROLL_SPEED)),
+            ("speed", Json::number(scroll_speed(distance))),
             // So that the page is sent wheel events rather than touch ones: a
             // site that listens for `wheel`, or calls `preventDefault` on it,
             // behaves as it would in a window.
@@ -1740,6 +1769,22 @@ mod tests {
         let mut released = key(Key::Char('q'), Mods::CTRL);
         released.action = KeyAction::Release;
         assert_eq!(command(&released), None);
+    }
+
+    #[test]
+    fn a_notch_keeps_the_floor_speed_and_a_pile_gets_a_faster_one() {
+        // One notch is exactly the floor: the animation the engine gives a
+        // single notch does not change.
+        assert_eq!(scroll_speed((0.0, -WHEEL_PIXELS)), SCROLL_SPEED);
+        assert_eq!(scroll_speed((0.0, 0.0)), SCROLL_SPEED);
+        // Five notches coalesced take the same time as one, so five times the
+        // speed, and the rule is symmetric in direction and axis.
+        assert_eq!(scroll_speed((0.0, -5.0 * WHEEL_PIXELS)), 5 * SCROLL_SPEED);
+        assert_eq!(scroll_speed((5.0 * WHEEL_PIXELS, 0.0)), 5 * SCROLL_SPEED);
+        assert_eq!(scroll_speed((0.0, 5.0 * WHEEL_PIXELS)), 5 * SCROLL_SPEED);
+        // Diagonal distance is the vector's length, not the sum of the axes.
+        let both = scroll_speed((3.0 * WHEEL_PIXELS, 4.0 * WHEEL_PIXELS));
+        assert_eq!(both, 5 * SCROLL_SPEED);
     }
 
     #[test]

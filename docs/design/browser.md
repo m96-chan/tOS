@@ -145,11 +145,15 @@ notch reaches the page as **twelve `wheel` events** carrying a slice each
 rather than one of 120 pixels, so a site that counts them — a full-screen
 carousel that advances per event — will advance twelve times; what such a site
 does with `preventDefault` still works, and a gesture over an inner scroller
-scrolls that scroller and not the page, both checked. And because the speed is
-fixed, a sustained hand faster than 700 ÷ 120 ≈ 5.8 notches a second asks for
-more scrolling than the engine will deliver, so the page keeps moving after the
-wheel stops — 830 ms after five notches. A speed that grew with the coalesced
-distance would fix that and is the obvious follow-up; it was not measured here.
+scrolls that scroller and not the page, both checked. And the speed is not
+fixed: the first cut fixed it at 700 px/s, and on the installed machine a hand
+faster than 700 ÷ 120 ≈ 5.8 notches a second piled up distance the engine then
+animated at the speed of one notch, so the page went on scrolling for a second
+and more after the wheel stopped. Now a gesture is sized to take about one
+notch's time whatever it carries — speed is distance over `SCROLL_SECONDS`,
+with 700 px/s as the floor so a single notch keeps its animation — and a fast
+hand gets the same ~230 ms per gesture with a page that jumps further each
+time, which is what a flick does in a window.
 
 A page with nothing left to scroll is not a failure and needs no handling of
 its own: at the bottom of a long page, and on `about:blank`, the engine
