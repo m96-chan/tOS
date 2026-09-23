@@ -924,10 +924,132 @@ fn wait_for_frame(client: &mut Client, timeout: Duration) -> Option<Vec<u8>> {
     }
     None
 }
+/// The engine is a wrapper, a browser and a handful of helpers, and stopping
+/// it has to be the end of all of them.
+///
+/// On Debian — a tOS rootfs is Debian — `/usr/bin/chromium-shell` is a shell
+/// script that runs `/usr/lib/chromium/chromium-shell` as its child, so the
+/// pid `spawn` returns is `/bin/sh` and a signal to that pid alone leaves a
+/// browser behind with the page still painting and the debugging port still
+/// open. That is what was found on an installed machine: seven sessions, seven
+/// engines, none of them being looked at. This test is the shape of that bug —
+/// the group is read before the engine is dropped, and has to be empty after.
+#[test]
+fn killing_the_engine_leaves_nothing_of_its_process_group() {
+    let Some((engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    let address = engine.address().expect("an address");
+    let group = engine
+        .group()
+        .expect("the engine is started in a group of its own");
+    assert_ne!(group, own_group(), "the engine's group is not this test's");
 
-// ---------------------------------------------------------------------------
-// The format the frames go in
-// ---------------------------------------------------------------------------
+    let before = group_members(group);
+    assert!(
+        before.len() >= 2,
+        "an engine is a wrapper and a browser at least, and this group has {}",
+        describe(&before)
+    );
+    eprintln!("group {group}: {}", describe(&before));
+
+    drop(client);
+    drop(engine);
+
+    // Two seconds: the polite stop inside `Engine::kill` is allowed half of
+    // one, and the SIGKILL after it is not something a process can be slow
+    // about.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut left = group_members(group);
+    while !left.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        left = group_members(group);
+    }
+    assert!(
+        left.is_empty(),
+        "the engine was killed and these are still running: {}",
+        describe(&left)
+    );
+    assert!(
+        std::net::TcpStream::connect(&address).is_err(),
+        "something is still listening on {address}"
+    );
+}
+
+/// Every process in `group` that is still running, as pid and command line.
+///
+/// A process that has exited and not yet been waited for is still in the
+/// group as far as the kernel is concerned, and is not what this is looking
+/// for: the browser this test is about reparents to init, which reaps it in
+/// its own time. So state `Z` is not a member here.
+fn group_members(group: i32) -> Vec<(i32, String)> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Ok(pid) = name.to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let Some((state, pgrp)) = state_and_group(&entry.path()) else {
+            continue;
+        };
+        if pgrp == group && state != 'Z' {
+            found.push((pid, command_of(&entry.path())));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// The group this test process is in, read the same way as anybody else's.
+fn own_group() -> i32 {
+    state_and_group(std::path::Path::new("/proc/self"))
+        .expect("this process has a /proc entry")
+        .1
+}
+
+/// The run state and process group out of `/proc/<pid>/stat`.
+///
+/// The second field is the command in brackets and may contain spaces and
+/// brackets of its own, so the fields are counted from the last `)` rather
+/// than from the start of the line.
+fn state_and_group(dir: &std::path::Path) -> Option<(char, i32)> {
+    let text = std::fs::read_to_string(dir.join("stat")).ok()?;
+    let after_command = &text[text.rfind(')')? + 1..];
+    let mut fields = after_command.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let _parent = fields.next()?;
+    let group = fields.next()?.parse().ok()?;
+    Some((state, group))
+}
+
+/// What a process was started as, short enough to put in a failure.
+fn command_of(dir: &std::path::Path) -> String {
+    let Ok(raw) = std::fs::read(dir.join("cmdline")) else {
+        return String::from("(gone)");
+    };
+    let line = String::from_utf8_lossy(&raw).replace('\0', " ");
+    let line = line.trim().to_string();
+    match line.char_indices().nth(90) {
+        Some((at, _)) => format!("{}...", &line[..at]),
+        None => line,
+    }
+}
+
+fn describe(members: &[(i32, String)]) -> String {
+    members
+        .iter()
+        .map(|(pid, command)| format!("{pid} {command}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+
+    // ---------------------------------------------------------------------------
+    // The format the frames go in
+    // ---------------------------------------------------------------------------
+}
 
 /// A page the shape of a real article, which is what the format tests need.
 ///
