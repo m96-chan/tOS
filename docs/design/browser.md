@@ -102,65 +102,152 @@ a degraded mode worth hiding — link-clicking on a cell grid is usable for a
 page of prose and unusable for a dense one, and the browser should say which
 it is in.
 
-### The other gap: a wheel notch is a gesture, not an event
+### The other gap: a wheel notch is an animation, not an event
 
 Scrolling read as choppy on the installed machine, and it was not the frame
 rate. `Input.dispatchMouseEvent` with `type: mouseWheel` and `deltaY: 120` —
-what the crate sent until now — moves the page 120 pixels in **one screencast
-frame**, measured against `chromium-shell` 153 at 1280×768 in docker on two
-cores. Not a fast animation: no animation. `--enable-smooth-scrolling` on the
-engine changes nothing, because the engine's smooth scrolling belongs to the
-wheel input pipeline that a synthetic event skips, and splitting one notch into
-six twenty-pixel events over a hundred milliseconds gives three frames and
-still reads as a jump. No amount of frame-rate work can fix a page that
-teleports.
+one event per notch — moves the page 120 pixels in **one screencast frame**,
+measured against `chromium-shell` 153 at 1280×768 in docker on two cores. Not a
+fast animation: no animation. `--enable-smooth-scrolling` on the engine changes
+nothing, because the engine's smooth scrolling belongs to the wheel input
+pipeline that a synthetic event skips. No amount of frame-rate work can fix a
+page that teleports.
 
-`Input.synthesizeScrollGesture` is the one the engine animates itself. At
-`app::SCROLL_SPEED`, 700 CSS pixels a second, one 120-pixel notch is **13
-screencast frames over 232 ms** (six runs, 231 to 242 ms), and it ends exactly
-120 pixels down. The cost is distance ÷ speed plus a flat 60 to 65 ms of the
-engine's own, so 240 pixels is 366 ms and 600 pixels is 800 ms. 700 rather than
-the protocol's default of 800 because of what happens when a hand is faster
-than the engine: a gesture is in flight for as long as it animates, and two in
-flight at once are neither refused nor dropped but **serialised** — issued
-together, or 50 or 120 ms apart, the replies come at 181 and 365 ms and the
-page ends 240 pixels down either way. So one gesture per notch would put the
-page further and further behind the hand. Instead the first notch after idle
-goes out at once, notches that arrive while one animates are added up, and the
-sum goes out when the reply comes. Five notches 100 ms apart — the fast end of
-what a wheel produces — is then three gestures of 120, 240 and 240 pixels at
-speed 700, reproducibly across eight runs, and flips between three and four at
-speed 800. One gesture for a sum is also cheaper than the notches it stands
-for, because that 65 ms is per gesture: two notches are 366 ms together and
-464 ms apart.
+#### What was tried first: the engine's own gesture
 
-The gesture is issued asynchronously, for the reason the lossless still is: the
-reply arrives when the animation *ends*, and a loop sitting in a `call` for a
-quarter of a second is a loop that is not reading the terminal. Both ends of it
-count as input in [`motion`](../../apps/browser/src/motion.rs)'s sense — at
-issue and at reply — so no still is asked for in the middle of an animation.
+`Input.synthesizeScrollGesture` is the one the engine animates itself. At 700
+CSS pixels a second, one 120-pixel notch is 13 screencast frames over 232 ms
+(six runs, 231 to 242 ms), and it ends exactly 120 pixels down; the cost is
+distance ÷ speed plus a flat 60 to 65 ms of the engine's own. A gesture is in
+flight for as long as it animates, and two in flight at once are neither
+refused nor dropped but **serialised** — issued together, or 50 or 120 ms
+apart, the replies come at 181 and 365 ms and the page ends 240 pixels down
+either way. So one gesture per notch would put the page further and further
+behind the hand, and the crate coalesced instead: the first notch after idle
+went out at once, notches that arrived while one animated were added up, and
+the sum went out when the reply came.
 
-Two things it is worth knowing are not identical to a wheel in a window. One
-notch reaches the page as **twelve `wheel` events** carrying a slice each
-rather than one of 120 pixels, so a site that counts them — a full-screen
-carousel that advances per event — will advance twelve times; what such a site
-does with `preventDefault` still works, and a gesture over an inner scroller
-scrolls that scroller and not the page, both checked. And the speed is not
-fixed: the first cut fixed it at 700 px/s, and on the installed machine a hand
-faster than 700 ÷ 120 ≈ 5.8 notches a second piled up distance the engine then
-animated at the speed of one notch, so the page went on scrolling for a second
-and more after the wheel stopped. Now a gesture is sized to take about one
-notch's time whatever it carries — speed is distance over `SCROLL_SECONDS`,
-with 700 px/s as the floor so a single notch keeps its animation — and a fast
-hand gets the same ~230 ms per gesture with a page that jumps further each
-time, which is what a flick does in a window.
+That shipped, and it was wrong. Measured the way that matters — the scroll
+offset that each screencast frame carries, on ja.wikipedia at 1280×770 —
+five notches 100 ms apart gave:
 
-A page with nothing left to scroll is not a failure and needs no handling of
-its own: at the bottom of a long page, and on `about:blank`, the engine
-animates the gesture anyway and answers with an ordinary empty result after
-215 and 231 ms. An error reply would throw the pending distance away rather
-than re-send it, so a page that refuses one gesture cannot wedge the wheel for
-the pages after it.
+```text
+12 12 12 11 12 9 [0] 12 23 23 24 23 18 [0] 10 12 23 25 22 …
+```
+
+Every gesture starts from a standstill and ends at a dead stop. The `[0]`s are
+the seams between one engine animation and the next, and the hand's notches do
+not fall on them. Ten notches 60 ms apart were worse, because the piles are
+bigger:
+
+```text
+… 48 70 25 44 [0] 45 46 47 … 47 [116] 12 [0] 5 5 13 17 …
+```
+
+— a stop, a 116-pixel jump, another stop, and a slow tail still running after
+the wheel had stopped. The person's words for the two halves of this were
+"ドッ、ドッ" — pulsing — and, separately, that the scrolling had "an upper limit
+on speed, unlike a normal browser's", and that when they stopped the wheel they
+wanted it to stop.
+
+None of that is tunable. There is one seam per pile whatever the pile is worth,
+the speed is a property of the gesture rather than of the hand, and sizing a
+gesture to a fixed duration (the fix that was in the tree) buys the second
+complaint at the cost of making the first one land harder. So the gesture is
+gone.
+
+#### What replaced it: a client-side animator
+
+A notch no longer moves the page. It adds `WHEEL_PIXELS` to a **distance still
+owed**, and every 16 ms a tick sends a fraction `scroll::K` of what is left as
+one ordinary `mouseWheel` event. There is exactly one animation, never two, and
+a notch that arrives in the middle of one extends its target instead of
+queueing behind it — so the next step is *larger* rather than a fresh start
+from zero velocity. `mouseWheel` deltas are applied by the engine on the next
+frame (one event, one frame, about 12 ms), so the frames simply follow the
+ticks. `apps/browser/src/scroll.rs` is the whole rule, and it touches no
+socket: it is arithmetic on a distance and a clock, unit-tested without an
+engine.
+
+With `K` = 0.3 and a floor of 4 pixels, the same measurement on the same page:
+
+```text
+one notch     36 25 18 12 9 6 4 4 6
+five @100 ms  36 25 18 12 9 6 4 39 27 19 13 9 7 41 28 20 14 10 7 41 29 20 14
+              10 7 5 39 28 [0] 33 9 7 5 4 7
+ten @60 ms    36 25 18 12 45 31 22 15 47 33 23 16 47 33 23 16 47 33 [0] 23 52
+              37 26 66 34 24 17 48 33 23 16 47 33 23 16 [0] 81 39 11 8 6 4 4 5
+```
+
+One notch is nine frames over 132 to 143 ms. Five notches are one animation
+whose step grows where each notch lands — 4 then 39, 7 then 41 — and it is over
+173 to 175 ms after the hand comes off. Ten notches 60 ms apart never drop
+below 11 pixels a frame while the hand is on the wheel, reach 81 in the middle,
+and are over 181 to 198 ms after the last one. (Two runs each; the ticks are
+the same numbers every time and what moves is the engine's frame cadence.)
+
+The `[0]`s that remain are not seams. They are single frames in which the
+engine had no new delta to apply, because a screencast frame on that host is
+16.7 ms and a tick is 16, so about twice a second a frame falls in a gap and
+the next one carries two ticks; the page never stands still for more than 40 ms
+and never for two frames running. On the machine this is really for — 24 to
+27 ms a frame — every frame holds a tick or two and they cannot happen at all.
+
+**Nothing caps a step.** A tick sends a fraction of whatever is owed, so a hand
+that rolls fast owes more and therefore moves further, which is what a flick
+does in a window; a ceiling is exactly what would give the scrolling a speed
+limit. And because the fraction is the same whatever the amount, a big pile is
+paid off *faster* rather than *longer*: eleven ticks are 96% of any distance at
+all, which is why the page stops when the hand does however much it owed.
+
+Why 0.3. The choice is a trade between how long one notch takes and how long a
+flick goes on after the wheel stops, and it was measured rather than guessed:
+
+| `K` | one notch | five @100 ms | ten @60 ms | tail of floor steps |
+|------|-------------|--------------|--------------|-------------------|
+| 0.22 | 193 ms | +222 ms | +245 ms | 4 |
+| 0.25 | 166 ms | +207 ms | +216 ms | 4 |
+| 0.3  | 132–143 ms | +173–175 ms | +181–198 ms | 2 |
+
+The middle columns are how long after the last notch the page was still moving;
+the deadline is 250 ms. 0.22 misses it by five milliseconds on a host with two
+spare cores and nothing else to do, which is no margin at all. 0.3 has fifty,
+and it is also the one with the short tail, because four minimum-sized steps at
+the end of an animation is the creeping the floor exists to remove. The floor
+itself is what ends a geometric series that otherwise never arrives: without
+one, a notch spent its last third of a second moving a pixel a frame — sixteen
+frames and 340 ms at `K` = 0.22, the last six of them 1 pixel.
+
+Two things are worth knowing about how a page sees this. One notch reaches it
+as **nine `wheel` events** carrying a slice each, rather than one of 120
+pixels, so a site that counts them — a full-screen carousel that advances per
+event — will advance nine times; what such a site does with `preventDefault`
+still works, and a notch over an inner scroller scrolls that scroller. And the
+events are dispatched with `Client::notify` rather than `Client::send`: a
+`mouseWheel` has nothing to say back, and nine round trips a notch would be
+nine replies to collect. Chromium answers a notification all the same and
+`cdp::Client` files every reply under its id whether anybody asked for one, so
+those replies sit in the mailbox unread — a leak older than this code, fed
+sixty times a second by the screencast acknowledgements, and one for `cdp.rs`
+to fix.
+
+Every tick that goes out counts as input in
+[`motion`](../../apps/browser/src/motion.rs)'s sense, as does every notch, so
+the quiet interval that earns a lossless still runs from the last tick of the
+animation rather than from the last notch of the hand: no still is asked for in
+the middle of a scroll. A tab switch, a tab closing or a resize drops what is
+owed — the point it would be sent at belongs to a viewport that is gone. A key
+or a click during an animation does not cancel it, because a browser does not
+either.
+
+The loop's `poll` timeout, which was a flat 50 ms, becomes the time until the
+next tick while anything is owed; when nothing is owed it is 50 ms as before. A
+pass held up by a slow paint fires the ticks it missed, so the animation keeps
+to the wall clock rather than stretching, and a stall longer than a tenth of a
+second restarts the schedule instead of replaying twenty ticks at once.
+
+A page with nothing left to scroll needs no handling of its own: the events go
+out, the page does not move, and nothing is owed a few ticks later.
 
 ---
 
@@ -656,10 +743,11 @@ process on this machine, so it is the same clock this program reads.
 `apps/browser/src/motion.rs` is the policy and its tests, away from the engine,
 the terminal and the pane. `apps/browser/tests/engine.rs` pins the three
 claims against a real engine: that a still provokes exactly one screencast
-frame and where in its window that frame lands; that ten wheel notches 200 ms
-apart produce no still until they stop and exactly one afterwards; and that a
-key sent while a still is in flight reaches the page before the still's reply
-is collected.
+frame and where in its window that frame lands; that ten wheel notches 60 ms
+apart produce no still until the animation they start has finished, and exactly
+one afterwards; and that a key sent while a still is in flight reaches the page
+before the still's reply is collected. The same three wheel runs assert the
+shape of the scrolling itself, frame by frame, from `metadata.scrollOffsetY`.
 
 ### The decoder, and a decision overturned
 

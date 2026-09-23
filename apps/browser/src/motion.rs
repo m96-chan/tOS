@@ -49,8 +49,8 @@
 //! jpeg q85 screencast while scrolling      about 42 fps, 24 to 27 ms gaps
 //! ```
 //!
-//! A mouse-wheel notch makes the engine animate for about 100 ms and then
-//! stop. A hand on a wheel produces notches 150 to 300 ms apart. At 150 ms of
+//! A mouse-wheel notch moves the page for about 130 ms and then stops. A hand
+//! on a wheel produces notches 150 to 300 ms apart. At 150 ms of
 //! frame quiet, *every notch* therefore ended in a lossless still, and what
 //! was on the screen was JPEG frames, PNG, JPEG frames, PNG, several times a
 //! second. On a page with any colour in it — a gradient, a picture, coloured
@@ -134,12 +134,13 @@ pub const REST_AFTER: Duration = Duration::from_millis(250);
 /// 400 ms is 300 with room — and a scroll then costs one still at the end of
 /// it rather than one per notch.
 ///
-/// A notch is now an `Input.synthesizeScrollGesture` rather than a dispatched
-/// wheel event, so the animation is 232 ms rather than about 100 and it
-/// outlives the notch that asked for it. [`Motion::input`] is called at both
-/// ends of one — when it is issued and when its reply says it has finished —
-/// so this interval is counted from the end of the *animation* rather than
-/// from the end of the hand. See `docs/design/browser.md`.
+/// A notch is now the start of an animation this program drives rather than a
+/// single dispatched wheel event — a tick every 16 ms for as long as anything
+/// is owed, which outlives the notch that asked for it by about 180 ms after a
+/// flick. [`Motion::input`] is called on every one of those ticks as well as
+/// on every notch, so this interval is counted from the end of the
+/// *animation* rather than from the end of the hand. See
+/// [`crate::scroll`] and `docs/design/browser.md`.
 pub const INPUT_QUIET: Duration = Duration::from_millis(400);
 
 /// How many screencast frames a still produces just by being taken.

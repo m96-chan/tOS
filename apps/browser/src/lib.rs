@@ -106,6 +106,7 @@ pub mod json;
 pub mod keys;
 pub mod motion;
 pub mod screen;
+pub mod scroll;
 pub mod sha1;
 pub mod tabs;
 pub mod ws;
