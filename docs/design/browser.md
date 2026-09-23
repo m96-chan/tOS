@@ -362,6 +362,15 @@ exit, and any profile on disk.** The engine gets a temporary profile that is
 removed when the client exits. Persistence is a question about where a tOS
 machine keeps a person's data, and it is not this experiment's to answer.
 
+Tabs came in anyway, and the reason is worth recording because it is not scope
+creep. A link with `target=_blank` makes the engine open a page target whatever
+the client does, and a target nothing attaches to is a click that does nothing
+at all — the first thing anybody meets on a real site. So `tos-browser` keeps a
+list of page targets, one WebSocket each, on the row it already owns, with a
+screencast on the one in front and none on the rest; `apps/browser/src/tabs.rs`
+has the model and `lib.rs` has why they are tabs rather than panes. Still out:
+everything else in that paragraph.
+
 ---
 
 ## What it costs, and what to measure

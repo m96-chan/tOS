@@ -28,6 +28,7 @@ use tos_browser::graphics::{Painter, IMAGE_ID};
 use tos_browser::input::{Key, KeyAction, KeyInput, Mods};
 use tos_browser::json::Json;
 use tos_browser::keys;
+use tos_browser::tabs::{Outcome, Tab, Tabs};
 use tos_compositor::ImageFiles;
 use tos_preview::fit::Cells;
 
@@ -59,6 +60,18 @@ requestAnimationFrame(f)}f();\
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 360;
 const CELL: (u32, u32) = (8, 16);
+
+/// The same, with the target id the page connection belongs to, for the tests
+/// that are about which targets exist.
+fn connect_with_target() -> Option<(Engine, Client, String)> {
+    let (engine, client) = connect()?;
+    // `connect` found the page in `/json/list`; the id is the tail of the url
+    // it found, which is exactly how the program itself gets it.
+    let address = engine.address().expect("an address");
+    let url = engine::page_target(&address, Duration::from_secs(20)).expect("a page");
+    let target = engine::target_of(&url).expect("an id").to_string();
+    Some((engine, client, target))
+}
 
 /// Connect to a fresh engine, or say why the test is not running.
 fn connect() -> Option<(Engine, Client)> {
@@ -458,4 +471,431 @@ fn a_click_lands_where_the_cell_was() {
 
     client.close();
     engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+
+/// A page with a link that asks for a window of its own, and the page behind
+/// it.
+///
+/// Served over HTTP rather than handed over as a `data:` url like [`PAGE`]. A
+/// data: url is an opaque origin and Chromium refuses a top-level navigation
+/// to one, so a link out of a data: page into a new tab would fail for a
+/// reason that has nothing to do with this crate. The link is positioned and
+/// sized so that a click at a known point lands on it without the test having
+/// to ask the page where anything is.
+const FIRST_PAGE: &str = "<!doctype html><body style='margin:0;background:#fff'>\
+<a id=l href='/second' target=_blank \
+style='position:absolute;left:0;top:0;width:240px;height:80px;background:#cc3'>open</a>\
+<script>document.title='first'</script></body>";
+
+const SECOND_PAGE: &str = "<!doctype html><body style='margin:0;background:#39c'>\
+<script>document.title='second'</script></body>";
+
+/// Serve those two pages on a port of the kernel's choosing, for as long as
+/// the test binary runs.
+fn serve() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to serve on");
+    let address = listener.local_addr().expect("an address");
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut head = [0u8; 2048];
+            let read = stream.read(&mut head).unwrap_or(0);
+            let request = String::from_utf8_lossy(&head[..read]).to_string();
+            let body = if request.starts_with("GET /second") {
+                SECOND_PAGE
+            } else {
+                FIRST_PAGE
+            };
+            let answer = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(answer.as_bytes());
+        }
+    });
+    format!("http://{address}/")
+}
+
+/// The viewport the program would set, on whichever tab is being driven.
+fn viewport(client: &mut Client) {
+    client
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            Json::object(vec![
+                ("width", Json::number(WIDTH)),
+                ("height", Json::number(HEIGHT)),
+                ("deviceScaleFactor", Json::number(1)),
+                ("mobile", Json::Bool(false)),
+            ]),
+        )
+        .expect("the viewport");
+}
+
+/// The browser-level connection, with target discovery on, and the tab list
+/// the program would be holding.
+fn tabbed(engine: &Engine, page: Client, target: String) -> (Client, Tabs<Client>) {
+    let mut browser =
+        Client::connect(engine.browser_url(), Duration::from_secs(10)).expect("the browser socket");
+    browser
+        .call(
+            "Target.setDiscoverTargets",
+            Json::object(vec![("discover", Json::Bool(true))]),
+        )
+        .expect("discovery");
+    (browser, Tabs::new(Tab::new(target, page, "about:blank")))
+}
+
+/// Feed what the browser connection has said into the tab list until `done` is
+/// satisfied or the time is up: what `app::handle_target_events` does, with
+/// the drawing left out.
+fn pump(
+    browser: &mut Client,
+    tabs: &mut Tabs<Client>,
+    browser_url: &str,
+    timeout: Duration,
+    done: impl Fn(&Tabs<Client>) -> bool,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        for event in browser.events() {
+            let outcome = tabs.take(&event, |target| {
+                let socket = engine::target_url(browser_url, target)?;
+                Client::connect(&socket, Duration::from_secs(5))
+            });
+            match outcome {
+                Outcome::Failed(why) => panic!("a tab that would not open: {why}"),
+                Outcome::Gone { mut tab, why } => {
+                    if let Some(why) = why {
+                        eprintln!("a tab went: {why}");
+                    }
+                    tab.connection.close();
+                }
+                _ => {}
+            }
+        }
+        if done(tabs) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// An engine with two tabs in it: the second opened by a click on a
+/// `target=_blank` link in the first, which is how a person opens one.
+fn two_tabs() -> Option<(Engine, Client, Tabs<Client>, String)> {
+    let (engine, page, target) = connect_with_target()?;
+    let browser_url = engine.browser_url().to_string();
+    let base = serve();
+    let (mut browser, mut tabs) = tabbed(&engine, page, target);
+
+    {
+        let first = tabs.active_mut().expect("the first tab");
+        first
+            .connection
+            .call("Page.enable", Json::empty())
+            .expect("Page.enable");
+        viewport(&mut first.connection);
+        first
+            .connection
+            .call(
+                "Page.navigate",
+                Json::object(vec![("url", Json::string(&base))]),
+            )
+            .expect("the page loads");
+        assert_eq!(
+            wait_for_title(&mut first.connection, "first", Duration::from_secs(10)),
+            "first"
+        );
+
+        // A click on the link, dispatched the way a terminal's mouse report
+        // would be: press and release at a point inside it.
+        for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+            first
+                .connection
+                .call(
+                    "Input.dispatchMouseEvent",
+                    Json::object(vec![
+                        ("type", Json::string(kind)),
+                        ("x", Json::number(40)),
+                        ("y", Json::number(20)),
+                        ("button", Json::string("left")),
+                        ("buttons", Json::number(buttons)),
+                        ("clickCount", Json::number(1)),
+                        ("modifiers", Json::number(0)),
+                    ]),
+                )
+                .expect("the click is dispatched");
+        }
+    }
+
+    assert!(
+        pump(
+            &mut browser,
+            &mut tabs,
+            &browser_url,
+            Duration::from_secs(15),
+            |tabs| tabs.len() == 2,
+        ),
+        "the link with target=_blank opened no tab"
+    );
+    Some((engine, browser, tabs, browser_url))
+}
+
+/// The whole reason tabs exist: a link that wants a window gets a tab, that
+/// tab is the one in front, and it is the one painting.
+#[test]
+fn a_link_that_wants_a_window_becomes_the_tab_in_front() {
+    let Some((mut engine, mut browser, mut tabs, browser_url)) = two_tabs() else {
+        return;
+    };
+    assert_eq!(tabs.len(), 2);
+    assert_eq!(
+        tabs.active_index(),
+        1,
+        "a tab the person opened is the one they are taken to"
+    );
+
+    // The urls come from the browser connection, with nothing asked of either
+    // page — and the second tab's is the one the link pointed at.
+    assert!(
+        pump(
+            &mut browser,
+            &mut tabs,
+            &browser_url,
+            Duration::from_secs(10),
+            |tabs| tabs
+                .iter()
+                .nth(1)
+                .is_some_and(|tab| tab.url.ends_with("/second")),
+        ),
+        "the second tab's url never arrived: {:?}",
+        tabs.iter().map(|tab| tab.url.clone()).collect::<Vec<_>>()
+    );
+
+    // The titles come from the pages, which is the only place they are right:
+    // the browser connection would have said "127.0.0.1:NNNN/second" here.
+    let mut titles = Vec::new();
+    for index in 0..tabs.len() {
+        let tab = tabs.get_mut(index).expect("a tab");
+        titles.push(
+            tos_browser::app::page_title(&mut tab.connection).unwrap_or_else(|| "?".to_string()),
+        );
+    }
+    assert_eq!(titles, ["first", "second"]);
+
+    // And it paints: raised, sized, cast, and a PNG comes out of it.
+    let target = tabs.active_target().expect("a target").to_string();
+    browser
+        .call(
+            "Target.activateTarget",
+            Json::object(vec![("targetId", Json::string(&target))]),
+        )
+        .expect("the tab is raised");
+    let second = tabs.active_mut().expect("the second tab");
+    second
+        .connection
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut second.connection);
+    second
+        .connection
+        .call(
+            "Page.startScreencast",
+            Json::object(vec![
+                ("format", Json::string("png")),
+                ("maxWidth", Json::number(WIDTH)),
+                ("maxHeight", Json::number(HEIGHT)),
+                ("everyNthFrame", Json::number(1)),
+            ]),
+        )
+        .expect("the screencast starts");
+    let png = wait_for_frame(&mut second.connection, Duration::from_secs(10))
+        .expect("the tab in front paints");
+    assert_eq!(&png[..4], b"\x89PNG");
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}
+
+/// `ctrl+t`: a target this program asked for, reached on a url it worked out
+/// rather than looked up, and not announced twice as a tab.
+#[test]
+fn a_tab_this_program_opens_is_reachable_and_counted_once() {
+    let Some((mut engine, page, target)) = connect_with_target() else {
+        return;
+    };
+    let browser_url = engine.browser_url().to_string();
+    let base = serve();
+    let (mut browser, mut tabs) = tabbed(&engine, page, target);
+
+    let created = browser
+        .call(
+            "Target.createTarget",
+            Json::object(vec![("url", Json::string("about:blank"))]),
+        )
+        .expect("a new target");
+    let opened = created
+        .get("targetId")
+        .and_then(Json::as_str)
+        .expect("the engine says which")
+        .to_string();
+    let socket = engine::target_url(&browser_url, &opened).expect("a socket url");
+    let connection = Client::connect(&socket, Duration::from_secs(10))
+        .expect("the url worked out from the browser's own");
+    tabs.open(Tab::new(opened, connection, "about:blank"));
+    assert_eq!(tabs.len(), 2);
+    assert_eq!(tabs.active_index(), 1);
+
+    // The `Target.targetCreated` for it has no opener, so the list must not
+    // take it as a second tab for the same page.
+    assert!(!pump(
+        &mut browser,
+        &mut tabs,
+        &browser_url,
+        Duration::from_secs(3),
+        |tabs| tabs.len() > 2,
+    ));
+    assert_eq!(
+        tabs.len(),
+        2,
+        "the tab this program opened was counted twice"
+    );
+
+    // And it drives like any other tab.
+    let tab = tabs.active_mut().expect("the new tab");
+    tab.connection
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    tab.connection
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(&base))]),
+        )
+        .expect("it navigates");
+    assert_eq!(
+        wait_for_title(&mut tab.connection, "first", Duration::from_secs(10)),
+        "first"
+    );
+    let mut gone = tabs.close(1).expect("the tab");
+    gone.connection.close();
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}
+
+/// `ctrl+w`: the engine closes the page, the list loses the tab, and what is
+/// left is the tab it was opened from.
+#[test]
+fn closing_a_tab_leaves_the_one_it_was_opened_from() {
+    let Some((mut engine, mut browser, mut tabs, browser_url)) = two_tabs() else {
+        return;
+    };
+    let closing = tabs.active_target().expect("a target").to_string();
+
+    // What `Command::CloseTab` does: the target in the engine, then the socket.
+    let index = tabs.active_index();
+    let mut tab = tabs.close(index).expect("the tab");
+    browser
+        .call(
+            "Target.closeTarget",
+            Json::object(vec![("targetId", Json::string(&closing))]),
+        )
+        .expect("the target closes");
+    tab.connection.close();
+
+    assert_eq!(tabs.len(), 1);
+    assert_eq!(tabs.active_index(), 0);
+    // And the engine agrees. Its `targetDestroyed` arrives for a tab that has
+    // already gone, which must not be an error or a second tab lost.
+    assert!(
+        pump(
+            &mut browser,
+            &mut tabs,
+            &browser_url,
+            Duration::from_secs(10),
+            |tabs| tabs.len() == 1,
+        ),
+        "the engine's own news about the closed target upset the list"
+    );
+    let left = tabs.active_mut().expect("the tab that is left");
+    assert_eq!(
+        tos_browser::app::page_title(&mut left.connection).as_deref(),
+        Some("first"),
+        "what is left is not the page the link was on"
+    );
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}
+
+/// A page that closes itself takes its tab with it, with no key pressed.
+#[test]
+fn a_page_that_calls_window_close_removes_its_own_tab() {
+    let Some((mut engine, mut browser, mut tabs, browser_url)) = two_tabs() else {
+        return;
+    };
+    let closing = tabs.active_target().expect("a target").to_string();
+    {
+        let second = tabs.active_mut().expect("the second tab");
+        // A page may close a window that was opened by script, which is what
+        // the link with target=_blank made this one. `notify` rather than
+        // `call`: the reply to an evaluation that closes the page never comes.
+        let _ = second.connection.notify(
+            "Runtime.evaluate",
+            Json::object(vec![("expression", Json::string("window.close()"))]),
+        );
+    }
+
+    assert!(
+        pump(
+            &mut browser,
+            &mut tabs,
+            &browser_url,
+            Duration::from_secs(10),
+            |tabs| tabs.len() == 1,
+        ),
+        "window.close() left the tab where it was"
+    );
+    assert_eq!(tabs.index_of(&closing), None);
+    assert_eq!(tabs.active_index(), 0);
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}
+
+/// The next screencast frame, decoded, or nothing within the time.
+fn wait_for_frame(client: &mut Client, timeout: Duration) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        for event in client.events() {
+            if event.method != "Page.screencastFrame" {
+                continue;
+            }
+            if let Some(session) = event.params.get("sessionId").and_then(Json::as_i64) {
+                let _ = client.notify(
+                    "Page.screencastFrameAck",
+                    Json::object(vec![("sessionId", Json::number(session as f64))]),
+                );
+            }
+            if let Some(data) = event.params.get("data").and_then(Json::as_str) {
+                if let Ok(png) = tos_browser::base64::decode(data.as_bytes()) {
+                    return Some(png);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
 }
