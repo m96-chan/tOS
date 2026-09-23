@@ -13,20 +13,35 @@
 //! what a wheel notch is worth, what a click on the status row means, what
 //! happens to the frames that arrive faster than a pane can draw them, and
 //! what is on the screen in the moment between two tabs.
+//!
+//! The one that is not here is which format a frame comes in and which of two
+//! frames wins when they arrive out of order: that is [`crate::motion`],
+//! because it is a policy with a measurement behind it and it can be tested
+//! without an engine, a terminal or a pane.
+//!
+//! The other thing that is not here is the wheel's animation. It was, and a
+//! loop that spends nine milliseconds decoding a frame is a loop that sends a
+//! scroll's ticks in bursts, which the engine applies as jumps — so the ticks
+//! moved to a thread of their own in [`crate::scroll`]. What is left on this
+//! side is a notch handed over as it is read and a timestamp read back once a
+//! pass.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tos_platform::tty::{self, ReadOutcome};
 use tos_preview::fit::{Cells, Metrics};
 
-use crate::cdp::{Client, Event};
+use crate::cdp::{Client, Event, Notifier, Pending};
 use crate::engine::Engine;
-use crate::graphics::Painter;
+use crate::graphics::{Painter, Raw};
 use crate::input::{Input, Key, KeyAction, KeyInput, MouseInput, MouseKind, Parser};
 use crate::json::Json;
 use crate::keys;
+use crate::motion::{self, Motion};
 use crate::screen::{self, Pane};
+use crate::scroll::{self, Step};
 use crate::tabs::{Outcome, Tab, Tabs};
 
 /// How long the engine gets to print its port.
@@ -41,11 +56,34 @@ const TARGET_TIMEOUT: Duration = Duration::from_secs(15);
 /// A terminal mouse reports notches and nothing else — no acceleration, no
 /// fractional scroll — so the number is a constant, and this is the one that
 /// makes a page move by about the same amount it would in a window.
-const WHEEL_PIXELS: f64 = 120.0;
+///
+/// What a notch *is* on the wire is [`crate::scroll`]'s: it starts a curve of
+/// its own that delivers this much over [`crate::scroll::D`], and a tick every
+/// 16 ms — on that module's thread, not on this loop — sends what every
+/// running curve has not been given yet as one `Input.dispatchMouseEvent` of
+/// type `mouseWheel`. It used to be one `Input.synthesizeScrollGesture` per
+/// notch animated by the engine, and then one exponential approach to a
+/// distance owed; the measurements that took both of those out are in that
+/// module and in `docs/design/browser.md`.
+pub const WHEEL_PIXELS: f64 = 120.0;
 
 /// How close in time and space two presses have to be to be a double click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 const DOUBLE_CLICK_SLOP: i32 = 4;
+
+/// How long the loop waits for something to happen.
+///
+/// Long enough that an idle browser costs twenty wake-ups a second, short
+/// enough that a held Escape is told apart from an escape sequence and a
+/// signal is noticed.
+///
+/// A scroll used to shorten it to the next tick of the animation, and that is
+/// gone with the animation: the ticks are [`crate::scroll::Wheel`]'s thread's
+/// and it keeps its own clock. All this loop does with a scroll is read
+/// [`crate::scroll::Wheel::activity`] each pass, and the interval that reads
+/// it is 400 ms — see [`motion::INPUT_QUIET`] — so fifty is eight times as
+/// often as it needs to be.
+const POLL_MS: i32 = 50;
 
 /// The row the page starts on, one-based: the first is this program's.
 const PAGE_ROW: u32 = 2;
@@ -59,6 +97,25 @@ const SWITCH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long a new tab's socket has to be accepted.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the engine gets to draw the lossless picture of a page that has
+/// stopped.
+///
+/// It is a whole-page paint and an encode, so it is slower than a screencast
+/// frame: 66 to 98 milliseconds at a pane's size on the VirtualBox machine
+/// [`crate::motion`] was measured on. It does not block this loop for them —
+/// the command goes out with [`Client::send`] and the reply is collected on
+/// whichever pass it has arrived on — so this is a deadline rather than a
+/// wait. A page that cannot produce a picture of itself in two seconds has
+/// something else wrong with it, and the last motion frame stays up.
+const STILL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The largest frame either decoder may produce, in bytes of pixels.
+///
+/// A frame is a pane, so this is never reached; it is the ceiling that stops
+/// a malformed header from asking for a gigabyte. Sixty-four megabytes is a
+/// 4096x4096 picture in RGBA, which is larger than any display tOS runs on.
+const FRAME_BUDGET: usize = 64 * 1024 * 1024;
 
 /// Set by the signal handlers. A handler may do nothing else.
 static QUIT: AtomicBool = AtomicBool::new(false);
@@ -106,6 +163,13 @@ struct Chrome {
     clicks: Clicks,
     buttons: u32,
     metrics: Metrics,
+    /// Whether the page in front is moving, and what its screen holds.
+    motion: Motion,
+    /// The lossless still that has been asked for and not yet answered.
+    still: Option<Still>,
+    /// The thread that animates the wheel. This loop tells it what the hand
+    /// did and asks it what it has sent; it does the rest on its own clock.
+    wheel: scroll::Wheel,
     /// `Some` while the url is being typed.
     editing: Option<String>,
     /// Whether that url is still the one the page had, untouched.
@@ -116,6 +180,19 @@ struct Chrome {
     /// the old url until then is what makes `ctrl+l` also a way to read where
     /// you are.
     editing_whole: bool,
+}
+
+/// A `Page.captureScreenshot` that is out with the engine.
+///
+/// The target is kept beside the command because a tab can be switched away
+/// from, resized or closed while the engine is drawing: a reply collected
+/// against the wrong page would paint one tab's picture under another tab's
+/// name.
+struct Still {
+    target: String,
+    pending: Pending,
+    /// When it went out, against [`STILL_TIMEOUT`].
+    sent: Instant,
 }
 
 /// Run until the person quits or something goes wrong.
@@ -195,6 +272,9 @@ fn drive(
         clicks: Clicks::default(),
         buttons: 0,
         metrics,
+        motion: Motion::new(Instant::now()),
+        still: None,
+        wheel: scroll::Wheel::start(),
         editing: None,
         editing_whole: false,
     };
@@ -234,6 +314,18 @@ fn drive(
                 emulate(&mut tab.connection, metrics)?;
                 restart_screencast(&mut tab.connection, metrics)?;
             }
+            // The screen was cleared and the page is a different size, so
+            // nothing that was captured before this is worth painting and the
+            // still that reflows the page is worth asking for.
+            chrome.motion.reset(Instant::now());
+            // A scroll that was running is not dropped, though. A hand is
+            // still on the wheel and a pane changing size is no reason for the
+            // page to stop dead halfway through a flick; what a resize really
+            // invalidates is the *point* the events are sent at, which may now
+            // be off the page, so that is brought back inside it and the
+            // notches carry on. See `docs/design/browser.md`.
+            let (width, height) = page_pixels(chrome.metrics);
+            chrome.wheel.resized((width as i32, height as i32));
             redraw_row(pane, tabs, &chrome)?;
         }
 
@@ -252,8 +344,8 @@ fn drive(
         let wake = tabs.active().map(|tab| tab.connection.wake_fd());
         let mut watching = vec![pane.input_fd(), browser.wake_fd()];
         watching.extend(wake);
-        let ready =
-            tty::poll_readable(&watching, 50).map_err(|e| format!("cannot wait for input: {e}"))?;
+        let ready = tty::poll_readable(&watching, POLL_MS)
+            .map_err(|e| format!("cannot wait for input: {e}"))?;
 
         if ready.contains(&pane.input_fd()) {
             match tty::read_available(pane.input_fd(), &mut buf) {
@@ -276,6 +368,14 @@ fn drive(
             }
         }
 
+        // What the animator thread has been doing while this loop was busy.
+        // Nothing here drives it — it has its own clock and its own socket —
+        // but every tick it sent is a page that moved, and a page that moved
+        // is not a page to photograph. See [`motion::INPUT_QUIET`].
+        if let Some(at) = chrome.wheel.activity() {
+            chrome.motion.input(at);
+        }
+
         if ready.contains(&browser.wake_fd()) {
             browser.drain_wake();
         }
@@ -294,6 +394,9 @@ fn drive(
         // and never from one that has just been left behind.
         handle_target_events(pane, tabs, browser, &mut chrome, browser_url)?;
         handle_page_events(pane, tabs, &mut chrome)?;
+        // And last, because it is the thing to do when nothing else happened:
+        // a page that has stopped moving gets its lossless picture.
+        rest_shot(pane, tabs, &mut chrome)?;
     }
     Ok(())
 }
@@ -313,12 +416,14 @@ fn emulate(client: &mut Client, metrics: Metrics) -> Result<(), String> {
     Ok(())
 }
 
+/// Start the frames coming, in the format [`crate::motion`] argues for.
 fn start_screencast(client: &mut Client, metrics: Metrics) -> Result<(), String> {
     let (width, height) = page_pixels(metrics);
     client.call(
         "Page.startScreencast",
         Json::object(vec![
-            ("format", Json::string("png")),
+            ("format", Json::string("jpeg")),
+            ("quality", Json::number(motion::QUALITY)),
             ("maxWidth", Json::number(width)),
             ("maxHeight", Json::number(height)),
             ("everyNthFrame", Json::number(1)),
@@ -410,6 +515,11 @@ fn activate(
         tab.title = title;
     }
     start_screencast(&mut tab.connection, metrics)?;
+    // A different page, so a different clock: nothing this tab sends can be
+    // compared against what the last one had on screen, and a page that is
+    // already loaded and still gets its lossless picture a rest interval
+    // from now rather than never.
+    chrome.motion.reset(Instant::now());
     Ok(())
 }
 
@@ -442,6 +552,11 @@ fn switched(
     if now == was {
         return Ok(());
     }
+    // What the last tab was owed is not owed to this one, and there is
+    // nothing in flight to disown: the animation is this program's, so
+    // forgetting it is the whole of stopping it. It also lets go of that
+    // tab's socket, which a tab that is closing needs.
+    chrome.wheel.forget();
     if let Some(was) = &was {
         deactivate(tabs, was);
     }
@@ -675,6 +790,7 @@ fn handle_page_events(
     chrome: &mut Chrome,
 ) -> Result<(), String> {
     let active = tabs.active_index();
+    // The newest frame worth painting, still encoded.
     let mut newest_frame: Option<Vec<u8>> = None;
     let mut redraw = false;
 
@@ -704,8 +820,25 @@ fn handle_page_events(
                         continue;
                     }
                     if let Some(data) = params.get("data").and_then(Json::as_str) {
+                        // CDP's `TimeSinceEpoch`: seconds, on the clock this
+                        // program reads too, which is what makes a frame and
+                        // a still comparable at all.
+                        let stamp = params
+                            .path(&["metadata", "timestamp"])
+                            .and_then(Json::as_f64);
+                        // Every frame is told to the policy, even though only
+                        // the last will be painted. Frames are coalesced here
+                        // because a pane cannot draw sixty a second; the count
+                        // in a still's window is not, because one frame there
+                        // is the still photographing itself and two are the
+                        // page moving — see [`motion::SHUTTER_FRAMES`] — and a
+                        // pass that happened to collect two must not look like
+                        // a pass that collected one.
+                        if !chrome.motion.motion_frame(stamp, Instant::now()) {
+                            continue;
+                        }
                         match crate::base64::decode(data.as_bytes()) {
-                            Ok(png) => newest_frame = Some(png),
+                            Ok(jpeg) => newest_frame = Some(jpeg),
                             // A frame that will not decode is a frame, not a
                             // session: the next one is along in sixteen
                             // milliseconds.
@@ -756,19 +889,225 @@ fn handle_page_events(
     if redraw {
         redraw_row(pane, tabs, chrome)?;
     }
-    if let Some(png) = newest_frame {
-        let bytes = chrome
-            .painter
-            .frame(&png, page_cells(chrome.metrics), PAGE_ROW, 1);
-        pane.write(&bytes).map_err(|e| e.to_string())?;
-        // The picture does not move the cursor (`C=1`), but the status line
-        // owns the cursor's position when the url is being typed, so it is
-        // written again rather than left where the last frame found it.
-        if chrome.editing.is_some() {
-            redraw_row(pane, tabs, chrome)?;
+    if let Some(jpeg) = newest_frame {
+        // Ordered above, decoded here: a frame that lost to the still on
+        // screen is eight milliseconds of work not done.
+        //
+        // A frame that will not decode is dropped on the same rule as one that
+        // would not base64: one of them is nothing. A run of them is a page
+        // that looks frozen, which is what the engine test comparing the two
+        // formats through both decoders exists to catch before a person meets
+        // it.
+        if let Ok(image) = tos_term::jpeg::decode(&jpeg, FRAME_BUDGET) {
+            let raw = Raw::rgb(&image.rgb, image.width, image.height);
+            paint(pane, tabs, chrome, raw)?;
         }
     }
     Ok(())
+}
+
+/// Put a decoded frame on the screen.
+fn paint(
+    pane: &mut Pane,
+    tabs: &Tabs<Client>,
+    chrome: &mut Chrome,
+    raw: Raw<'_>,
+) -> Result<(), String> {
+    let bytes = chrome
+        .painter
+        .frame(raw, page_cells(chrome.metrics), PAGE_ROW, 1);
+    pane.write(&bytes).map_err(|e| e.to_string())?;
+    // The picture does not move the cursor (`C=1`), but the status line owns
+    // the cursor's position when the url is being typed, so it is written
+    // again rather than left where the last frame found it.
+    if chrome.editing.is_some() {
+        redraw_row(pane, tabs, chrome)?;
+    }
+    Ok(())
+}
+
+/// A page that has stopped moving gets one lossless picture of itself.
+///
+/// This is the other half of [`crate::motion`]'s policy: the screencast is
+/// JPEG so that a scroll keeps up, and once it has stopped the text somebody
+/// is about to read is replaced with the PNG of the same page. It costs one
+/// `Page.captureScreenshot` per stop and nothing at all while the page stays
+/// still, so a static page is one still and then silence.
+///
+/// Nothing here waits. The screenshot is 66 to 98 milliseconds of engine at a
+/// pane's size, and a loop that sat in a `call` for them would be a loop that
+/// was not reading the terminal — which is what made a key pressed during one
+/// arrive a tenth of a second late, and sometimes need pressing twice. So the
+/// reply is collected first, and a new request only goes out when there is
+/// nothing outstanding and the page has been quiet in both the ways
+/// [`crate::motion`] asks about.
+fn rest_shot(pane: &mut Pane, tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> Result<(), String> {
+    collect_still(pane, tabs, chrome)?;
+    request_still(tabs, chrome);
+    Ok(())
+}
+
+/// Take the reply to the still, if it has come back.
+///
+/// Called after the page's events have been drained, so that a frame which
+/// arrived on the same pass as the reply has already been counted against it —
+/// which matters, because the count is the rule: one frame in the window is
+/// the still photographing itself and more than one is the page moving. See
+/// [`motion::SHUTTER_FRAMES`].
+fn collect_still(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+) -> Result<(), String> {
+    let Some(still) = chrome.still.as_ref() else {
+        return Ok(());
+    };
+    if tabs.active_target() != Some(still.target.as_str()) {
+        // The tab was switched away from or closed while the engine drew. The
+        // motion state was reset with the switch, so there is nothing to tell
+        // it; dropping the still drops its `Pending`, which is what tells the
+        // mailbox not to keep a megabyte of picture nobody will collect.
+        chrome.still = None;
+        return Ok(());
+    }
+    let timed_out = still.sent.elapsed() >= STILL_TIMEOUT;
+    let Some(tab) = tabs.active_mut() else {
+        return Ok(());
+    };
+    let Some(answer) = tab.connection.take_reply(&still.pending) else {
+        if timed_out {
+            chrome.still = None;
+            chrome.motion.still_failed();
+        }
+        return Ok(());
+    };
+    chrome.still = None;
+    // Whether it is worth having is asked before it is decoded: a still that
+    // lost to a frame is a megabyte of PNG this loop does not have to look at,
+    // and the moment it loses is the moment the page is moving and the time is
+    // wanted elsewhere.
+    if !chrome.motion.still_arrived(motion::now_seconds()) {
+        return Ok(());
+    }
+    let decoded = answer
+        .ok()
+        .and_then(|reply| reply.get("data").and_then(Json::as_str).map(str::to_string))
+        .and_then(|data| crate::base64::decode(data.as_bytes()).ok())
+        .and_then(|png| tos_term::png::decode(&png, FRAME_BUDGET).ok());
+    let Some(image) = decoded else {
+        // The tab stays marked at rest, which is what stops a page whose
+        // screenshots will not decode being asked again every pass.
+        chrome.motion.still_failed();
+        return Ok(());
+    };
+    let raw = Raw::rgba(&image.rgba, image.width, image.height);
+    paint(pane, tabs, chrome, raw)
+}
+
+/// Ask for a still, if the page has earned one.
+///
+/// A failure to send is a failure of the still and not of the program: the
+/// socket going is heard on the next pass by everything that cares.
+fn request_still(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    if !chrome.motion.wants_still(Instant::now()) {
+        return;
+    }
+    let Some(target) = tabs.active_target().map(str::to_string) else {
+        return;
+    };
+    let Some(tab) = tabs.active_mut() else {
+        return;
+    };
+    let sent = tab.connection.send(
+        "Page.captureScreenshot",
+        Json::object(vec![("format", Json::string("png"))]),
+    );
+    match sent {
+        Ok(pending) => {
+            chrome.motion.still_requested();
+            chrome.still = Some(Still {
+                target,
+                pending,
+                sent: Instant::now(),
+            });
+        }
+        Err(_) => chrome.motion.still_failed(),
+    }
+}
+
+/// Where a step of the animation goes: one `mouseWheel` on the tab that was
+/// being scrolled, put on the wire by the animator's own thread.
+///
+/// The event goes out with [`crate::cdp::Notifier::notify`], which is what an
+/// acknowledged screencast frame uses: a `mouseWheel` has nothing to say back,
+/// and fourteen round trips per notch would be fourteen replies to collect and
+/// a `Pending` to carry for each of them. Chromium answers a notification all
+/// the same, and those answers cost nothing: a notification's id is never
+/// registered with the mailbox, so the reader thread drops its reply where it
+/// reads it.
+///
+/// This is the only part of the animation that knows what CDP is, which is why
+/// it is here rather than in [`crate::scroll`] — that module is arithmetic on
+/// a distance and a clock, and it stays testable without an engine.
+pub struct Wire(Notifier);
+
+impl Wire {
+    pub fn new(notifier: Notifier) -> Wire {
+        Wire(notifier)
+    }
+}
+
+impl scroll::Dispatch for Wire {
+    fn send(&self, step: Step) -> Result<(), String> {
+        self.0.notify(
+            "Input.dispatchMouseEvent",
+            Json::object(vec![
+                ("type", Json::string("mouseWheel")),
+                ("x", Json::number(step.at.0)),
+                ("y", Json::number(step.at.1)),
+                ("deltaX", Json::number(step.delta.0)),
+                ("deltaY", Json::number(step.delta.1)),
+                ("modifiers", Json::number(0)),
+                ("button", Json::string("none")),
+                ("buttons", Json::number(0)),
+            ]),
+        )
+    }
+}
+
+/// One wheel notch: a curve handed to the animator thread.
+///
+/// Nothing is sent from here and nothing is timed from here. The notch starts
+/// a curve of its own beside whatever is already running, and the thread pays
+/// all of them out a tick at a time — which is what makes a second notch in
+/// the middle of the first add to the movement rather than restart it, and
+/// what keeps the ticks off this loop's schedule.
+///
+/// The sign is the page's: `deltaY` of +120 on a `mouseWheel` leaves
+/// `window.scrollY` at 120, and `deltaX` of +120 leaves `scrollX` at 120 —
+/// checked against the engine rather than read off the documentation, and the
+/// opposite of what `Input.synthesizeScrollGesture`'s `yDistance` wanted.
+fn scroll(tabs: &Tabs<Client>, chrome: &Chrome, report: &MouseInput) {
+    let pixels = chrome.parser.pixel_coordinates();
+    let (x, y) = crate::input::page_point(report, pixels, chrome.metrics.cell, 1);
+    if y < 0 {
+        // The status row is this program's, and turning the wheel over it is
+        // not the page's business.
+        return;
+    }
+    let Some(tab) = tabs.active() else {
+        return;
+    };
+    let distance = (
+        report.wheel.0 as f64 * WHEEL_PIXELS,
+        report.wheel.1 as f64 * WHEEL_PIXELS,
+    );
+    chrome.wheel.notch(
+        &tab.target,
+        Arc::new(Wire::new(tab.connection.notifier())),
+        (x, y),
+        distance,
+    );
 }
 
 /// Handle one thing the terminal said. `false` means quit.
@@ -783,6 +1122,13 @@ fn handle_input(
     match input {
         Input::Mode { .. } => {}
         Input::Key(key) => {
+            // A key is a person working on this page, which is a reason not to
+            // interrupt them with a screenshot — see [`motion::INPUT_QUIET`].
+            // A release is not: it follows a press that has already been
+            // counted, and a modifier let go on its own moves nothing.
+            if key.action != KeyAction::Release {
+                chrome.motion.input(Instant::now());
+            }
             if chrome.editing.is_some() {
                 return edit_url(pane, tabs, chrome, key);
             }
@@ -850,6 +1196,17 @@ fn handle_input(
             }
         }
         Input::Mouse(report) => {
+            // Only the wheel. A hand on a wheel is what the still has to keep
+            // out of the way of; a pointer drifting across a page is
+            // not, and counting moves would mean a page nobody had scrolled
+            // never got its lossless picture at all.
+            if report.kind == MouseKind::Wheel {
+                chrome.motion.input(Instant::now());
+                // Not an event but a curve: what puts it on the wire is
+                // [`crate::scroll::Wheel`]'s thread, on its own clock.
+                scroll(tabs, chrome, &report);
+                return Ok(true);
+            }
             let metrics = chrome.metrics;
             let pixels = chrome.parser.pixel_coordinates();
             let clicks = &mut chrome.clicks;
@@ -1148,13 +1505,11 @@ fn send_mouse(
             ("mouseReleased", vec![("clickCount", Json::number(1))])
         }
         MouseKind::Move => ("mouseMoved", Vec::new()),
-        MouseKind::Wheel => (
-            "mouseWheel",
-            vec![
-                ("deltaX", Json::number(report.wheel.0 as f64 * WHEEL_PIXELS)),
-                ("deltaY", Json::number(report.wheel.1 as f64 * WHEEL_PIXELS)),
-            ],
-        ),
+        // A wheel notch never reaches here. One dispatched `mouseWheel` of
+        // 120 pixels moves the page in a single frame, so a notch is a curve
+        // and about fourteen smaller events instead. See [`scroll`] and
+        // [`crate::scroll`].
+        MouseKind::Wheel => return,
     };
 
     let mut fields = vec![

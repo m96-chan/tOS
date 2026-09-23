@@ -102,6 +102,225 @@ a degraded mode worth hiding — link-clicking on a cell grid is usable for a
 page of prose and unusable for a dense one, and the browser should say which
 it is in.
 
+### The other gap: a wheel notch is an animation, not an event
+
+Scrolling read as choppy on the installed machine, and it was not the frame
+rate. `Input.dispatchMouseEvent` with `type: mouseWheel` and `deltaY: 120` —
+one event per notch — moves the page 120 pixels in **one screencast frame**,
+measured against `chromium-shell` 153 at 1280×768 in docker on two cores. Not a
+fast animation: no animation. `--enable-smooth-scrolling` on the engine changes
+nothing, because the engine's smooth scrolling belongs to the wheel input
+pipeline that a synthetic event skips. No amount of frame-rate work can fix a
+page that teleports.
+
+#### What was tried first: the engine's own gesture
+
+`Input.synthesizeScrollGesture` is the one the engine animates itself. At 700
+CSS pixels a second, one 120-pixel notch is 13 screencast frames over 232 ms
+(six runs, 231 to 242 ms), and it ends exactly 120 pixels down; the cost is
+distance ÷ speed plus a flat 60 to 65 ms of the engine's own. A gesture is in
+flight for as long as it animates, and two in flight at once are neither
+refused nor dropped but **serialised** — issued together, or 50 or 120 ms
+apart, the replies come at 181 and 365 ms and the page ends 240 pixels down
+either way. So one gesture per notch would put the page further and further
+behind the hand, and the crate coalesced instead: the first notch after idle
+went out at once, notches that arrived while one animated were added up, and
+the sum went out when the reply came.
+
+That shipped, and it was wrong. Measured the way that matters — the scroll
+offset that each screencast frame carries, on ja.wikipedia at 1280×770 —
+five notches 100 ms apart gave:
+
+```text
+12 12 12 11 12 9 [0] 12 23 23 24 23 18 [0] 10 12 23 25 22 …
+```
+
+Every gesture starts from a standstill and ends at a dead stop. The `[0]`s are
+the seams between one engine animation and the next, and the hand's notches do
+not fall on them. Ten notches 60 ms apart were worse, because the piles are
+bigger:
+
+```text
+… 48 70 25 44 [0] 45 46 47 … 47 [116] 12 [0] 5 5 13 17 …
+```
+
+— a stop, a 116-pixel jump, another stop, and a slow tail still running after
+the wheel had stopped. The person's words for the two halves of this were
+"ドッ、ドッ" — pulsing — and, separately, that the scrolling had "an upper limit
+on speed, unlike a normal browser's", and that when they stopped the wheel they
+wanted it to stop.
+
+None of that is tunable. There is one seam per pile whatever the pile is worth,
+the speed is a property of the gesture rather than of the hand, and sizing a
+gesture to a fixed duration (the fix that was in the tree) buys the second
+complaint at the cost of making the first one land harder. So the gesture is
+gone.
+
+#### What was tried next: one exponential approach
+
+A notch stopped moving the page. It added `WHEEL_PIXELS` to a **distance still
+owed**, and every 16 ms a tick sent a fraction `K` = 0.3 of what was left as
+one ordinary `mouseWheel` event, with a floor of 4 pixels under it to end a
+series that otherwise never arrives. One animation, never two, and a notch in
+the middle of one extended its target instead of queueing behind it.
+
+That fixed the seams and it shipped, and on the installed machine the person
+said the page **shakes up and down**. The measurement says why. One notch on
+its own was good — `36 25 18 12 9 6 4 4 6`, nine frames and done — but a steady
+hand, a notch every 100 ms, which is what a person rolling a wheel actually
+produces, was this:
+
+```text
+25 18 12 9 6 4 | 39 27 19 13 9 7 | 41 28 20 14 10 | 43 30 21 15 …
+```
+
+Every notch is delivered front-loaded, because the fraction is taken of
+everything owed at once: the page lurches where a notch lands and creeps where
+one does not. A tenfold swing inside every notch, about ten times a second.
+
+No value of `K` fixes that, because the swing **is** the exponential. A smaller
+`K` flattens each notch's decay and makes the lurches further apart, and it
+also breaks the other promise — `K` = 0.22 was already missing the 250 ms
+deadline for stopping when the hand stops, with two spare cores and nothing
+else to do. The shape was wrong, not the number.
+
+#### What replaced it: a curve per notch, added together
+
+**Every notch is its own curve, and the curves are summed.** A notch of 120
+pixels is delivered over `scroll::D` = 220 ms following an ease-out —
+`120 × (1 − (1 − x)²)`, fast at the start and slowing to nothing — and a notch
+that arrives while others are still running neither resets them nor waits for
+them. It starts a curve beside them. Every 16 ms each running curve is asked
+how far it should have got by now, and what goes out is the sum of what none of
+them has been given yet. A notch appends; nothing else is touched. There is no
+floor and no ceiling on a step.
+
+That the curves are read from the wall clock rather than accumulated is the
+property everything else rests on: a notch that should have delivered 71 pixels
+by now delivers 71 whether it is asked at the right moment, four milliseconds
+late, or twice in the same millisecond. Nothing is in flight to lose and there
+is no backlog to replay. `apps/browser/src/scroll.rs` is the whole rule, and it
+touches no socket: arithmetic on a distance and a clock, unit-tested without an
+engine.
+
+The same measurement on the same page, `chromium-shell` in docker on two vCPUs
+at 1280×770, as the offset each screencast frame carried:
+
+```text
+one notch     17 16 14 13 12 10 9 8 7 5 4 3 2
+steady hand   17 16 14 13 12 10 | 22 24 21 19 16 14 | 20 25 22 19 17 14 |
+              15 26 23 20 18 15 | 12 25 44 18 [0] 29 | 21 24 22 19 16 14 |
+              11 9 7 6 5 3 2 1
+fast hand     17 16 14 27 27 25 35 36 32 37 41 35 37 42 36 35 42 [0] 37 32 44
+              38 33 43 39 74 40 34 39 41 35 [0] 79 36 36 42 37 32 27 22 18 15
+              11 9 6 4 3 1
+```
+
+The steady hand — six notches 100 ms apart — swings between 12 and 26 pixels a
+frame over the middle of the run: 2.2 times, against the exponential's ten, and
+the seam where one curve takes over from the last is not visible in the numbers
+at all. The fast hand — twelve notches 50 ms apart, quicker than anybody really
+rolls — never stands still for two frames running, reaches 79 in the middle,
+and stops 268 ms after the last notch. One notch on its own is fourteen frames
+over 227 ms.
+
+Starved of a core, at `--cpus=1` rather than 2, the numbers barely move:
+`17 16 14 13 12 10 9 8 7 5 4 3 2` again for one notch, 10 to 26 for the steady
+hand, and 241 ms to settle after the fast one.
+
+The `44` and the `[0]` beside it are one frame that carried two ticks and one
+that carried none — the screencast's 16.7 ms cadence beating against the 16 ms
+tick, about twice a second, and not the curve. On the machine this is really
+for, where a frame is 24 to 27 ms, every frame holds a tick or two and it
+cannot happen. The tests forgive exactly one such frame, as they always have.
+
+Why 220 ms. The trade is between how steady a hand looks and how long a single
+notch takes, and what sets it is how much the curves overlap:
+
+| `D` | one notch settles in | a steady hand swings by |
+|--------|----------------------|-------------------------|
+| 150 ms | ≈ 200 ms | 34 down to 8 — it pulses again |
+| 220 ms | 227 ms | 2.2× (12 to 26) |
+| 250 ms | ≈ 290 ms | 2× (13 to 27) |
+| 300 ms | ≈ 340 ms | steadiest of the four |
+
+At 100 ms between notches, 220 keeps two and a bit curves running at any
+moment, which is enough to fill the gaps between them. Below about 150 they
+stop overlapping at all and the pulsing comes straight back in a new shape: the
+last curve is finished before the next notch arrives, which is a dead stop by
+another route. Above 300 a notch stops feeling like a notch — a third of a
+second to move 120 pixels is a page that lags the hand. 220 is the shortest
+that still overlaps, which is the side to be on, because it is the only one of
+the four where nothing is being traded away.
+
+**Nothing caps a step and nothing floors one.** Ten notches at once move ten
+times as far on every tick, which is what a flick does in a window; and because
+every curve is `D` long whatever else is running, ten notches take exactly as
+long to settle as one. A big pile moves *further* rather than for *longer*,
+which is the whole of "when I stop the wheel I want it to stop".
+
+#### Why the animation has a thread of its own
+
+It did not, and on the installed machine the page moved like this, frame by
+frame: `-420 -126 -90 -8 -14 -138 -310 …`. Several ticks' worth in one frame
+and then almost nothing. The loop decodes a JPEG frame in about 9 ms, writes
+2.9 MB into shared memory and handles whatever the terminal said, and while it
+is doing that it is not sending wheel events; the ticks it missed then went out
+together and the engine applied them as one jump. A catch-up rule made that
+worse rather than better, because catching up is exactly what produces the
+burst.
+
+So the animation is not a thing the loop does when it gets round to it.
+`scroll::Wheel` starts a thread that sleeps until the next tick, wakes, asks
+the curves where they are, and sends. The loop's two remaining jobs are to say
+what the hand did — a notch, with the tab and the connection it belongs to, and
+"forget it" when the tab in front changes or goes — and to read the thread's
+"last sent something" timestamp once a pass. Nothing the loop does can delay a
+tick by more than the time it takes to append a notch under a mutex.
+
+Sending from another thread needed one small thing in
+[`cdp`](../../apps/browser/src/cdp.rs): a `Notifier`, which is a clone of the
+socket's writing half — already behind a mutex, because the reader thread has
+always held it to answer a ping — and the command counter, now an atomic so
+that an id is still spent exactly once. It cannot call, cannot wait for a
+reply, and never touches the mailbox or the reader. A notification's id is
+never registered, so the reply Chromium sends all the same is dropped where it
+is read, exactly as before — see [what the mailbox
+keeps](#what-the-mailbox-keeps).
+
+The loop's `poll` timeout, which a scroll used to shorten to the next tick,
+goes back to a flat 50 ms. There is nothing left for the loop to be on time
+for.
+
+#### What a page sees, and what the rest of the program does about it
+
+One notch reaches the page as **about fourteen `wheel` events** carrying a
+slice each, rather than one of 120 pixels, so a site that counts them — a
+full-screen carousel that advances per event — will advance fourteen times;
+what such a site does with `preventDefault` still works, and a notch over an
+inner scroller scrolls that scroller.
+
+Every tick that goes out counts as input in
+[`motion`](../../apps/browser/src/motion.rs)'s sense, as does every notch, so
+the quiet interval that earns a lossless still runs from the last tick of the
+animation rather than from the last notch of the hand: no still is asked for in
+the middle of a scroll. The animator thread does not touch that state — it
+publishes an atomic timestamp and the loop feeds it to `Motion::input`, which
+takes the later of what it is told and what it knows, because two clocks now
+write to it.
+
+A **tab switch or a tab closing** drops the notches, and lets go of that tab's
+connection with them: the animation belongs to the tab in front. A **resize**
+keeps them. A hand is still on the wheel and a pane changing size is no reason
+for the page to stop dead halfway through a flick; what a resize really
+invalidates is the *point* the events are sent at, which may now be off the
+page, so that point is clamped into the new viewport and the curves carry on. A
+key or a click during an animation does not cancel it, because a browser does
+not either.
+
+A page with nothing left to scroll needs no handling of its own: the events go
+out, the page does not move, and every curve is finished 220 ms later.
+
 ---
 
 ## The engine
@@ -165,14 +384,13 @@ the cap, not the engine's limit — the test page repainted its whole area every
 frame and the rate stayed pinned there, so the engine is not the bottleneck in
 this experiment and something else will be.
 
-**The frames go through as PNG, unchanged.** JPEG is 4× smaller per frame and
-it is not used, because `tos-term` cannot decode it and writing a decoder to
-get this is the trade `apps/preview/src/lib.rs` already refused for previews: a
-baseline JPEG decoder is 600–900 lines before progressive JPEG is considered,
-in a repository whose one dependency is `libc`, and nothing else in the tree
-wants it. PNG is what the graphics protocol names as its own payload format
-and what the compositor already decodes, so the client's frame path is a
-base64 decode and a write — it does not touch a pixel.
+**The frames went through as PNG, unchanged, and that is no longer true.**
+It was the right call at 640×360 and the wrong one at a pane's real size; the
+section [The format is the frame rate](#the-format-is-the-frame-rate) below
+has the measurement that changed it, and the short version is that the
+engine's PNG encoder is the bottleneck and swapping it for JPEG buys 24 frames
+a second. The client now decodes every frame itself and hands the compositor
+raw pixels.
 
 ### Why not WPE WebKit, honestly
 
@@ -238,21 +456,25 @@ absent until somebody installs 482 MB is honest; a 723 MB ISO is not.
         │  Blink, V8, layout, paint                    │   482 MB
         └──────────────┬───────────────────────────────┘
                        │ CDP over a websocket on 127.0.0.1
-                       │ Page.screencastFrame — base64 PNG, ~57.8 KB
+                       │ Page.screencastFrame — base64 JPEG q85, ~185 KB
+                       │   while the page moves; one Page.captureScreenshot
+                       │   in PNG when it stops
                        ▼
         ┌──────────────────────────────────────────────┐
         │  tos-browser                                 │
         │  an ordinary program in a pane. No compositor│   on the image
         │  API, no socket to the compositor, no plugin │
+        │  jpeg.rs / png.rs decode the frame here, 8 ms│
         └──────────────┬───────────────────────────────┘
-                       │ write the PNG to /dev/shm/<name>
-                       │ ESC_G a=T,f=100,t=s,q=2;<base64 name> ESC\
+                       │ write the RGB to /dev/shm/<name>, 2.9 MB
+                       │ ESC_G a=T,f=24,s=W,v=H,t=s,q=2;<base64 name> ESC\
                        │ PTY
                        ▼
         ┌──────────────────────────────────────────────┐
         │  tos-term                                    │
         │  ImageFiles reads /dev/shm and unlinks it    │
-        │  png.rs decodes to RGBA8, GraphicsStore holds│
+        │  no decode: f=24 is pixels. GraphicsStore    │
+        │  holds them                                  │
         └──────────────┬───────────────────────────────┘
                        ▼
                    tos-render  ──►  DRM/KMS
@@ -290,13 +512,21 @@ and the other way, which is where the compositor changes:
 
 Three details in that are decisions rather than drawing.
 
-**`t=s` and not `t=d`.** A 57.8 KB frame base64s to 77 KB of escape sequence
-sixty times a second, which is 4.6 MB/s of PTY. A shared memory name is about
-thirty bytes. The compositor already reads `/dev/shm` for `t=s` and already
-unlinks the object afterwards, which means the client writes a fresh name per
-frame and never cleans up — the consuming read is the cleanup. That is the
-protocol working as designed, and it is also the thing to measure first,
-because it is an object created and destroyed sixty times a second.
+**`t=s` and not `t=d`.** A 2.9 MB frame of raw pixels base64s to 3.9 MB of
+escape sequence, and at 58 frames a second that is 226 MB/s of PTY. A shared
+memory name is about thirty bytes. The compositor already reads `/dev/shm` for
+`t=s` and already unlinks the object afterwards, which means the client writes
+a fresh name per frame and never cleans up — the consuming read is the
+cleanup. That is the protocol working as designed, and it is also the thing to
+measure first, because it is an object created and destroyed sixty times a
+second.
+
+The inline fallback still exists and still works, and it is now a slideshow
+rather than a slower picture. It sends the same raw pixels, because the
+alternatives are to send a JPEG the terminal cannot read or to write a PNG
+*encoder* in `apps/browser` — a third codec from a specification, to make
+faster a path that exists only for terminals which are not tOS. Correct and
+slow was the right side of that.
 
 **The page is a picture; the browser's own chrome is cells.** The URL line,
 the back and forward indicators and any error message are drawn as text in the
@@ -312,6 +542,36 @@ SIGWINCH, reads the new pixel fields out of `TIOCGWINSZ`, and sends
 bounded to the new size. The engine then lays the page out at the pane's real
 pixel dimensions rather than being scaled into them, which is what makes a
 resize a reflow rather than a blur.
+
+### What the mailbox keeps
+
+`cdp::Client`'s reader thread sorts what arrives into replies, kept under the
+`id` of the command they answer, and events, queued for the loop to drain. The
+event queue has always been bounded — 512, oldest dropped, because the newest
+frame is the one worth having. The reply map was not, and that was a leak with
+a rate: almost everything this program says to the engine it says with
+`Client::notify`, which sends and never comes back, and Chromium answers every
+one of those. A screencast acknowledgement per frame is sixty replies a
+second; fourteen `mouseWheel` events a notch and a key event per keystroke are the
+rest. An hour of reading was a map of hundreds of thousands of answers to
+questions nobody had asked.
+
+So the mailbox keeps a reply only while somebody has a claim on it. `call` and
+`send` register their `id` before the command goes out — before, so that a
+reply cannot beat the registration — and the reader keeps a reply only if it
+finds its id in that set, which is one hash lookup on the path every frame
+takes. `notify` registers nothing. A claim ends when the reply is taken, when
+a `call` gives up at its deadline, or when the `Pending` from a `send` is
+dropped: `Pending::drop` unregisters the id *and* removes a reply that arrived
+in the meantime, which is what makes "the tab was switched away from while the
+engine was drawing a screenshot" cost nothing rather than a megabyte. That is
+also why a `Pending` is neither `Clone` nor `Eq` — two of them for one id
+would be two claims on one reply, and the first drop would cancel the second.
+
+`Client::replies_held` and `Client::replies_wanted` report the two numbers, so
+that the claim can be asserted rather than believed: the engine test rolls a
+three-second screencast with acknowledgements and a burst of wheel notches
+past it and expects both to be zero at the end.
 
 ---
 
@@ -378,11 +638,12 @@ everything else in that paragraph.
 Nothing here is a reason not to do it. They are the things that will be found
 by somebody with a profiler if they are not written down now.
 
-**3.5 MB/s of PNG through `/dev/shm`.** 60.2 fps × 57.8 KB. The engine
-compresses it and the compositor decompresses it, sixty times a second, for
-pixels that were raw on one side and are raw again on the other. It is the
-price of the frame path being a protocol both ends already speak, and it is
-the first number WPE would delete.
+**170 MB/s of raw pixels through `/dev/shm`.** 58 fps × 2.9 MB. This used to
+be 3.5 MB/s of PNG, and the trade was made knowingly: tmpfs is memory, so a
+write and a read are a memcpy at memory speed and cost about a third of a
+millisecond each, while the PNG decode they replaced cost fifteen to twenty on
+the compositor's parse loop. What is left is one large copy in each direction,
+which is the thing WPE would delete by handing over a buffer instead.
 
 **One shared memory object created and unlinked per frame.** Sixty
 `open`/`write`/`close` on the client's side and sixty `open`/`read`/`unlink`
@@ -390,12 +651,15 @@ on the compositor's, in the parse loop. `/dev/shm` is tmpfs so the bytes are a
 memcpy, but the directory operations are not free and nothing in the tree has
 asked this of them before.
 
-**PNG decode on the CPU, in the compositor, per frame, on the parse loop.**
-`docs/design/graphics-file-transmission.md` already lists reading off the parse
-loop as a follow-up for latency reasons; a browser is the first program that
-makes it a throughput question too. This is the first thing to measure once it
-runs on real hardware, and it is the number most likely to say that 60 fps is
-not what tOS actually gets.
+**~~PNG decode on the CPU, in the compositor, per frame, on the parse
+loop.~~** Gone, and this is how. The decode is now in the pane's own process,
+where it is 8 ms for a 1280×770 JPEG frame and costs the compositor nothing;
+`f=24` is pixels and the terminal copies them. What remains on the parse loop
+is the read out of `/dev/shm` and the copy into the store.
+`docs/design/graphics-file-transmission.md` still lists reading off the parse
+loop as a follow-up, and it is still worth doing — it is a 2.9 MB read now
+rather than a 320 KB one — but it is no longer the number that decides the
+frame rate.
 
 **Seven engine processes behind one pane.** The browser process, two zygotes,
 a GPU process that has no GPU, a network service, a storage service and one
@@ -408,6 +672,224 @@ side. What has never been measured is the whole path — paint to
 `screencastFrame` to shm to decode to blit to page flip — on a real machine
 with a real display. The engine sustaining 60.2 fps into a socket says nothing
 about what arrives on the screen.
+
+---
+
+## The format is the frame rate
+
+Everything above was measured at 640×360. At the size a pane actually is —
+1280×770, two vCPUs, a scrolling ja.wikipedia page, `chromium-shell` 153 — the
+engine does not sustain 60 frames a second, and what stops it is not the
+network, the PTY or the terminal. It is the engine's own single-threaded
+encode of each frame:
+
+| format | fps | KB/frame | frame gap p50 / p95 / max |
+| --- | --- | --- | --- |
+| png | 33.8 | 320 | 28 / 37 / 39 ms |
+| jpeg q70 | 60.0 | 139 | 17 / 18 / 20 ms |
+| **jpeg q85** | **57.8** | **185** | ≈ 17 ms |
+| jpeg q95 | 40.0 | 268 | |
+| jpeg q100 | 27.8 | 387 | |
+
+**The rate does not change from two vCPUs to eight**, which is what says it is
+one thread's encode rather than contention. `Page.captureScreenshot` in a loop
+is 10–12 fps in every format CDP offers — `png`, `png` with
+`optimizeForSpeed`, and lossless `webp` — so there is no fast lossless path to
+prefer: it is JPEG or it is half the frame rate.
+
+**Chromium's screencast JPEG is 4:2:0 at every quality.** The encoder
+hard-codes a sampling factor of `2x2,1x1,1x1`, so chroma is half resolution in
+both axes whatever quality is asked for and coloured text smears a little at
+100 as well as at 70. Quality only decides how much of the luma underneath it
+survives. At q70 the halo around blue link text is visible at 1:1. At q85 the
+difference from the PNG of the same frame needs 3× zoom to find. **The person
+looked at the comparison and chose 85.**
+
+### What reproduced when the branch was built, and what did not
+
+The table above is the measurement that decided this, and it is kept because
+it is the one that was argued from. What a later run on different hardware
+found is also kept, because the two disagree about the headline number and
+pretending otherwise would leave the next person confused.
+
+On 2026-09-23, in the same container with `--cpus=2`, at 1280×768, against a
+page of prose with a picture in it, scrolling every frame:
+
+| | frames a second | KB/frame | in the terminal, per frame |
+| --- | --- | --- | --- |
+| png, decoded by `tos-term` | 59.7–60.0 | 267 | 6.2–7.2 ms |
+| jpeg q85, decoded in the pane | 59.7–59.8 | 204 | 0.89–0.91 ms |
+
+The JPEG's 6.7 ms of decoding is not in that last column because it is not in
+the compositor: it happens in the pane's own process, where it competes with
+the engine for the same two vCPUs and still leaves the frame rate where it
+was.
+
+**The engine's PNG encoder kept up on that host.** The 33.8 fps in the table
+is a slower machine against a real ja.wikipedia page — more glyphs, more
+colour, a heavier encode — and it is a real number about a real machine tOS
+will run on. It is simply not a number every machine produces, which means
+*the format is the frame rate only where the encoder is the bottleneck*, and
+whether it is depends on the page and the CPU.
+
+What is a property of this code rather than of the host is the last column,
+and it is the same several-fold difference everywhere: **the compositor's
+per-frame cost falls seven- or eightfold**, because a PNG decode on the parse
+loop became a copy out of tmpfs. That is what
+`apps/browser/tests/engine.rs` asserts; the frame rates it prints and does not
+assert, for exactly this reason.
+
+So the decision stands on two legs rather than one. On a machine where the
+encoder binds, JPEG is 24 frames a second. On every machine, the decode leaves
+the thread that has to keep every other pane on the screen as well.
+
+### JPEG while it moves, PNG when it stops
+
+So the policy, which is what VNC and RDP do and for the same reason:
+
+- The screencast runs at `format=jpeg, quality=85`.
+- When no screencast frame has arrived for **250 ms** *and* no wheel notch or
+  key has arrived for **400 ms**, the tab in front is asked for one
+  `Page.captureScreenshot` in PNG, without waiting for it.
+- The reply is painted only if at most **one** screencast frame arrived while
+  it was being drawn — the one the screenshot takes of itself, below. Two or
+  more and it is thrown away and the tab stays in motion.
+- A painted still is credited with the moment its **reply** arrived, and a
+  frame older than what is on screen is dropped and is not counted as motion.
+- The next screencast frame that is newer than what is on screen resumes
+  motion.
+
+Text that somebody is reading is therefore always lossless. The lossy frames
+are only ever the ones scrolling past, which nobody reads. A page that never
+moves costs one still and then nothing at all — no frames, no polling, no
+repainting.
+
+#### What a slow engine did to the first version of this
+
+The first version had one interval (150 ms of frame quiet), credited the still
+with the moment it was asked for, and took it with a blocking call. On the
+host the format was chosen on that was invisible. On an installed tOS in
+VirtualBox — 2 vCPUs, no GPU, a 1280×770 pane — scrolling flashed. Measured
+there, through an ssh tunnel, against the VM's own engine:
+
+| | on the VM |
+| --- | --- |
+| `Page.captureScreenshot`, png, pane size | 66–98 ms |
+| `Page.captureScreenshot`, jpeg, pane size | 42–51 ms |
+| jpeg q85 screencast while scrolling | ≈ 42 fps, 24–27 ms gaps |
+
+`metadata.timestamp` was checked against `SystemTime` on that machine and the
+two are the same clock, so none of what follows is a clock bug.
+
+Three separate things were wrong, and all three are the same number being too
+small:
+
+1. **A still after every notch.** A wheel notch makes the engine animate for
+   about 100 ms and then stop; a hand on a wheel produces notches 150–300 ms
+   apart. 150 ms of frame quiet therefore fits in the gap *between two
+   notches*, so every notch ended in a PNG. The screen went JPEG frames, PNG,
+   JPEG frames, PNG, several times a second, and because Chromium's screencast
+   JPEG is 4:2:0 at every quality, on anything with colour in it — a gradient,
+   a picture, coloured text — that difference is visible at 1:1. **No interval
+   on the frames alone can fix this**: nothing about a gap in the frames says
+   whether it is the end of a scroll or the moment before the next notch. The
+   wheel says. So a still now waits for input quiet as well, and 400 ms is the
+   300 ms a hand leaves with room.
+2. **The loop blocked for 66–98 ms per still.** `Page.captureScreenshot` went
+   out with `Client::call`, which sits on the mailbox's condition variable
+   until the reply comes, so for the whole of the screenshot the program was
+   not reading the terminal. That is the "sometimes a key needs pressing
+   twice" report: the key was not lost, it was a tenth of a second late.
+   `Client::send` and `Client::take_reply` were added for this — the same
+   mailbox, the same wake pipe, the reply collected on whichever pass it has
+   arrived on — and the loop keeps polling, handling input and painting frames
+   while the still is in flight.
+3. **Request-time crediting fed the still back into itself.** This is the one
+   that was not guessed, and it turned up when the new rule — "any frame
+   between the request and the reply means the page moved" — was driven
+   against a real engine and *never produced a still at all*: 67 asked for, 67
+   thrown away, on a page nothing was happening to. Probed on
+   `chromium-shell`, at 1280×768, on an idle page:
+
+   ```text
+   idle, no screenshots          0 frames in 3 s
+   8 screenshots in a row        exactly 1 screencast frame each
+   that frame's timestamp        +4 ms from the request, 35–48 ms before the reply
+   fromSurface=false             the same
+   ```
+
+   **`Page.captureScreenshot` forces a capture of the page's surface, and the
+   screencast is watching that same surface, so every still photographs itself
+   into the screencast.** Credit the still with the instant it was *asked for*
+   and that shutter frame — stamped 4 ms later — counts as newer, so a JPEG of
+   the page was painted straight over the PNG that had just replaced it, which
+   cleared the tab's rest, which asked for another still 150 ms later, which
+   produced another shutter frame. **A loop, about four times a second, on
+   every page including a completely static one.** That is the flashing; the
+   wheel only made it more frequent.
+
+   So: one frame in the window is free (`motion::SHUTTER_FRAMES`), two or more
+   are the page moving; a painted still is credited with the moment its
+   **reply** arrived, the latest instant it could depict, which puts the
+   shutter frame on the stale side; and **a frame older than what is on screen
+   is not motion** — it shows a moment already drawn, so it does not clear the
+   rest and does not restart the rest timer. With all three, the loop has
+   nothing to stand on.
+
+**What the timestamps are for.** Ordering a frame that was in the mailbox
+before a still that *was* painted, arriving after it — the shutter frame is
+the common case of exactly that. `Page.screencastFrame` carries
+`metadata.timestamp` in seconds since the epoch and the engine is a child
+process on this machine, so it is the same clock this program reads.
+
+`apps/browser/src/motion.rs` is the policy and its tests, away from the engine,
+the terminal and the pane. `apps/browser/tests/engine.rs` pins the three
+claims against a real engine: that a still provokes exactly one screencast
+frame and where in its window that frame lands; that twelve wheel notches 50 ms
+apart produce no still until the animation they start has finished, and exactly
+one afterwards; and that a key sent while a still is in flight reaches the page
+before the still's reply is collected. The same three wheel runs assert the
+shape of the scrolling itself, frame by frame, from `metadata.scrollOffsetY` —
+driving the real animator thread rather than ticking the curve by hand, because
+the profiles are only worth anything if the ticks are timed the way the program
+times them.
+
+### The decoder, and a decision overturned
+
+None of this is available without a JPEG decoder, and `apps/preview/src/lib.rs`
+had refused to write one: 600–900 lines for a second format, in a repository
+whose one dependency is `libc`, with nothing in the tree wanting it. Every
+clause of that was true and the estimate was accurate — `tos_term::jpeg` is a
+little over nine hundred lines of code, written from T.81 the way `png.rs` and
+`inflate.rs` were, baseline only and refusing progressive by name.
+
+What changed is the other side of the ledger, and the point worth keeping is
+that it changed because somebody measured it. "Nothing else in the tree wants
+it" stopped being true the moment a pane-sized screencast was the first thing
+that did, and 24 frames a second is not an argument anybody was going to win
+with a line count. The preview program still does not show JPEGs — that is a
+follow-up with its own tests — but the reason it gave for never showing them
+is gone.
+
+The decoder is 8.1 ms for a 1280×770 4:2:0 frame at quality 85, in release,
+on the host the branch was built on, and 5.7 ms for a lighter page in the
+container: inside the 17 ms between two frames either way, on one core, in the
+pane's own process. `compositor/tos-term/examples/jpeg_decode.rs` is how that
+is measured and `compositor/tos-term/tests/jpeg.rs` is what says it is right —
+fixtures from ImageMagick with their pixels from Pillow, and a check against a
+real Chromium screencast frame that came out within three counts a channel of
+what libjpeg makes of the same file, at 37 dB against the PNG.
+
+### And the frames stopped being files
+
+The second half of the change, and the one that cost the compositor nothing:
+the client decodes and sends **raw pixels**, `f=24`, over the same `t=s` it
+used for the PNG. The terminal cannot read JPEG on the graphics path at all,
+so something had to decode; doing it in the pane rather than in the compositor
+deletes the per-frame PNG decode from the parse loop instead of moving it, and
+`f=24` is the protocol's own format, so nothing in `tos-term`, `tos-render` or
+the compositor changed. A still goes over as `f=32`, because that is what the
+PNG decoder produces and a still is one frame every 150 ms.
 
 ---
 
@@ -498,11 +980,18 @@ gives damage rectangles, and this document's engine choice is provisional
 until somebody has tried it. If it does not, that is worth knowing once and
 citing thereafter. Labels: `experiment`, `area:browser`.
 
-**Measure the compositor's PNG decode per frame on real hardware.** The
-engine's 60.2 fps is one end of a path nobody has timed. Decode, store and
-blit, on the machine tOS boots on, against a page that repaints fully — and
-against one that does not. This is the number that says whether the PoC is
-60 fps or 20. Labels: `experiment`, `area:graphics`.
+**~~Measure the compositor's PNG decode per frame on real hardware.~~**
+Answered by deleting it: the decode is in the pane now and the compositor
+takes pixels. What is still untimed is the rest of that path — the read out of
+`/dev/shm`, the copy into the store and the blit — on the machine tOS boots
+on, with a 2.9 MB frame rather than a 320 KB one. Labels: `experiment`,
+`area:graphics`.
+
+**Show JPEGs in `tos-preview`.** The decoder exists and the program that
+exists to prove the graphics path from the other end still refuses the format.
+It is the `--rgba` path with a decoder in front of it, plus a decision about
+what a progressive file the person double-clicked should say. Labels:
+`enhancement`, `area:applications`.
 
 **Send `a=f` frames bounded to the damaged rectangle.** Depends on the
 measurement above being taken first, because "only send what changed" is worth
