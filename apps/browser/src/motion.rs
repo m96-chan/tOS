@@ -135,12 +135,14 @@ pub const REST_AFTER: Duration = Duration::from_millis(250);
 /// it rather than one per notch.
 ///
 /// A notch is now the start of an animation this program drives rather than a
-/// single dispatched wheel event — a tick every 16 ms for as long as anything
-/// is owed, which outlives the notch that asked for it by about 180 ms after a
-/// flick. [`Motion::input`] is called on every one of those ticks as well as
-/// on every notch, so this interval is counted from the end of the
-/// *animation* rather than from the end of the hand. See
-/// [`crate::scroll`] and `docs/design/browser.md`.
+/// single dispatched wheel event — a tick every 16 ms until every curve has
+/// been delivered, which outlives the notch that asked for it by
+/// [`crate::scroll::D`]. [`Motion::input`] is given the moment of the last of
+/// those ticks as well as the moment of every notch, so this interval is
+/// counted from the end of the *animation* rather than from the end of the
+/// hand. The ticks happen on the animator's own thread and reach this state
+/// through [`crate::scroll::Wheel::activity`], which the loop reads once a
+/// pass. See [`crate::scroll`] and `docs/design/browser.md`.
 pub const INPUT_QUIET: Duration = Duration::from_millis(400);
 
 /// How many screencast frames a still produces just by being taken.
@@ -243,9 +245,21 @@ impl Motion {
         true
     }
 
-    /// The person turned the wheel or pressed a key. See [`INPUT_QUIET`].
+    /// The person turned the wheel or pressed a key, or a step of the wheel
+    /// animation went out. See [`INPUT_QUIET`].
+    ///
+    /// The later of what is known and what is being told, because two clocks
+    /// feed this. A key is stamped when the loop reads it; a tick of the
+    /// animation is stamped by [`crate::scroll::Wheel`]'s thread and read off
+    /// an atomic on whichever pass comes next, so it can arrive after a key
+    /// that happened later than it did. Taking the later of the two is what
+    /// stops a tick read a pass late from winding the quiet interval
+    /// backwards.
     pub fn input(&mut self, now: Instant) {
-        self.last_input = Some(now);
+        self.last_input = Some(match self.last_input {
+            Some(was) if was > now => was,
+            _ => now,
+        });
     }
 
     /// Whether the page has been quiet long enough to be worth a lossless

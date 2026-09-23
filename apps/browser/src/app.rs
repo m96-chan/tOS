@@ -18,14 +18,22 @@
 //! frames wins when they arrive out of order: that is [`crate::motion`],
 //! because it is a policy with a measurement behind it and it can be tested
 //! without an engine, a terminal or a pane.
+//!
+//! The other thing that is not here is the wheel's animation. It was, and a
+//! loop that spends nine milliseconds decoding a frame is a loop that sends a
+//! scroll's ticks in bursts, which the engine applies as jumps — so the ticks
+//! moved to a thread of their own in [`crate::scroll`]. What is left on this
+//! side is a notch handed over as it is read and a timestamp read back once a
+//! pass.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tos_platform::tty::{self, ReadOutcome};
 use tos_preview::fit::{Cells, Metrics};
 
-use crate::cdp::{Client, Event, Pending};
+use crate::cdp::{Client, Event, Notifier, Pending};
 use crate::engine::Engine;
 use crate::graphics::{Painter, Raw};
 use crate::input::{Input, Key, KeyAction, KeyInput, MouseInput, MouseKind, Parser};
@@ -33,7 +41,7 @@ use crate::json::Json;
 use crate::keys;
 use crate::motion::{self, Motion};
 use crate::screen::{self, Pane};
-use crate::scroll::Animator;
+use crate::scroll::{self, Step};
 use crate::tabs::{Outcome, Tab, Tabs};
 
 /// How long the engine gets to print its port.
@@ -49,24 +57,32 @@ const TARGET_TIMEOUT: Duration = Duration::from_secs(15);
 /// fractional scroll — so the number is a constant, and this is the one that
 /// makes a page move by about the same amount it would in a window.
 ///
-/// What a notch *is* on the wire is [`crate::scroll`]'s: it adds this much to
-/// a distance owed, and a tick every 16 ms sends a fraction of the remainder
-/// as one `Input.dispatchMouseEvent` of type `mouseWheel`. It used to be one
-/// `Input.synthesizeScrollGesture` per notch, animated by the engine; the
-/// measurements that took that out are in that module and in
-/// `docs/design/browser.md`.
+/// What a notch *is* on the wire is [`crate::scroll`]'s: it starts a curve of
+/// its own that delivers this much over [`crate::scroll::D`], and a tick every
+/// 16 ms — on that module's thread, not on this loop — sends what every
+/// running curve has not been given yet as one `Input.dispatchMouseEvent` of
+/// type `mouseWheel`. It used to be one `Input.synthesizeScrollGesture` per
+/// notch animated by the engine, and then one exponential approach to a
+/// distance owed; the measurements that took both of those out are in that
+/// module and in `docs/design/browser.md`.
 pub const WHEEL_PIXELS: f64 = 120.0;
 
 /// How close in time and space two presses have to be to be a double click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 const DOUBLE_CLICK_SLOP: i32 = 4;
 
-/// How long the loop waits for something to happen when nothing is owed.
+/// How long the loop waits for something to happen.
 ///
 /// Long enough that an idle browser costs twenty wake-ups a second, short
 /// enough that a held Escape is told apart from an escape sequence and a
-/// signal is noticed. A scroll shortens it to the next step of the animation;
-/// see [`crate::scroll::TICK`].
+/// signal is noticed.
+///
+/// A scroll used to shorten it to the next tick of the animation, and that is
+/// gone with the animation: the ticks are [`crate::scroll::Wheel`]'s thread's
+/// and it keeps its own clock. All this loop does with a scroll is read
+/// [`crate::scroll::Wheel::activity`] each pass, and the interval that reads
+/// it is 400 ms — see [`motion::INPUT_QUIET`] — so fifty is eight times as
+/// often as it needs to be.
 const POLL_MS: i32 = 50;
 
 /// The row the page starts on, one-based: the first is this program's.
@@ -151,8 +167,9 @@ struct Chrome {
     motion: Motion,
     /// The lossless still that has been asked for and not yet answered.
     still: Option<Still>,
-    /// The scroll this program is animating, and what is left of it.
-    scroll: Animator,
+    /// The thread that animates the wheel. This loop tells it what the hand
+    /// did and asks it what it has sent; it does the rest on its own clock.
+    wheel: scroll::Wheel,
     /// `Some` while the url is being typed.
     editing: Option<String>,
     /// Whether that url is still the one the page had, untouched.
@@ -257,7 +274,7 @@ fn drive(
         metrics,
         motion: Motion::new(Instant::now()),
         still: None,
-        scroll: Animator::default(),
+        wheel: scroll::Wheel::start(),
         editing: None,
         editing_whole: false,
     };
@@ -299,11 +316,16 @@ fn drive(
             }
             // The screen was cleared and the page is a different size, so
             // nothing that was captured before this is worth painting and the
-            // still that reflows the page is worth asking for. A scroll that
-            // was owed goes with it: the point it would be sent at was a point
-            // in a viewport that no longer exists.
+            // still that reflows the page is worth asking for.
             chrome.motion.reset(Instant::now());
-            chrome.scroll.forget();
+            // A scroll that was running is not dropped, though. A hand is
+            // still on the wheel and a pane changing size is no reason for the
+            // page to stop dead halfway through a flick; what a resize really
+            // invalidates is the *point* the events are sent at, which may now
+            // be off the page, so that is brought back inside it and the
+            // notches carry on. See `docs/design/browser.md`.
+            let (width, height) = page_pixels(chrome.metrics);
+            chrome.wheel.resized((width as i32, height as i32));
             redraw_row(pane, tabs, &chrome)?;
         }
 
@@ -322,16 +344,7 @@ fn drive(
         let wake = tabs.active().map(|tab| tab.connection.wake_fd());
         let mut watching = vec![pane.input_fd(), browser.wake_fd()];
         watching.extend(wake);
-        // A pass has to happen when the next step of a scroll is due, or the
-        // page misses a frame of it; the rest of the time this is the interval
-        // it has always been. Rounded up, because a `poll` that comes back
-        // just before the tick it was waiting for is a `poll` that goes round
-        // again for nothing.
-        let timeout = match chrome.scroll.until(Instant::now()) {
-            Some(left) => (left.as_micros().div_ceil(1000) as i32).min(POLL_MS),
-            None => POLL_MS,
-        };
-        let ready = tty::poll_readable(&watching, timeout)
+        let ready = tty::poll_readable(&watching, POLL_MS)
             .map_err(|e| format!("cannot wait for input: {e}"))?;
 
         if ready.contains(&pane.input_fd()) {
@@ -355,10 +368,13 @@ fn drive(
             }
         }
 
-        // Straight after the terminal and before anything that might take a
-        // while: a notch read on this pass moves the page on this pass, and a
-        // step that is due is a step the page is waiting for.
-        animate_scroll(tabs, &mut chrome);
+        // What the animator thread has been doing while this loop was busy.
+        // Nothing here drives it — it has its own clock and its own socket —
+        // but every tick it sent is a page that moved, and a page that moved
+        // is not a page to photograph. See [`motion::INPUT_QUIET`].
+        if let Some(at) = chrome.wheel.activity() {
+            chrome.motion.input(at);
+        }
 
         if ready.contains(&browser.wake_fd()) {
             browser.drain_wake();
@@ -538,8 +554,9 @@ fn switched(
     }
     // What the last tab was owed is not owed to this one, and there is
     // nothing in flight to disown: the animation is this program's, so
-    // forgetting it is the whole of stopping it.
-    chrome.scroll.forget();
+    // forgetting it is the whole of stopping it. It also lets go of that
+    // tab's socket, which a tab that is closing needs.
+    chrome.wheel.forget();
     if let Some(was) = &was {
         deactivate(tabs, was);
     }
@@ -1018,58 +1035,31 @@ fn request_still(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
     }
 }
 
-/// One wheel notch: a distance added to what the page is owed.
+/// Where a step of the animation goes: one `mouseWheel` on the tab that was
+/// being scrolled, put on the wire by the animator's own thread.
 ///
-/// Nothing is sent from here. The notch goes on [`crate::scroll`]'s pile and
-/// [`animate_scroll`] pays it off a tick at a time, which is what makes a
-/// second notch in the middle of the first extend the animation rather than
-/// queue behind it.
+/// The event goes out with [`crate::cdp::Notifier::notify`], which is what an
+/// acknowledged screencast frame uses: a `mouseWheel` has nothing to say back,
+/// and fourteen round trips per notch would be fourteen replies to collect and
+/// a `Pending` to carry for each of them. Chromium answers a notification all
+/// the same, and those answers cost nothing: a notification's id is never
+/// registered with the mailbox, so the reader thread drops its reply where it
+/// reads it.
 ///
-/// The sign is the page's: `deltaY` of +120 on a `mouseWheel` leaves
-/// `window.scrollY` at 120, and `deltaX` of +120 leaves `scrollX` at 120 —
-/// checked against the engine rather than read off the documentation, and the
-/// opposite of what `Input.synthesizeScrollGesture`'s `yDistance` wanted.
-fn scroll(chrome: &mut Chrome, report: &MouseInput) {
-    let pixels = chrome.parser.pixel_coordinates();
-    let (x, y) = crate::input::page_point(report, pixels, chrome.metrics.cell, 1);
-    if y < 0 {
-        // The status row is this program's, and turning the wheel over it is
-        // not the page's business.
-        return;
+/// This is the only part of the animation that knows what CDP is, which is why
+/// it is here rather than in [`crate::scroll`] — that module is arithmetic on
+/// a distance and a clock, and it stays testable without an engine.
+pub struct Wire(Notifier);
+
+impl Wire {
+    pub fn new(notifier: Notifier) -> Wire {
+        Wire(notifier)
     }
-    let distance = (
-        report.wheel.0 as f64 * WHEEL_PIXELS,
-        report.wheel.1 as f64 * WHEEL_PIXELS,
-    );
-    chrome.scroll.notch((x, y), distance, Instant::now());
 }
 
-/// Send whichever steps of the scroll animation have come due.
-///
-/// Called once a pass, with the loop's `poll` timeout shortened to the next
-/// tick so that a pass happens when one is due — see [`crate::scroll::TICK`].
-/// More than one can be due at a time, when a pass was held up by a slow
-/// paint; sending them together is what keeps the animation on the wall clock,
-/// and the engine folds them into the frame it was going to draw anyway.
-///
-/// The event goes out with [`Client::notify`], which is what an acknowledged
-/// screencast frame uses: a `mouseWheel` has nothing to say back, and eighteen
-/// round trips per notch would be eighteen replies to collect and a `Pending`
-/// to carry for each of them. Chromium answers a notification all the same,
-/// and those answers cost nothing: a notification's id is never registered
-/// with the mailbox, so the reader thread drops its reply where it reads it.
-///
-/// Every step that goes out is input in [`crate::motion`]'s sense, so the
-/// quiet interval that earns a lossless still runs from the last tick of the
-/// animation rather than from the last notch of the hand: a still taken in the
-/// middle of a scroll is a picture of a page that has already moved on.
-fn animate_scroll(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
-    while let Some(step) = chrome.scroll.tick(Instant::now()) {
-        let Some(tab) = tabs.active_mut() else {
-            chrome.scroll.forget();
-            return;
-        };
-        let sent = tab.connection.notify(
+impl scroll::Dispatch for Wire {
+    fn send(&self, step: Step) -> Result<(), String> {
+        self.0.notify(
             "Input.dispatchMouseEvent",
             Json::object(vec![
                 ("type", Json::string("mouseWheel")),
@@ -1081,16 +1071,43 @@ fn animate_scroll(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
                 ("button", Json::string("none")),
                 ("buttons", Json::number(0)),
             ]),
-        );
-        if sent.is_err() {
-            // The socket is gone, which everything that cares hears on the
-            // next pass. What must not happen is a distance owed to a page
-            // that cannot be sent to, because the loop would tick for ever.
-            chrome.scroll.forget();
-            return;
-        }
-        chrome.motion.input(Instant::now());
+        )
     }
+}
+
+/// One wheel notch: a curve handed to the animator thread.
+///
+/// Nothing is sent from here and nothing is timed from here. The notch starts
+/// a curve of its own beside whatever is already running, and the thread pays
+/// all of them out a tick at a time — which is what makes a second notch in
+/// the middle of the first add to the movement rather than restart it, and
+/// what keeps the ticks off this loop's schedule.
+///
+/// The sign is the page's: `deltaY` of +120 on a `mouseWheel` leaves
+/// `window.scrollY` at 120, and `deltaX` of +120 leaves `scrollX` at 120 —
+/// checked against the engine rather than read off the documentation, and the
+/// opposite of what `Input.synthesizeScrollGesture`'s `yDistance` wanted.
+fn scroll(tabs: &Tabs<Client>, chrome: &Chrome, report: &MouseInput) {
+    let pixels = chrome.parser.pixel_coordinates();
+    let (x, y) = crate::input::page_point(report, pixels, chrome.metrics.cell, 1);
+    if y < 0 {
+        // The status row is this program's, and turning the wheel over it is
+        // not the page's business.
+        return;
+    }
+    let Some(tab) = tabs.active() else {
+        return;
+    };
+    let distance = (
+        report.wheel.0 as f64 * WHEEL_PIXELS,
+        report.wheel.1 as f64 * WHEEL_PIXELS,
+    );
+    chrome.wheel.notch(
+        &tab.target,
+        Arc::new(Wire::new(tab.connection.notifier())),
+        (x, y),
+        distance,
+    );
 }
 
 /// Handle one thing the terminal said. `false` means quit.
@@ -1185,9 +1202,9 @@ fn handle_input(
             // never got its lossless picture at all.
             if report.kind == MouseKind::Wheel {
                 chrome.motion.input(Instant::now());
-                // Not an event but a distance owed: the animation that pays it
-                // off is [`animate_scroll`], on the next line of the loop.
-                scroll(chrome, &report);
+                // Not an event but a curve: what puts it on the wire is
+                // [`crate::scroll::Wheel`]'s thread, on its own clock.
+                scroll(tabs, chrome, &report);
                 return Ok(true);
             }
             let metrics = chrome.metrics;
@@ -1489,9 +1506,9 @@ fn send_mouse(
         }
         MouseKind::Move => ("mouseMoved", Vec::new()),
         // A wheel notch never reaches here. One dispatched `mouseWheel` of
-        // 120 pixels moves the page in a single frame, so a notch is a
-        // distance owed and an animation of about eighteen smaller events
-        // instead. See [`scroll`] and [`crate::scroll`].
+        // 120 pixels moves the page in a single frame, so a notch is a curve
+        // and about fourteen smaller events instead. See [`scroll`] and
+        // [`crate::scroll`].
         MouseKind::Wheel => return,
     };
 

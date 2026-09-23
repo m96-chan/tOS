@@ -1,89 +1,109 @@
-//! The animation a wheel notch starts, and the ticks that carry it out.
+//! The animation a wheel notch starts, the ticks that carry it out, and the
+//! thread that keeps them on time.
 //!
 //! A terminal mouse reports notches: discrete, instantaneous, with no
 //! acceleration and no fractional scroll. A page expects a wheel. Everything
-//! between the two is here, and none of it touches a socket — this module is
-//! arithmetic on a distance and a clock, so the rule can be read and tested
-//! without an engine, a terminal or a pane.
+//! between the two is here.
 //!
-//! The rule is the one a browser in a window follows. A notch does not move
-//! the page; it adds to a **distance still owed**, and an animation that is
-//! already running simply gets a further target. Every [`TICK`] a fraction
-//! [`K`] of what is owed goes out as one `mouseWheel` event, so the page eases
-//! towards where the hand asked for and a notch that arrives meanwhile makes
-//! the next step *larger* rather than starting a new animation. Nothing is
-//! ever in flight, nothing waits for a reply, and there is no state to get
-//! wrong when a second notch lands in the middle of the first.
+//! Two things live in this file and they are deliberately separable.
+//! [`Animator`] is the curve — arithmetic on a distance and a clock, no
+//! socket, no thread, testable without an engine or a terminal. [`Wheel`] is
+//! the thread that drives it: its own clock, its own `mouseWheel` events, and
+//! a main loop that only ever says "a notch, here, on this tab" and "forget
+//! it".
+//!
+//! ## The rule
+//!
+//! **Every notch is its own curve, and the curves are added together.** A
+//! notch of 120 pixels is delivered over [`D`] following an ease-out — fast
+//! at the start, slowing to nothing at the end — and a notch that arrives
+//! while others are still running neither resets them nor waits for them: it
+//! starts a curve of its own beside them, and each [`TICK`] every curve is
+//! asked how far it should have got by now. What goes on the wire is the sum
+//! of what they have not been given yet.
+//!
+//! That the curves are read from the wall clock rather than accumulated is the
+//! whole of why this can live on a thread of its own and why a late tick costs
+//! nothing: a notch that should have delivered 71 pixels by now delivers 71
+//! whether it was asked at the right moment, four milliseconds late, or twice
+//! in the same millisecond. There is no distance in flight to lose and no
+//! backlog to replay.
 //!
 //! ## What this replaced, and why
 //!
-//! `Input.synthesizeScrollGesture` — the engine animating a distance itself —
-//! was measured against `chromium-shell` 153 in docker on two vCPUs at
-//! 1280×770 on ja.wikipedia, as the scroll offset each screencast frame
-//! carried. Five notches 100 ms apart, one gesture per coalesced pile:
+//! First `Input.synthesizeScrollGesture` — the engine animating a distance
+//! itself — which pulsed because a gesture is an animation with its own
+//! beginning and end and the hand's notches do not fall on them; there is one
+//! dead stop per pile whatever the pile is worth. `docs/design/browser.md`
+//! keeps the measurements.
+//!
+//! Then an **exponential approach**: one distance owed, and each tick sent a
+//! fraction `K` = 0.3 of the remainder with a floor of 4 pixels. That is the
+//! shape a lot of browsers use and it was measured the same way as everything
+//! else here — the scroll offset each screencast frame carries, against
+//! `chromium-shell` in docker on two vCPUs at 1280×770. One notch on its own
+//! was good: `36 25 18 12 9 6 4 4 6`, nine frames and over. A steady hand — a
+//! notch every 100 ms, which is what a person actually does — was not:
 //!
 //! ```text
-//! 12 12 12 11 12 9 [0] 12 23 23 24 23 18 [0] 10 12 23 25 22 …
+//! 25 18 12 9 6 4 | 39 27 19 13 9 7 | 41 28 20 14 10 | 43 30 21 15 …
 //! ```
 //!
-//! Every gesture starts from a standstill and ends at one, because a gesture
-//! is an animation with its own beginning and end and the hand's notches do
-//! not line up with them. The person's word for what that feels like was
-//! "ドッ、ドッ" — pulsing — and ten notches 60 ms apart were worse, because the
-//! piles get bigger: `… 48 70 25 44 [0] 45 46 47 … 47 [116] 12 [0] 5 5 13 17 …`
-//! is two dead stops, a 116-pixel jump and a slow tail.
+//! Every notch is delivered front-loaded, because the fraction is taken of
+//! everything owed at once, so the page lurches where a notch lands and creeps
+//! where one does not: a tenfold swing inside every notch, about ten times a
+//! second. On the VM the person's word for it was that the page "shakes up and
+//! down". No value of `K` fixes it — the swing *is* the exponential, and a
+//! smaller `K` only makes the lurches further apart. So the exponential is
+//! gone, and what replaced it is a curve per notch.
 //!
-//! No amount of tuning the gesture fixes that. The stops are not a frame rate
-//! or a speed; they are the seams between one engine animation and the next,
-//! and there is one seam per pile whatever the pile is worth. So the animation
-//! moved to this side of the socket, where there is only ever *one* of it and
-//! a notch extends it instead of queueing behind it.
-//!
-//! ## What the animator gives, measured the same way
+//! ## What the additive curve gives, measured the same way
 //!
 //! Same engine, same page, same size, read off `metadata.scrollOffsetY` frame
-//! by frame — this is `apps/browser/tests/engine.rs` with `--nocapture`:
+//! by frame. This is `apps/browser/tests/engine.rs`, which asserts the shape
+//! of all three and prints the numbers with `--nocapture`:
 //!
 //! ```text
-//! one notch     36 25 18 12 9 6 4 4 6
-//! five @100 ms  36 25 18 12 9 6 4 39 27 19 13 9 7 41 28 20 14 10 7 41 29 20
-//!               14 10 7 5 39 28 [0] 33 9 7 5 4 7
-//! ten @60 ms    36 25 18 12 45 31 22 15 47 33 23 16 47 33 23 16 47 33 [0] 23
-//!               52 37 26 66 34 24 17 48 33 23 16 47 33 23 16 [0] 81 39 11 8
-//!               6 4 4 5
+//! one notch     17 16 14 13 12 10 9 8 7 5 4 3 2
+//! steady hand   17 16 14 13 12 10 | 22 24 21 19 16 14 | 20 25 22 19 17 14 |
+//!               15 26 23 20 18 15 | 12 25 44 18 [0] 29 | 21 24 22 19 16 14 |
+//!               11 9 7 6 5 3 2 1
+//! fast hand     17 16 14 27 27 25 35 36 32 37 41 35 37 42 36 35 42 [0] 37 32
+//!               44 38 33 43 39 74 40 34 39 41 35 [0] 79 36 36 42 37 32 27 22
+//!               18 15 11 9 6 4 3 1
 //! ```
 //!
-//! One notch is nine frames over 132 to 143 ms and it is over. Five notches
-//! are one animation whose step *grows* where each notch lands — 4 then 39, 7
-//! then 41 — and it is done 173 to 175 ms after the hand comes off. Ten
-//! notches 60 ms apart never fall below 11 pixels a frame while the hand is on
-//! the wheel, reach 81 in the middle, and are done 181 to 198 ms after the
-//! last one. (Two runs each; what moves between them is the engine's frame
-//! cadence rather than the ticks, which are the same numbers every time.)
+//! The steady hand is the case the exponential lost. A notch every 100 ms
+//! swings between 12 and 26 pixels a frame over the middle of the run — 2.2
+//! times, against the exponential's ten — and the seam where one notch's curve
+//! takes over from the last one's is not visible in the numbers, let alone on
+//! a screen. The `44` and the `[0]` beside it are one frame that carried two
+//! ticks and one that carried none, which is the screencast's 16.7 ms cadence
+//! beating against the 16 ms tick and not the curve; on the machine this is
+//! really for, where a frame is 24 to 27 ms, every frame holds a tick or two
+//! and it cannot happen.
 //!
-//! The `[0]`s are not seams. They are single frames in which the engine had no
-//! new delta to apply, because on that host a screencast frame is 16.7 ms and
-//! a tick is 16, so twice a second a frame falls in a gap and the next one
-//! carries two ticks; the page never stands still for more than 40 ms and
-//! never for two frames running. On the machine this is really for — 24 to
-//! 27 ms a frame — every frame holds a tick or two and they cannot happen at
-//! all. The gesture's `[0]`s were one per pile, always at the same place, and
-//! always followed by a step that started over from nothing.
+//! The fast hand — twelve notches 50 ms apart, quicker than anybody really
+//! rolls — never stalls for two frames running and stops 268 ms after the last
+//! notch. One notch on its own is fourteen frames over 227 ms, which is longer
+//! than the exponential's 140 and is the price: a curve that ends gently ends
+//! later than one that is cut off by a floor.
 //!
-//! Nothing anywhere caps a step, which is the other half of what the person
-//! reported: the scrolling had "an upper limit on speed, unlike a normal
-//! browser". A tick sends [`K`] of whatever is owed, so ten notches owe more
-//! and therefore move further, and a pile is paid off *faster* rather than
-//! *longer* — eleven ticks are 96% of any amount at all, which is why "when I
-//! stop the wheel I want it to stop" holds for a flick as well as for a notch.
+//! Starved of a core — the same three at `--cpus=1` rather than 2 — the
+//! numbers barely move: `17 16 14 13 12 10 9 8 7 5 4 3 2` again for a notch,
+//! 10 to 26 for the steady hand, 241 ms to settle after the fast one. That is
+//! the thread doing its job. On the loop, where this used to be, a single core
+//! is exactly where the ticks piled up.
 //!
-//! The page sees ordinary `wheel` events — nine for a notch on its own, and
-//! about seven per notch when they run together — so a site that listens for
-//! them, or calls `preventDefault` on them, behaves as it would in a window,
-//! and a notch over an inner scroller scrolls that scroller. `mouseWheel`
-//! deltas are applied by the engine on the frame after the event (measured:
-//! one event, one frame, about 12 ms), so the frames follow the ticks.
+//! The page sees ordinary `wheel` events — about fourteen for a notch on its
+//! own — so a site that listens for them, or calls `preventDefault` on them,
+//! behaves as it would in a window, and a notch over an inner scroller scrolls
+//! that scroller. `mouseWheel` deltas are applied by the engine on the frame
+//! after the event (measured: one event, one frame, about 12 ms), so the
+//! frames follow the ticks.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// How long one step of the animation lasts.
@@ -97,63 +117,63 @@ use std::time::{Duration, Instant};
 /// not move.
 pub const TICK: Duration = Duration::from_millis(16);
 
-/// The fraction of what is still owed that one tick sends.
+/// How long one notch takes to be delivered in full.
 ///
-/// This is the whole of the feel, and the profiles it gives against
-/// `chromium-shell` 153 on two vCPUs at 1280×770 are at the top of this file.
-/// What they come to, with [`MIN_STEP`] at 4 pixels:
+/// This is the whole of the feel. Measured against `chromium-shell` in docker
+/// on two vCPUs at 1280×770, as the scroll offset each screencast frame
+/// carries — a steady hand is a notch every 100 ms, which is what a person
+/// rolling a wheel produces:
 ///
-/// | `K` | one notch | five @100 ms | ten @60 ms | tail of floor steps |
-/// |------|-------------|--------------|--------------|-------------------|
-/// | 0.22 | 193 ms | +222 ms | +245 ms | 4 |
-/// | 0.25 | 166 ms | +207 ms | +216 ms | 4 |
-/// | 0.3  | 132–143 ms | +173–175 ms | +181–198 ms | 2 |
+/// | `D` | one notch settles in | a steady hand swings by |
+/// |--------|----------------------|-------------------------|
+/// | 150 ms | ~200 ms | 34 down to 8 — it pulses again |
+/// | 220 ms | 227 ms | 2.2× (12 to 26) |
+/// | 250 ms | ~290 ms | 2× (13 to 27) |
+/// | 300 ms | ~340 ms | steadiest of the four |
 ///
-/// The middle two columns are how long after the last notch the page was still
-/// moving, which is the number the person's second report is about: "when I
-/// stop the wheel I want it to stop." The deadline is 250 ms. 0.22 misses it
-/// by five milliseconds on a host with two spare cores and nothing else to do,
-/// which is no margin at all; 0.25 has 34; 0.3 has 52, and it is also the one
-/// that shortens the tail, because four minimum-sized steps at the end of an
-/// animation is the creeping a floor was supposed to remove.
+/// The trade is between how steady a hand on the wheel looks and how long a
+/// single notch takes, and what sets it is how much the curves overlap: at
+/// 100 ms between notches, `D` = 220 keeps two and a bit curves running at any
+/// moment, which is enough to fill the gaps between them. Below about 150 they
+/// stop overlapping at all and the pulsing comes straight back in a new shape
+/// — the last notch's curve is finished before the next one arrives, which is
+/// a dead stop by another route. Above 300 a single notch stops feeling like a
+/// notch: a third of a second to move 120 pixels is a page that lags the hand.
 ///
-/// The cost of 0.3 is that one notch on its own is 140 ms rather than the 180
-/// to 260 this was aimed at. That band came from a run with a 1-pixel floor,
-/// where the length *was* the tail: at 0.22 with no floor a notch took
-/// sixteen frames and 340 ms, the last six of them a pixel each. With a real
-/// floor the animation is nine frames that move 36, 25, 18, 12, 9, 6, 4, 4 and
-/// 6 pixels, which nobody could mistake for a jump — and a browser's own wheel
-/// animation in a window is about the same length.
-pub const K: f64 = 0.3;
+/// 220 is the shortest that still overlaps, which is the side to be on: it is
+/// the only one of the four where nothing is being traded away. The measured
+/// profiles, at two vCPUs and at one, are at the top of this file.
+pub const D: Duration = Duration::from_millis(220);
 
-/// The smallest step a tick sends, in CSS pixels.
+/// How long the thread sleeps when there is nothing to animate.
 ///
-/// A geometric series never arrives, so something has to end it. Without a
-/// floor, one notch at [`K`] spends its last third of a second moving a pixel
-/// at a time — measured at 0.22 with no floor: sixteen frames, the last six of
-/// them 1 pixel, about 340 ms of visible creeping after the page had for all
-/// practical purposes arrived.
-///
-/// Four pixels is the smallest step that still reads as movement rather than
-/// as a twitch at a pane's size, and at [`K`] it turns the tail into exactly
-/// two of them: the measured end of a notch is `… 6 4 4 6`. A tick that would
-/// leave less than a floor behind takes the remainder instead, which is where
-/// that last 6 comes from — the animation never spends a whole tick on a
-/// fraction of a pixel, and the last frame is a real step rather than a
-/// rounding error.
-pub const MIN_STEP: f64 = 4.0;
+/// A notch wakes it, so this is only how long it takes to notice that it has
+/// been told to stop — which happens once, at the end of the program.
+const IDLE: Duration = Duration::from_millis(250);
 
-/// How far behind its own schedule the animation may fall and still be caught
-/// up on.
+/// How far one notch has been delivered, as a fraction, `x` of the way through
+/// [`D`].
 ///
-/// Ticks are counted on the wall clock rather than from whenever the loop got
-/// round to the last one: a pass held up by a slow paint fires the ticks it
-/// missed, so nine ticks span 128 ms whatever the loop was doing, and that is
-/// what "it stops when I stop" rests on. Beyond a tenth of a second the
-/// program was not running at all — a pane that was not scheduled, a still
-/// that went wrong — and replaying twenty ticks at once would be the jump this
-/// module exists to remove, so the schedule restarts from now instead.
-const CATCH_UP: Duration = Duration::from_millis(100);
+/// Ease-out squared: `1 − (1 − x)²`. Its speed is `2(1 − x)`, so a notch
+/// starts at twice its average pace and slows steadily to a stop — which is
+/// what makes the end of a scroll a settling rather than a cut. Nothing here
+/// is tuned; the tuning is [`D`].
+fn ease(x: f64) -> f64 {
+    let x = x.clamp(0.0, 1.0);
+    1.0 - (1.0 - x) * (1.0 - x)
+}
+
+/// One notch of one axis, and how much of it has gone out.
+#[derive(Debug, Clone, Copy)]
+struct Notch {
+    /// When the wheel was turned. The curve is read from this and the clock,
+    /// never from the last tick, so a missed tick loses nothing.
+    started_at: Instant,
+    /// What this notch is worth, in CSS pixels, signed.
+    amount: f64,
+    /// How much of `amount` has already been sent.
+    delivered: f64,
+}
 
 /// One step of the animation: where to send it, and how far.
 ///
@@ -169,8 +189,21 @@ pub struct Step {
     pub delta: (f64, f64),
 }
 
-/// One page's scrolling: what is owed, where to send it, and when the next
-/// step is due.
+/// Where a step goes.
+///
+/// A trait rather than a connection, because this module has no business
+/// knowing what CDP is and because the thread underneath it is worth testing
+/// without an engine: a fake that records when it was called is all a test of
+/// the clock needs. `apps/browser/src/app.rs` has the one implementation that
+/// is not a fake.
+pub trait Dispatch: Send + Sync {
+    /// Put one step on the wire. An error is a socket that has gone, and it
+    /// ends the animation rather than being retried.
+    fn send(&self, step: Step) -> Result<(), String>;
+}
+
+/// One page's scrolling: the notches still being delivered, where to send
+/// them, and when the next step is due.
 ///
 /// One of these rather than one per tab, for the reason [`crate::motion`] is
 /// one: only the tab in front is being scrolled, and a switch drops what the
@@ -178,113 +211,359 @@ pub struct Step {
 /// nobody is looking at.
 #[derive(Debug, Default)]
 pub struct Animator {
-    /// What is still to be scrolled, in CSS pixels: x then y.
-    owed: (f64, f64),
+    /// The notches still being delivered, one list per axis. A notch is
+    /// appended and nothing else is touched — that is the whole of what makes
+    /// a second notch add to the movement instead of restarting it.
+    x: Vec<Notch>,
+    y: Vec<Notch>,
     /// Where the pointer was for the most recent notch.
     ///
     /// The animation is sent where the wheel was last turned rather than where
     /// it was first turned, because a pointer that has moved onto a different
     /// scroller is a person who means the one they are pointing at now.
     at: (i32, i32),
-    /// When the next tick is due. `None` is nothing owed and nothing to do.
+    /// When the next tick is due. `None` is nothing running and nothing to do.
     next: Option<Instant>,
 }
 
 impl Animator {
     /// A notch, as the distance it is worth on each axis.
     ///
-    /// It extends the target rather than replacing it, and it does not restart
-    /// the clock: an animation that is already running keeps its tick times
-    /// and simply has more to pay, so the next step is *larger* than the last
-    /// instead of beginning again at the top of a new curve. That is the
-    /// difference between momentum and pulsing.
+    /// It appends a curve and resets nothing: the notches already running keep
+    /// their own start times and their own remaining distance, and this one is
+    /// simply added to the sum. An axis given zero is given no curve, so a
+    /// vertical notch never puts a horizontal one in the list.
     pub fn notch(&mut self, at: (i32, i32), distance: (f64, f64), now: Instant) {
         self.at = at;
-        self.owed.0 += distance.0;
-        self.owed.1 += distance.1;
-        if self.owed == (0.0, 0.0) {
-            // Two notches that cancel, which is a hand changing its mind.
-            self.next = None;
-            return;
+        for (axis, amount) in [(&mut self.x, distance.0), (&mut self.y, distance.1)] {
+            if amount == 0.0 {
+                continue;
+            }
+            axis.push(Notch {
+                started_at: now,
+                amount,
+                delivered: 0.0,
+            });
         }
-        if self.next.is_none() {
-            // Nothing was animating, so the first step is due at once: a wheel
-            // that waited a frame before moving would be a wheel with lag.
-            self.next = Some(now);
+        if self.next.is_none() && !(self.x.is_empty() && self.y.is_empty()) {
+            // A tick from now rather than at once: at the instant a notch
+            // arrives its curve has delivered nothing, so a step taken here
+            // would be a step of zero pixels.
+            self.next = Some(now + TICK);
         }
     }
 
-    /// How long until the next step is due, if anything is owed.
+    /// How long until the next step is due, if anything is running.
     ///
-    /// This is what the loop's `poll` waits for: a tick that is late is a
-    /// frame in which the page did not move.
+    /// This is what the thread sleeps for. `Some(ZERO)` is "now".
     pub fn until(&self, now: Instant) -> Option<Duration> {
         self.next.map(|next| next.saturating_duration_since(now))
     }
 
     /// The step to send now, if one is due.
     ///
-    /// Called until it says `None`, which is both "not yet" and "nothing left"
-    /// — the caller has no decision to make either way.
+    /// `None` is "not yet", "nothing left", and also "every curve happens to
+    /// be exactly where it was a moment ago" — the caller has no decision to
+    /// make between them, because all three mean there is nothing to put on
+    /// the wire.
     pub fn tick(&mut self, now: Instant) -> Option<Step> {
         let next = self.next?;
         if now < next {
             return None;
         }
-        let delta = (step(self.owed.0), step(self.owed.1));
-        self.owed.0 -= delta.0;
-        self.owed.1 -= delta.1;
-        self.next = if self.owed == (0.0, 0.0) {
+        let delta = (deliver(&mut self.x, now), deliver(&mut self.y, now));
+        self.next = if self.x.is_empty() && self.y.is_empty() {
             None
-        } else if now.saturating_duration_since(next) > CATCH_UP {
+        } else if now.saturating_duration_since(next) > TICK {
+            // More than a whole tick late: the thread was not scheduled. The
+            // curves are read from the clock, so nothing was lost and there is
+            // nothing to replay; the schedule simply starts again from here.
             Some(now + TICK)
         } else {
             Some(next + TICK)
         };
         if delta == (0.0, 0.0) {
-            // Nothing was owed on either axis, which `notch` does not allow
-            // and a caller asking again after the end would otherwise get.
-            self.next = None;
             return None;
         }
         Some(Step { at: self.at, delta })
     }
 
-    /// Nothing is owed any more: the tab in front changed, the pane was
-    /// resized, or the event could not be sent.
+    /// Nothing is being delivered any more: the tab in front changed, the tab
+    /// was closed, or the event could not be sent.
     pub fn forget(&mut self) {
-        self.owed = (0.0, 0.0);
+        self.x.clear();
+        self.y.clear();
         self.next = None;
     }
 
-    /// What is still to be scrolled. For the tests and the status of the loop.
+    /// The pane changed size, so the point the animation is sent at may be
+    /// outside the page.
+    ///
+    /// The notches are kept — a person's hand is still on the wheel and a
+    /// resize is not a reason for the page to stop dead — and only the point
+    /// is brought back inside the new viewport. See `docs/design/browser.md`.
+    pub fn resized(&mut self, page: (i32, i32)) {
+        self.at = (
+            self.at.0.clamp(0, (page.0 - 1).max(0)),
+            self.at.1.clamp(0, (page.1 - 1).max(0)),
+        );
+    }
+
+    /// What is still to be delivered. For the tests and the status of the
+    /// loop.
     pub fn owed(&self) -> (f64, f64) {
-        self.owed
+        (owed(&self.x), owed(&self.y))
+    }
+
+    /// Where the next step would be sent.
+    pub fn at(&self) -> (i32, i32) {
+        self.at
     }
 }
 
-/// How far one tick moves an axis that is owed `owed`.
+/// How much one axis owes.
+fn owed(notches: &[Notch]) -> f64 {
+    notches
+        .iter()
+        .map(|notch| notch.amount - notch.delivered)
+        .sum()
+}
+
+/// Ask every notch of one axis where it should have got to by `now`, and
+/// return what none of them has been given yet. Notches that have arrived are
+/// dropped.
+fn deliver(notches: &mut Vec<Notch>, now: Instant) -> f64 {
+    let whole = D.as_secs_f64();
+    let mut step = 0.0;
+    notches.retain_mut(|notch| {
+        let x = now
+            .saturating_duration_since(notch.started_at)
+            .as_secs_f64()
+            / whole;
+        let want = if x >= 1.0 {
+            // Exactly the amount, so that what a notch delivers in the end is
+            // the notch and not the notch plus a rounding error.
+            notch.amount
+        } else {
+            notch.amount * ease(x)
+        };
+        step += want - notch.delivered;
+        notch.delivered = want;
+        x < 1.0
+    });
+    step
+}
+
+/// The animator on a thread of its own.
 ///
-/// Three rules in one expression: a fraction [`K`] of what is left, never less
-/// than [`MIN_STEP`], and never more than what is left. The third is also the
-/// end: a step that would leave behind less than a floor takes the remainder,
-/// so the animation finishes on a real step rather than spending one more tick
-/// on a hundredth of a pixel.
+/// # Why it is not on the loop
 ///
-/// There is deliberately no fourth rule. Nothing caps the step from above, so
-/// a hand that owes a thousand pixels moves three hundred on the next tick —
-/// a ceiling there is what makes a scroll feel like it has a speed limit,
-/// which is the one thing a wheel in a window does not have.
-fn step(owed: f64) -> f64 {
-    let left = owed.abs();
-    if left == 0.0 {
-        return 0.0;
+/// It was, and on the installed machine the page moved like this, frame by
+/// frame: `-420 -126 -90 -8 -14 -138 -310 …`. Several ticks' worth in one
+/// frame and then almost nothing. The loop decodes a JPEG frame in about 9 ms,
+/// writes 2.9 MB into shared memory and handles whatever the terminal said,
+/// and while it is doing that it is not sending wheel events; the ticks it
+/// missed then went out together, and the engine applied them as one jump.
+///
+/// The animation cannot be a thing the loop does when it gets round to it. So
+/// it is not: this thread sleeps until the next tick, wakes, asks the curves
+/// where they are, and sends. Nothing it does is blocked by a frame, and
+/// nothing the loop does delays a tick by more than the time it takes to add a
+/// notch under a mutex.
+///
+/// The loop keeps two jobs. It says what the hand did — [`Wheel::notch`], and
+/// [`Wheel::forget`] when the tab in front changes or goes — and it reads
+/// [`Wheel::activity`], which is how the ticks this thread sent count as input
+/// for [`crate::motion`] without this thread touching that state at all.
+pub struct Wheel {
+    shared: Arc<Shared>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// What the loop and the animator thread share.
+struct Shared {
+    state: Mutex<State>,
+    /// Knocked on when a notch arrives, when the pile is dropped, and when the
+    /// thread is told to stop — so that none of the three waits out a tick.
+    wake: Condvar,
+    stop: AtomicBool,
+    /// The clock [`Shared::activity`] is counted on.
+    epoch: Instant,
+    /// When a step was last put on the wire, in nanoseconds since `epoch`;
+    /// zero is "never". An atomic rather than a callback, because what reads
+    /// it is the loop's own [`crate::motion::Motion`] and a second thread
+    /// writing into that would be two owners of one piece of state.
+    activity: AtomicU64,
+}
+
+/// The pile and where it goes.
+struct State {
+    animator: Animator,
+    /// The tab the notches belong to, and the socket they go out on. Both are
+    /// the loop's to say, and both arrive with every notch — which is what
+    /// makes a notch on a different tab start a different animation without
+    /// this module knowing what a tab is.
+    tab: String,
+    to: Option<Arc<dyn Dispatch>>,
+}
+
+impl Wheel {
+    /// Start the thread. It sleeps until there is something to animate.
+    pub fn start() -> Wheel {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
+                animator: Animator::default(),
+                tab: String::new(),
+                to: None,
+            }),
+            wake: Condvar::new(),
+            stop: AtomicBool::new(false),
+            epoch: Instant::now(),
+            activity: AtomicU64::new(0),
+        });
+        let thread = std::thread::spawn({
+            let shared = Arc::clone(&shared);
+            move || animate(&shared)
+        });
+        Wheel {
+            shared,
+            thread: Some(thread),
+        }
     }
-    let wanted = (left * K).max(MIN_STEP);
-    if wanted >= left - MIN_STEP {
-        return owed;
+
+    /// The hand turned the wheel `distance` at `at`, over the tab `tab`, whose
+    /// connection is `to`.
+    ///
+    /// A notch for a different tab from the last one drops what the last one
+    /// had left: there is only ever one animation, and it belongs to the tab
+    /// in front.
+    pub fn notch(&self, tab: &str, to: Arc<dyn Dispatch>, at: (i32, i32), distance: (f64, f64)) {
+        let Ok(mut state) = self.shared.state.lock() else {
+            return;
+        };
+        if state.tab != tab {
+            state.animator.forget();
+            state.tab = tab.to_string();
+        }
+        state.to = Some(to);
+        state.animator.notch(at, distance, Instant::now());
+        drop(state);
+        self.shared.wake.notify_all();
     }
-    wanted.copysign(owed)
+
+    /// Drop what the tab in front had left, and let go of its connection.
+    ///
+    /// "Forget tab T" and "forget" are the same act here, because there is
+    /// only ever one pile and the loop only ever forgets the tab in front — on
+    /// a switch, on a close, and when the socket it was going out on failed.
+    pub fn forget(&self) {
+        let Ok(mut state) = self.shared.state.lock() else {
+            return;
+        };
+        state.animator.forget();
+        state.tab.clear();
+        // The connection goes with it: a thread holding a socket open for a
+        // page nobody is looking at is a page that cannot be closed.
+        state.to = None;
+    }
+
+    /// The pane changed size. See [`Animator::resized`].
+    pub fn resized(&self, page: (i32, i32)) {
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.animator.resized(page);
+        }
+    }
+
+    /// When this thread last put something on the wire, if it ever has.
+    ///
+    /// The loop feeds it to [`crate::motion::Motion::input`] every pass, which
+    /// is what keeps a lossless still out of the middle of a scroll: the quiet
+    /// interval runs from the last tick of the animation rather than from the
+    /// last notch of the hand.
+    pub fn activity(&self) -> Option<Instant> {
+        match self.shared.activity.load(Ordering::Relaxed) {
+            0 => None,
+            nanos => Some(self.shared.epoch + Duration::from_nanos(nanos)),
+        }
+    }
+
+    /// What is still to be delivered. For the tests and the status of the
+    /// loop.
+    pub fn owed(&self) -> (f64, f64) {
+        match self.shared.state.lock() {
+            Ok(state) => state.animator.owed(),
+            Err(_) => (0.0, 0.0),
+        }
+    }
+
+    /// Stop the thread and wait for it. Idempotent, because [`Drop`] does it
+    /// too.
+    pub fn stop(&mut self) {
+        self.shared.stop.store(true, Ordering::SeqCst);
+        self.shared.wake.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        // Whatever socket it was sending on is released here rather than
+        // whenever this happens to be dropped.
+        self.forget();
+    }
+}
+
+impl Drop for Wheel {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// The thread: sleep until the next tick, ask the curves, send.
+///
+/// The step is worked out under the lock and sent outside it, so that a notch
+/// arriving from the loop waits for arithmetic rather than for a socket.
+fn animate(shared: &Shared) {
+    loop {
+        let sending = {
+            let Ok(mut state) = shared.state.lock() else {
+                return;
+            };
+            loop {
+                if shared.stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                let now = Instant::now();
+                let wait = match state.animator.until(now) {
+                    Some(left) if left.is_zero() => break,
+                    Some(left) => left,
+                    // Nothing to animate. A notch knocks, so this is only how
+                    // long it takes to notice `stop`.
+                    None => IDLE,
+                };
+                let Ok((next, _)) = shared.wake.wait_timeout(state, wait) else {
+                    return;
+                };
+                state = next;
+            }
+            let due = state.animator.tick(Instant::now());
+            due.and_then(|step| state.to.clone().map(|to| (to, step)))
+        };
+        let Some((to, step)) = sending else {
+            continue;
+        };
+        if to.send(step).is_err() {
+            // The socket is gone, which everything that cares hears on its own
+            // account. What must not happen is a distance owed to a page that
+            // cannot be sent to, because this thread would tick for ever.
+            if let Ok(mut state) = shared.state.lock() {
+                state.animator.forget();
+                state.to = None;
+            }
+            continue;
+        }
+        let since = Instant::now().saturating_duration_since(shared.epoch);
+        shared
+            .activity
+            .store(since.as_nanos().max(1) as u64, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -292,8 +571,8 @@ mod tests {
     use super::*;
     use crate::app::WHEEL_PIXELS;
 
-    /// Every step of one animation, driven from `start` as fast as the clock
-    /// allows, with the tick times it would really have had.
+    /// Every step of one animation, ticked on the schedule the thread would
+    /// have kept.
     fn profile(animator: &mut Animator, start: Instant) -> Vec<(f64, f64)> {
         let mut steps = Vec::new();
         let mut now = start;
@@ -313,9 +592,10 @@ mod tests {
         animator.notch((10, 20), (0.0, WHEEL_PIXELS), now);
     }
 
-    /// A notch owes a notch, and the ticks pay it off exactly.
+    /// The curve delivers the notch, all of it, and hands it over in steps
+    /// that only ever get smaller.
     #[test]
-    fn a_notch_owes_a_notch_and_the_ticks_pay_it() {
+    fn a_notch_is_delivered_in_full_and_the_steps_only_shrink() {
         let start = Instant::now();
         let mut animator = Animator::default();
         assert_eq!(animator.owed(), (0.0, 0.0));
@@ -329,118 +609,141 @@ mod tests {
         assert_eq!(animator.owed(), (0.0, WHEEL_PIXELS));
         assert_eq!(
             animator.until(start),
-            Some(Duration::ZERO),
-            "the first step of a new animation is due at once"
+            Some(TICK),
+            "the first step is a tick away: at the notch itself the curve is at zero"
         );
 
-        let steps = profile(&mut animator, start);
-        let moved: f64 = steps.iter().map(|delta| delta.1).sum();
+        let steps: Vec<f64> = profile(&mut animator, start)
+            .into_iter()
+            .map(|delta| delta.1)
+            .collect();
+        let moved: f64 = steps.iter().sum();
         assert!(
             (moved - WHEEL_PIXELS).abs() < 1e-9,
-            "the animation moved {moved} for a notch of {WHEEL_PIXELS}"
+            "the animation moved {moved} for a notch of {WHEEL_PIXELS}: {steps:?}"
         );
         assert_eq!(animator.owed(), (0.0, 0.0));
         assert_eq!(animator.until(start), None, "a finished animation is idle");
-    }
 
-    /// The steps are the geometric series, with the floor under them and
-    /// nothing above them, and never a step past what is owed.
-    #[test]
-    fn the_steps_decay_and_never_overshoot() {
-        let start = Instant::now();
-        let mut animator = Animator::default();
-        down(&mut animator, start);
-
-        let mut left = WHEEL_PIXELS;
-        let mut now = start;
-        let mut steps = Vec::new();
-        while let Some(step) = animator.tick(now) {
-            let delta = step.delta.1;
-            assert!(delta > 0.0, "a downward notch moved {delta}");
+        // Ease-out: the pace is 2(1 - x), so every step is smaller than the
+        // one before it. The first two are allowed to be equal because a notch
+        // does not have to land on a tick.
+        for pair in steps.windows(2).skip(1) {
             assert!(
-                delta <= left + 1e-9,
-                "a step of {delta} for {left} owed is an overshoot"
+                pair[1] <= pair[0] + 1e-9,
+                "the curve sped up: {:?} then {:?} in {steps:?}",
+                pair[0],
+                pair[1]
             );
-            assert!(
-                delta >= MIN_STEP.min(left) - 1e-9,
-                "a step of {delta} is under the floor"
-            );
-            // Above the floor the step is exactly the fraction, and there is
-            // no ceiling on it.
-            if left * K > MIN_STEP && left - left * K > MIN_STEP {
-                assert!(
-                    (delta - left * K).abs() < 1e-9,
-                    "a step of {delta} is not {K} of {left}"
-                );
-            }
-            left -= delta;
-            steps.push(delta);
-            now += TICK;
         }
-        assert!(left.abs() < 1e-9, "{left} was never paid");
+        assert!(steps.iter().all(|step| *step > 0.0), "{steps:?}");
+        // Over D at a tick each, which is what makes it a curve and not a jump.
+        let ticks = (D.as_millis() / TICK.as_millis()) as usize;
         assert!(
-            steps.len() >= 6 && steps.len() <= 16,
-            "one notch took {} ticks: {steps:?}",
+            steps.len() >= ticks - 1 && steps.len() <= ticks + 1,
+            "{} steps for a {D:?} curve of {TICK:?} ticks: {steps:?}",
             steps.len()
         );
-        // The decay: every step is smaller than the last until the floor, and
-        // the floor is never so long a tail that it reads as creeping.
-        let floored = steps
-            .iter()
-            .filter(|step| **step <= MIN_STEP + 1e-9)
-            .count();
-        assert!(floored <= 3, "a tail of {floored} minimum steps: {steps:?}");
     }
 
-    /// A notch in the middle of an animation makes the next step bigger. It
-    /// does not restart the animation, and it does not wait for it.
+    /// Two notches a hundred milliseconds apart overlap, and the sum of them
+    /// never falls away while both are running. This is the case the
+    /// exponential lost.
     #[test]
-    fn a_second_notch_extends_the_target_without_restarting() {
+    fn two_notches_overlap_and_the_step_never_falls_away() {
         let start = Instant::now();
+        let apart = Duration::from_millis(100);
         let mut animator = Animator::default();
         down(&mut animator, start);
 
-        let first = animator.tick(start).expect("a first step").delta.1;
-        let second = animator.tick(start + TICK).expect("a second step").delta.1;
+        let mut steps = Vec::new();
+        let mut now = start;
+        let mut second = false;
+        while let Some(left) = animator.until(now) {
+            now += left.max(Duration::from_micros(1));
+            if !second && now.duration_since(start) >= apart {
+                down(&mut animator, start + apart);
+                second = true;
+            }
+            if let Some(step) = animator.tick(now) {
+                steps.push((now.duration_since(start), step.delta.1));
+            }
+        }
+        assert!(second, "the second notch never went in");
+
+        let moved: f64 = steps.iter().map(|(_, step)| step).sum();
         assert!(
-            second < first,
-            "the animation is not decaying: {first}, {second}"
+            (moved - 2.0 * WHEEL_PIXELS).abs() < 1e-9,
+            "two notches moved {moved}"
+        );
+        // While both curves are running — from the second notch until the
+        // first one is done — no step may be half of the one before it. That
+        // is the seam, and it is the thing the person saw as shaking.
+        let both = apart..D;
+        let mut last: Option<f64> = None;
+        for (when, step) in &steps {
+            if both.contains(when) {
+                if let Some(last) = last {
+                    assert!(
+                        *step >= last * 0.5,
+                        "{step} after {last} at {when:?} is a seam: {steps:?}"
+                    );
+                }
+            }
+            last = Some(*step);
+        }
+    }
+
+    /// A notch in the middle of another adds to it rather than restarting it,
+    /// and it does not disturb the notch already running.
+    #[test]
+    fn a_second_notch_adds_a_curve_and_resets_nothing() {
+        let start = Instant::now();
+        let mut alone = Animator::default();
+        down(&mut alone, start);
+        let mut both = Animator::default();
+        down(&mut both, start);
+
+        // Four ticks in, the two are identical.
+        let mut at = start;
+        for _ in 0..4 {
+            at += TICK;
+            let one = alone.tick(at).expect("a step").delta.1;
+            let two = both.tick(at).expect("a step").delta.1;
+            assert!((one - two).abs() < 1e-9);
+        }
+        // A second notch, and from here the one with two curves is exactly the
+        // one with one plus a curve of its own — nothing was reset.
+        both.notch((10, 20), (0.0, WHEEL_PIXELS), at);
+        let owed = both.owed().1;
+        assert!(
+            (owed - (alone.owed().1 + WHEEL_PIXELS)).abs() < 1e-9,
+            "the notch replaced the curve instead of adding one: {owed}"
         );
 
-        let owed = animator.owed().1;
-        let was = animator.until(start + TICK).expect("the animation runs");
-        down(&mut animator, start + TICK + Duration::from_millis(4));
-        assert_eq!(
-            animator.owed().1,
-            owed + WHEEL_PIXELS,
-            "the notch replaced the target instead of extending it"
-        );
-        assert_eq!(
-            animator.until(start + TICK),
-            Some(was),
-            "the notch restarted the clock"
-        );
-
-        let next = animator
-            .tick(start + TICK + TICK)
-            .expect("a third step")
-            .delta
-            .1;
+        at += TICK;
+        let one = alone.tick(at).expect("a step").delta.1;
+        let two = both.tick(at).expect("a step").delta.1;
         assert!(
-            next > second,
-            "the notch did not add momentum: {second} then {next}"
+            two > one,
+            "the second notch did not add movement: {one} then {two}"
         );
+        // And the older curve is still on its own schedule: what the newer one
+        // contributes is exactly a fresh notch's first step.
+        let mut fresh = Animator::default();
+        down(&mut fresh, at - TICK);
+        let alone_again = fresh.tick(at).expect("a step").delta.1;
         assert!(
-            next > first,
-            "a second notch should outrun the first step of the first: {first} then {next}"
+            (two - one - alone_again).abs() < 1e-9,
+            "{two} is not {one} plus {alone_again}"
         );
     }
 
-    /// Nothing caps the step, so a hand that rolls fast scrolls far — and it
-    /// still stops when it stops, because what it costs to pay off a hundred
-    /// times as much is a handful of ticks and not a hundred times as many.
+    /// Nothing caps a step, so a hand that rolls fast scrolls far — and it
+    /// still stops when it stops, because every curve is over [`D`] after the
+    /// notch that started it whatever else is running.
     #[test]
-    fn nothing_caps_the_step_and_a_big_pile_still_settles() {
+    fn nothing_caps_the_step_and_a_big_pile_still_settles_in_one_curve() {
         let start = Instant::now();
         let mut one = Animator::default();
         down(&mut one, start);
@@ -467,16 +770,12 @@ mod tests {
             "a hundred notches hit a ceiling at {}",
             huge[0].1
         );
-        // Ten times the distance is a few ticks more, not ten times the ticks:
-        // the tail is the same length and only the decay in front of it grows,
-        // by log(10) ÷ log(1 ÷ (1 - K)) ≈ 6.5 of them.
-        assert!(
-            large.len() <= small.len() + 8 && huge.len() <= small.len() + 15,
-            "{} ticks for one notch, {} for ten, {} for a hundred",
-            small.len(),
-            large.len(),
-            huge.len()
-        );
+        // And a hundred times the distance takes exactly as long as one: the
+        // curves are the same length and they all started together. That is
+        // the other half of "when I stop the wheel I want it to stop", and it
+        // is a property of the shape rather than a number that was tuned.
+        assert_eq!(large.len(), small.len(), "ten notches took longer than one");
+        assert_eq!(huge.len(), small.len(), "a hundred notches took longer");
         let moved: f64 = large.iter().map(|delta| delta.1).sum();
         assert!(
             (moved - 10.0 * WHEEL_PIXELS).abs() < 1e-9,
@@ -484,8 +783,8 @@ mod tests {
         );
     }
 
-    /// The two axes are one animation but two sums, and a horizontal notch
-    /// neither steals from nor waits for a vertical one.
+    /// The two axes are two lists, and a horizontal notch neither steals from
+    /// nor waits for a vertical one.
     #[test]
     fn the_axes_are_independent() {
         let start = Instant::now();
@@ -494,55 +793,76 @@ mod tests {
         animator.notch((1, 2), (-WHEEL_PIXELS, 0.0), start);
         assert_eq!(animator.owed(), (-WHEEL_PIXELS, WHEEL_PIXELS));
 
-        let step = animator.tick(start).expect("a step");
+        let step = animator.tick(start + TICK).expect("a step");
         assert!(step.delta.0 < 0.0 && step.delta.1 > 0.0, "{:?}", step.delta);
         assert_eq!(
             step.delta.0, -step.delta.1,
             "equal distances should move equally"
         );
 
-        let steps = profile(&mut animator, start);
+        let steps = profile(&mut animator, start + TICK);
         let x: f64 = step.delta.0 + steps.iter().map(|delta| delta.0).sum::<f64>();
         let y: f64 = step.delta.1 + steps.iter().map(|delta| delta.1).sum::<f64>();
         assert!((x + WHEEL_PIXELS).abs() < 1e-9, "x moved {x}");
         assert!((y - WHEEL_PIXELS).abs() < 1e-9, "y moved {y}");
     }
 
-    /// An animation only runs where the wheel was last turned.
+    /// An animation only runs where the wheel was last turned, and a resize
+    /// brings that point inside the page it now has.
     #[test]
-    fn the_animation_follows_the_pointer() {
+    fn the_animation_follows_the_pointer_and_a_resize_keeps_it_on_the_page() {
         let start = Instant::now();
         let mut animator = Animator::default();
         animator.notch((10, 20), (0.0, WHEEL_PIXELS), start);
-        assert_eq!(animator.tick(start).expect("a step").at, (10, 20));
+        assert_eq!(animator.tick(start + TICK).expect("a step").at, (10, 20));
         animator.notch((70, 90), (0.0, WHEEL_PIXELS), start + TICK);
-        assert_eq!(animator.tick(start + TICK).expect("a step").at, (70, 90));
+        assert_eq!(
+            animator.tick(start + TICK * 2).expect("a step").at,
+            (70, 90)
+        );
+
+        // A pane that shrank under the point the wheel was turned at. The
+        // notches stay; only the point moves.
+        let owed = animator.owed();
+        animator.resized((64, 48));
+        assert_eq!(animator.owed(), owed, "a resize dropped the notches");
+        assert_eq!(
+            animator.tick(start + TICK * 3).expect("a step").at,
+            (63, 47)
+        );
+        // A pane that grew leaves it alone.
+        animator.resized((1280, 768));
+        assert_eq!(
+            animator.tick(start + TICK * 4).expect("a step").at,
+            (63, 47)
+        );
     }
 
-    /// A tab that is left, or a pane that is resized, owes nothing.
+    /// A tab that is left owes nothing, and the next notch starts cleanly.
     #[test]
-    fn forget_clears_what_is_owed() {
+    fn forget_drops_the_notches() {
         let start = Instant::now();
         let mut animator = Animator::default();
         down(&mut animator, start);
-        animator.tick(start).expect("a step");
+        animator.tick(start + TICK).expect("a step");
         assert_ne!(animator.owed(), (0.0, 0.0));
 
         animator.forget();
         assert_eq!(animator.owed(), (0.0, 0.0));
         assert_eq!(animator.until(start), None);
         assert_eq!(
-            animator.tick(start + TICK),
+            animator.tick(start + TICK * 2),
             None,
             "a forgotten animation ticks"
         );
 
-        // And the next notch starts cleanly rather than finding a stuck clock.
-        down(&mut animator, start + TICK);
-        assert_eq!(animator.until(start + TICK), Some(Duration::ZERO));
+        down(&mut animator, start + TICK * 2);
+        assert_eq!(animator.until(start + TICK * 2), Some(TICK));
+        assert_eq!(animator.owed(), (0.0, WHEEL_PIXELS));
     }
 
-    /// Two notches that cancel leave nothing to animate.
+    /// Two notches that cancel leave nothing to animate — but not instantly:
+    /// they are two curves and they cancel all the way down.
     #[test]
     fn opposite_notches_cancel() {
         let start = Instant::now();
@@ -550,36 +870,184 @@ mod tests {
         animator.notch((1, 1), (0.0, WHEEL_PIXELS), start);
         animator.notch((1, 1), (0.0, -WHEEL_PIXELS), start);
         assert_eq!(animator.owed(), (0.0, 0.0));
-        assert_eq!(animator.until(start), None);
-        assert_eq!(animator.tick(start), None);
+        // Every tick is a step of nothing, so nothing goes on the wire.
+        for n in 1..20 {
+            assert_eq!(animator.tick(start + TICK * n), None);
+        }
+        assert_eq!(animator.until(start + TICK * 20), None);
     }
 
-    /// The schedule is the wall clock: a loop that was held up fires the ticks
-    /// it missed, so the animation ends when it would have ended.
+    /// A tick that comes late delivers what the clock says, not what the
+    /// missed ticks would have: the curve is absolute, so there is no backlog
+    /// to fire in a burst.
+    ///
+    /// That burst is what the loop did on the installed machine —
+    /// `-420 -126 -90 -8 -14 -138 -310` — and it is the reason the animation
+    /// has a thread.
     #[test]
-    fn a_late_pass_catches_up() {
+    fn a_late_tick_delivers_the_clock_and_not_a_backlog() {
         let start = Instant::now();
-        let mut animator = Animator::default();
-        down(&mut animator, start);
-        animator.tick(start).expect("a first step");
-
-        // Three ticks' worth of a slow paint, and three steps are due.
-        let late = start + TICK * 3;
-        for _ in 0..3 {
-            assert!(animator.tick(late).is_some(), "a missed tick was dropped");
-        }
-        assert_eq!(animator.tick(late), None, "a fourth tick was not due");
-
-        // But a stall longer than the animation is not replayed at once.
+        let mut kept = Animator::default();
         let mut stalled = Animator::default();
+        down(&mut kept, start);
         down(&mut stalled, start);
-        stalled.tick(start).expect("a first step");
-        let much_later = start + Duration::from_secs(1);
-        assert!(stalled.tick(much_later).is_some());
-        assert_eq!(
-            stalled.tick(much_later),
-            None,
-            "a stall replayed the whole animation in one pass"
+
+        // One ticks every 16 ms; the other is not looked at for a hundred.
+        let late = start + Duration::from_millis(112);
+        let mut on_time = 0.0;
+        let mut at = start;
+        while at < late {
+            at += TICK;
+            on_time += kept.tick(at).map(|step| step.delta.1).unwrap_or(0.0);
+        }
+        let in_one = stalled.tick(late).expect("a step").delta.1;
+        assert!(
+            (in_one - on_time).abs() < 1e-9,
+            "seven ticks delivered {on_time} and one late tick {in_one}"
         );
+        // And the one that stalled does not then fire six more.
+        assert_eq!(
+            stalled.tick(late),
+            None,
+            "a late tick was followed by the ticks it missed"
+        );
+        assert!((stalled.owed().1 - kept.owed().1).abs() < 1e-9);
+    }
+
+    /// A [`Dispatch`] that records when it was called, and nothing else.
+    #[derive(Default)]
+    struct Recorder {
+        sent: Mutex<Vec<(Instant, Step)>>,
+    }
+
+    impl Dispatch for Recorder {
+        fn send(&self, step: Step) -> Result<(), String> {
+            self.sent
+                .lock()
+                .expect("the recorder")
+                .push((Instant::now(), step));
+            Ok(())
+        }
+    }
+
+    /// The thread keeps the tick schedule while the thread that started it is
+    /// busy.
+    ///
+    /// The 60 ms sleeps are a main loop decoding a frame, writing 2.9 MB into
+    /// shared memory and handling what the terminal said, which on the
+    /// installed machine is what made the ticks arrive in bursts. Here it does
+    /// that between notches, as a hand on the wheel would, and twenty ticks
+    /// still have to land on their own schedule — because the schedule is the
+    /// animation.
+    #[test]
+    fn the_thread_ticks_on_time_while_the_loop_is_busy() {
+        let recorder = Arc::new(Recorder::default());
+        let wheel = Wheel::start();
+        let start = Instant::now();
+        wheel.notch("t", recorder.clone(), (10, 20), (0.0, WHEEL_PIXELS));
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(60));
+            wheel.notch("t", recorder.clone(), (10, 20), (0.0, WHEEL_PIXELS));
+        }
+        std::thread::sleep(Duration::from_millis(60));
+
+        let sent = recorder.sent.lock().expect("the recorder").clone();
+        assert!(
+            sent.len() >= 20,
+            "only {} ticks in 420 ms of {TICK:?}",
+            sent.len()
+        );
+        let slack = Duration::from_millis(4);
+        for (n, (at, step)) in sent.iter().take(20).enumerate() {
+            let due = start + TICK * (n as u32 + 1);
+            let off = if *at > due {
+                at.duration_since(due)
+            } else {
+                due.duration_since(*at)
+            };
+            assert!(
+                off <= slack,
+                "tick {} landed {off:?} from its schedule",
+                n + 1
+            );
+            assert!(step.delta.1 > 0.0, "tick {} sent nothing", n + 1);
+        }
+    }
+
+    /// A notch for another tab is another animation, and forgetting is
+    /// forgetting.
+    #[test]
+    fn the_thread_drops_a_pile_that_is_not_the_tab_in_front() {
+        let recorder = Arc::new(Recorder::default());
+        let wheel = Wheel::start();
+        wheel.notch("a", recorder.clone(), (1, 1), (0.0, 10.0 * WHEEL_PIXELS));
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(wheel.owed().1 > 0.0);
+
+        wheel.notch("b", recorder.clone(), (1, 1), (0.0, WHEEL_PIXELS));
+        assert!(
+            wheel.owed().1 <= WHEEL_PIXELS,
+            "the other tab's notches came along: {:?}",
+            wheel.owed()
+        );
+
+        wheel.forget();
+        assert_eq!(wheel.owed(), (0.0, 0.0));
+        let was = recorder.sent.lock().expect("the recorder").len();
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            recorder.sent.lock().expect("the recorder").len(),
+            was,
+            "a forgotten animation went on sending"
+        );
+    }
+
+    /// What the thread sends is what the loop hears about, and what it never
+    /// sends it never claims.
+    #[test]
+    fn the_thread_says_when_it_last_sent_something() {
+        let recorder = Arc::new(Recorder::default());
+        let mut wheel = Wheel::start();
+        assert_eq!(wheel.activity(), None, "an idle animator has sent nothing");
+
+        let before = Instant::now();
+        wheel.notch("t", recorder, (1, 1), (0.0, WHEEL_PIXELS));
+        std::thread::sleep(Duration::from_millis(60));
+        let at = wheel.activity().expect("something went out");
+        assert!(at > before && at <= Instant::now());
+
+        // And the thread ends when it is told to, rather than when the program
+        // does.
+        wheel.stop();
+        let after = wheel.activity();
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            wheel.activity(),
+            after,
+            "a stopped animator went on ticking"
+        );
+        assert_eq!(wheel.owed(), (0.0, 0.0));
+    }
+
+    /// A socket that has gone ends the animation rather than being retried for
+    /// ever.
+    #[test]
+    fn a_connection_that_failed_ends_the_animation() {
+        struct Gone;
+        impl Dispatch for Gone {
+            fn send(&self, _: Step) -> Result<(), String> {
+                Err("the connection was closed".to_string())
+            }
+        }
+
+        let wheel = Wheel::start();
+        wheel.notch("t", Arc::new(Gone), (1, 1), (0.0, 10.0 * WHEEL_PIXELS));
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            wheel.owed(),
+            (0.0, 0.0),
+            "the animation is still owed to a socket that has gone"
+        );
+        assert_eq!(wheel.activity(), None, "a failed send counted as activity");
     }
 }

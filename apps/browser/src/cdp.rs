@@ -21,7 +21,7 @@
 //! The mailbox keeps a reply only while somebody is coming back for it. Most
 //! of what this program says to the engine is said with [`Client::notify`] —
 //! the acknowledgement of a screencast frame, sixty times a second, a
-//! `mouseWheel` nine times a notch, a key as it is pressed — and Chromium
+//! `mouseWheel` fourteen times a notch, a key as it is pressed — and Chromium
 //! answers every one of them whether or not the answer is worth anything. A
 //! mailbox that filed all of those would grow for as long as the pane is open:
 //! an hour of reading is hundreds of thousands of replies nobody will ever
@@ -34,7 +34,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -126,6 +126,51 @@ impl Mailbox {
     }
 }
 
+/// The right to put a notification on a client's socket, from any thread.
+///
+/// [`Client`] is the main loop's and stays the main loop's: the mailbox, the
+/// wake pipe and every command that expects a reply are its. This is the one
+/// thing another thread needs — [`crate::scroll`]'s animator sends a
+/// `mouseWheel` every 16 ms on a clock of its own, and having to ask the loop
+/// to put it on the wire is exactly the dependency that made the scrolling
+/// lurch.
+///
+/// It is the smallest thing that works, because both pieces underneath were
+/// already shared: the socket's writing half has always been behind a mutex —
+/// the reader thread holds it to answer a ping — and the command counter is
+/// now an atomic, so an id is still spent exactly once. Nothing here touches
+/// the mailbox or the reader, and a notification's id is never registered, so
+/// the reply Chromium sends all the same is dropped where it is read, exactly
+/// as before.
+#[derive(Clone)]
+pub struct Notifier {
+    sender: Arc<Mutex<Sender>>,
+    next_id: Arc<AtomicI64>,
+}
+
+impl Notifier {
+    /// Send a command and do not wait for its reply. This is
+    /// [`Client::notify`] without the `&mut`.
+    pub fn notify(&self, method: &str, params: Json) -> Result<(), String> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
+        let message = message(id, method, params);
+        let mut sender = self
+            .sender
+            .lock()
+            .map_err(|_| "the connection is poisoned".to_string())?;
+        sender
+            .send_text(&message)
+            .map_err(|why| format!("cannot send {method}: {why}"))
+    }
+}
+
+impl std::fmt::Debug for Notifier {
+    /// What it is for, not the socket behind it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Notifier")
+    }
+}
+
 /// A connection to one CDP target.
 pub struct Client {
     sender: Arc<Mutex<Sender>>,
@@ -134,7 +179,12 @@ pub struct Client {
     /// Read end of the pipe the reader thread knocks on.
     wake_read: RawFd,
     wake_write: RawFd,
-    next_id: i64,
+    /// The id the next command goes out under.
+    ///
+    /// An atomic rather than a plain field, because a [`Notifier`] spends ids
+    /// from another thread and two commands sharing an id would be two
+    /// commands sharing a reply.
+    next_id: Arc<AtomicI64>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -208,9 +258,17 @@ impl Client {
             stop,
             wake_read,
             wake_write,
-            next_id: 0,
+            next_id: Arc::new(AtomicI64::new(0)),
             reader: Some(reader),
         })
+    }
+
+    /// A handle another thread may send notifications on. See [`Notifier`].
+    pub fn notifier(&self) -> Notifier {
+        Notifier {
+            sender: Arc::clone(&self.sender),
+            next_id: Arc::clone(&self.next_id),
+        }
     }
 
     /// The descriptor to poll alongside the terminal.
@@ -243,8 +301,7 @@ impl Client {
         params: Json,
         timeout: Duration,
     ) -> Result<Json, String> {
-        self.next_id += 1;
-        let id = self.next_id;
+        let id = self.next_id();
         let message = message(id, method, params);
 
         self.want(id)?;
@@ -302,8 +359,7 @@ impl Client {
     /// withdraws the claim: a caller that stops caring — the tab was switched
     /// away from, the still took too long — has only to let it go.
     pub fn send(&mut self, method: &str, params: Json) -> Result<Pending, String> {
-        self.next_id += 1;
-        let id = self.next_id;
+        let id = self.next_id();
         let message = message(id, method, params);
         self.want(id)?;
         if let Err(why) = self.transmit(&message) {
@@ -347,10 +403,15 @@ impl Client {
     /// the same is read off the socket and dropped. This is the command that
     /// runs all day, and nothing it does is kept.
     pub fn notify(&mut self, method: &str, params: Json) -> Result<(), String> {
-        self.next_id += 1;
-        let message = message(self.next_id, method, params);
+        let message = message(self.next_id(), method, params);
         self.transmit(&message)
             .map_err(|why| format!("cannot send {method}: {why}"))
+    }
+
+    /// The id the next command goes out under. Every one is spent once,
+    /// whichever thread spends it.
+    fn next_id(&self) -> i64 {
+        self.next_id.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// Register an id as one whose reply is going to be collected.
