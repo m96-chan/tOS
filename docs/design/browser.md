@@ -165,14 +165,13 @@ the cap, not the engine's limit — the test page repainted its whole area every
 frame and the rate stayed pinned there, so the engine is not the bottleneck in
 this experiment and something else will be.
 
-**The frames go through as PNG, unchanged.** JPEG is 4× smaller per frame and
-it is not used, because `tos-term` cannot decode it and writing a decoder to
-get this is the trade `apps/preview/src/lib.rs` already refused for previews: a
-baseline JPEG decoder is 600–900 lines before progressive JPEG is considered,
-in a repository whose one dependency is `libc`, and nothing else in the tree
-wants it. PNG is what the graphics protocol names as its own payload format
-and what the compositor already decodes, so the client's frame path is a
-base64 decode and a write — it does not touch a pixel.
+**The frames went through as PNG, unchanged, and that is no longer true.**
+It was the right call at 640×360 and the wrong one at a pane's real size; the
+section [The format is the frame rate](#the-format-is-the-frame-rate) below
+has the measurement that changed it, and the short version is that the
+engine's PNG encoder is the bottleneck and swapping it for JPEG buys 24 frames
+a second. The client now decodes every frame itself and hands the compositor
+raw pixels.
 
 ### Why not WPE WebKit, honestly
 
@@ -238,21 +237,25 @@ absent until somebody installs 482 MB is honest; a 723 MB ISO is not.
         │  Blink, V8, layout, paint                    │   482 MB
         └──────────────┬───────────────────────────────┘
                        │ CDP over a websocket on 127.0.0.1
-                       │ Page.screencastFrame — base64 PNG, ~57.8 KB
+                       │ Page.screencastFrame — base64 JPEG q85, ~185 KB
+                       │   while the page moves; one Page.captureScreenshot
+                       │   in PNG when it stops
                        ▼
         ┌──────────────────────────────────────────────┐
         │  tos-browser                                 │
         │  an ordinary program in a pane. No compositor│   on the image
         │  API, no socket to the compositor, no plugin │
+        │  jpeg.rs / png.rs decode the frame here, 8 ms│
         └──────────────┬───────────────────────────────┘
-                       │ write the PNG to /dev/shm/<name>
-                       │ ESC_G a=T,f=100,t=s,q=2;<base64 name> ESC\
+                       │ write the RGB to /dev/shm/<name>, 2.9 MB
+                       │ ESC_G a=T,f=24,s=W,v=H,t=s,q=2;<base64 name> ESC\
                        │ PTY
                        ▼
         ┌──────────────────────────────────────────────┐
         │  tos-term                                    │
         │  ImageFiles reads /dev/shm and unlinks it    │
-        │  png.rs decodes to RGBA8, GraphicsStore holds│
+        │  no decode: f=24 is pixels. GraphicsStore    │
+        │  holds them                                  │
         └──────────────┬───────────────────────────────┘
                        ▼
                    tos-render  ──►  DRM/KMS
@@ -290,13 +293,21 @@ and the other way, which is where the compositor changes:
 
 Three details in that are decisions rather than drawing.
 
-**`t=s` and not `t=d`.** A 57.8 KB frame base64s to 77 KB of escape sequence
-sixty times a second, which is 4.6 MB/s of PTY. A shared memory name is about
-thirty bytes. The compositor already reads `/dev/shm` for `t=s` and already
-unlinks the object afterwards, which means the client writes a fresh name per
-frame and never cleans up — the consuming read is the cleanup. That is the
-protocol working as designed, and it is also the thing to measure first,
-because it is an object created and destroyed sixty times a second.
+**`t=s` and not `t=d`.** A 2.9 MB frame of raw pixels base64s to 3.9 MB of
+escape sequence, and at 58 frames a second that is 226 MB/s of PTY. A shared
+memory name is about thirty bytes. The compositor already reads `/dev/shm` for
+`t=s` and already unlinks the object afterwards, which means the client writes
+a fresh name per frame and never cleans up — the consuming read is the
+cleanup. That is the protocol working as designed, and it is also the thing to
+measure first, because it is an object created and destroyed sixty times a
+second.
+
+The inline fallback still exists and still works, and it is now a slideshow
+rather than a slower picture. It sends the same raw pixels, because the
+alternatives are to send a JPEG the terminal cannot read or to write a PNG
+*encoder* in `apps/browser` — a third codec from a specification, to make
+faster a path that exists only for terminals which are not tOS. Correct and
+slow was the right side of that.
 
 **The page is a picture; the browser's own chrome is cells.** The URL line,
 the back and forward indicators and any error message are drawn as text in the
@@ -378,11 +389,12 @@ everything else in that paragraph.
 Nothing here is a reason not to do it. They are the things that will be found
 by somebody with a profiler if they are not written down now.
 
-**3.5 MB/s of PNG through `/dev/shm`.** 60.2 fps × 57.8 KB. The engine
-compresses it and the compositor decompresses it, sixty times a second, for
-pixels that were raw on one side and are raw again on the other. It is the
-price of the frame path being a protocol both ends already speak, and it is
-the first number WPE would delete.
+**170 MB/s of raw pixels through `/dev/shm`.** 58 fps × 2.9 MB. This used to
+be 3.5 MB/s of PNG, and the trade was made knowingly: tmpfs is memory, so a
+write and a read are a memcpy at memory speed and cost about a third of a
+millisecond each, while the PNG decode they replaced cost fifteen to twenty on
+the compositor's parse loop. What is left is one large copy in each direction,
+which is the thing WPE would delete by handing over a buffer instead.
 
 **One shared memory object created and unlinked per frame.** Sixty
 `open`/`write`/`close` on the client's side and sixty `open`/`read`/`unlink`
@@ -390,12 +402,15 @@ on the compositor's, in the parse loop. `/dev/shm` is tmpfs so the bytes are a
 memcpy, but the directory operations are not free and nothing in the tree has
 asked this of them before.
 
-**PNG decode on the CPU, in the compositor, per frame, on the parse loop.**
-`docs/design/graphics-file-transmission.md` already lists reading off the parse
-loop as a follow-up for latency reasons; a browser is the first program that
-makes it a throughput question too. This is the first thing to measure once it
-runs on real hardware, and it is the number most likely to say that 60 fps is
-not what tOS actually gets.
+**~~PNG decode on the CPU, in the compositor, per frame, on the parse
+loop.~~** Gone, and this is how. The decode is now in the pane's own process,
+where it is 8 ms for a 1280×770 JPEG frame and costs the compositor nothing;
+`f=24` is pixels and the terminal copies them. What remains on the parse loop
+is the read out of `/dev/shm` and the copy into the store.
+`docs/design/graphics-file-transmission.md` still lists reading off the parse
+loop as a follow-up, and it is still worth doing — it is a 2.9 MB read now
+rather than a 320 KB one — but it is no longer the number that decides the
+frame rate.
 
 **Seven engine processes behind one pane.** The browser process, two zygotes,
 a GPU process that has no GPU, a network service, a storage service and one
@@ -408,6 +423,143 @@ side. What has never been measured is the whole path — paint to
 `screencastFrame` to shm to decode to blit to page flip — on a real machine
 with a real display. The engine sustaining 60.2 fps into a socket says nothing
 about what arrives on the screen.
+
+---
+
+## The format is the frame rate
+
+Everything above was measured at 640×360. At the size a pane actually is —
+1280×770, two vCPUs, a scrolling ja.wikipedia page, `chromium-shell` 153 — the
+engine does not sustain 60 frames a second, and what stops it is not the
+network, the PTY or the terminal. It is the engine's own single-threaded
+encode of each frame:
+
+| format | fps | KB/frame | frame gap p50 / p95 / max |
+| --- | --- | --- | --- |
+| png | 33.8 | 320 | 28 / 37 / 39 ms |
+| jpeg q70 | 60.0 | 139 | 17 / 18 / 20 ms |
+| **jpeg q85** | **57.8** | **185** | ≈ 17 ms |
+| jpeg q95 | 40.0 | 268 | |
+| jpeg q100 | 27.8 | 387 | |
+
+**The rate does not change from two vCPUs to eight**, which is what says it is
+one thread's encode rather than contention. `Page.captureScreenshot` in a loop
+is 10–12 fps in every format CDP offers — `png`, `png` with
+`optimizeForSpeed`, and lossless `webp` — so there is no fast lossless path to
+prefer: it is JPEG or it is half the frame rate.
+
+**Chromium's screencast JPEG is 4:2:0 at every quality.** The encoder
+hard-codes a sampling factor of `2x2,1x1,1x1`, so chroma is half resolution in
+both axes whatever quality is asked for and coloured text smears a little at
+100 as well as at 70. Quality only decides how much of the luma underneath it
+survives. At q70 the halo around blue link text is visible at 1:1. At q85 the
+difference from the PNG of the same frame needs 3× zoom to find. **The person
+looked at the comparison and chose 85.**
+
+### What reproduced when the branch was built, and what did not
+
+The table above is the measurement that decided this, and it is kept because
+it is the one that was argued from. What a later run on different hardware
+found is also kept, because the two disagree about the headline number and
+pretending otherwise would leave the next person confused.
+
+On 2026-09-23, in the same container with `--cpus=2`, at 1280×768, against a
+page of prose with a picture in it, scrolling every frame:
+
+| | frames a second | KB/frame | in the terminal, per frame |
+| --- | --- | --- | --- |
+| png, decoded by `tos-term` | 59.7–60.0 | 267 | 6.2–7.2 ms |
+| jpeg q85, decoded in the pane | 59.7–59.8 | 204 | 0.89–0.91 ms |
+
+The JPEG's 6.7 ms of decoding is not in that last column because it is not in
+the compositor: it happens in the pane's own process, where it competes with
+the engine for the same two vCPUs and still leaves the frame rate where it
+was.
+
+**The engine's PNG encoder kept up on that host.** The 33.8 fps in the table
+is a slower machine against a real ja.wikipedia page — more glyphs, more
+colour, a heavier encode — and it is a real number about a real machine tOS
+will run on. It is simply not a number every machine produces, which means
+*the format is the frame rate only where the encoder is the bottleneck*, and
+whether it is depends on the page and the CPU.
+
+What is a property of this code rather than of the host is the last column,
+and it is the same several-fold difference everywhere: **the compositor's
+per-frame cost falls seven- or eightfold**, because a PNG decode on the parse
+loop became a copy out of tmpfs. That is what
+`apps/browser/tests/engine.rs` asserts; the frame rates it prints and does not
+assert, for exactly this reason.
+
+So the decision stands on two legs rather than one. On a machine where the
+encoder binds, JPEG is 24 frames a second. On every machine, the decode leaves
+the thread that has to keep every other pane on the screen as well.
+
+### JPEG while it moves, PNG when it stops
+
+So the policy, which is what VNC and RDP do and for the same reason:
+
+- The screencast runs at `format=jpeg, quality=85`.
+- When no screencast frame has arrived for **150 ms**, the tab in front is
+  asked for one `Page.captureScreenshot` in PNG, and that is what is left on
+  the screen.
+- The next screencast frame resumes motion.
+
+Text that somebody is reading is therefore always lossless. The lossy frames
+are only ever the ones scrolling past, which nobody reads. A page that never
+moves costs one still and then nothing at all — no frames, no polling, no
+repainting.
+
+**Ordering.** Two sources now paint one pane and they can arrive out of order:
+a screencast frame captured before the still was asked for can turn up after
+it, and a still can come back after the page started moving again. The rule is
+that the newer capture wins, on the wall clock — `Page.screencastFrame`
+carries `metadata.timestamp` in seconds since the epoch and the engine is a
+child process on this machine, so it is the same clock this program reads. A
+still has no timestamp, so it is credited with the moment it was *asked for*,
+which is the earliest instant it could depict. That is what decides the one
+case the timestamps cannot order, a frame captured while the screenshot was
+being drawn: **motion wins the tie**, because a moving page produces another
+frame in 17 ms and corrects any mistake, while a still wrongly dropped leaves
+a stale picture up for as long as the page stays still.
+`apps/browser/src/motion.rs` is the policy and its tests, away from the engine,
+the terminal and the pane.
+
+### The decoder, and a decision overturned
+
+None of this is available without a JPEG decoder, and `apps/preview/src/lib.rs`
+had refused to write one: 600–900 lines for a second format, in a repository
+whose one dependency is `libc`, with nothing in the tree wanting it. Every
+clause of that was true and the estimate was accurate — `tos_term::jpeg` is a
+little over nine hundred lines of code, written from T.81 the way `png.rs` and
+`inflate.rs` were, baseline only and refusing progressive by name.
+
+What changed is the other side of the ledger, and the point worth keeping is
+that it changed because somebody measured it. "Nothing else in the tree wants
+it" stopped being true the moment a pane-sized screencast was the first thing
+that did, and 24 frames a second is not an argument anybody was going to win
+with a line count. The preview program still does not show JPEGs — that is a
+follow-up with its own tests — but the reason it gave for never showing them
+is gone.
+
+The decoder is 8.1 ms for a 1280×770 4:2:0 frame at quality 85, in release,
+on the host the branch was built on, and 5.7 ms for a lighter page in the
+container: inside the 17 ms between two frames either way, on one core, in the
+pane's own process. `compositor/tos-term/examples/jpeg_decode.rs` is how that
+is measured and `compositor/tos-term/tests/jpeg.rs` is what says it is right —
+fixtures from ImageMagick with their pixels from Pillow, and a check against a
+real Chromium screencast frame that came out within three counts a channel of
+what libjpeg makes of the same file, at 37 dB against the PNG.
+
+### And the frames stopped being files
+
+The second half of the change, and the one that cost the compositor nothing:
+the client decodes and sends **raw pixels**, `f=24`, over the same `t=s` it
+used for the PNG. The terminal cannot read JPEG on the graphics path at all,
+so something had to decode; doing it in the pane rather than in the compositor
+deletes the per-frame PNG decode from the parse loop instead of moving it, and
+`f=24` is the protocol's own format, so nothing in `tos-term`, `tos-render` or
+the compositor changed. A still goes over as `f=32`, because that is what the
+PNG decoder produces and a still is one frame every 150 ms.
 
 ---
 
@@ -498,11 +650,18 @@ gives damage rectangles, and this document's engine choice is provisional
 until somebody has tried it. If it does not, that is worth knowing once and
 citing thereafter. Labels: `experiment`, `area:browser`.
 
-**Measure the compositor's PNG decode per frame on real hardware.** The
-engine's 60.2 fps is one end of a path nobody has timed. Decode, store and
-blit, on the machine tOS boots on, against a page that repaints fully — and
-against one that does not. This is the number that says whether the PoC is
-60 fps or 20. Labels: `experiment`, `area:graphics`.
+**~~Measure the compositor's PNG decode per frame on real hardware.~~**
+Answered by deleting it: the decode is in the pane now and the compositor
+takes pixels. What is still untimed is the rest of that path — the read out of
+`/dev/shm`, the copy into the store and the blit — on the machine tOS boots
+on, with a 2.9 MB frame rather than a 320 KB one. Labels: `experiment`,
+`area:graphics`.
+
+**Show JPEGs in `tos-preview`.** The decoder exists and the program that
+exists to prove the graphics path from the other end still refuses the format.
+It is the `--rgba` path with a decoder in front of it, plus a decision about
+what a progressive file the person double-clicked should say. Labels:
+`enhancement`, `area:applications`.
 
 **Send `a=f` frames bounded to the damaged rectangle.** Depends on the
 measurement above being taken first, because "only send what changed" is worth

@@ -7,17 +7,19 @@
 //! the Kitty keyboard protocol, and those three together are enough to be a
 //! screen, a mouse and a keyboard. So `tos-browser` runs a headless Chromium
 //! as a child process, drives it over the Chrome DevTools Protocol on a
-//! hand-rolled WebSocket, takes its screencast as PNG frames and hands them to
-//! the terminal as graphics commands, and turns the terminal's own reports of
-//! keys and mouse back into CDP input events. The engine renders; the
-//! compositor displays; this crate is the wire between them and nothing else.
+//! hand-rolled WebSocket, takes its screencast, decodes each frame here, and
+//! hands the terminal raw pixels as graphics commands, turning the terminal's
+//! own reports of keys and mouse back into CDP input events. The engine
+//! renders; the compositor displays; this crate is the wire between them and
+//! nothing else.
 //!
-//! The numbers it was built against: 60 frames a second at 640x360, about
-//! 58 kB per PNG frame on the engine's side. What that costs on the terminal's
-//! side is the question this crate exists to answer, which is why the frames
+//! The numbers it was built against: 57.8 frames a second at 1280x770, about
+//! 185 kB per frame on the engine's side, 8 ms to decode one here. The frames
 //! go through `/dev/shm` (`t=s`) rather than as base64 in the escape sequence
-//! wherever the terminal will read them — see [`graphics`] for the id and the
-//! transport, both of which are decisions rather than defaults.
+//! wherever the terminal will read them, and they go as raw pixels (`f=24`,
+//! `f=32`) rather than as files the terminal decodes — see [`graphics`] for
+//! the id, the format and the transport, all three of which are decisions
+//! rather than defaults.
 //!
 //! # Tabs, and why they are not panes
 //!
@@ -41,13 +43,37 @@
 //! was already there, and the pane stays one pane. See [`tabs`] for what that
 //! costs per tab, which is one socket and no frames.
 //!
-//! # What it deliberately does not do
+//! # JPEG while it moves, PNG when it stops
 //!
-//! **No JPEG.** The screencast can produce it and [`tos_term::png`] cannot
-//! read it; adding a baseline decoder would be more code than the PNG and
-//! inflate decoders put together, for a second format, in a workspace whose
-//! only dependency is `libc`. `tos-preview` made the same call for the same
-//! reason.
+//! This paragraph used to say "No JPEG", on the grounds that a baseline
+//! decoder is more code than PNG and inflate put together for a second format
+//! in a workspace whose one dependency is `libc`. It was measured and it was
+//! wrong — not about the code, which is nine hundred lines in
+//! `tos_term::jpeg`, but about what it buys.
+//!
+//! `Page.startScreencast` is bounded by the engine's own single-threaded
+//! encode of each frame. At 1280x770 on two cores that is 33.8 frames a
+//! second as PNG and 57.8 as JPEG at quality 85, and it does not change from
+//! two cores to eight. `Page.captureScreenshot` in a loop is 10 to 12 in
+//! every format CDP offers, lossless webp included, so there is no third
+//! option: it is JPEG or it is half the frame rate.
+//!
+//! So the screencast is JPEG at quality 85 while the page is moving, and the
+//! moment it stops — a rest interval of 150 ms with no frame — the tab in
+//! front is asked for one `Page.captureScreenshot` in PNG and that is what is
+//! left on screen. Text that is being read is always lossless; the lossy
+//! frames are the ones scrolling past, which nobody reads. A page that never
+//! moves costs one still and then nothing. [`motion`] has the table, the
+//! reason quality 85 rather than 70 or 95, and the rule that decides which of
+//! two frames arriving out of order is the one to keep.
+//!
+//! The frames are decoded here rather than by the terminal, which is the
+//! other half of the change and the reason the compositor needed none: the
+//! pixels go over as `f=24` and the per-frame PNG decode on the compositor's
+//! parse loop — named in `docs/design/browser.md` as the first cost to delete
+//! — is gone rather than moved.
+//!
+//! # What it deliberately does not do
 //!
 //! **No text as cells.** A page is not re-rendered as characters in the grid.
 //! That is a different program — a text browser — and it would throw away the
@@ -78,6 +104,7 @@ pub mod http;
 pub mod input;
 pub mod json;
 pub mod keys;
+pub mod motion;
 pub mod screen;
 pub mod sha1;
 pub mod tabs;

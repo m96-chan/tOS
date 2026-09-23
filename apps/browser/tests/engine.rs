@@ -4,7 +4,7 @@
 //! The terminal here is `tos_term::Terminal` with the compositor's own
 //! `ImageFiles` installed, which is exactly what `Pane::spawn` gives a pane —
 //! so the `t=s` path is the real one, names and unlinking included, and the
-//! PNGs are decoded by the decoder that runs in a session. What is missing
+//! frames go through the store that holds them in a session. What is missing
 //! compared with a booted tOS is the renderer and the PTY, neither of which
 //! can say anything about whether the protocol is right.
 //!
@@ -24,10 +24,11 @@ use std::time::{Duration, Instant};
 
 use tos_browser::cdp::Client;
 use tos_browser::engine::{self, Engine};
-use tos_browser::graphics::{Painter, IMAGE_ID};
+use tos_browser::graphics::{Painter, Raw, IMAGE_ID};
 use tos_browser::input::{Key, KeyAction, KeyInput, Mods};
 use tos_browser::json::Json;
 use tos_browser::keys;
+use tos_browser::motion;
 use tos_browser::tabs::{Outcome, Tab, Tabs};
 use tos_compositor::ImageFiles;
 use tos_preview::fit::Cells;
@@ -158,9 +159,15 @@ fn wait_for_title(client: &mut Client, wanted: &str, timeout: Duration) -> Strin
 }
 
 fn a_terminal(dir: &std::path::Path) -> tos_term::Terminal {
+    sized_terminal(dir, WIDTH, HEIGHT)
+}
+
+/// A terminal with the compositor's own file reader, one row taller than the
+/// page so that the status line has somewhere to go.
+fn sized_terminal(dir: &std::path::Path, width: u32, height: u32) -> tos_term::Terminal {
     let mut terminal = tos_term::Terminal::new(
-        (WIDTH / CELL.0) as usize,
-        (HEIGHT / CELL.1) as usize + 1,
+        (width / CELL.0) as usize,
+        (height / CELL.1) as usize + 1,
         tos_term::TerminalConfig::default(),
     );
     terminal.set_medium_reader(Box::new(ImageFiles::at(
@@ -170,13 +177,57 @@ fn a_terminal(dir: &std::path::Path) -> tos_term::Terminal {
     terminal
 }
 
+/// The next screencast frame as the engine sent it, with the capture time it
+/// carries. Acknowledges everything it takes, as the program does.
+fn take_frames(client: &mut Client) -> Vec<(Vec<u8>, Option<f64>)> {
+    let mut frames = Vec::new();
+    for event in client.events() {
+        if event.method != "Page.screencastFrame" {
+            continue;
+        }
+        if let Some(session) = event.params.get("sessionId").and_then(Json::as_i64) {
+            let _ = client.notify(
+                "Page.screencastFrameAck",
+                Json::object(vec![("sessionId", Json::number(session as f64))]),
+            );
+        }
+        let Some(data) = event.params.get("data").and_then(Json::as_str) else {
+            continue;
+        };
+        let stamp = event
+            .params
+            .path(&["metadata", "timestamp"])
+            .and_then(Json::as_f64);
+        if let Ok(bytes) = tos_browser::base64::decode(data.as_bytes()) {
+            frames.push((bytes, stamp));
+        }
+    }
+    frames
+}
+
+/// Start a screencast in one format at one size.
+fn cast(client: &mut Client, format: &str, quality: Option<u32>, width: u32, height: u32) {
+    let mut fields = vec![
+        ("format", Json::string(format)),
+        ("maxWidth", Json::number(width)),
+        ("maxHeight", Json::number(height)),
+        ("everyNthFrame", Json::number(1)),
+    ];
+    if let Some(quality) = quality {
+        fields.push(("quality", Json::number(quality)));
+    }
+    client
+        .call("Page.startScreencast", Json::object(fields))
+        .expect("the screencast starts");
+}
+
 fn temp_dir(what: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("tos-browser-it-{what}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("a directory");
     dir
 }
 
-/// A screencast, decoded and drawn, with the numbers it cost.
+/// A screencast, decoded here and drawn, with the numbers it cost.
 #[test]
 fn frames_reach_a_terminal_through_shared_memory() {
     let Some((mut engine, mut client)) = connect() else {
@@ -192,51 +243,39 @@ fn frames_reach_a_terminal_through_shared_memory() {
         rows: HEIGHT / CELL.1,
     };
 
-    client
-        .call(
-            "Page.startScreencast",
-            Json::object(vec![
-                ("format", Json::string("png")),
-                ("maxWidth", Json::number(WIDTH)),
-                ("maxHeight", Json::number(HEIGHT)),
-                ("everyNthFrame", Json::number(1)),
-            ]),
-        )
-        .expect("the screencast starts");
+    cast(&mut client, "jpeg", Some(motion::QUALITY), WIDTH, HEIGHT);
 
     let run_for = Duration::from_secs(3);
     let started = Instant::now();
     let (mut frames, mut bytes, mut escape_bytes) = (0usize, 0usize, 0usize);
-    let mut drawing = Duration::ZERO;
+    let (mut decoding, mut drawing) = (Duration::ZERO, Duration::ZERO);
 
     while started.elapsed() < run_for {
-        for event in client.events() {
-            if event.method != "Page.screencastFrame" {
-                continue;
-            }
-            if let Some(session) = event.params.get("sessionId").and_then(Json::as_i64) {
-                client
-                    .notify(
-                        "Page.screencastFrameAck",
-                        Json::object(vec![("sessionId", Json::number(session as f64))]),
-                    )
-                    .expect("the ack goes out");
-            }
-            let data = event
-                .params
-                .get("data")
-                .and_then(Json::as_str)
-                .expect("a frame carries its picture");
-            let png = tos_browser::base64::decode(data.as_bytes()).expect("valid base64");
-            assert_eq!(&png[..4], b"\x89PNG", "the engine promised PNG");
+        for (jpeg, stamp) in take_frames(&mut client) {
+            assert_eq!(&jpeg[..2], b"\xff\xd8", "the engine promised JPEG");
+            // The clock the ordering rule in `tos_browser::motion` leans on:
+            // CDP says seconds since the epoch, and the engine is a child of
+            // this process, so it had better be this epoch.
+            let stamp = stamp.expect("a frame says when it was captured");
+            let drift = (motion::now_seconds() - stamp).abs();
+            assert!(
+                drift < 60.0,
+                "metadata.timestamp is {stamp}, which is {drift:.1} s from this clock"
+            );
 
             let at = Instant::now();
-            let sequence = painter.frame(&png, cells, 2, 1);
+            let image = tos_term::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
+            decoding += at.elapsed();
+            assert_eq!((image.width, image.height), (WIDTH, HEIGHT));
+
+            let at = Instant::now();
+            let raw = Raw::rgb(&image.rgb, image.width, image.height);
+            let sequence = painter.frame(raw, cells, 2, 1);
             terminal.advance(&sequence);
             drawing += at.elapsed();
 
             frames += 1;
-            bytes += png.len();
+            bytes += jpeg.len();
             escape_bytes += sequence.len();
         }
         std::thread::sleep(Duration::from_millis(2));
@@ -245,12 +284,13 @@ fn frames_reach_a_terminal_through_shared_memory() {
 
     assert!(frames > 10, "only {frames} frames in three seconds");
     eprintln!(
-        "shared memory: {frames} frames in {:?} ({:.1}/s), {} bytes of PNG on average, \
-         {} bytes down the pane per frame, {:?} in the terminal per frame",
+        "shared memory: {frames} frames in {:?} ({:.1}/s), {} bytes of JPEG on average, \
+         {} bytes down the pane per frame, {:?} decoding and {:?} in the terminal per frame",
         started.elapsed(),
         frames as f64 / started.elapsed().as_secs_f64(),
         bytes / frames,
         escape_bytes / frames,
+        decoding / frames as u32,
         drawing / frames as u32,
     );
 
@@ -279,7 +319,12 @@ fn frames_reach_a_terminal_through_shared_memory() {
 }
 
 /// The same, inline, which is the path a terminal that cannot read `/dev/shm`
-/// takes — and the one whose cost is worth knowing.
+/// takes — and the one whose cost is worth knowing, because raw pixels made
+/// it four times what it was.
+///
+/// The fallback sends the decoded pixels rather than the encoded frame,
+/// because the encoded frame is a JPEG and no terminal's graphics path reads
+/// one. `apps/browser/src/graphics.rs` argues that; this measures it.
 #[test]
 fn frames_also_reach_a_terminal_inline() {
     let Some((mut engine, mut client)) = connect() else {
@@ -293,38 +338,15 @@ fn frames_also_reach_a_terminal_inline() {
         cols: WIDTH / CELL.0,
         rows: HEIGHT / CELL.1,
     };
-    client
-        .call(
-            "Page.startScreencast",
-            Json::object(vec![
-                ("format", Json::string("png")),
-                ("maxWidth", Json::number(WIDTH)),
-                ("maxHeight", Json::number(HEIGHT)),
-                ("everyNthFrame", Json::number(1)),
-            ]),
-        )
-        .expect("the screencast starts");
+    cast(&mut client, "jpeg", Some(motion::QUALITY), WIDTH, HEIGHT);
 
     let started = Instant::now();
     let (mut frames, mut escape_bytes) = (0usize, 0usize);
     while started.elapsed() < Duration::from_secs(2) {
-        for event in client.events() {
-            if event.method != "Page.screencastFrame" {
-                continue;
-            }
-            if let Some(session) = event.params.get("sessionId").and_then(Json::as_i64) {
-                let _ = client.notify(
-                    "Page.screencastFrameAck",
-                    Json::object(vec![("sessionId", Json::number(session as f64))]),
-                );
-            }
-            let data = event
-                .params
-                .get("data")
-                .and_then(Json::as_str)
-                .unwrap_or("");
-            let png = tos_browser::base64::decode(data.as_bytes()).expect("valid base64");
-            let sequence = tos_browser::graphics::inline_command(&png, cells);
+        for (jpeg, _) in take_frames(&mut client) {
+            let image = tos_term::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
+            let raw = Raw::rgb(&image.rgb, image.width, image.height);
+            let sequence = tos_browser::graphics::inline_command(&raw, cells);
             terminal.advance(&sequence);
             frames += 1;
             escape_bytes += sequence.len();
@@ -333,7 +355,7 @@ fn frames_also_reach_a_terminal_inline() {
     }
     let _ = client.call("Page.stopScreencast", Json::empty());
 
-    assert!(frames > 5, "only {frames} frames inline");
+    assert!(frames > 2, "only {frames} frames inline");
     eprintln!(
         "inline: {frames} frames in {:?} ({:.1}/s), {} bytes down the pane per frame",
         started.elapsed(),
@@ -904,25 +926,59 @@ fn wait_for_frame(client: &mut Client, timeout: Duration) -> Option<Vec<u8>> {
 // The format the frames go in
 // ---------------------------------------------------------------------------
 
-/// The same screenful as [`PAGE`] with nothing moving in it.
+/// A page the shape of a real article, which is what the format tests need.
 ///
-/// Comparing a JPEG against the PNG of the same frame needs the frame to be
-/// the same frame, and [`PAGE`] repaints a moving block sixty times a second
-/// by design. The coloured text is the point of the comparison rather than
-/// decoration: Chromium's JPEG encoder is 4:2:0 at every quality, so a blue
-/// word on white is the worst thing in a page and the thing quality 85 was
-/// chosen to keep legible.
-const STILL_PAGE: &str = "data:text/html,\
-<body style='margin:0;height:100vh;font:12px monospace;overflow:hidden;background:%23fff'>\
-<div id=t></div><div style='position:absolute;left:400px;top:40px;width:160px;height:120px;\
-background:linear-gradient(135deg,%23c33,%233c3,%2333c)'></div><script>\
-var rows=[];for(var i=0;i<28;i++){rows.push(i+' the quick brown fox jumps over the lazy dog \
-0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ')}\
-var t=document.getElementById('t');\
-t.innerHTML=rows.map(function(r,i){return i%253==0?\
-'<span style=color:%230645ad>'+r+'</span>':r}).join('<br>');\
-document.title='still';\
+/// [`PAGE`] is a screenful of monospace text and one moving block, which is
+/// right for measuring a frame path and wrong for measuring a format: it is
+/// almost all sharp black-on-white edges, which is the worst case a JPEG ever
+/// meets, and at 640x360 it is dense enough to come out at 28 dB — a number
+/// about that page rather than about quality 85. So this is prose at a
+/// reading size, in a column, with a picture beside it and links in it, which
+/// is what the measurement in `docs/design/browser.md` was taken on.
+///
+/// It is still until `f()` is called, and then it scrolls, which is the two
+/// things the two tests below want: a frame that can be captured twice and
+/// get the same picture, and a viewport that changes completely every frame.
+const ARTICLE: &str = "data:text/html,\
+<body style='margin:0;font:13px/17px serif;background:%23fff;color:%23202122'>\
+<div style='position:absolute;right:20px;top:60px;width:320px;height:240px;\
+background:linear-gradient(135deg,%23c33,%233c3,%2333c,%23fc0)'></div>\
+<div id=t style='padding:8px 340px 8px 16px'></div><script>\
+var w='the quick brown fox jumps over a lazy dog while Blink lays out a page of \
+prose and the encoder works out what it costs to send'.split(' ');\
+var rows=[];for(var i=0;i<400;i++){var s=[];for(var j=0;j<28;j++){\
+s.push(w[(i*7+j*3)%25w.length])}\
+rows.push('<p style=margin:4px>'+i+' '+s.join(' ')+' <a href=%23 \
+style=color:%230645ad>a link</a></p>')}\
+document.getElementById('t').innerHTML=rows.join('');\
+document.title='article';\
+var n=0;function f(){n=(n+4)%252000;scrollTo(0,n);requestAnimationFrame(f)}\
 </script></body>";
+
+/// Load [`ARTICLE`] at `width` by `height` and wait for it to be there.
+fn article(client: &mut Client, width: u32, height: u32) {
+    client
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            Json::object(vec![
+                ("width", Json::number(width)),
+                ("height", Json::number(height)),
+                ("deviceScaleFactor", Json::number(1)),
+                ("mobile", Json::Bool(false)),
+            ]),
+        )
+        .expect("a pane-sized viewport");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(ARTICLE))]),
+        )
+        .expect("the article loads");
+    assert_eq!(
+        wait_for_title(client, "article", Duration::from_secs(15)),
+        "article"
+    );
+}
 
 /// One `Page.captureScreenshot`, in whichever format.
 fn screenshot(client: &mut Client, format: &str, quality: Option<u32>) -> Vec<u8> {
@@ -944,32 +1000,29 @@ fn screenshot(client: &mut Client, format: &str, quality: Option<u32>) -> Vec<u8
 ///
 /// This is the number `docs/design/browser.md`'s JPEG section rests on: the
 /// frames are only allowed to be lossy while the page is moving, and how
-/// lossy is a thing to measure rather than to trust. 35 dB is the floor — the
-/// measured figure on this page is comfortably above it, and anything near
-/// the floor means either the encoder's defaults moved or `tos_term::jpeg`
-/// has a bug the fixtures did not catch.
+/// lossy is a thing to measure rather than to trust. 35 dB is the floor and
+/// the measured figure on this page is 37; anything near the floor means
+/// either the encoder's defaults moved or `tos_term::jpeg` has a bug the
+/// fixtures did not catch.
+///
+/// Read the floor as being about this page. A screenful of small monospace
+/// text is 28 dB at the same quality and is not a worse decoder or a worse
+/// encoder — it is what 4:2:0 and a quantisation table do to sharp edges, and
+/// it is exactly the case the motion-and-rest policy exists to keep off the
+/// screen while somebody is reading.
 #[test]
 fn a_jpeg_frame_at_quality_85_is_the_png_of_the_same_frame() {
     let Some((mut engine, mut client)) = connect() else {
         return;
     };
     prepare(&mut client);
-    client
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(STILL_PAGE))]),
-        )
-        .expect("the still page loads");
-    assert_eq!(
-        wait_for_title(&mut client, "still", Duration::from_secs(10)),
-        "still"
-    );
+    article(&mut client, WIDE, TALL);
     // A frame after the load event is not necessarily a frame that has been
     // painted; one screenshot forces one.
     let _ = screenshot(&mut client, "png", None);
 
     let png = screenshot(&mut client, "png", None);
-    let jpeg = screenshot(&mut client, "jpeg", Some(85));
+    let jpeg = screenshot(&mut client, "jpeg", Some(motion::QUALITY));
     assert_eq!(&png[..4], b"\x89PNG");
     assert_eq!(&jpeg[..2], b"\xff\xd8");
 
@@ -1000,15 +1053,222 @@ fn a_jpeg_frame_at_quality_85_is_the_png_of_the_same_frame() {
         10.0 * (255.0f64 * 255.0 / mse).log10()
     };
     eprintln!(
-        "quality 85 at {}x{}: {psnr:.1} dB, {} kB of JPEG against {} kB of PNG, \
+        "quality {} at {}x{}: {psnr:.1} dB, {} kB of JPEG against {} kB of PNG, \
          decoded in {decoding:?}",
+        motion::QUALITY,
         lossy.width,
         lossy.height,
         jpeg.len() / 1024,
         png.len() / 1024,
     );
-    assert!(psnr >= 35.0, "quality 85 came out at {psnr:.1} dB");
+    assert!(
+        psnr >= 35.0,
+        "quality {} came out at {psnr:.1} dB",
+        motion::QUALITY
+    );
 
+    client.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// What the branch is for: frames a second, at the size a pane actually is
+// ---------------------------------------------------------------------------
+
+/// A pane's worth of page: 160 by 48 cells on the 8x16 face, with a row left
+/// over for the status line. The measurement that chose JPEG was taken at
+/// 1280x770; 768 is the same pane rounded to a whole number of cells, which
+/// is the only height a pane can actually have.
+const WIDE: u32 = 1280;
+const TALL: u32 = 768;
+
+/// The frame path as it was before this branch: the encoded file itself,
+/// named in `/dev/shm`, decoded by the terminal on its parse loop.
+///
+/// Built here rather than kept in `graphics.rs`, because the program no
+/// longer has this path and a dead branch kept alive for a benchmark is a
+/// branch that rots. It is byte for byte what `Painter::frame` used to emit.
+fn png_through_the_terminal(
+    dir: &std::path::Path,
+    counter: &mut u64,
+    png: &[u8],
+    cells: Cells,
+) -> Vec<u8> {
+    *counter += 1;
+    let name = format!("tos-browser-before-{}-{counter}", std::process::id());
+    let partial = dir.join(format!("{name}.part"));
+    std::fs::write(&partial, png).expect("a frame file");
+    std::fs::rename(&partial, dir.join(&name)).expect("renamed into place");
+    let control = format!(
+        "a=T,f=100,i={IMAGE_ID},p=1,c={},r={},C=1,q=2",
+        cells.cols, cells.rows
+    );
+    let payload = tos_browser::base64::encode(format!("/{name}").as_bytes());
+    format!("\x1b[2;1H\x1b_G{control},t=s;{payload}\x1b\\").into_bytes()
+}
+
+/// What the frame path costs, before and after, at the size a pane is.
+///
+/// "Before" is a PNG screencast handed to the terminal as a file, which is
+/// what `main` did until this branch: the engine encodes a PNG, the terminal
+/// decodes it on the thread that parses escape sequences. "After" is a JPEG
+/// screencast at quality 85 decoded in this process and handed over as raw
+/// pixels. Both run against the same page, scrolling, at the same size,
+/// through the same `/dev/shm` transport and the same terminal, for the same
+/// three seconds.
+///
+/// **What is asserted is the terminal's cost, not the frame rate**, and the
+/// reason is worth knowing. `docs/design/browser.md` records 33.8 fps for PNG
+/// against 57.8 for JPEG, measured on a slower machine against a real
+/// ja.wikipedia page; on a fast host with `--cpus=2` and this page the
+/// engine's PNG encoder keeps up and both formats arrive at very nearly 60,
+/// so a frame-rate assertion here would be asserting something about the
+/// machine. The cost this branch actually controls is the compositor's: a PNG
+/// decode on the parse loop against a copy out of tmpfs, which is the same
+/// several-fold difference whatever the engine manages. Both numbers are
+/// printed; only the one that is a property of the code is asserted.
+#[test]
+fn raw_pixels_cost_the_terminal_a_fraction_of_what_a_png_frame_did() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    article(&mut client, WIDE, TALL);
+    client
+        .call(
+            "Runtime.evaluate",
+            Json::object(vec![("expression", Json::string("f()"))]),
+        )
+        .expect("the page starts scrolling");
+
+    let cells = Cells {
+        cols: WIDE / CELL.0,
+        rows: TALL / CELL.1,
+    };
+    let run_for = Duration::from_secs(3);
+
+    // Before: PNG, decoded by the terminal on its parse loop.
+    let before_dir = temp_dir("before");
+    let mut terminal = sized_terminal(&before_dir, WIDE, TALL);
+    let mut counter = 0u64;
+    cast(&mut client, "png", None, WIDE, TALL);
+    let started = Instant::now();
+    let (mut before_frames, mut before_bytes) = (0usize, 0usize);
+    let mut before_terminal = Duration::ZERO;
+    while started.elapsed() < run_for {
+        for (png, _) in take_frames(&mut client) {
+            let sequence = png_through_the_terminal(&before_dir, &mut counter, &png, cells);
+            let at = Instant::now();
+            terminal.advance(&sequence);
+            before_terminal += at.elapsed();
+            before_frames += 1;
+            before_bytes += png.len();
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let before_seconds = started.elapsed().as_secs_f64();
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    // `Page.stopScreencast` returns before the last frames do, and the ones
+    // still coming are in the old format. Only a test that changes format
+    // mid-session meets this — the program picks one at `Page.enable` and
+    // keeps it — but here it is the difference between a measurement and a
+    // panic, so the queue is drained until it stays empty.
+    let give_up = Instant::now() + Duration::from_secs(2);
+    let mut quiet_since = Instant::now();
+    while Instant::now() < give_up && quiet_since.elapsed() < Duration::from_millis(300) {
+        if !take_frames(&mut client).is_empty() {
+            quiet_since = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(before_frames > 5, "only {before_frames} PNG frames");
+    assert_eq!(
+        terminal
+            .graphics()
+            .image(IMAGE_ID)
+            .map(|i| (i.width, i.height)),
+        Some((WIDE, TALL)),
+        "the before path did not put a frame in the store"
+    );
+
+    // After: JPEG at quality 85, decoded here, raw pixels over.
+    let after_dir = temp_dir("after");
+    let mut painter = Painter::at(&after_dir);
+    let mut terminal = sized_terminal(&after_dir, WIDE, TALL);
+    cast(&mut client, "jpeg", Some(motion::QUALITY), WIDE, TALL);
+    let started = Instant::now();
+    let (mut after_frames, mut after_bytes) = (0usize, 0usize);
+    let (mut decoding, mut after_terminal) = (Duration::ZERO, Duration::ZERO);
+    let mut stragglers = 0usize;
+    while started.elapsed() < run_for {
+        for (jpeg, _) in take_frames(&mut client) {
+            if jpeg.get(..2) != Some(b"\xff\xd8") {
+                // A PNG from the pass above that outlived the drain. Counted
+                // rather than ignored, because a lot of them would mean the
+                // measurement below is of the wrong thing.
+                stragglers += 1;
+                continue;
+            }
+            let at = Instant::now();
+            let image = tos_term::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
+            decoding += at.elapsed();
+            let raw = Raw::rgb(&image.rgb, image.width, image.height);
+            let sequence = painter.frame(raw, cells, 2, 1);
+            let at = Instant::now();
+            terminal.advance(&sequence);
+            after_terminal += at.elapsed();
+            after_frames += 1;
+            after_bytes += jpeg.len();
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let after_seconds = started.elapsed().as_secs_f64();
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    assert!(after_frames > 5, "only {after_frames} JPEG frames");
+    assert!(
+        stragglers < after_frames / 10,
+        "{stragglers} frames of the old format against {after_frames} of the new"
+    );
+    assert_eq!(
+        terminal
+            .graphics()
+            .image(IMAGE_ID)
+            .map(|i| (i.width, i.height)),
+        Some((WIDE, TALL)),
+        "the after path did not put a frame in the store"
+    );
+
+    let before_fps = before_frames as f64 / before_seconds;
+    let after_fps = after_frames as f64 / after_seconds;
+    let before_each = before_terminal / before_frames as u32;
+    let after_each = after_terminal / after_frames as u32;
+    eprintln!(
+        "{WIDE}x{TALL} end to end:\n  \
+         before  png  decoded by the terminal: {before_fps:.1} fps, \
+         {} kB a frame, {before_each:?} in the terminal\n  \
+         after   jpeg q{} decoded here:        {after_fps:.1} fps, \
+         {} kB a frame, {:?} decoding, {after_each:?} in the terminal\n  \
+         the terminal's share is {:.1}x smaller",
+        before_bytes / before_frames / 1024,
+        motion::QUALITY,
+        after_bytes / after_frames / 1024,
+        decoding / after_frames as u32,
+        before_each.as_secs_f64() / after_each.as_secs_f64().max(f64::EPSILON),
+    );
+
+    assert!(
+        after_each * 2 < before_each,
+        "the terminal spent {after_each:?} a frame on raw pixels against \
+         {before_each:?} on a PNG: the decode was supposed to leave the \
+         compositor's thread"
+    );
+    // And the path as a whole keeps up with something worth calling a
+    // browser, whichever format the engine is fast enough to manage.
+    assert!(after_fps > 25.0, "only {after_fps:.1} fps end to end");
+
+    painter.clean_up();
+    std::fs::remove_dir_all(&before_dir).ok();
+    std::fs::remove_dir_all(&after_dir).ok();
     client.close();
     engine.kill();
 }

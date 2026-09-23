@@ -1,9 +1,26 @@
 //! Putting a frame of video where a picture goes.
 //!
-//! Every screencast frame is a whole PNG, so every frame is a transmission of
-//! a new image. Sixty times a second, that raises two questions the protocol
-//! answers badly if you do not think about them: which image id to use, and
-//! how the bytes get there.
+//! Every screencast frame is a whole picture, so every frame is a
+//! transmission of a new image. Sixty times a second, that raises three
+//! questions the protocol answers badly if you do not think about them: which
+//! image id to use, which format the bytes are in, and how they get there.
+//!
+//! # Raw pixels, decoded here
+//!
+//! **`f=24` and `f=32`, not `f=100`.** The frames arrive from the engine as
+//! JPEG while the page is moving and as PNG when it stops (see
+//! [`crate::motion`]), and neither should be handed to the terminal to
+//! decode: it cannot read JPEG on the graphics path at all, and the PNG
+//! decode it does do is on the compositor's parse loop, which
+//! `docs/design/browser.md` already names as the first cost to delete. So
+//! this program decodes — 8 ms for a 1280x770 JPEG frame, on its own thread,
+//! in the pane — and hands over pixels, which is the protocol's own raw
+//! format and needs no compositor change at all.
+//!
+//! It costs bytes: 2.9 MB of RGB where the JPEG was 185 kB. Through `t=s`
+//! that is a `write` into tmpfs and a `read` out of it, which is a memcpy at
+//! memory speed and cheaper than the decode it replaces. Through the inline
+//! fallback it is not, and the section below says what that means.
 //!
 //! # One image id, retransmitted
 //!
@@ -26,8 +43,8 @@
 //! # A name, not the bytes
 //!
 //! `t=s` hands the compositor a POSIX shared memory name and it reads the file
-//! itself, which keeps a 58 kB frame out of the PTY sixty times a second —
-//! base64 would make it 77 kB and the pane's reader would spend its day on it.
+//! itself, which keeps the frame out of the PTY sixty times a second — base64
+//! would add a third to it and the pane's reader would spend its day on it.
 //! The compositor *unlinks the object after reading it*
 //! (`docs/design/graphics-file-transmission.md`), so every frame needs a name
 //! of its own; the counter in [`Painter`] is that.
@@ -40,6 +57,16 @@
 //! pile up in `/dev/shm` and nothing appears on screen, so after a few
 //! unconsumed names [`Painter`] gives up and sends the bytes inline instead.
 //! That check is what makes the same binary work in Kitty.
+//!
+//! **The fallback sends the same raw pixels, base64, and it is slow.** That
+//! is a decision rather than an oversight. Sending the encoded frame instead
+//! is not available: the motion frames are JPEG and no terminal's graphics
+//! path reads JPEG. Re-encoding the decoded pixels as PNG would mean a PNG
+//! *encoder* in this crate — a third codec written from a specification — to
+//! make faster a path that exists only for terminals which are not tOS. So:
+//! 2.9 MB becomes 3.9 MB of base64 a frame and a pane in somebody else's
+//! terminal gets a slideshow. It is correct, it is obviously correct, and the
+//! terminal this program is for never takes it.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -67,6 +94,53 @@ pub const SHM_DIR: &str = "/dev/shm";
 /// written. Sixteen frames is a quarter of a second at sixty; a terminal that
 /// has not read a name by then is not going to.
 const IN_FLIGHT: usize = 16;
+
+/// One decoded frame, in the layout its decoder produced.
+///
+/// Three channels or four, and the protocol has a format for each, so the
+/// pixels go across as they are rather than being widened or narrowed:
+/// `tos_term::jpeg` produces RGB and a JPEG has no alpha to lose,
+/// `tos_term::png` produces RGBA and a still is one frame in a hundred and
+/// fifty milliseconds, so neither conversion would buy anything.
+#[derive(Debug, Clone, Copy)]
+pub struct Raw<'a> {
+    pub pixels: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+    /// Bytes a pixel: three for `f=24`, four for `f=32`.
+    pub channels: u32,
+}
+
+impl<'a> Raw<'a> {
+    /// Three bytes a pixel, which is what a decoded JPEG is.
+    pub fn rgb(pixels: &'a [u8], width: u32, height: u32) -> Raw<'a> {
+        Raw {
+            pixels,
+            width,
+            height,
+            channels: 3,
+        }
+    }
+
+    /// Four, which is what a decoded PNG is.
+    pub fn rgba(pixels: &'a [u8], width: u32, height: u32) -> Raw<'a> {
+        Raw {
+            pixels,
+            width,
+            height,
+            channels: 4,
+        }
+    }
+
+    /// The protocol's `f=` for this layout.
+    fn format(&self) -> u32 {
+        if self.channels == 3 {
+            24
+        } else {
+            32
+        }
+    }
+}
 
 /// How the payload reaches the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,32 +196,32 @@ impl Painter {
         self.transport
     }
 
-    /// The bytes that put `png` on screen at `row`, `col`, sized to `cells`.
+    /// The bytes that put `raw` on screen at `row`, `col`, sized to `cells`.
     ///
     /// The cursor is moved to the placement's corner first, because `a=T`
     /// places at the cursor, and `C=1` keeps it there so that the status line
     /// can be written afterwards without the picture having moved anything.
-    pub fn frame(&mut self, png: &[u8], cells: Cells, row: u32, col: u32) -> Vec<u8> {
+    pub fn frame(&mut self, raw: Raw<'_>, cells: Cells, row: u32, col: u32) -> Vec<u8> {
         let mut out = format!("\x1b[{row};{col}H").into_bytes();
         match self.transport {
-            Transport::SharedMemory => match self.write_object(png) {
-                Some(name) => out.extend_from_slice(&shared_memory_command(&name, cells)),
+            Transport::SharedMemory => match self.write_object(raw.pixels) {
+                Some(name) => out.extend_from_slice(&shared_memory_command(&name, &raw, cells)),
                 None => {
                     // Writing failed, so the directory that worked at startup
                     // does not any more; the picture is more important than
                     // the transport it arrives by.
                     self.transport = Transport::Inline;
-                    out.extend_from_slice(&inline_command(png, cells));
+                    out.extend_from_slice(&inline_command(&raw, cells));
                 }
             },
-            Transport::Inline => out.extend_from_slice(&inline_command(png, cells)),
+            Transport::Inline => out.extend_from_slice(&inline_command(&raw, cells)),
         }
         out
     }
 
     /// Write one frame under a fresh name, and retire the names that are old
     /// enough to have been read by now.
-    fn write_object(&mut self, png: &[u8]) -> Option<String> {
+    fn write_object(&mut self, pixels: &[u8]) -> Option<String> {
         self.counter += 1;
         let name = format!("{}-{}", self.prefix, self.counter);
         let path = self.dir.join(&name);
@@ -156,7 +230,7 @@ impl Painter {
         // Written under another name and renamed, so that the compositor never
         // sees a file that is still growing: it takes the size from the
         // descriptor and would read a short image.
-        if std::fs::write(&partial, png).is_err() {
+        if std::fs::write(&partial, pixels).is_err() {
             let _ = std::fs::remove_file(&partial);
             return None;
         }
@@ -208,17 +282,28 @@ impl Drop for Painter {
 }
 
 /// The control keys every frame carries.
-fn control(cells: Cells) -> String {
+///
+/// `s=` and `v=` are the picture's real pixel dimensions, and for a raw
+/// payload they are not advisory the way they are for a PNG: pixels are a
+/// rectangle and nothing else, so this is where the terminal learns its
+/// shape. `c=` and `r=` are the cells it is drawn into, which is a separate
+/// thing, and the two agree because the page is laid out at the pane's own
+/// pixel size — a frame that is the size of the cells it fills is blitted
+/// rather than resampled.
+fn control(raw: &Raw<'_>, cells: Cells) -> String {
     format!(
-        "a=T,f=100,i={IMAGE_ID},p={PLACEMENT_ID},c={},r={},C=1,q=2",
+        "a=T,f={},s={},v={},i={IMAGE_ID},p={PLACEMENT_ID},c={},r={},C=1,q=2",
+        raw.format(),
+        raw.width.max(1),
+        raw.height.max(1),
         cells.cols.max(1),
         cells.rows.max(1)
     )
 }
 
 /// `t=s`: the payload is the name of the object, not the image.
-pub fn shared_memory_command(name: &str, cells: Cells) -> Vec<u8> {
-    let control = control(cells);
+pub fn shared_memory_command(name: &str, raw: &Raw<'_>, cells: Cells) -> Vec<u8> {
+    let control = control(raw, cells);
     format!(
         "\x1b_G{control},t=s;{}\x1b\\",
         base64::encode(name.as_bytes())
@@ -236,17 +321,18 @@ pub fn shared_memory_command(name: &str, cells: Cells) -> Vec<u8> {
 /// An empty pane is honest about there being nothing to show yet.
 ///
 /// `d=I` rather than `d=i`: the uppercase form frees the image data as well as
-/// the placement, and the data is the pane in RGBA — nearly a megabyte at
-/// 640x368. The next frame transmits a new image under the same id anyway, so
+/// the placement, and the data is the pane in RGBA — nearly four megabytes at
+/// 1280x770. The next frame transmits a new image under the same id anyway, so
 /// there is nothing to keep.
 pub fn clear_command() -> Vec<u8> {
     format!("\x1b_Ga=d,d=I,i={IMAGE_ID},p={PLACEMENT_ID},q=2\x1b\\").into_bytes()
 }
 
-/// `t=d`: the image itself, base64, in as many escape sequences as it takes.
-pub fn inline_command(png: &[u8], cells: Cells) -> Vec<u8> {
-    let control = control(cells);
-    let encoded = base64::encode(png);
+/// `t=d`: the pixels themselves, base64, in as many escape sequences as it
+/// takes — which for a pane-sized frame is several hundred.
+pub fn inline_command(raw: &Raw<'_>, cells: Cells) -> Vec<u8> {
+    let control = control(raw, cells);
+    let encoded = base64::encode(raw.pixels);
     if encoded.is_empty() {
         return format!("\x1b_G{control};\x1b\\").into_bytes();
     }
@@ -276,6 +362,21 @@ mod tests {
         Cells { cols, rows }
     }
 
+    /// A 2x2 picture, in each of the two layouts the protocol takes.
+    fn rgb() -> Vec<u8> {
+        vec![
+            10, 20, 30, 40, 50, 60, //
+            70, 80, 90, 100, 110, 120,
+        ]
+    }
+
+    fn rgba() -> Vec<u8> {
+        vec![
+            10, 20, 30, 255, 40, 50, 60, 255, //
+            70, 80, 90, 255, 100, 110, 120, 255,
+        ]
+    }
+
     /// Pull the APC bodies out the way the terminal's parser does.
     fn apc_bodies(bytes: &[u8]) -> Vec<Vec<u8>> {
         let mut bodies = Vec::new();
@@ -297,12 +398,15 @@ mod tests {
 
     #[test]
     fn a_shared_memory_frame_names_an_object_and_says_nothing_back() {
-        let bytes = shared_memory_command("/tos-browser-1-2", cells(80, 23));
+        let pixels = rgb();
+        let raw = Raw::rgb(&pixels, 640, 368);
+        let bytes = shared_memory_command("/tos-browser-1-2", &raw, cells(80, 23));
         let bodies = apc_bodies(&bytes);
         assert_eq!(bodies.len(), 1);
         let cmd = GraphicsCommand::parse(&bodies[0]).expect("parses");
         assert_eq!(cmd.action, Action::TransmitAndDisplay);
-        assert_eq!(cmd.format, Format::Png);
+        assert_eq!(cmd.format, Format::Rgb, "the pixels go over, not a file");
+        assert_eq!((cmd.width, cmd.height), (640, 368));
         assert_eq!(cmd.medium, Medium::SharedMemory);
         assert_eq!(cmd.image_id, IMAGE_ID);
         assert_eq!(cmd.placement_id, PLACEMENT_ID);
@@ -312,10 +416,28 @@ mod tests {
         assert_eq!(cmd.payload, b"/tos-browser-1-2");
     }
 
+    /// A still is RGBA because that is what the PNG decoder produces, and the
+    /// protocol takes it under a format of its own rather than a conversion.
+    #[test]
+    fn a_still_goes_over_as_rgba_and_a_motion_frame_as_rgb() {
+        let three = rgb();
+        let four = rgba();
+        for (raw, format) in [
+            (Raw::rgb(&three, 2, 2), Format::Rgb),
+            (Raw::rgba(&four, 2, 2), Format::Rgba),
+        ] {
+            let bodies = apc_bodies(&inline_command(&raw, cells(2, 1)));
+            let cmd = GraphicsCommand::parse(&bodies[0]).expect("parses");
+            assert_eq!(cmd.format, format);
+            assert_eq!((cmd.width, cmd.height), (2, 2));
+        }
+    }
+
     #[test]
     fn an_inline_frame_is_the_picture_in_chunks_that_reassemble() {
-        let png: Vec<u8> = (0..CHUNK * 5).map(|i| (i * 31) as u8).collect();
-        let bodies = apc_bodies(&inline_command(&png, cells(10, 4)));
+        let pixels: Vec<u8> = (0..CHUNK * 5).map(|i| (i * 31) as u8).collect();
+        let raw = Raw::rgb(&pixels, (CHUNK as u32 * 5) / 3, 1);
+        let bodies = apc_bodies(&inline_command(&raw, cells(10, 4)));
         assert!(bodies.len() > 1);
 
         let first = GraphicsCommand::parse(&bodies[0]).expect("parses");
@@ -333,14 +455,15 @@ mod tests {
             let semicolon = body.iter().position(|&b| b == b';').unwrap();
             joined.extend_from_slice(&tos_term::graphics::decode_base64(&body[semicolon + 1..]));
         }
-        assert_eq!(joined, png);
+        assert_eq!(joined, pixels);
     }
 
     #[test]
     fn switching_tabs_takes_the_old_page_off_the_screen() {
         let mut terminal = tos_term::Terminal::new(40, 12, tos_term::TerminalConfig::default());
         let mut painter = Painter::at(Path::new("/nonexistent-for-a-test"));
-        terminal.advance(&painter.frame(&tiny_png(), cells(4, 2), 2, 1));
+        let pixels = rgb();
+        terminal.advance(&painter.frame(Raw::rgb(&pixels, 2, 2), cells(4, 2), 2, 1));
         assert_eq!(terminal.graphics().placements().count(), 1);
         assert!(terminal.graphics().image(IMAGE_ID).is_some());
 
@@ -360,7 +483,7 @@ mod tests {
     fn a_frame_puts_the_cursor_where_the_picture_goes() {
         let mut painter = Painter::at(Path::new("/nonexistent-for-a-test"));
         assert_eq!(painter.transport(), Transport::Inline);
-        let bytes = painter.frame(b"png", cells(4, 2), 2, 1);
+        let bytes = painter.frame(Raw::rgb(b"rgb", 1, 1), cells(4, 2), 2, 1);
         assert!(bytes.starts_with(b"\x1b[2;1H"), "{bytes:?}");
     }
 
@@ -372,7 +495,7 @@ mod tests {
 
         let mut names = Vec::new();
         for _ in 0..4 {
-            let bytes = painter.frame(b"png", cells(4, 2), 2, 1);
+            let bytes = painter.frame(Raw::rgb(b"rgb", 1, 1), cells(4, 2), 2, 1);
             let body = apc_bodies(&bytes).remove(0);
             let cmd = GraphicsCommand::parse(&body).expect("parses");
             let name = String::from_utf8(cmd.payload).expect("a name");
@@ -380,7 +503,7 @@ mod tests {
             assert!(!name.contains(".part"), "{name}");
             // The file is there, whole, and nothing is left half-written.
             let path = dir.join(name.trim_start_matches('/'));
-            assert_eq!(std::fs::read(&path).unwrap(), b"png");
+            assert_eq!(std::fs::read(&path).unwrap(), b"rgb");
             names.push(name);
             // The terminal reads and unlinks; here the test does.
             std::fs::remove_file(&path).expect("consume");
@@ -400,7 +523,7 @@ mod tests {
         let dir = temp_dir("unread");
         let mut painter = Painter::at(&dir);
         for _ in 0..IN_FLIGHT * 2 {
-            painter.frame(b"png", cells(4, 2), 2, 1);
+            painter.frame(Raw::rgb(b"rgb", 1, 1), cells(4, 2), 2, 1);
         }
         assert_eq!(
             painter.transport(),
@@ -418,81 +541,20 @@ mod tests {
         // The real thing: drive a terminal with the bytes and look at its
         // store. Retransmitting under the same id must not accumulate.
         let mut terminal = tos_term::Terminal::new(40, 12, tos_term::TerminalConfig::default());
-        let png = tiny_png();
+        let pixels = rgb();
         for _ in 0..8 {
-            terminal.advance(&inline_command(&png, cells(8, 4)));
+            terminal.advance(&inline_command(&Raw::rgb(&pixels, 2, 2), cells(8, 4)));
         }
         let store = terminal.graphics();
         assert_eq!(store.placements().count(), 1);
         let image = store.image(IMAGE_ID).expect("the one image");
         assert_eq!((image.width, image.height), (2, 2));
+        // RGB widens to the RGBA the store holds, with an opaque alpha.
+        assert_eq!(&image.data[..8], &[10, 20, 30, 255, 40, 50, 60, 255]);
         let placement = store.placements().next().expect("the one placement");
         assert_eq!(placement.image_id, IMAGE_ID);
         assert_eq!(placement.placement_id, PLACEMENT_ID);
         assert_eq!((placement.cols, placement.rows), (8, 4));
-    }
-
-    /// A 2x2 PNG, built by the encoder in the test suite next door.
-    fn tiny_png() -> Vec<u8> {
-        let mut raw = Vec::new();
-        for _ in 0..2 {
-            // Each row starts with its filter byte, which is "none".
-            raw.extend_from_slice(&[0u8]);
-            for x in 0..2u8 {
-                raw.extend_from_slice(&[x * 100, 40, 200, 255]);
-            }
-        }
-        let mut idat = vec![0x78, 0x01];
-        // One stored deflate block, which needs no compressor.
-        idat.push(1);
-        idat.extend_from_slice(&(raw.len() as u16).to_le_bytes());
-        idat.extend_from_slice(&(!(raw.len() as u16)).to_le_bytes());
-        idat.extend_from_slice(&raw);
-        idat.extend_from_slice(&adler32(&raw).to_be_bytes());
-
-        let mut ihdr = Vec::new();
-        ihdr.extend_from_slice(&2u32.to_be_bytes());
-        ihdr.extend_from_slice(&2u32.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
-
-        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-        push_chunk(&mut png, b"IHDR", &ihdr);
-        push_chunk(&mut png, b"IDAT", &idat);
-        push_chunk(&mut png, b"IEND", &[]);
-        png
-    }
-
-    fn push_chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
-        png.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        png.extend_from_slice(kind);
-        png.extend_from_slice(data);
-        let mut crc_input = kind.to_vec();
-        crc_input.extend_from_slice(data);
-        png.extend_from_slice(&crc32(&crc_input).to_be_bytes());
-    }
-
-    fn crc32(data: &[u8]) -> u32 {
-        let mut crc = 0xffff_ffffu32;
-        for &byte in data {
-            crc ^= byte as u32;
-            for _ in 0..8 {
-                crc = if crc & 1 != 0 {
-                    (crc >> 1) ^ 0xedb8_8320
-                } else {
-                    crc >> 1
-                };
-            }
-        }
-        !crc
-    }
-
-    fn adler32(data: &[u8]) -> u32 {
-        let (mut a, mut b) = (1u32, 0u32);
-        for &byte in data {
-            a = (a + byte as u32) % 65521;
-            b = (b + a) % 65521;
-        }
-        (b << 16) | a
     }
 
     fn temp_dir(what: &str) -> PathBuf {
