@@ -499,30 +499,107 @@ the thread that has to keep every other pane on the screen as well.
 So the policy, which is what VNC and RDP do and for the same reason:
 
 - The screencast runs at `format=jpeg, quality=85`.
-- When no screencast frame has arrived for **150 ms**, the tab in front is
-  asked for one `Page.captureScreenshot` in PNG, and that is what is left on
-  the screen.
-- The next screencast frame resumes motion.
+- When no screencast frame has arrived for **250 ms** *and* no wheel notch or
+  key has arrived for **400 ms**, the tab in front is asked for one
+  `Page.captureScreenshot` in PNG, without waiting for it.
+- The reply is painted only if at most **one** screencast frame arrived while
+  it was being drawn — the one the screenshot takes of itself, below. Two or
+  more and it is thrown away and the tab stays in motion.
+- A painted still is credited with the moment its **reply** arrived, and a
+  frame older than what is on screen is dropped and is not counted as motion.
+- The next screencast frame that is newer than what is on screen resumes
+  motion.
 
 Text that somebody is reading is therefore always lossless. The lossy frames
 are only ever the ones scrolling past, which nobody reads. A page that never
 moves costs one still and then nothing at all — no frames, no polling, no
 repainting.
 
-**Ordering.** Two sources now paint one pane and they can arrive out of order:
-a screencast frame captured before the still was asked for can turn up after
-it, and a still can come back after the page started moving again. The rule is
-that the newer capture wins, on the wall clock — `Page.screencastFrame`
-carries `metadata.timestamp` in seconds since the epoch and the engine is a
-child process on this machine, so it is the same clock this program reads. A
-still has no timestamp, so it is credited with the moment it was *asked for*,
-which is the earliest instant it could depict. That is what decides the one
-case the timestamps cannot order, a frame captured while the screenshot was
-being drawn: **motion wins the tie**, because a moving page produces another
-frame in 17 ms and corrects any mistake, while a still wrongly dropped leaves
-a stale picture up for as long as the page stays still.
+#### What a slow engine did to the first version of this
+
+The first version had one interval (150 ms of frame quiet), credited the still
+with the moment it was asked for, and took it with a blocking call. On the
+host the format was chosen on that was invisible. On an installed tOS in
+VirtualBox — 2 vCPUs, no GPU, a 1280×770 pane — scrolling flashed. Measured
+there, through an ssh tunnel, against the VM's own engine:
+
+| | on the VM |
+| --- | --- |
+| `Page.captureScreenshot`, png, pane size | 66–98 ms |
+| `Page.captureScreenshot`, jpeg, pane size | 42–51 ms |
+| jpeg q85 screencast while scrolling | ≈ 42 fps, 24–27 ms gaps |
+
+`metadata.timestamp` was checked against `SystemTime` on that machine and the
+two are the same clock, so none of what follows is a clock bug.
+
+Three separate things were wrong, and all three are the same number being too
+small:
+
+1. **A still after every notch.** A wheel notch makes the engine animate for
+   about 100 ms and then stop; a hand on a wheel produces notches 150–300 ms
+   apart. 150 ms of frame quiet therefore fits in the gap *between two
+   notches*, so every notch ended in a PNG. The screen went JPEG frames, PNG,
+   JPEG frames, PNG, several times a second, and because Chromium's screencast
+   JPEG is 4:2:0 at every quality, on anything with colour in it — a gradient,
+   a picture, coloured text — that difference is visible at 1:1. **No interval
+   on the frames alone can fix this**: nothing about a gap in the frames says
+   whether it is the end of a scroll or the moment before the next notch. The
+   wheel says. So a still now waits for input quiet as well, and 400 ms is the
+   300 ms a hand leaves with room.
+2. **The loop blocked for 66–98 ms per still.** `Page.captureScreenshot` went
+   out with `Client::call`, which sits on the mailbox's condition variable
+   until the reply comes, so for the whole of the screenshot the program was
+   not reading the terminal. That is the "sometimes a key needs pressing
+   twice" report: the key was not lost, it was a tenth of a second late.
+   `Client::send` and `Client::take_reply` were added for this — the same
+   mailbox, the same wake pipe, the reply collected on whichever pass it has
+   arrived on — and the loop keeps polling, handling input and painting frames
+   while the still is in flight.
+3. **Request-time crediting fed the still back into itself.** This is the one
+   that was not guessed, and it turned up when the new rule — "any frame
+   between the request and the reply means the page moved" — was driven
+   against a real engine and *never produced a still at all*: 67 asked for, 67
+   thrown away, on a page nothing was happening to. Probed on
+   `chromium-shell`, at 1280×768, on an idle page:
+
+   ```text
+   idle, no screenshots          0 frames in 3 s
+   8 screenshots in a row        exactly 1 screencast frame each
+   that frame's timestamp        +4 ms from the request, 35–48 ms before the reply
+   fromSurface=false             the same
+   ```
+
+   **`Page.captureScreenshot` forces a capture of the page's surface, and the
+   screencast is watching that same surface, so every still photographs itself
+   into the screencast.** Credit the still with the instant it was *asked for*
+   and that shutter frame — stamped 4 ms later — counts as newer, so a JPEG of
+   the page was painted straight over the PNG that had just replaced it, which
+   cleared the tab's rest, which asked for another still 150 ms later, which
+   produced another shutter frame. **A loop, about four times a second, on
+   every page including a completely static one.** That is the flashing; the
+   wheel only made it more frequent.
+
+   So: one frame in the window is free (`motion::SHUTTER_FRAMES`), two or more
+   are the page moving; a painted still is credited with the moment its
+   **reply** arrived, the latest instant it could depict, which puts the
+   shutter frame on the stale side; and **a frame older than what is on screen
+   is not motion** — it shows a moment already drawn, so it does not clear the
+   rest and does not restart the rest timer. With all three, the loop has
+   nothing to stand on.
+
+**What the timestamps are for.** Ordering a frame that was in the mailbox
+before a still that *was* painted, arriving after it — the shutter frame is
+the common case of exactly that. `Page.screencastFrame` carries
+`metadata.timestamp` in seconds since the epoch and the engine is a child
+process on this machine, so it is the same clock this program reads.
+
 `apps/browser/src/motion.rs` is the policy and its tests, away from the engine,
-the terminal and the pane.
+the terminal and the pane. `apps/browser/tests/engine.rs` pins the three
+claims against a real engine: that a still provokes exactly one screencast
+frame and where in its window that frame lands; that ten wheel notches 200 ms
+apart produce no still until they stop and exactly one afterwards; and that a
+key sent while a still is in flight reaches the page before the still's reply
+is collected.
 
 ### The decoder, and a decision overturned
 

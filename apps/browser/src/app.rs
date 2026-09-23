@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use tos_platform::tty::{self, ReadOutcome};
 use tos_preview::fit::{Cells, Metrics};
 
-use crate::cdp::{Client, Event};
+use crate::cdp::{Client, Event, Pending};
 use crate::engine::Engine;
 use crate::graphics::{Painter, Raw};
 use crate::input::{Input, Key, KeyAction, KeyInput, MouseInput, MouseKind, Parser};
@@ -70,10 +70,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// stopped.
 ///
 /// It is a whole-page paint and an encode, so it is slower than a screencast
-/// frame — tens of milliseconds at a pane's size — and it blocks this loop
-/// while it happens, which is why it only ever runs when nothing is moving.
-/// A page that cannot produce one in two seconds has something else wrong
-/// with it and the last motion frame stays up.
+/// frame: 66 to 98 milliseconds at a pane's size on the VirtualBox machine
+/// [`crate::motion`] was measured on. It does not block this loop for them —
+/// the command goes out with [`Client::send`] and the reply is collected on
+/// whichever pass it has arrived on — so this is a deadline rather than a
+/// wait. A page that cannot produce a picture of itself in two seconds has
+/// something else wrong with it, and the last motion frame stays up.
 const STILL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The largest frame either decoder may produce, in bytes of pixels.
@@ -131,6 +133,8 @@ struct Chrome {
     metrics: Metrics,
     /// Whether the page in front is moving, and what its screen holds.
     motion: Motion,
+    /// The lossless still that has been asked for and not yet answered.
+    still: Option<Still>,
     /// `Some` while the url is being typed.
     editing: Option<String>,
     /// Whether that url is still the one the page had, untouched.
@@ -141,6 +145,19 @@ struct Chrome {
     /// the old url until then is what makes `ctrl+l` also a way to read where
     /// you are.
     editing_whole: bool,
+}
+
+/// A `Page.captureScreenshot` that is out with the engine.
+///
+/// The target is kept beside the command because a tab can be switched away
+/// from, resized or closed while the engine is drawing: a reply collected
+/// against the wrong page would paint one tab's picture under another tab's
+/// name.
+struct Still {
+    target: String,
+    pending: Pending,
+    /// When it went out, against [`STILL_TIMEOUT`].
+    sent: Instant,
 }
 
 /// Run until the person quits or something goes wrong.
@@ -221,6 +238,7 @@ fn drive(
         buttons: 0,
         metrics,
         motion: Motion::new(Instant::now()),
+        still: None,
         editing: None,
         editing_whole: false,
     };
@@ -715,8 +733,8 @@ fn handle_page_events(
     chrome: &mut Chrome,
 ) -> Result<(), String> {
     let active = tabs.active_index();
-    // The encoded frame and the moment the engine says it was captured.
-    let mut newest_frame: Option<(Vec<u8>, Option<f64>)> = None;
+    // The newest frame worth painting, still encoded.
+    let mut newest_frame: Option<Vec<u8>> = None;
     let mut redraw = false;
 
     for index in 0..tabs.len() {
@@ -751,8 +769,19 @@ fn handle_page_events(
                         let stamp = params
                             .path(&["metadata", "timestamp"])
                             .and_then(Json::as_f64);
+                        // Every frame is told to the policy, even though only
+                        // the last will be painted. Frames are coalesced here
+                        // because a pane cannot draw sixty a second; the count
+                        // in a still's window is not, because one frame there
+                        // is the still photographing itself and two are the
+                        // page moving — see [`motion::SHUTTER_FRAMES`] — and a
+                        // pass that happened to collect two must not look like
+                        // a pass that collected one.
+                        if !chrome.motion.motion_frame(stamp, Instant::now()) {
+                            continue;
+                        }
                         match crate::base64::decode(data.as_bytes()) {
-                            Ok(jpeg) => newest_frame = Some((jpeg, stamp)),
+                            Ok(jpeg) => newest_frame = Some(jpeg),
                             // A frame that will not decode is a frame, not a
                             // session: the next one is along in sixteen
                             // milliseconds.
@@ -803,19 +832,18 @@ fn handle_page_events(
     if redraw {
         redraw_row(pane, tabs, chrome)?;
     }
-    if let Some((jpeg, stamp)) = newest_frame {
-        // Ordered before decoded: a frame that lost to the still on screen
-        // is eight milliseconds of work not done.
-        if chrome.motion.motion_frame(stamp, Instant::now()) {
-            // A frame that will not decode is dropped on the same rule as one
-            // that would not base64: one of them is nothing. A run of them is
-            // a page that looks frozen, which is what the engine test
-            // comparing the two formats through both decoders exists to catch
-            // before a person meets it.
-            if let Ok(image) = tos_term::jpeg::decode(&jpeg, FRAME_BUDGET) {
-                let raw = Raw::rgb(&image.rgb, image.width, image.height);
-                paint(pane, tabs, chrome, raw)?;
-            }
+    if let Some(jpeg) = newest_frame {
+        // Ordered above, decoded here: a frame that lost to the still on
+        // screen is eight milliseconds of work not done.
+        //
+        // A frame that will not decode is dropped on the same rule as one that
+        // would not base64: one of them is nothing. A run of them is a page
+        // that looks frozen, which is what the engine test comparing the two
+        // formats through both decoders exists to catch before a person meets
+        // it.
+        if let Ok(image) = tos_term::jpeg::decode(&jpeg, FRAME_BUDGET) {
+            let raw = Raw::rgb(&image.rgb, image.width, image.height);
+            paint(pane, tabs, chrome, raw)?;
         }
     }
     Ok(())
@@ -844,47 +872,109 @@ fn paint(
 /// A page that has stopped moving gets one lossless picture of itself.
 ///
 /// This is the other half of [`crate::motion`]'s policy: the screencast is
-/// JPEG so that a scroll keeps up, and the moment it stops the text somebody
+/// JPEG so that a scroll keeps up, and once it has stopped the text somebody
 /// is about to read is replaced with the PNG of the same page. It costs one
 /// `Page.captureScreenshot` per stop and nothing at all while the page stays
 /// still, so a static page is one still and then silence.
 ///
-/// It blocks this loop for as long as the engine takes, which is the one
-/// place in the program that does. That is deliberate and it is bounded: it
-/// only ever runs when no frame has arrived for a rest interval, so there is
-/// nothing to fall behind, and [`STILL_TIMEOUT`] is the ceiling.
+/// Nothing here waits. The screenshot is 66 to 98 milliseconds of engine at a
+/// pane's size, and a loop that sat in a `call` for them would be a loop that
+/// was not reading the terminal — which is what made a key pressed during one
+/// arrive a tenth of a second late, and sometimes need pressing twice. So the
+/// reply is collected first, and a new request only goes out when there is
+/// nothing outstanding and the page has been quiet in both the ways
+/// [`crate::motion`] asks about.
 fn rest_shot(pane: &mut Pane, tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> Result<(), String> {
-    if !chrome.motion.wants_still(Instant::now()) {
+    collect_still(pane, tabs, chrome)?;
+    request_still(tabs, chrome);
+    Ok(())
+}
+
+/// Take the reply to the still, if it has come back.
+///
+/// Called after the page's events have been drained, so that a frame which
+/// arrived on the same pass as the reply has already been counted against it —
+/// which matters, because the count is the rule: one frame in the window is
+/// the still photographing itself and more than one is the page moving. See
+/// [`motion::SHUTTER_FRAMES`].
+fn collect_still(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+) -> Result<(), String> {
+    let Some(still) = chrome.still.as_ref() else {
+        return Ok(());
+    };
+    if tabs.active_target() != Some(still.target.as_str()) {
+        // The tab was switched away from or closed while the engine drew. The
+        // motion state was reset with the switch, so there is nothing to tell
+        // it; the reply, if it ever comes, is left in a mailbox nobody reads.
+        chrome.still = None;
         return Ok(());
     }
-    // The still is credited with the moment it was asked for rather than the
-    // moment it arrived, which is the earliest instant it could depict — see
-    // `crate::motion` for why that is the side to err on.
-    let requested_at = motion::now_seconds();
+    let timed_out = still.sent.elapsed() >= STILL_TIMEOUT;
     let Some(tab) = tabs.active_mut() else {
         return Ok(());
     };
-    let answer = tab.connection.call_within(
-        "Page.captureScreenshot",
-        Json::object(vec![("format", Json::string("png"))]),
-        STILL_TIMEOUT,
-    );
+    let Some(answer) = tab.connection.take_reply(&still.pending) else {
+        if timed_out {
+            chrome.still = None;
+            chrome.motion.still_failed();
+        }
+        return Ok(());
+    };
+    chrome.still = None;
+    // Whether it is worth having is asked before it is decoded: a still that
+    // lost to a frame is a megabyte of PNG this loop does not have to look at,
+    // and the moment it loses is the moment the page is moving and the time is
+    // wanted elsewhere.
+    if !chrome.motion.still_arrived(motion::now_seconds()) {
+        return Ok(());
+    }
     let decoded = answer
         .ok()
         .and_then(|reply| reply.get("data").and_then(Json::as_str).map(str::to_string))
         .and_then(|data| crate::base64::decode(data.as_bytes()).ok())
         .and_then(|png| tos_term::png::decode(&png, FRAME_BUDGET).ok());
     let Some(image) = decoded else {
+        // The tab stays marked at rest, which is what stops a page whose
+        // screenshots will not decode being asked again every pass.
         chrome.motion.still_failed();
         return Ok(());
     };
-    if !chrome.motion.still_arrived(requested_at) {
-        // The page moved while this was being drawn, and what is on screen is
-        // newer than this is.
-        return Ok(());
-    }
     let raw = Raw::rgba(&image.rgba, image.width, image.height);
     paint(pane, tabs, chrome, raw)
+}
+
+/// Ask for a still, if the page has earned one.
+///
+/// A failure to send is a failure of the still and not of the program: the
+/// socket going is heard on the next pass by everything that cares.
+fn request_still(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    if !chrome.motion.wants_still(Instant::now()) {
+        return;
+    }
+    let Some(target) = tabs.active_target().map(str::to_string) else {
+        return;
+    };
+    let Some(tab) = tabs.active_mut() else {
+        return;
+    };
+    let sent = tab.connection.send(
+        "Page.captureScreenshot",
+        Json::object(vec![("format", Json::string("png"))]),
+    );
+    match sent {
+        Ok(pending) => {
+            chrome.motion.still_requested();
+            chrome.still = Some(Still {
+                target,
+                pending,
+                sent: Instant::now(),
+            });
+        }
+        Err(_) => chrome.motion.still_failed(),
+    }
 }
 
 /// Handle one thing the terminal said. `false` means quit.
@@ -899,6 +989,13 @@ fn handle_input(
     match input {
         Input::Mode { .. } => {}
         Input::Key(key) => {
+            // A key is a person working on this page, which is a reason not to
+            // interrupt them with a screenshot — see [`motion::INPUT_QUIET`].
+            // A release is not: it follows a press that has already been
+            // counted, and a modifier let go on its own moves nothing.
+            if key.action != KeyAction::Release {
+                chrome.motion.input(Instant::now());
+            }
             if chrome.editing.is_some() {
                 return edit_url(pane, tabs, chrome, key);
             }
@@ -966,6 +1063,13 @@ fn handle_input(
             }
         }
         Input::Mouse(report) => {
+            // Only the wheel. A hand on a wheel is the gesture the still has
+            // to keep out of the way of; a pointer drifting across a page is
+            // not, and counting moves would mean a page nobody had scrolled
+            // never got its lossless picture at all.
+            if report.kind == MouseKind::Wheel {
+                chrome.motion.input(Instant::now());
+            }
             let metrics = chrome.metrics;
             let pixels = chrome.parser.pixel_coordinates();
             let clicks = &mut chrome.clicks;

@@ -22,13 +22,13 @@
 
 use std::time::{Duration, Instant};
 
-use tos_browser::cdp::Client;
+use tos_browser::cdp::{Client, Pending};
 use tos_browser::engine::{self, Engine};
 use tos_browser::graphics::{Painter, Raw, IMAGE_ID};
 use tos_browser::input::{Key, KeyAction, KeyInput, Mods};
 use tos_browser::json::Json;
 use tos_browser::keys;
-use tos_browser::motion;
+use tos_browser::motion::{self, Motion};
 use tos_browser::tabs::{Outcome, Tab, Tabs};
 use tos_compositor::ImageFiles;
 use tos_preview::fit::Cells;
@@ -1269,6 +1269,353 @@ fn raw_pixels_cost_the_terminal_a_fraction_of_what_a_png_frame_did() {
     painter.clean_up();
     std::fs::remove_dir_all(&before_dir).ok();
     std::fs::remove_dir_all(&after_dir).ok();
+    client.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// When the lossless still is taken, and what it costs the loop
+// ---------------------------------------------------------------------------
+
+/// One wheel notch over the middle of the page, exactly as `app::send_mouse`
+/// sends one: a notification, because the reply says nothing and a round trip
+/// between two notches would be a round trip a person can feel.
+fn notch(client: &mut Client) {
+    client
+        .notify(
+            "Input.dispatchMouseEvent",
+            Json::object(vec![
+                ("type", Json::string("mouseWheel")),
+                ("x", Json::number(WIDE / 2)),
+                ("y", Json::number(TALL / 2)),
+                ("modifiers", Json::number(0)),
+                ("button", Json::string("none")),
+                ("buttons", Json::number(0)),
+                ("deltaX", Json::number(0)),
+                ("deltaY", Json::number(120)),
+            ]),
+        )
+        .expect("the notch goes out");
+}
+
+/// Ask for the lossless still without waiting for it, as the loop does.
+fn ask_for_a_still(client: &mut Client) -> Pending {
+    client
+        .send(
+            "Page.captureScreenshot",
+            Json::object(vec![("format", Json::string("png"))]),
+        )
+        .expect("the still goes out")
+}
+
+/// The picture out of a still's reply, or nothing if it carried none.
+fn still_picture(answer: Result<Json, String>) -> Option<Vec<u8>> {
+    answer
+        .ok()
+        .and_then(|reply| reply.get("data").and_then(Json::as_str).map(str::to_string))
+        .and_then(|data| tos_browser::base64::decode(data.as_bytes()).ok())
+}
+
+/// Ten notches, 200 ms apart: two seconds of scrolling, in the middle of the
+/// 150 to 300 ms a hand leaves between them.
+const NOTCHES: u32 = 10;
+const EVERY: Duration = Duration::from_millis(200);
+
+/// A still photographs itself into the screencast, exactly once.
+///
+/// `motion::SHUTTER_FRAMES` is the number the whole rest policy is built on,
+/// and it is a property of the engine rather than of this crate: a
+/// `Page.captureScreenshot` forces a capture of the page's surface, and the
+/// screencast is watching that same surface. Taking it for granted is what
+/// made the first version of the policy loop — the frame the still provoked
+/// was read as the page moving, which cleared the rest, which asked for
+/// another still. So it is asserted here, on a page nothing at all is
+/// happening to, along with where in the still's window the frame lands.
+#[test]
+fn a_still_photographs_itself_into_the_screencast_exactly_once() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    article(&mut client, WIDE, TALL);
+    let _ = screenshot(&mut client, "png", None);
+    cast(&mut client, "jpeg", Some(motion::QUALITY), WIDE, TALL);
+    // Let the load's own frames go by, and check that a page nobody is
+    // touching then produces none of its own.
+    let settle = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < settle {
+        take_frames(&mut client);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut idle = 0usize;
+    let quiet = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < quiet {
+        idle += take_frames(&mut client).len();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(idle, 0, "the page moved on its own, so this proves nothing");
+
+    for round in 0..5 {
+        let requested = motion::now_seconds();
+        let pending = ask_for_a_still(&mut client);
+        let mut answer = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(reply) = client.take_reply(&pending) {
+                answer = Some(reply);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let replied = motion::now_seconds();
+        assert!(
+            still_picture(answer.expect("the still came back")).is_some(),
+            "a still with no picture in it"
+        );
+        // Everything the screenshot provoked, including anything that was
+        // already queued when the reply was taken.
+        let mut stamps = Vec::new();
+        let until = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < until {
+            stamps.extend(
+                take_frames(&mut client)
+                    .into_iter()
+                    .filter_map(|(_, at)| at),
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        eprintln!(
+            "still {round}: {:.0} ms to the reply, {} frame(s) at [{}] ms from the request",
+            (replied - requested) * 1000.0,
+            stamps.len(),
+            stamps
+                .iter()
+                .map(|at| format!("{:+.0}", (at - requested) * 1000.0))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        assert_eq!(
+            stamps.len(),
+            motion::SHUTTER_FRAMES as usize,
+            "a still provoked {} screencast frames, not {}",
+            stamps.len(),
+            motion::SHUTTER_FRAMES,
+        );
+        // And it is stamped inside the still's own window, which is what makes
+        // crediting the still with its reply enough to keep it off the screen.
+        assert!(
+            stamps[0] >= requested && stamps[0] <= replied,
+            "the shutter frame is stamped outside the still it belongs to"
+        );
+    }
+
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    client.close();
+    engine.kill();
+}
+
+/// A hand on the wheel gets JPEG frames and nothing else.
+///
+/// This is the flicker, against a real engine: ten notches 200 ms apart, which
+/// is what a hand does, driven through the policy in
+/// `apps/browser/src/motion.rs`. With the rule that shipped first — a still
+/// after 150 ms of frame quiet, with no notice taken of the wheel — every
+/// notch ended in a lossless still, so the screen went JPEG, PNG, JPEG, PNG
+/// several times a second and a page with colour in it flashed. What is
+/// asserted is that no still is even *asked for* while the notches are going,
+/// and that exactly one is painted once they stop.
+#[test]
+fn a_hand_on_the_wheel_gets_no_still_until_it_stops() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    article(&mut client, WIDE, TALL);
+    // A page that has loaded is not necessarily a page that has painted; one
+    // screenshot forces the first paint, so the frames below are the wheel's.
+    let _ = screenshot(&mut client, "png", None);
+    cast(&mut client, "jpeg", Some(motion::QUALITY), WIDE, TALL);
+
+    let mut rest = Motion::new(Instant::now());
+    let mut in_flight: Option<(Pending, Instant)> = None;
+    let mut sent = 0u32;
+    let mut next = Instant::now();
+    let mut last_notch = Instant::now();
+    let mut requested: Vec<Instant> = Vec::new();
+    let mut painted: Vec<Instant> = Vec::new();
+    let mut discarded = 0usize;
+    let mut frames = 0usize;
+    let mut settled: Option<Instant> = None;
+
+    let give_up = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < give_up {
+        let now = Instant::now();
+        if sent < NOTCHES && now >= next {
+            notch(&mut client);
+            rest.input(now);
+            last_notch = now;
+            sent += 1;
+            next = now + EVERY;
+        }
+        // Frames first and the reply second, which is the order the loop
+        // itself keeps: a frame that arrived on the same pass as the reply has
+        // to have been counted against it before it is judged.
+        for (_, stamp) in take_frames(&mut client) {
+            frames += 1;
+            rest.motion_frame(stamp, Instant::now());
+        }
+        match in_flight.take() {
+            Some((pending, at)) => match client.take_reply(&pending) {
+                Some(answer) => {
+                    if rest.still_arrived(motion::now_seconds()) {
+                        assert!(
+                            still_picture(answer).is_some(),
+                            "a still was painted with no picture in it"
+                        );
+                        painted.push(Instant::now());
+                        settled = Some(Instant::now());
+                    } else {
+                        discarded += 1;
+                    }
+                }
+                None => {
+                    assert!(
+                        at.elapsed() < Duration::from_secs(5),
+                        "the engine never answered a screenshot"
+                    );
+                    in_flight = Some((pending, at));
+                }
+            },
+            None => {
+                if rest.wants_still(Instant::now()) {
+                    requested.push(Instant::now());
+                    rest.still_requested();
+                    in_flight = Some((ask_for_a_still(&mut client), Instant::now()));
+                }
+            }
+        }
+        // Once a still is up, half a second of nothing else happening is what
+        // says it was the only one.
+        if let Some(settled) = settled {
+            if sent == NOTCHES && settled.elapsed() > Duration::from_millis(600) {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    eprintln!(
+        "{NOTCHES} notches every {EVERY:?}: {frames} frames, {} stills asked for, \
+         {} painted, {discarded} thrown away because the page moved",
+        requested.len(),
+        painted.len(),
+    );
+    assert!(frames > 5, "only {frames} frames: the wheel moved nothing");
+    assert!(
+        requested.iter().all(|at| *at > last_notch),
+        "a still was asked for while the wheel was still turning"
+    );
+    assert!(
+        painted.iter().all(|at| *at > last_notch),
+        "a still was painted while the wheel was still turning"
+    );
+    assert_eq!(
+        painted.len(),
+        1,
+        "the scroll should cost one lossless still, at the end of it"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// The loop keeps its hands free while the engine draws a still.
+///
+/// `Page.captureScreenshot` at a pane's size is 66 to 98 ms on the VirtualBox
+/// machine this was measured on, and the first version took it with a blocking
+/// call — so every key pressed in that window arrived a tenth of a second
+/// late, and a key that seemed to need pressing twice was the report that
+/// found it. Here the still goes out with `Client::send`, the key goes out
+/// immediately afterwards, and the page has acted on it before the still's
+/// reply is collected.
+#[test]
+fn a_key_is_handled_while_the_still_is_in_flight() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    // A pane's worth of viewport, because that is what makes the screenshot
+    // slow enough to be worth not waiting for.
+    client
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            Json::object(vec![
+                ("width", Json::number(WIDE)),
+                ("height", Json::number(TALL)),
+                ("deviceScaleFactor", Json::number(1)),
+                ("mobile", Json::Bool(false)),
+            ]),
+        )
+        .expect("a pane-sized viewport");
+    client
+        .call(
+            "Runtime.evaluate",
+            Json::object(vec![
+                ("expression", Json::string("document.title='waiting'")),
+                ("returnByValue", Json::Bool(true)),
+            ]),
+        )
+        .expect("the title is reset");
+
+    let at = Instant::now();
+    let pending = ask_for_a_still(&mut client);
+    // What the loop does next is read the terminal, not wait.
+    let params = keys::dispatch(&KeyInput {
+        key: Key::Char('k'),
+        mods: Mods::default(),
+        action: KeyAction::Press,
+        text: Some('k'),
+    })
+    .expect("a key with a name");
+    client
+        .notify("Input.dispatchKeyEvent", params)
+        .expect("the key is dispatched");
+    let dispatched = at.elapsed();
+    let early = client.take_reply(&pending);
+    assert!(
+        early.is_none(),
+        "the still replied before a key could even be sent, so this proves \
+         nothing about the loop"
+    );
+
+    // The page acts on the key while the engine is still drawing.
+    let seen = wait_for_title(&mut client, "key ", Duration::from_secs(5));
+    assert_eq!(&seen, "key k KeyK 75");
+
+    // And the still comes back afterwards, whole.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut answer = None;
+    while Instant::now() < deadline {
+        if let Some(reply) = client.take_reply(&pending) {
+            answer = Some(reply);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let png = still_picture(answer.expect("the still came back")).expect("a picture");
+    assert_eq!(&png[..4], b"\x89PNG");
+    eprintln!(
+        "the key went out {dispatched:?} after the still was asked for; \
+         the whole still took {:?} and is {} kB of PNG",
+        at.elapsed(),
+        png.len() / 1024,
+    );
+    assert!(
+        dispatched < Duration::from_millis(20),
+        "sending a key took {dispatched:?}, which is not \"immediately\""
+    );
+
     client.close();
     engine.kill();
 }

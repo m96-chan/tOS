@@ -30,6 +30,16 @@ use crate::ws::{self, Incoming, Opcode, Sender};
 /// How long a command may take before it is a failure rather than a wait.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// A command that has gone out and whose reply has not been taken yet.
+///
+/// The method travels with the id so that a reply collected long after the
+/// fact says what it was a reply to, exactly as [`Client::call`]'s errors do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    id: i64,
+    method: String,
+}
+
 /// An event as it arrived: the method and its parameters.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Event {
@@ -188,14 +198,7 @@ impl Client {
             .map_err(|_| "the connection is poisoned".to_string())?;
         loop {
             if let Some(reply) = mailbox.replies.remove(&id) {
-                if let Some(error) = reply.get("error") {
-                    let what = error
-                        .get("message")
-                        .and_then(Json::as_str)
-                        .unwrap_or("the engine refused it");
-                    return Err(format!("{method}: {what}"));
-                }
-                return Ok(reply.get("result").cloned().unwrap_or(Json::Null));
+                return outcome(method, &reply);
             }
             if let Some(ended) = &mailbox.ended {
                 return Err(format!("{method}: {ended}"));
@@ -212,6 +215,61 @@ impl Client {
                 .map_err(|_| "the connection is poisoned".to_string())?;
             mailbox = next;
         }
+    }
+
+    /// Send a command and come back for the reply later.
+    ///
+    /// [`Client::call`] is the right shape for everything on a person's
+    /// critical path — a navigation, a history entry — because there is
+    /// nothing useful to do until the engine has answered. It is the wrong
+    /// shape for the lossless still: that is tens of milliseconds of engine at
+    /// a pane's size, and a loop that sits in `call` for them is a loop that
+    /// is not reading the terminal. So the command goes out here and the reply
+    /// is collected by [`Client::take_reply`] on whichever pass it has
+    /// arrived on.
+    ///
+    /// Nothing new is needed underneath: a reply is filed in the mailbox under
+    /// its own id by the same reader thread, and the same wake pipe knocks for
+    /// it, so a `poll` that came back for an event comes back for this too.
+    pub fn send(&mut self, method: &str, params: Json) -> Result<Pending, String> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let message = Json::object(vec![
+            ("id", Json::number(id as f64)),
+            ("method", Json::string(method)),
+            ("params", params),
+        ])
+        .to_string();
+        let mut sender = self
+            .sender
+            .lock()
+            .map_err(|_| "the connection is poisoned".to_string())?;
+        sender
+            .send_text(&message)
+            .map_err(|e| format!("cannot send {method}: {e}"))?;
+        Ok(Pending {
+            id,
+            method: method.to_string(),
+        })
+    }
+
+    /// The reply to a [`Client::send`], if it has come.
+    ///
+    /// `None` is "not yet, ask again" and nothing else: the caller keeps the
+    /// [`Pending`] and its own deadline, because how long a command is worth
+    /// waiting for is the caller's decision rather than this module's. A
+    /// connection that has ended answers straight away, with why, so that a
+    /// caller is never left asking a socket that is gone.
+    pub fn take_reply(&self, pending: &Pending) -> Option<Result<Json, String>> {
+        let (lock, _) = &*self.mailbox;
+        let mut mailbox = lock.lock().ok()?;
+        if let Some(reply) = mailbox.replies.remove(&pending.id) {
+            return Some(outcome(&pending.method, &reply));
+        }
+        mailbox
+            .ended
+            .as_ref()
+            .map(|ended| Err(format!("{}: {ended}", pending.method)))
     }
 
     /// Send a command and do not wait for its reply.
@@ -271,6 +329,18 @@ impl Drop for Client {
             libc::close(self.wake_write);
         }
     }
+}
+
+/// What one reply means: the result, or the engine's refusal in words.
+fn outcome(method: &str, reply: &Json) -> Result<Json, String> {
+    if let Some(error) = reply.get("error") {
+        let what = error
+            .get("message")
+            .and_then(Json::as_str)
+            .unwrap_or("the engine refused it");
+        return Err(format!("{method}: {what}"));
+    }
+    Ok(reply.get("result").cloned().unwrap_or(Json::Null))
 }
 
 /// Put one message where it belongs.
