@@ -14,7 +14,6 @@ members = [
     "compositor/tos-compositor",
     "apps/installer",
     "apps/preview",
-    "apps/browser",
     "android/native",
 ]
 
@@ -39,7 +38,6 @@ tos-ime = { path = "compositor/tos-ime" }
 tos-compositor = { path = "compositor/tos-compositor" }
 tos-install = { path = "apps/installer" }
 tos-preview = { path = "apps/preview" }
-tos-browser = { path = "apps/browser" }
 libc = "0.2"
 
 [profile.release]
