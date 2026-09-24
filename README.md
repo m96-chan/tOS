@@ -1111,15 +1111,21 @@ second pile of work.
 The ticked one arrived early and sideways: the standalone APK is tOS on a
 phone that keeps Android, which is a different answer from the boot image the
 rest of this list is about. The unticked three are still what it would take to
-*be* the phone's system rather than a program on it.
-- vendor hardware integration where necessary
+*be* the phone's system rather than a program on it, with vendor hardware
+integration where necessary.
 
 ### Later — Web
 
-- WebKit experiments
-- terminal-native browser
-- graphical web surfaces
-- keyboard / pointer / touch web interaction
+- [x] engine experiments — Chromium's headless shell won; WPE WebKit is the open question
+- [x] terminal-native browser — blinkterm, in its own repository since 2026-09-24
+- [x] graphical web surfaces — Kitty graphics over shared memory
+- [x] keyboard / pointer web interaction — the Kitty keyboard protocol and mouse mode 1016
+- [ ] touch web interaction
+
+The experiment was #147 and it is answered in
+[`docs/design/browser.md`](docs/design/browser.md); what the browser does next
+is tracked in [blinkterm](https://github.com/m96-chan/blinkterm), not here.
+The engine is not on the image and never will be at its size.
 
 ## Applications
 
@@ -1140,7 +1146,7 @@ cost; this is the list.
 | Basic tools | less, openssh-client, rsync, unzip, file | Debian |
 | Face | HackGen Console NF | upstream zip, pinned |
 | Network, Bluetooth | tOS's own menus | tOS |
-| Web browser | tOS browser, TBD | [#147](https://github.com/m96-chan/tOS/issues/147) |
+| Web browser | blinkterm, in its own repository; the Chromium engine is the person's | [blinkterm](https://github.com/m96-chan/blinkterm) |
 
 **Bash is the shell**, and installing Homebrew does not change that: Homebrew
 is a package manager that came from macOS, and the shell macOS defaults to is
