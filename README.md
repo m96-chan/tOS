@@ -404,8 +404,11 @@ reported in 8×16 cells cannot hit a link.
 The engine is **not on the image** — at 482 MB it is twice the ISO, which is
 the clearest case of the rule in
 [`docs/design/applications.md`](docs/design/applications.md) that everything
-past the base set is the person's. The `tos-browser` client ships; the engine
-is found on `$PATH` or at `$TOS_BROWSER_ENGINE`.
+past the base set is the person's. The client is
+[blinkterm](https://github.com/m96-chan/blinkterm) — it began here as
+`tos-browser` and moved to its own repository on 2026-09-24, because it runs
+in any terminal that speaks the same protocols and wanted a CI with a Chromium
+in it; the engine is found on `$PATH` or at `$BLINKTERM_ENGINE`.
 
 Page text as terminal cells is deliberately not part of this. It is a research
 item with its own conditions, written down at the end of the design note.
@@ -1286,10 +1289,9 @@ minds losing.
 ```text
 tOS/
 ├── apps/                programs that run in a pane; none of them is the compositor
+│                        (the browser, blinkterm, has a repository of its own)
 │   ├── installer/       tos-install: put tOS on a disk from the live session
-│   ├── preview/         tos-preview: show an image in a pane
-│   └── browser/         tos-browser: a web page in a pane, on an engine the person
-│                        installs; and the PoC tools that decided its design
+│   └── preview/         tos-preview: show an image in a pane
 ├── iso/                 bootable image and its initramfs
 ├── android/             the standalone APK, for a phone that keeps Android
 │   ├── app/             the Android view: Java UI, JNI bridge, resources

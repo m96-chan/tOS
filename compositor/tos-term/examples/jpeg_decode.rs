@@ -1,6 +1,6 @@
 //! How long [`tos_term::jpeg`] takes over one frame.
 //!
-//! The decoder is on the hot path of `tos-browser`: a screencast frame
+//! The decoder is on the hot path of blinkterm (the browser, once `tos-browser` in this tree): a screencast frame
 //! arrives, is decoded here, and is handed to the terminal as raw RGB, and
 //! the whole of that has to fit inside the 17 ms between two frames at 58
 //! frames a second. So the number this prints is a requirement rather than a

@@ -43,17 +43,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tos-browser"
-version = "0.0.8"
-dependencies = [
- "libc",
- "tos-compositor",
- "tos-platform",
- "tos-preview",
- "tos-term",
-]
-
-[[package]]
 name = "tos-compositor"
 version = "0.0.8"
 dependencies = [

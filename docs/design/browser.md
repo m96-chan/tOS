@@ -7,7 +7,7 @@ and the frame path needs no compositor change at all. The engine is Chromium's
 headless shell, driven over the DevTools protocol, chosen over WPE WebKit for
 the proof of concept because its no-display-server operation was proven here in
 one run and WPE's was not. The engine is **not on the ISO** — it is twice the
-image — so `tos-browser` ships and the engine is the person's. The one
+image — so `blinkterm` ships and the engine is the person's. The one
 compositor change the experiment needs is on the input side: SGR-Pixels mouse
 reporting (mode 1016), because a click reported in 8×16 cells cannot hit a
 link.
@@ -97,7 +97,7 @@ already routed to `report_private_mode`, which answers `CSI ? 1016 ; s $ y`
 with `s` of 1 for set, 2 for reset and — because of its `_ => 0` arm — **0 for
 a mode it has never heard of**, which is what DECRQM defines 0 to mean. So the
 probe already works today and already gives the right answer on a compositor
-without the mode: `tos-browser` asks, gets `0`, and runs in cells. That is not
+without the mode: `blinkterm` asks, gets `0`, and runs in cells. That is not
 a degraded mode worth hiding — link-clicking on a cell grid is usable for a
 page of prose and unusable for a dense one, and the browser should say which
 it is in.
@@ -199,7 +199,7 @@ That the curves are read from the wall clock rather than accumulated is the
 property everything else rests on: a notch that should have delivered 71 pixels
 by now delivers 71 whether it is asked at the right moment, four milliseconds
 late, or twice in the same millisecond. Nothing is in flight to lose and there
-is no backlog to replay. `apps/browser/src/scroll.rs` is the whole rule, and it
+is no backlog to replay. blinkterm's `src/scroll.rs` is the whole rule, and it
 touches no socket: arithmetic on a distance and a clock, unit-tested without an
 engine.
 
@@ -279,7 +279,7 @@ what the hand did — a notch, with the tab and the connection it belongs to, an
 tick by more than the time it takes to append a notch under a mutex.
 
 Sending from another thread needed one small thing in
-[`cdp`](../../apps/browser/src/cdp.rs): a `Notifier`, which is a clone of the
+[`cdp`](https://github.com/m96-chan/blinkterm/blob/main/src/cdp.rs): a `Notifier`, which is a clone of the
 socket's writing half — already behind a mutex, because the reader thread has
 always held it to answer a ping — and the command counter, now an atomic so
 that an id is still spent exactly once. It cannot call, cannot wait for a
@@ -301,7 +301,7 @@ what such a site does with `preventDefault` still works, and a notch over an
 inner scroller scrolls that scroller.
 
 Every tick that goes out counts as input in
-[`motion`](../../apps/browser/src/motion.rs)'s sense, as does every notch, so
+[`motion`](https://github.com/m96-chan/blinkterm/blob/main/src/motion.rs)'s sense, as does every notch, so
 the quiet interval that earns a lossless still runs from the last tick of the
 animation rather than from the last notch of the hand: no still is asked for in
 the middle of a scroll. The animator thread does not touch that state — it
@@ -434,11 +434,11 @@ binary on every image and said everything else is the person's, and it left
 the browser to this issue by name. A browser engine is the clearest case that
 rule will ever get.
 
-**So `tos-browser` ships and the engine does not.** The client is a small Rust
+**So `blinkterm` ships and the engine does not.** The client is a small Rust
 program — a CDP client over a local websocket, a PNG passthrough, an input
 translator — and it belongs on the image for the same reason `tos-preview`
 does: it is the program that proves the protocol from the other end. It finds
-the engine by looking for `$TOS_BROWSER_ENGINE` and then for
+the engine by looking for `$BLINKTERM_ENGINE` and then for
 `chromium-shell`, `chromium` and `chrome` on `$PATH`, and when it finds none
 it says which names it looked for and what to `apt install`. A browser that is
 absent until somebody installs 482 MB is honest; a 723 MB ISO is not.
@@ -461,7 +461,7 @@ absent until somebody installs 482 MB is honest; a 723 MB ISO is not.
                        │   in PNG when it stops
                        ▼
         ┌──────────────────────────────────────────────┐
-        │  tos-browser                                 │
+        │  blinkterm                                 │
         │  an ordinary program in a pane. No compositor│   on the image
         │  API, no socket to the compositor, no plugin │
         │  jpeg.rs / png.rs decode the frame here, 8 ms│
@@ -494,7 +494,7 @@ and the other way, which is where the compositor changes:
           │ 1016:  ESC [ < 0 ; x   ; y   M      pixels
           │ PTY
           ▼
-        tos-browser  subtracts the placement's origin
+        blinkterm  subtracts the placement's origin
           │ CDP Input.dispatchMouseEvent
           ▼
         chromium-shell
@@ -504,7 +504,7 @@ and the other way, which is where the compositor changes:
           │ the Kitty keyboard protocol: ESC [ 97 ; 1 : 1 ; 97 u
           │ PTY
           ▼
-        tos-browser
+        blinkterm
           │ CDP Input.dispatchKeyEvent, and insertText for committed text
           ▼
         chromium-shell
@@ -524,7 +524,7 @@ second.
 The inline fallback still exists and still works, and it is now a slideshow
 rather than a slower picture. It sends the same raw pixels, because the
 alternatives are to send a JPEG the terminal cannot read or to write a PNG
-*encoder* in `apps/browser` — a third codec from a specification, to make
+*encoder* in blinkterm (then `apps/browser`) — a third codec from a specification, to make
 faster a path that exists only for terminals which are not tOS. Correct and
 slow was the right side of that.
 
@@ -579,7 +579,7 @@ past it and expects both to be zero at the end.
 
 Included, and this is the checklist #147's "Done when" is measured against:
 
-- `tos-browser https://example.org` in a pane shows the page, at the engine's
+- `blinkterm https://example.org` in a pane shows the page, at the engine's
   frame rate, with a URL line above it.
 - Scrolling with the wheel and with the keyboard.
 - Clicking links: pixel-precise where the compositor has 1016, cell-precise
@@ -625,9 +625,9 @@ machine keeps a person's data, and it is not this experiment's to answer.
 Tabs came in anyway, and the reason is worth recording because it is not scope
 creep. A link with `target=_blank` makes the engine open a page target whatever
 the client does, and a target nothing attaches to is a click that does nothing
-at all — the first thing anybody meets on a real site. So `tos-browser` keeps a
+at all — the first thing anybody meets on a real site. So `blinkterm` keeps a
 list of page targets, one WebSocket each, on the row it already owns, with a
-screencast on the one in front and none on the rest; `apps/browser/src/tabs.rs`
+screencast on the one in front and none on the rest; blinkterm's `src/tabs.rs`
 has the model and `lib.rs` has why they are tabs rather than panes. Still out:
 everything else in that paragraph.
 
@@ -736,7 +736,7 @@ What is a property of this code rather than of the host is the last column,
 and it is the same several-fold difference everywhere: **the compositor's
 per-frame cost falls seven- or eightfold**, because a PNG decode on the parse
 loop became a copy out of tmpfs. That is what
-`apps/browser/tests/engine.rs` asserts; the frame rates it prints and does not
+blinkterm's `tests/engine.rs` asserts; the frame rates it prints and does not
 assert, for exactly this reason.
 
 So the decision stands on two legs rather than one. On a machine where the
@@ -842,8 +842,8 @@ the common case of exactly that. `Page.screencastFrame` carries
 `metadata.timestamp` in seconds since the epoch and the engine is a child
 process on this machine, so it is the same clock this program reads.
 
-`apps/browser/src/motion.rs` is the policy and its tests, away from the engine,
-the terminal and the pane. `apps/browser/tests/engine.rs` pins the three
+blinkterm's `src/motion.rs` is the policy and its tests, away from the engine,
+the terminal and the pane. blinkterm's `tests/engine.rs` pins the three
 claims against a real engine: that a still provokes exactly one screencast
 frame and where in its window that frame lands; that twelve wheel notches 50 ms
 apart produce no still until the animation they start has finished, and exactly
@@ -917,7 +917,24 @@ PNG decoder produces and a still is one frame every 150 ms.
 
 ## Where the crate lives, and what would move it out
 
-**Decided: `apps/browser`, in this tree, beside `apps/preview` and
+**Update, 2026-09-24: it moved.** The browser is
+[m96-chan/blinkterm](https://github.com/m96-chan/blinkterm), with the history
+of `browser/` and `apps/browser/` carried over. The section below is the
+decision as it stood a day earlier and is kept because its reasoning is still
+right; what changed is which of its conditions arrived first. It was not the
+publishing of the pane-program crates and not 0.1 — it was pace: in two days
+the browser took four pull requests, a docker harness of its own and a test
+suite that needs a Chromium, which this repository's CI cannot run and the
+browser's can. And it was never only for tOS: the protocols it speaks are the
+ones Kitty, WezTerm and Ghostty speak, so a name that said tOS was wrong.
+blinkterm depends on `tos-term`, `tos-platform` and `tos-preview` as git
+dependencies pinned to a revision of this repository, which is the "test the
+past" cost named below, accepted knowingly; publishing those crates is what
+would remove it. The contract tests moved with the crate and run against the
+pinned revision.
+
+
+**Decided, 2026-09-23 (superseded above): `apps/browser`, in this tree, beside `apps/preview` and
 `apps/installer`.** Not its own repository yet — and the conditions under
 which it becomes one are written here so that the question is answered by
 events rather than reopened by mood.
