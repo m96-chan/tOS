@@ -254,7 +254,9 @@ the point of it — none of this is on the path that finds the medium.
 
 ## What this does not settle
 
-- The **browser** is #147 and is not on this page.
+- The **browser** is [blinkterm](https://github.com/m96-chan/blinkterm), in
+  its own repository; #147 settled it, and its engine is the clearest case of
+  the rule above that everything past the base set is the person's.
 - **Network and Bluetooth** stay tOS's own menus, as the issue asks; no `nmtui`
   and no `bluetuith`, because those would be a second answer to a question the
   compositor already answers.
